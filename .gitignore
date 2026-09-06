@@ -27,3 +27,5 @@ status-*.json
 asar-out/
 **/teleagent.log
 **/chrome-profile*/
+# job run outputs (eternal receive path)
+jobs/runs/

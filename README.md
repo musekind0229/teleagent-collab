@@ -26,8 +26,11 @@
 ## 仓库结构
 
 ```
-docs/                 # 工人契约、发现笔记、计量笔记
-src/                  # glue / cut2 / cut3 胶水源码
+bin/run-job.py        # 永续入口：读章程 → glue.run_job → 落报告
+jobs/examples/        # 样例章程（*.charter.yaml）
+jobs/runs/            # 收件目录（status/report；gitignore）
+docs/                 # 工人契约、发现笔记、计量笔记、永续骨架
+src/                  # glue / cut2 / cut3 / charter 胶水源码
 templates/            # 报告模板（脱敏）
 ```
 
@@ -66,6 +69,18 @@ python3 cut3.py   # 或 glue.py / cut2.py（按脚本约定的工作目录）
 | **Lead 枚举** | `once|reject|deny_job|demand_safe_path`；后两者映射 API 为 `reject`；禁 always / yolo |
 
 黄金回放：`python3 src/golden_replay_secret_env.py`（无白名单绝不 once/always；有白名单可 once+日志）；笔记 [`docs/golden-replay-secret-env.md`](docs/golden-replay-secret-env.md)。
+
+
+## 永续 ↔ 工人（章程骨架）
+
+永续层**只写包、开跑、收件**——用章程文件（`goal` / `must` / `must_not` / `allow_*` / `done_when|acceptance`）交接，**禁止**只靠长提示词口头指挥工人。
+
+```bash
+python3 bin/run-job.py --dry-run jobs/examples/hello.charter.yaml
+python3 bin/run-job.py jobs/examples/hello.charter.yaml   # 真跑需 :4399 + 组长
+```
+
+报告落在 `jobs/runs/<name>-<utc>/{status.json,report.json,report.md}`。详见 [`docs/eternal-worker-skeleton.md`](docs/eternal-worker-skeleton.md)。
 
 ## 一句话
 

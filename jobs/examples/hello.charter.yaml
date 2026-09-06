@@ -1,0 +1,35 @@
+# Sample charter — eternal layer writes this package; worker executes via bin/run-job.py.
+# Do NOT replace this file with a long oral prompt to the worker.
+
+name: hello
+goal: "In the collab workspace only, create hello-from-worker.txt with exactly one short greeting line, then stop."
+
+must:
+  - Stay inside the assigned workspace
+  - Create the artifact named in done_when.artifacts
+  - Stop when the file exists
+
+must_not:
+  - Read or copy credentials, tokens, cookies, or secret files
+  - Use always-approve / yolo / global auto-approve
+  - Touch directories outside the workspace
+
+# At least one allowlist field required (empty = no secret paths authorized).
+allow_secret_globs: []
+allow_paths: []
+allow_keys: []
+
+allowed_surfaces:
+  - workspace_fs
+  - lead_approved_tools
+
+done_when:
+  artifacts:
+    - hello-from-worker.txt
+
+acceptance: |
+  hello-from-worker.txt exists under the collab workspace and contains exactly
+  one non-empty text line.
+
+timeout_sec: 240
+force_lead_review: false
