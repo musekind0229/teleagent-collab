@@ -29,3 +29,5 @@ asar-out/
 **/chrome-profile*/
 # job run outputs (eternal receive path)
 jobs/runs/
+# per-job isolated workdirs (scheduler)
+jobs/workspaces/

@@ -74,18 +74,27 @@ def find_creds():
     raise RuntimeError("TeleAgent local API creds not found in process environ")
 
 
-USER, PW, KEY = find_creds()
-BASIC = "Basic " + base64.b64encode(f"{USER}:{PW}".encode()).decode()
+_CREDS: tuple[str, str, str] | None = None
+
+
+def _ensure_creds() -> tuple[str, str, str]:
+    """Lazy TeleAgent creds — import glue without :4399 for dry/scheduler unit tests."""
+    global _CREDS
+    if _CREDS is None:
+        _CREDS = find_creds()
+    return _CREDS
 
 
 def sign_headers(method: str, url: str) -> dict:
+    user, pw, key = _ensure_creds()
+    basic = "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode()
     n = urlparse(url)
     path = f'{n.path}{("?" + n.query) if n.query else ""}'
     ts = str(int(time.time() * 1000))
     nonce = secrets.token_hex(12)
     payload = "\n".join(["local-v1", method.upper(), path, ts, nonce])
     sig = (
-        base64.urlsafe_b64encode(hmac.new(KEY.encode(), payload.encode(), hashlib.sha256).digest())
+        base64.urlsafe_b64encode(hmac.new(key.encode(), payload.encode(), hashlib.sha256).digest())
         .decode()
         .rstrip("=")
     )
@@ -94,7 +103,7 @@ def sign_headers(method: str, url: str) -> dict:
         "X-SA-Timestamp": ts,
         "X-SA-Nonce": nonce,
         "X-SA-Signature": sig,
-        "Authorization": BASIC,
+        "Authorization": basic,
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
@@ -319,8 +328,12 @@ def run_job(
     charter: dict | None = None,
     worker_intent: str | None = None,
     blocker: dict | str | None = None,
+    workspace: str | Path | None = None,
 ) -> dict:
-    ws = str(COLLAB)
+    """Run one TeleAgent job. workspace= isolates files per job_id (parallel-safe)."""
+    ws_path = Path(workspace) if workspace else COLLAB
+    ws_path.mkdir(parents=True, exist_ok=True)
+    ws = str(ws_path)
     # Charter for decision packets (first ping may include full text; later charter_ref only).
     job_charter = charter or {
         "goal": (instruction or "")[:240],

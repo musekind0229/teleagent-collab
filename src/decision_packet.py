@@ -205,12 +205,17 @@ def packet_from_permission(
     ping_reason: str = "permission",
 ) -> dict:
     """Build packet from a TeleAgent permission payload — never tool+path only."""
+    # NOTE: parenthesize ternary — bare `a or b or c if cond else d` binds wrong and
+    # drops `path` when `patterns` is absent (else branch returns None).
+    patterns = permission_dict.get("patterns")
+    if isinstance(patterns, list):
+        pattern0 = (patterns or [None])[0]
+    else:
+        pattern0 = patterns
     path = (
         permission_dict.get("path")
         or permission_dict.get("filepath")
-        or (permission_dict.get("patterns") or [None])[0]
-        if isinstance(permission_dict.get("patterns"), list)
-        else permission_dict.get("patterns")
+        or pattern0
     )
     if not path and isinstance(permission_dict.get("metadata"), dict):
         path = permission_dict["metadata"].get("path") or permission_dict["metadata"].get("filepath")

@@ -41,3 +41,8 @@ python3 bin/run-job.py jobs/examples/hello.charter.yaml
 ## 与硬规则的关系
 
 本刀**不改** `hard_rules.py` 逻辑。章程里的 `allow_*` 原样交给现有 `glue.run_job(..., charter=…)`；刀3另做硬规则演进。
+
+## 并行调度（可选）
+
+多章程并行时用 `bin/run-scheduler.py`（`max_parallel`、独立 workdir、扫描 ≠ call_lead）。见 [`parallel-scheduler.md`](parallel-scheduler.md)。
+

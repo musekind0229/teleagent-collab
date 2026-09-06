@@ -174,6 +174,11 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Override charter timeout_sec",
     )
+    ap.add_argument(
+        "--workspace",
+        default=None,
+        help="Per-job workdir (default: glue.COLLAB). Use distinct dirs for parallel jobs.",
+    )
     args = ap.parse_args(argv)
 
     try:
@@ -194,7 +199,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         import glue as g
 
-        ws = Path(g.COLLAB)
+        ws = Path(args.workspace) if args.workspace else Path(g.COLLAB)
         ws.mkdir(parents=True, exist_ok=True)
         arts = expected_artifacts(charter, workspace=ws)
         # Clean expected artifacts so sample jobs are repeatable
@@ -219,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:
             worker_intent=charter.get("worker_intent")
             or f"Execute charter job {name!r}: {charter['goal'][:200]}",
             blocker=charter.get("blocker"),
+            workspace=ws,
         )
         result.setdefault("notes", []).append(f"wall_sec={time.time() - t0:.1f}")
         result["dry_run"] = False

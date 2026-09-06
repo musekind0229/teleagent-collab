@@ -27,6 +27,7 @@
 
 ```
 bin/run-job.py        # 永续入口：读章程 → glue.run_job → 落报告
+bin/run-scheduler.py  # 并行调度 + 自适应审批扫描（scan ≠ lead）
 jobs/examples/        # 样例章程（*.charter.yaml）
 jobs/runs/            # 收件目录（status/report；gitignore）
 docs/                 # 工人契约、发现笔记、计量笔记、永续骨架
@@ -70,6 +71,15 @@ python3 cut3.py   # 或 glue.py / cut2.py（按脚本约定的工作目录）
 
 黄金回放：`python3 src/golden_replay_secret_env.py`（无白名单绝不 once/always；有白名单可 once+日志）；笔记 [`docs/golden-replay-secret-env.md`](docs/golden-replay-secret-env.md)。
 
+
+## 并行调度 + 审批抽检
+
+调度器定时/短轮询**只扫描**各 job 的 pending 栈；无请求就跳过。只有硬规则未处理、真正需要 lead 时才 `call_lead`（`max_parallel=3`，每单独立 `job_id` + workdir）。详见 [`docs/parallel-scheduler.md`](docs/parallel-scheduler.md)。
+
+```bash
+python3 bin/run-scheduler.py --smoke          # 3 路隔离 + 串行短轮询烟测
+python3 bin/run-scheduler.py --dry-run --max-parallel 3 jobs/examples/hello.charter.yaml
+```
 
 ## 永续 ↔ 工人（章程骨架）
 
