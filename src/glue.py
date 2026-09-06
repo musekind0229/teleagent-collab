@@ -19,6 +19,16 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
+from hard_rules import hard_rule_decision
+from decision_packet import (
+    PingDeduper,
+    format_lead_prompt,
+    lead_permission_schema,
+    map_lead_decision_to_api,
+    packet_from_permission,
+    should_ping_lead,
+)
+
 COLLAB = Path("/workspace/teleagent/probe-sandbox/collab")
 BASE = "http://127.0.0.1:4399"
 # Lead is swappable: default Grok Build; override with COLLAB_LEAD_BIN (Claude Code/Codex later).
@@ -306,8 +316,23 @@ def run_job(
     expected_artifacts: list[str],
     force_lead_review: bool = False,
     timeout_sec: int = 300,
+    charter: dict | None = None,
+    worker_intent: str | None = None,
+    blocker: dict | str | None = None,
 ) -> dict:
     ws = str(COLLAB)
+    # Charter for decision packets (first ping may include full text; later charter_ref only).
+    job_charter = charter or {
+        "goal": (instruction or "")[:240],
+        "must": [f"stay inside workspace {ws}"],
+        "must_not": [
+            "read or copy credentials, tokens, cookies, or secret files",
+            "use always-approve / yolo",
+        ],
+        "allowed_surfaces": ["workspace_fs", "lead_approved_tools"],
+    }
+    ping_deduper = PingDeduper()
+    charter_sent_full = False
     report = {
         "name": name,
         "session_id": "",
@@ -324,6 +349,7 @@ def run_job(
         "error": "",
         "path": "permission_api" if not force_lead_review else "lead_review",
         "notes": [],
+        "hard_rule_rejects": [],
     }
 
     code, created = call(
@@ -362,59 +388,131 @@ def run_job(
                     continue
                 summary = summarize_permission(p)
                 report["pending_summaries"].append(summary)
+
+                # 1) Hard rules first — obvious credential paths / always+secret → reject, no lead.
+                hr = hard_rule_decision(p if isinstance(p, dict) else {})
+                if hr and hr.get("reply") == "reject":
+                    rc, rj = call("POST", f"/permission/{pid}/reply", body={"reply": "reject"})
+                    report["api_replies"].append(
+                        {"id": pid, "reply": "reject", "via": "hard_rule", "http": rc}
+                    )
+                    report["hard_rule_rejects"].append({"id": pid, "reason": hr.get("reason", "")})
+                    report["notes"].append(f"hard_rule reject: {hr.get('reason', '')}")
+                    report["grok_permission_decision"] = "reject"
+                    handled_perm_ids.add(pid)
+                    continue
+
+                # 2) Decision packet — must include worker_intent + blocker + charter_ref.
+                intent = (worker_intent or "").strip() or (
+                    f"Worker requests permission to continue job {name!r} "
+                    f"inside workspace; tool/path from pending (see proposed_action)."
+                )
+                blk = blocker if blocker is not None else {
+                    "failed_path": "permission_gate",
+                    "detail": "worker awaiting lead decision on pending permission",
+                }
+                include_full = not charter_sent_full
+                packet = packet_from_permission(
+                    p if isinstance(p, dict) else {},
+                    worker_intent=intent,
+                    blocker=blk,
+                    charter=job_charter,
+                    include_charter_full=include_full,
+                    ping_reason="permission",
+                    risk_tags=["permission"],
+                )
+                if include_full:
+                    charter_sent_full = True
+                # Forbid tool+path-only: assert required fields present.
+                missing = [
+                    req_k
+                    for req_k in ("worker_intent", "blocker", "charter_ref")
+                    if req_k not in packet or packet[req_k] in (None, "", {})
+                ]
+                if missing:
+                    report["notes"].append(f"packet missing {missing}; forcing reject")
+                    call("POST", f"/permission/{pid}/reply", body={"reply": "reject"})
+                    report["api_replies"].append({"id": pid, "reply": "reject", "via": "incomplete_packet"})
+                    handled_perm_ids.add(pid)
+                    continue
+
+                pa = packet.get("proposed_action") or {}
+                tclass = pa.get("target_class") or "unknown"
+                ppat = pa.get("path_pattern") or ""
+                if not ping_deduper.should_emit("permission", tclass, ppat):
+                    # Same fork already pinged — conservative reject until charter changes.
+                    call("POST", f"/permission/{pid}/reply", body={"reply": "reject"})
+                    report["api_replies"].append({"id": pid, "reply": "reject", "via": "ping_dedupe"})
+                    report["notes"].append(f"deduped permission ping {tclass}/{ppat}")
+                    handled_perm_ids.add(pid)
+                    continue
+
+                # Ordinary in-workspace source R/W: still need an API reply, but may skip lead
+                # when should_ping_lead is False — default once for tiny workspace edits only.
+                path_guess = pa.get("target") or ""
+                tool_guess = pa.get("tool") or ""
+                if not should_ping_lead(
+                    ping_reason="permission",
+                    tool=tool_guess,
+                    path=path_guess,
+                    target_class=tclass,
+                ) and path_guess.startswith(ws):
+                    rc, rj = call("POST", f"/permission/{pid}/reply", body={"reply": "once"})
+                    report["api_replies"].append(
+                        {"id": pid, "reply": "once", "via": "ordinary_rw_no_lead", "http": rc}
+                    )
+                    report["notes"].append("ordinary workspace R/W — no lead ping")
+                    report["grok_permission_decision"] = "once"
+                    handled_perm_ids.add(pid)
+                    continue
+
+                ping_deduper.mark_inflight("permission", tclass, ppat)
                 allow_hint = (
                     f"Allowed workspace only: {ws}. "
-                    "If the request is write/bash inside this workspace for the stated tiny job, reply once. "
-                    "If outside workspace, destructive, network exfil, or unclear, reply reject. "
+                    "Secret-adjacent / auth workarounds: reject or demand_safe_path, never once. "
                     "Never choose always."
                 )
-                schema = {
-                    "type": "object",
-                    "properties": {
-                        "decision": {"type": "string", "enum": ["once", "always", "reject", "deny_job"]},
-                        "reason": {"type": "string"},
-                    },
-                    "required": ["decision", "reason"],
-                    "additionalProperties": False,
-                }
-                prompt = (
-                    "You are the team lead approving a TeleAgent worker permission request. "
-                    "Output JSON only with decision and reason.\n"
-                    f"{allow_hint}\n"
-                    f"Permission request summary:\n{summary}\n"
-                )
+                schema = lead_permission_schema()
+                prompt = format_lead_prompt(packet, allow_hint=allow_hint)
                 raw, parsed = call_lead(prompt, schema, ws)
                 report["grok_permission_raw"] = raw
                 decision = None
                 if isinstance(parsed, dict):
                     decision = parsed.get("decision") or (parsed.get("result") or {}).get("decision")
-                    # unwrap common grok json envelopes
+                    so = parsed.get("structuredOutput")
+                    if not decision and isinstance(so, dict):
+                        decision = so.get("decision")
                     if not decision:
                         for k in ("output", "message", "content", "data"):
                             if isinstance(parsed.get(k), dict) and parsed[k].get("decision"):
                                 decision = parsed[k]["decision"]
                                 break
-                if decision == "always":
-                    decision = "once"  # harden: never promote to always
-                    report["notes"].append("downgraded always->once")
-                if decision not in ("once", "reject", "deny_job"):
-                    # parse from text
-                    m = re.search(r"\b(once|reject|deny_job|always)\b", raw or "")
+                if decision not in ("once", "reject", "deny_job", "demand_safe_path", "always"):
+                    m = re.search(r"\b(once|reject|deny_job|demand_safe_path|always)\b", raw or "")
                     decision = m.group(1) if m else "reject"
-                    if decision == "always":
-                        decision = "once"
                 report["grok_permission_decision"] = decision
+                api_reply, map_note = map_lead_decision_to_api(decision)
+                if map_note:
+                    report["notes"].append(map_note)
+                ping_deduper.mark_replied("permission", tclass, ppat)
                 if decision == "deny_job":
                     call("POST", f"/permission/{pid}/reply", body={"reply": "reject"})
                     report["api_replies"].append({"id": pid, "reply": "reject", "via": "deny_job"})
                     handled_perm_ids.add(pid)
                     report["state"] = "fail"
-                    report["error"] = "Grok deny_job"
+                    report["error"] = "lead deny_job"
                     _write_status(name, report)
                     return report
-                reply = "once" if decision == "once" else "reject"
-                rc, rj = call("POST", f"/permission/{pid}/reply", body={"reply": reply})
-                report["api_replies"].append({"id": pid, "reply": reply, "http": rc, "body": redact(rj) if rj else ""})
+                rc, rj = call("POST", f"/permission/{pid}/reply", body={"reply": api_reply})
+                report["api_replies"].append(
+                    {
+                        "id": pid,
+                        "reply": api_reply,
+                        "lead_decision": decision,
+                        "http": rc,
+                        "body": redact(rj) if rj else "",
+                    }
+                )
                 handled_perm_ids.add(pid)
 
         busy = session_busy(status, sid)

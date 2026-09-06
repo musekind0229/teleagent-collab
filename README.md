@@ -52,6 +52,21 @@ python3 cut3.py   # 或 glue.py / cut2.py（按脚本约定的工作目录）
 
 每次工人 prompt 会自动带 `queryID: q_<uuid4()>`（见 `src/glue.py`）。
 
+
+## 喂法 / 触发表 / 硬规则 / 非每步思考
+
+安全敏感活**不要**把工人 CoT 喂给 lead，也**不要**只塞 `tool+path`。在分叉上组 **决策包**（`worker_intent` + `blocker` + `charter_ref` + spine…），详见 [`docs/lead-feed.md`](docs/lead-feed.md)；咨询原文（脱敏）：[`docs/ask-lead-feed-out.txt`](docs/ask-lead-feed-out.txt)。
+
+| 机制 | 说明 |
+| --- | --- |
+| **硬规则** | `src/hard_rules.py`：`.env*` / `auth.json` / `token*` / cookie·profile / `~/.ssh` / `gh/hosts` / `.netrc` / credential basename；`always`+secret → **直接 reject**，不进 lead |
+| **触发表** | `plan_commit|rewrite`、`surface_switch`、`secret_adjacent`、`blocked_workaround`、`constraint_reinterp`、`permission`、`outbound_auth`、`job_end`（见 lead-feed） |
+| **去重** | 同一 `(ping_reason, target_class, path_pattern)` 在 lead 回复前只 ping 一次 |
+| **非每步** | 普通源码读写、测例、`ls`、已批计划下连续编辑 → `should_ping_lead` = False |
+| **Lead 枚举** | `once|reject|deny_job|demand_safe_path`；后两者映射 API 为 `reject`；禁 always / yolo |
+
+黄金回放：`python3 src/golden_replay_secret_env.py`（期望绝不 once/always）；笔记 [`docs/golden-replay-secret-env.md`](docs/golden-replay-secret-env.md)。
+
 ## 一句话
 
 **TeleAgent 出力，可插拔组长把门，脚本把审批和验收跑完——给人只留开题和收件。**

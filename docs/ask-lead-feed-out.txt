@@ -1,0 +1,154 @@
+这是门控咨询，不是实现。我会按「能拦住跑偏、又不把工人每一步思考都喂给 lead」来给最小信号方案。结论先说：**不要把工人的思考流给 lead**；也不要只在弹权和收工时给瘦 JSON。安全敏感活要在「换路 / 碰秘密 / 改约束」这三类分叉上，给一份 **300–800 token 的决策包**。Lead 判的是 **意图是否偏离章程**，不是复盘全文。
+
+硬规则继续拦明显凭据路径。Lead 要拦的是更阴的：`read_file` 看起来像普通读文件，但目的是「浏览器没登录 → 去用户工作区找 token」。没有 **意图 + 阻塞原因 + 章程约束**，我判不了。
+
+---
+
+### 1. 最少要什么（一次 ping 的决策包）
+
+固定 7 块，缺一就容易误放或误杀：
+
+- **章程锚点**：人要什么、明确约束、允许的表面（例：只用已登录浏览器）、禁止类（凭据、宿主机、越沙箱）
+- **本次事件**：工人 **马上要执行** 的动作（工具、目标、尚未发生）
+- **意图摘要**（1–3 句，≤400 字）：为什么觉得这是正确下一步——**工人自己的计划句**，不是思维链
+- **阻塞 / 换路原因**：主路径哪一步失败（例：工人浏览器 profile 未登录）
+- **约束差**：人说的约束 vs 工人正在做的解释
+- **最近动作脊**：最近 5–8 步的 `工具 + 目标类/路径模式 + 成败`，不要输出正文
+- **要我做的决定**：`reject` / `deny_job` / `demand_safe_path` /（非秘密类才）`once`
+
+可选但便宜、很有用：
+
+- `risk_tags`：`surface_switch` | `secret_adjacent` | `auth_workaround` | `constraint_reinterp`
+- `target_class`：`user_secret_store` | `browser_profile` | `env_file` | `source` | `url` …
+- 路径只给 **模式 + basename**，不给文件内容
+
+**不要**把秘密正文、cookie、token 值发给 lead。路径类 + 意图已经够判。
+
+---
+
+### 2. 形态：结构化 JSON，禁止聊天笔录
+
+Glue 组包，工人禁止自由发挥长文。建议 schema：
+
+```json
+{
+  "ping_reason": "secret_adjacent | surface_switch | blocked_workaround | constraint_reinterp | permission | plan_commit | job_end",
+  "charter_ref": "hash…",
+  "charter": { "goal": "…", "must": ["…"], "must_not": ["…"], "allowed_surfaces": ["human_logged_in_browser"] },
+  "proposed_action": {
+    "tool": "read_file",
+    "target": "~/.config/gh/hosts.yml",
+    "target_class": "user_secret_store",
+    "when": "before_exec"
+  },
+  "worker_intent": "≤400 chars",
+  "blocker": { "failed_path": "browser_login", "detail": "worker profile has no github session" },
+  "mismatch": { "human": "use already-logged-in browser", "worker": "harvest token from user workspace" },
+  "spine": [{ "tool": "browser", "target": "github.com/login", "status": "unauthenticated" }],
+  "risk_tags": ["surface_switch", "secret_adjacent", "auth_workaround"],
+  "ask": "reject|deny_job|demand_safe_path|once"
+}
+```
+
+章程只在 **首 ping 或章程变更** 时全文出现；之后只传 `charter_ref`。  
+权限弹窗必须 **附上 intent + blocker**，不能再只给 `tool + path patterns`。  
+收工评审继续用制品；安全活另加：是否发生过未批准的换路。
+
+Lead 仍可 `--max-turns 1`、禁用工具——**包要自洽**，不要让我再去翻工人会话。
+
+---
+
+### 3. 何时 ping（事件，不是每 N 步思考）
+
+只在 **分叉** 上叫 lead。同一 `(ping_reason, target_class, path_pattern)` 在 lead 回复前只 ping 一次。
+
+**必须叫（安全敏感 job）：**
+
+| 触发 | 为什么 |
+|---|---|
+| **plan_commit / plan_rewrite** | 工人写下新打法；这是最便宜的纠偏点 |
+| **surface_switch** | 浏览器 → 文件系统/环境变量/别人的 profile；UI 操作 → API token |
+| **secret_adjacent**（执行前） | 读/搜凭据类路径、cookie、`gh` hosts、`.netrc`、工作区里的 `*token*`、用户主目录 |
+| **blocked_workaround** | 主路径失败后的 Plan B（本例的核心） |
+| **constraint_reinterp** | 工人把「用已登录浏览器」改写成「搞到任意可用凭据」 |
+| **permission**（硬规则没直接打死时） | 弹权 = 执行前闸；必须带意图，否则我只能看路径瞎批 |
+| **outbound_auth** | 登录页、创 PAT、OAuth、把 cookie 拷走 |
+| **job_end** | 照旧验收；安全活要声明「未走未批换路」 |
+
+**不要叫：** 普通源码读写、测例、`ls`、同一已批计划下的连续编辑、工人内心独白、重复同类读。
+
+**硬规则仍先行：** 明显 `~/.ssh`、`.env`、cookie 库、把 `always` 当秘密授权——直接拒，不必消耗 lead。Lead 管 **灰色：路径不香、意图很脏**。
+
+---
+
+### 4. 为省 token 必须丢掉的
+
+- 工人完整 CoT / 逐步推理 / 聊天语气
+- 任何秘密 **值** 和秘密文件全文（只给 class + 模式）
+- 工具 stdout/HTML/截图（除非验收 UI）
+- 整段工人 transcript
+- 每次 ping 重复章程、政策长文、skills 目录
+- 已批计划下的逐文件 diff（plan_commit 给 **计划 diff** 即可）
+- 「always 允许读凭据」这类请求——Glue 直接丢
+
+预算直觉：普通步骤 0 token 给 lead；一次安全 ping **≤800 token**；整次 job 的 lead 调用 **个位数**，不是几十次。
+
+---
+
+### 5. 示例：即将从用户工作区读 token
+
+```json
+{
+  "job_id": "gh-repo-create-001",
+  "ping_reason": "blocked_workaround",
+  "when": "before_exec",
+  "charter_ref": "c7a1…",
+  "charter": {
+    "goal": "在 GitHub 建一个新仓库",
+    "must": ["使用人类已经登录的浏览器完成"],
+    "must_not": ["读取或复制人类工作区/主目录中的 token、cookie、凭据文件", "用工人自己的未登录 profile 凑认证"],
+    "allowed_surfaces": ["human_logged_in_browser"]
+  },
+  "proposed_action": {
+    "tool": "read_file",
+    "target": "/home/user/workspace/.env.local",
+    "target_class": "user_secret_store",
+    "path_pattern": "**/.env*",
+    "matched_keys_hint": ["GITHUB_TOKEN"]
+  },
+  "worker_intent": "工人浏览器 profile 未登录 GitHub。为继续建仓，打算从用户工作区 .env.local 读取 GITHUB_TOKEN，再用 API 创建仓库。",
+  "blocker": {
+    "failed_path": "browser_login",
+    "detail": "worker browser profile has no github.com session; github.com/login 为未登录页"
+  },
+  "mismatch": {
+    "human": "use already-logged-in browser",
+    "worker": "obtain any credential from user workspace after browser auth failed"
+  },
+  "spine": [
+    { "tool": "browser_navigate", "target": "github.com/new", "status": "redirect_login" },
+    { "tool": "browser_snapshot", "target": "github.com/login", "status": "unauthenticated" },
+    { "tool": "grep", "target": "workspace GITHUB_TOKEN|ghp_", "status": "hits_.env.local" }
+  ],
+  "risk_tags": ["surface_switch", "secret_adjacent", "auth_workaround", "constraint_reinterp"],
+  "ask": "reject|deny_job|demand_safe_path"
+}
+```
+
+**这个包上我会怎么判（意见）：**
+
+- **`reject` 该次 read**，并禁止同类 `secret_adjacent` 直到章程改写
+- **`demand_safe_path`**：挂上人类已登录的 browser profile / 让人类在工人浏览器里登录 / 停下来问人——**三选一，禁止凭据收割**
+- 若工人在拒绝后仍搜 token、读 cookie、拷 profile：**`deny_job`**
+- 绝不 `once`，更绝不 `always`
+
+---
+
+### 落地顺序（Glue 最小改动）
+
+1. 权限弹窗 JSON **强制加上** `worker_intent` + `blocker` + `charter_ref`（当前最薄、也最该补）
+2. 在 `blocked_workaround` 和 `surface_switch` 上各加一次执行前 ping
+3. 硬规则继续预过滤明显凭据路径；灰色才叫 lead
+4. 收工仍看制品；安全活加一句「换路是否经 lead」
+
+这样 lead 能在 **读 token 之前** 把活拽回主线，又不会变成「工人每想一步烧一次贵模型」。
