@@ -59,13 +59,13 @@ python3 cut3.py   # 或 glue.py / cut2.py（按脚本约定的工作目录）
 
 | 机制 | 说明 |
 | --- | --- |
-| **硬规则** | `src/hard_rules.py`：`.env*` / `auth.json` / `token*` / cookie·profile / `~/.ssh` / `gh/hosts` / `.netrc` / credential basename；`always`+secret → **直接 reject**，不进 lead |
+| **硬规则** | `src/hard_rules.py`：默认明显凭据路径 **reject**；`allow_secret_globs`/`allow_paths`（可选 `allow_keys`）显式授权 → 不 reject，glue once+日志；`~/.ssh`/cookie·profile/`gh/hosts`/`.netrc`/`always`+secret **永拒**；灰色问 lead |
 | **触发表** | `plan_commit|rewrite`、`surface_switch`、`secret_adjacent`、`blocked_workaround`、`constraint_reinterp`、`permission`、`outbound_auth`、`job_end`（见 lead-feed） |
 | **去重** | 同一 `(ping_reason, target_class, path_pattern)` 在 lead 回复前只 ping 一次 |
 | **非每步** | 普通源码读写、测例、`ls`、已批计划下连续编辑 → `should_ping_lead` = False |
 | **Lead 枚举** | `once|reject|deny_job|demand_safe_path`；后两者映射 API 为 `reject`；禁 always / yolo |
 
-黄金回放：`python3 src/golden_replay_secret_env.py`（期望绝不 once/always）；笔记 [`docs/golden-replay-secret-env.md`](docs/golden-replay-secret-env.md)。
+黄金回放：`python3 src/golden_replay_secret_env.py`（无白名单绝不 once/always；有白名单可 once+日志）；笔记 [`docs/golden-replay-secret-env.md`](docs/golden-replay-secret-env.md)。
 
 ## 一句话
 

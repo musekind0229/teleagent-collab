@@ -390,7 +390,11 @@ def run_job(
                 report["pending_summaries"].append(summary)
 
                 # 1) Hard rules first — obvious credential paths / always+secret → reject, no lead.
-                hr = hard_rule_decision(p if isinstance(p, dict) else {})
+                #    Charter allow_secret_globs / allow_paths may allowlist non-eternal secrets
+                #    → _hard_rule_allowlisted; glue once + notes (legitimate small-risk work).
+                #    Eternal paths (~/.ssh, cookies/profile, gh hosts, .netrc) still reject.
+                perm_obj = p if isinstance(p, dict) else {}
+                hr = hard_rule_decision(perm_obj, charter=job_charter)
                 if hr and hr.get("reply") == "reject":
                     rc, rj = call("POST", f"/permission/{pid}/reply", body={"reply": "reject"})
                     report["api_replies"].append(
@@ -399,6 +403,24 @@ def run_job(
                     report["hard_rule_rejects"].append({"id": pid, "reason": hr.get("reason", "")})
                     report["notes"].append(f"hard_rule reject: {hr.get('reason', '')}")
                     report["grok_permission_decision"] = "reject"
+                    handled_perm_ids.add(pid)
+                    continue
+                if perm_obj.get("_hard_rule_allowlisted"):
+                    # Explicit charter allowlist: do not reject; once + log (prove legal work).
+                    rc, rj = call("POST", f"/permission/{pid}/reply", body={"reply": "once"})
+                    report["api_replies"].append(
+                        {
+                            "id": pid,
+                            "reply": "once",
+                            "via": "hard_rule_allowlisted",
+                            "http": rc,
+                        }
+                    )
+                    report["notes"].append(
+                        "hard_rule allowlisted (charter allow_secret_globs/allow_paths): "
+                        "once — legitimate small-risk secret path; logged, no lead"
+                    )
+                    report["grok_permission_decision"] = "once"
                     handled_perm_ids.add(pid)
                     continue
 
