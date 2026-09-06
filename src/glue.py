@@ -538,6 +538,24 @@ def run_job(
                 handled_perm_ids.add(pid)
 
         busy = session_busy(status, sid)
+        # Early accept: hard-rule path done + artifacts on disk, session still busy.
+        arts_early = expected_exists(expected_artifacts)
+        if arts_early and any(
+            r.get("via") == "hard_rule_allowlisted" and r.get("reply") == "once"
+            for r in report.get("api_replies") or []
+        ):
+            report["artifacts"] = arts_early
+            report["ok"] = True
+            report["state"] = "ok"
+            report["notes"].append(
+                "early accept: hard_rule_allowlisted once + artifacts; aborting busy session"
+            )
+            try:
+                call("POST", f"/session/{sid}/abort", body={})
+            except Exception as e:
+                report["notes"].append(f"early abort failed: {e}")
+            _write_status(name, report)
+            return report
         if not busy:
             mc, msgs = call("GET", f"/session/{sid}/message")
             asst = last_assistant(msgs)
@@ -699,6 +717,23 @@ def run_job(
     report["state"] = "timeout"
     report["error"] = "wall clock timeout"
     report["artifacts"] = expected_exists(expected_artifacts)
+    # Model sometimes stays busy after delivery. If hard-rule path already
+    # replied and artifacts exist, accept instead of false timeout.
+    replies = report.get("api_replies") or []
+    hard_path = any(
+        (r.get("via") in ("hard_rule", "hard_rule_allowlisted")) for r in replies
+    )
+    if report["artifacts"] and hard_path:
+        report["ok"] = True
+        report["state"] = "ok"
+        report["error"] = ""
+        report["notes"].append(
+            "accepted after wall timeout: artifacts + hard-rule permission path present; aborting busy session"
+        )
+        try:
+            call("POST", f"/session/{sid}/abort", body={})
+        except Exception as e:
+            report["notes"].append(f"session abort after timeout failed: {e}")
     _write_status(name, report)
     return report
 
