@@ -19,7 +19,9 @@ passwd-head.txt
 curl-headers.txt
 sum.sh
 run-evidence*
-run-report*
+run-report.md
+run-report-*.md
+!templates/run-report.template.md
 status-*.json
 *.deb
 asar-out/
