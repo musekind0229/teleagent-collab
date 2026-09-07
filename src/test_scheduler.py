@@ -39,7 +39,7 @@ class TestSmoke(unittest.TestCase):
     def test_parallel_isolation(self):
         s = smoke_parallel_isolation(n=3, max_parallel=3)
         self.assertTrue(s["isolation_ok"])
-        self.assertEqual(s["stats"]["lead_calls"], 0)
+        self.assertGreaterEqual(s["stats"]["lead_calls"], 1)  # ordinary R/W now requires lead
         self.assertEqual(len(s["jobs"]), 3)
 
     def test_serial_short_poll(self):

@@ -11,7 +11,8 @@
 ## 已验证能力
 
 - **工人**：TeleAgent 本地 HTTP（Basic + HMAC），不靠 GUI 点窗口开工
-- **审批环**：`GET /permission` → 组长决策 `once|always|reject` → `POST /permission/:id/reply`
+- **审批环**：`GET /permission`（按 sessionID 过滤）→ 硬规则/组长 → `once|reject`（禁自动 always；批准前 reconfirm）
+- **适配层**：`teleagent_adapter`（Linux Basic+HMAC；Win 2.4.1 blocked）
 - **验收环**：产物 + 统一 `run-evidence.txt`（命令 + stdout/stderr）；组长 `pass|fail`
 - **等待策略**：会话 idle / 产物齐即收；墙钟只做死锁保险丝（避免「货已交仍 timeout」）
 - **编制**：`call_lead` + `COLLAB_LEAD_BIN`，组长可换 Claude Code / Codex 等
@@ -30,8 +31,9 @@ bin/run-job.py        # 永续入口：读章程 → glue.run_job → 落报告
 bin/run-scheduler.py  # 并行调度 + 自适应审批扫描（scan ≠ lead）
 jobs/examples/        # 样例章程（*.charter.yaml）
 jobs/runs/            # 收件目录（status/report；gitignore）
-docs/                 # 工人契约、发现笔记、计量笔记、永续骨架
-src/                  # glue / cut2 / cut3 / charter 胶水源码
+docs/                 # 工人契约、适配层、backlog、发现笔记、永续骨架
+src/                  # glue / scheduler / hard_rules / decision_packet
+src/teleagent_adapter/# Linux local-v1 / Windows blocked / doctor（条4）
 templates/            # 报告模板（脱敏）
 ```
 

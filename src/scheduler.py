@@ -8,7 +8,8 @@
    （实现：多次短 call_lead，不串上下文）。
 4. 单路串行弹权：session busy / 刚有 pending 时 BUSY_POLL（1～3s）；出一条批一条；
    硬规则/白名单秒回；禁止等攒齐再回。
-5. 复用 hard_rules + decision_packet（PingDeduper）；秘密类禁瞎 always。
+5. 复用 hard_rules + decision_packet；去重按 permission request id；秘密类禁 always。
+6. 禁无条件放行；路径 canonicalize + is_path_within；批准前 reconfirm；reply 成功后再 mark handled。
 """
 from __future__ import annotations
 
@@ -34,6 +35,7 @@ from decision_packet import (
     packet_from_permission,
     should_ping_lead,
 )
+from pathutil import canonicalize, is_path_within, permission_fingerprint
 
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_WORKSPACES = REPO / "jobs" / "workspaces"
@@ -221,7 +223,12 @@ class ParallelScheduler:
     def ta_call(self, method: str, path: str, body=None, extra_headers=None, timeout=120):
         if self._teleagent_call is not None:
             return self._teleagent_call(method, path, body, extra_headers, timeout)
-        return self._glue().call(method, path, body=body, extra_headers=extra_headers, timeout=timeout)
+        g = self._glue()
+        # Prefer adapter surface when glue exposes one
+        ad = getattr(g, "get_ta_adapter", lambda: None)()
+        if ad is not None and hasattr(ad, "call"):
+            return ad.call(method, path, body=body, extra_headers=extra_headers, timeout=timeout)
+        return g.call(method, path, body=body, extra_headers=extra_headers, timeout=timeout)
 
     def is_session_busy(self, status_obj, sid: str) -> bool:
         if self._session_busy_fn is not None:
@@ -468,7 +475,7 @@ class ParallelScheduler:
         perm_obj = dict(p) if isinstance(p, dict) else {}
         hr = hard_rule_decision(perm_obj, charter=job.charter)
         if hr and hr.get("reply") == "reject":
-            self._reply(job, pid, "reject", via="hard_rule")
+            self._reply(job, pid, "reject", via="hard_rule", original=perm_obj)
             job.hard_rule_rejects.append({"id": pid, "reason": hr.get("reason", "")})
             job.notes.append(f"hard_rule reject: {hr.get('reason', '')}")
             self.stats.hard_rule_hits += 1
@@ -476,7 +483,7 @@ class ParallelScheduler:
             return {"id": pid, "reply": "reject", "via": "hard_rule", "called_lead": False}
 
         if perm_obj.get("_hard_rule_allowlisted"):
-            self._reply(job, pid, "once", via="hard_rule_allowlisted")
+            self._reply(job, pid, "once", via="hard_rule_allowlisted", original=perm_obj)
             job.notes.append(
                 "hard_rule allowlisted: once — logged, no lead (secret always forbidden)"
             )
@@ -512,7 +519,7 @@ class ParallelScheduler:
             if req_k not in packet or packet[req_k] in (None, "", {})
         ]
         if missing:
-            self._reply(job, pid, "reject", via="incomplete_packet")
+            self._reply(job, pid, "reject", via="incomplete_packet", original=perm_obj)
             job.notes.append(f"packet missing {missing}; reject")
             self.stats.replies += 1
             return {"id": pid, "reply": "reject", "via": "incomplete_packet", "called_lead": False}
@@ -520,34 +527,29 @@ class ParallelScheduler:
         pa = packet.get("proposed_action") or {}
         tclass = pa.get("target_class") or "unknown"
         ppat = pa.get("path_pattern") or ""
-        if not job.ping_deduper.should_emit("permission", tclass, ppat):
-            self._reply(job, pid, "reject", via="ping_dedupe")
-            job.notes.append(f"deduped permission ping {tclass}/{ppat}")
-            self.stats.replies += 1
-            return {"id": pid, "reply": "reject", "via": "ping_dedupe", "called_lead": False}
-
         path_guess = pa.get("target") or perm_obj.get("path") or ""
         tool_guess = pa.get("tool") or ""
-        ws = str(job.workdir.resolve())
-        path_abs = str(Path(path_guess).resolve()) if path_guess else ""
-        in_ws = path_abs.startswith(ws) or path_guess.startswith(str(job.workdir))
+        ws = canonicalize(str(job.workdir))
+        # All non-hard-rule paths go through lead (no unconditional once / ordinary_rw bypass).
+        # Track ordinary_rw for stats only.
+        targets = pa.get("targets") or ([path_guess] if path_guess else [])
+        in_ws = all(is_path_within(canonicalize(t, base=ws), ws) for t in targets) if targets else False
         if (
             not should_ping_lead(
                 ping_reason="permission",
                 tool=tool_guess,
-                path=path_guess or path_abs,
+                path=path_guess,
                 target_class=tclass,
             )
             and in_ws
         ):
-            self._reply(job, pid, "once", via="ordinary_rw_no_lead")
-            job.notes.append("ordinary workspace R/W — no lead ping")
             self.stats.ordinary_rw_hits += 1
-            self.stats.replies += 1
-            return {"id": pid, "reply": "once", "via": "ordinary_rw_no_lead", "called_lead": False}
+            job.notes.append("ordinary workspace R/W — still requires lead approval (no auto-once)")
 
-        # 3) Truly need lead — event trigger + PingDeduper
-        job.ping_deduper.mark_inflight("permission", tclass, ppat)
+        # 3) Need lead — dedupe by permission request id only
+        if not job.ping_deduper.should_emit_id(pid):
+            return {"skipped": True, "reason": "dedupe_request_id", "id": pid}
+        job.ping_deduper.mark_inflight_id(pid)
         allow_hint = (
             f"Allowed workspace only: {ws}. "
             "Secret-adjacent / auth workarounds: reject or demand_safe_path, never once. "
@@ -576,8 +578,8 @@ class ParallelScheduler:
         api_reply, map_note = map_lead_decision_to_api(decision)
         if map_note:
             job.notes.append(map_note)
-        job.ping_deduper.mark_replied("permission", tclass, ppat)
-        self._reply(job, pid, api_reply, via="lead", lead_decision=decision, raw=raw[:500] if raw else "")
+        job.ping_deduper.mark_replied_id(pid)
+        self._reply(job, pid, api_reply, via="lead", lead_decision=decision, raw=raw[:500] if raw else "", original=perm_obj)
         self.stats.replies += 1
         if decision == "deny_job":
             job.state = JobState.FAIL
@@ -591,6 +593,30 @@ class ParallelScheduler:
             "called_lead": True,
         }
 
+    def _reconfirm_pending(self, job: JobSlot, pid: str, original: dict | None) -> tuple[bool, str]:
+        """Before approve/reject: still pending, session matches, content unchanged."""
+        if self.dry_run:
+            return True, "dry"
+        code, pending = self.ta_call("GET", "/permission")
+        if not isinstance(pending, list):
+            return False, "pending_list_unavailable"
+        match = None
+        for p in pending:
+            if not isinstance(p, dict):
+                continue
+            if str(p.get("id") or p.get("requestID") or "") == pid:
+                match = p
+                break
+        if match is None:
+            return False, "no_longer_pending"
+        sid = session_id_of_permission(match)
+        if sid and job.session_id and sid != job.session_id:
+            return False, "session_mismatch"
+        if original:
+            if permission_fingerprint(match) != permission_fingerprint(original):
+                return False, "content_changed"
+        return True, "ok"
+
     def _reply(
         self,
         job: JobSlot,
@@ -600,18 +626,41 @@ class ParallelScheduler:
         via: str,
         lead_decision: str | None = None,
         raw: str = "",
-    ) -> None:
+        original: dict | None = None,
+    ) -> bool:
+        # Default once; never auto-always
+        if reply == "always":
+            reply = "once"
+            job.notes.append("coerced always->once at reply boundary")
+        ok_rc, reason = self._reconfirm_pending(job, pid, original)
+        if not ok_rc:
+            job.notes.append(f"reconfirm failed ({reason}); not marking handled id={pid}")
+            entry = {"id": pid, "reply": reply, "via": via, "reconfirm": reason, "skipped_reply": True}
+            if lead_decision:
+                entry["lead_decision"] = lead_decision
+            job.api_replies.append(entry)
+            return False
+        http = 200
         if not self.dry_run:
-            self.ta_call("POST", f"/permission/{pid}/reply", body={"reply": reply})
-        entry = {"id": pid, "reply": reply, "via": via}
+            http, _body = self.ta_call("POST", f"/permission/{pid}/reply", body={"reply": reply})
+            if not (isinstance(http, int) and http < 300):
+                job.notes.append(f"reply POST failed http={http}; not marking handled")
+                job.api_replies.append(
+                    {"id": pid, "reply": reply, "via": via, "http": http, "skipped_mark": True}
+                )
+                return False
+        entry = {"id": pid, "reply": reply, "via": via, "http": http, "reconfirm": reason}
         if lead_decision:
             entry["lead_decision"] = lead_decision
         if raw:
             entry["lead_raw_trunc"] = raw
         job.api_replies.append(entry)
+        # Mark handled only after successful reply
         job.handled_perm_ids.add(pid)
+        job.ping_deduper.mark_replied_id(pid)
         if job.state == JobState.PENDING_APPROVAL:
             job.state = JobState.RUNNING
+        return True
 
     def dispatch_pending_batch(self, pending: list[dict]) -> list[dict]:
         """Batch schedule collected pending, but decide per job_id (one-by-one each).
@@ -909,8 +958,10 @@ def smoke_parallel_isolation(
         markers = list(wd.glob(f"_scheduler_marker_{jid}.txt"))
         assert markers, f"missing own marker in {wd}"
     assert not cross, f"cross-contamination: {cross}"
-    assert summary["stats"]["lead_calls"] == 0, (
-        "smoke iso: hard-rule/ordinary paths must not call lead; "
+    # Job0 hard-rule reject (no lead); job1 ordinary R/W still goes to lead (no auto-once);
+    # dry lead → reject. Isolation must still hold.
+    assert summary["stats"]["lead_calls"] >= 1, (
+        "smoke iso: ordinary workspace R/W must call lead after removing auto-once; "
         f"got {summary['stats']['lead_calls']}"
     )
     # empty scans happen after pending drained

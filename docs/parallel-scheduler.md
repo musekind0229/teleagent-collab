@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | **扫描 (scan)** | `GET /permission`（或 dry 模拟栈），按 `sessionID`/`job_id` 归到各槽 | **永不**。无 pending → 记 `empty_scans++` 直接跳过 |
 | **硬规则 / 白名单** | `hard_rule_decision`；命中 reject 或 `_hard_rule_allowlisted` → 秒回 API | **不**叫 lead |
-| **普通工作区 R/W** | `should_ping_lead == False` 且路径在本 job workdir | **不**叫 lead（once） |
+| **普通工作区 R/W** | `should_ping_lead == False` 且路径在本 job workdir（canonicalize/`is_path_within`） | **仍叫 lead**（已删除无条件 once） |
 | **真正需要 lead** | 硬规则未处理 + 触发表命中 + `PingDeduper` 允许 | 才 `call_lead`（事件触发；禁每步思考推组长） |
 
 **禁止** yolo / always-approve；秘密类即使 lead 说 `always` 也会被压成 once/reject。
@@ -50,7 +50,7 @@ python3 bin/run-scheduler.py --max-parallel 3 jobs/examples/hello.charter.yaml
 ```bash
 python3 bin/run-scheduler.py --smoke
 # 期望: parallel_isolation_ok=true, serial_short_poll_ok=true
-# stats.lead_calls：隔离烟测应为 0（硬规则+普通 R/W）；串行烟测应为 2（两条灰色，分两次短 call_lead）
+# stats.lead_calls：隔离烟测 ≥1（普通 R/W 也走 lead）；串行烟测应为 2（两条灰色，分两次短 call_lead）
 # busy_interval_sample ∈ [1, 3]
 
 python3 src/scheduler.py          # 同烟测直接跑
@@ -69,4 +69,4 @@ python3 src/test_scheduler.py     # unittest 包装
 
 - `src/scheduler.py` — `ParallelScheduler`、烟测 `smoke_parallel_isolation` / `smoke_serial_short_poll`
 - `bin/run-scheduler.py` — 永续入口
-- 复用：`hard_rules.py`、`decision_packet.py`（`PingDeduper` / `should_ping_lead`）、`glue.call_lead`（live）
+- 复用：`hard_rules.py`、`decision_packet.py`（`PingDeduper` 按 request id）、`teleagent_adapter`、`glue.call_lead`（live）

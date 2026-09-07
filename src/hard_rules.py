@@ -21,6 +21,8 @@ import re
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from pathutil import canonicalize, is_path_within
+
 # Basename / path fragments that are obviously secret stores.
 _SECRET_BASENAMES = frozenset(
     {
@@ -399,25 +401,36 @@ def path_allowlisted(
             break
         for ap in allow_paths:
             ap_n = ap.replace("\\", "/")
-            if c_norm == ap_n or c_exp == ap_n or c_norm.endswith("/" + ap_n.lstrip("./")):
+            # Exact / canonical equality (realpath) — no bare startswith
+            c_can = canonicalize(raw)
+            ap_can = canonicalize(ap)
+            if c_can and ap_can and c_can == ap_can:
+                matched_non_eternal = True
+                break
+            if c_norm == ap_n or c_exp == ap_n:
                 matched_non_eternal = True
                 break
             if _path_matches_glob(c_norm, ap_n) or _path_matches_glob(c_exp, ap_n):
                 matched_non_eternal = True
                 break
-            # allow_paths entry is a prefix directory
-            ap_prefix = ap_n.rstrip("/") + "/"
-            if c_norm.startswith(ap_prefix) or c_exp.startswith(ap_prefix):
+            # Directory allow: only if candidate is within allow_path (boundary-safe)
+            if ap_can and c_can and is_path_within(c_can, ap_can):
                 matched_non_eternal = True
                 break
-            # basename equality for simple filenames like ".env"
+            # basename equality for simple filenames like ".env" (relative allow entries)
             if _basename(c_norm) == _basename(ap_n) and (
                 ap_n in (".env", ".env.local") or ap_n.endswith("/" + _basename(c_norm))
             ):
-                # Prefer exact path match; basename-only for relative allow_paths
                 if "/" not in ap_n.rstrip("/") or c_norm.endswith(ap_n) or c_exp.endswith(ap_n):
-                    matched_non_eternal = True
-                    break
+                    if ap_can and c_can:
+                        if Path(c_can).name == Path(ap_can).name and (
+                            c_can == ap_can or is_path_within(c_can, str(Path(ap_can).parent))
+                        ):
+                            matched_non_eternal = True
+                            break
+                    else:
+                        matched_non_eternal = True
+                        break
         if matched_non_eternal:
             break
 

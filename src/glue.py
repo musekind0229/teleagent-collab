@@ -28,6 +28,18 @@ from decision_packet import (
     packet_from_permission,
     should_ping_lead,
 )
+from pathutil import canonicalize, is_path_within, permission_fingerprint
+
+_ADAPTER = None
+
+
+def get_ta_adapter():
+    """Lazy Linux local-v1 adapter (shared with scheduler). Dry tests may never call this."""
+    global _ADAPTER
+    if _ADAPTER is None:
+        from teleagent_adapter import get_adapter
+        _ADAPTER = get_adapter(platform="linux")
+    return _ADAPTER
 
 COLLAB = Path("/workspace/teleagent/probe-sandbox/collab")
 BASE = "http://127.0.0.1:4399"
@@ -110,28 +122,37 @@ def sign_headers(method: str, url: str) -> dict:
 
 
 def call(method: str, path: str, body=None, extra_headers=None, timeout=120):
-    url = f"{BASE}{path}"
-    h = sign_headers(method, url)
-    if extra_headers:
-        h.update(extra_headers)
-    data = None if body is None else json.dumps(body).encode()
-    req = urllib.request.Request(url, headers=h, method=method, data=data)
+    """HTTP to TeleAgent — prefers teleagent_adapter.LinuxLocalV1Adapter."""
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-            if not raw:
-                return resp.status, None
-            try:
-                return resp.status, json.loads(raw)
-            except Exception:
-                return resp.status, raw.decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        raw = e.read()
+        ad = get_ta_adapter()
+        # Keep adapter base in sync with glue.BASE
+        if getattr(ad, "base_url", None) and ad.base_url.rstrip("/") != BASE.rstrip("/"):
+            ad.base_url = BASE.rstrip("/")
+        return ad.call(method, path, body=body, extra_headers=extra_headers, timeout=timeout)
+    except Exception:
+        # Fallback to legacy inline HMAC if adapter import/creds fail mid-flight
+        url = f"{BASE}{path}"
+        h = sign_headers(method, url)
+        if extra_headers:
+            h.update(extra_headers)
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(url, headers=h, method=method, data=data)
         try:
-            j = json.loads(raw) if raw else None
-        except Exception:
-            j = raw.decode("utf-8", "replace") if raw else None
-        return e.code, j
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+                if not raw:
+                    return resp.status, None
+                try:
+                    return resp.status, json.loads(raw)
+                except Exception:
+                    return resp.status, raw.decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            try:
+                j = json.loads(raw) if raw else None
+            except Exception:
+                j = raw.decode("utf-8", "replace") if raw else None
+            return e.code, j
 
 
 def redact(obj):
@@ -319,6 +340,213 @@ def expected_exists(paths: list[str]) -> list[str]:
     return [p for p in paths if Path(p).exists()]
 
 
+
+def session_id_of_permission(p: dict) -> str:
+    for k in ("sessionID", "session_id", "sessionId"):
+        v = p.get(k) if isinstance(p, dict) else None
+        if v:
+            return str(v)
+    meta = p.get("metadata") if isinstance(p, dict) and isinstance(p.get("metadata"), dict) else {}
+    for k in ("sessionID", "session_id", "sessionId"):
+        v = meta.get(k)
+        if v:
+            return str(v)
+    return ""
+
+
+def _reconfirm_and_reply(sid: str, pid: str, reply: str, original: dict | None, report: dict, via: str, **extra) -> bool:
+    """Reconfirm still-pending + session + fingerprint; POST reply; mark handled only on success."""
+    if reply == "always":
+        reply = "once"
+        report.setdefault("notes", []).append("coerced always->once at reply boundary")
+    code, pending = call("GET", "/permission")
+    match = None
+    if isinstance(pending, list):
+        for p in pending:
+            if isinstance(p, dict) and str(p.get("id") or p.get("requestID") or "") == pid:
+                match = p
+                break
+    if match is None:
+        report.setdefault("notes", []).append(f"reconfirm: no_longer_pending id={pid}")
+        report.setdefault("api_replies", []).append(
+            {"id": pid, "reply": reply, "via": via, "reconfirm": "no_longer_pending", "skipped_reply": True, **extra}
+        )
+        return False
+    msid = session_id_of_permission(match)
+    if msid and sid and msid != sid:
+        report.setdefault("notes", []).append(f"reconfirm: session_mismatch id={pid}")
+        report.setdefault("api_replies", []).append(
+            {"id": pid, "reply": reply, "via": via, "reconfirm": "session_mismatch", "skipped_reply": True, **extra}
+        )
+        return False
+    if original is not None and permission_fingerprint(match) != permission_fingerprint(original):
+        report.setdefault("notes", []).append(f"reconfirm: content_changed id={pid}")
+        report.setdefault("api_replies", []).append(
+            {"id": pid, "reply": reply, "via": via, "reconfirm": "content_changed", "skipped_reply": True, **extra}
+        )
+        return False
+    rc, rj = call("POST", f"/permission/{pid}/reply", body={"reply": reply})
+    entry = {"id": pid, "reply": reply, "via": via, "http": rc, "reconfirm": "ok", **extra}
+    if rj:
+        entry["body"] = redact(rj)
+    report.setdefault("api_replies", []).append(entry)
+    if not (isinstance(rc, int) and rc < 300):
+        report.setdefault("notes", []).append(f"reply POST failed http={rc}; not marking handled")
+        return False
+    return True
+
+
+def _handle_permission_for_session(
+    p: dict,
+    *,
+    sid: str,
+    ws: str,
+    name: str,
+    job_charter: dict,
+    worker_intent,
+    blocker,
+    ping_deduper: PingDeduper,
+    charter_sent_full: bool,
+    handled_perm_ids: set,
+    report: dict,
+) -> tuple[bool, bool]:
+    """Process one permission strictly for *sid*. Returns (handled_ok, charter_sent_full)."""
+    if not isinstance(p, dict):
+        return False, charter_sent_full
+    psid = session_id_of_permission(p)
+    if psid and psid != sid:
+        return False, charter_sent_full  # never touch other sessions
+    pid = str(p.get("id") or p.get("requestID") or "")
+    if not pid or pid in handled_perm_ids:
+        return False, charter_sent_full
+    if ping_deduper.already_handled(pid):
+        return False, charter_sent_full
+
+    summary = summarize_permission(p)
+    report["pending_summaries"].append(summary)
+    perm_obj = p
+    hr = hard_rule_decision(perm_obj, charter=job_charter)
+    if hr and hr.get("reply") == "reject":
+        if _reconfirm_and_reply(sid, pid, "reject", perm_obj, report, "hard_rule"):
+            report["hard_rule_rejects"].append({"id": pid, "reason": hr.get("reason", "")})
+            report["notes"].append(f"hard_rule reject: {hr.get('reason', '')}")
+            report["grok_permission_decision"] = "reject"
+            handled_perm_ids.add(pid)
+            ping_deduper.mark_replied_id(pid)
+        return True, charter_sent_full
+    if perm_obj.get("_hard_rule_allowlisted"):
+        if _reconfirm_and_reply(sid, pid, "once", perm_obj, report, "hard_rule_allowlisted"):
+            report["notes"].append(
+                "hard_rule allowlisted (charter allow_secret_globs/allow_paths): "
+                "once — legitimate small-risk secret path; logged, no lead"
+            )
+            report["grok_permission_decision"] = "once"
+            handled_perm_ids.add(pid)
+            ping_deduper.mark_replied_id(pid)
+        return True, charter_sent_full
+
+    intent = (worker_intent or "").strip() or (
+        f"Worker requests permission to continue job {name!r} "
+        f"inside workspace; tool/path from pending (see proposed_action)."
+    )
+    blk = blocker if blocker is not None else {
+        "failed_path": "permission_gate",
+        "detail": "worker awaiting lead decision on pending permission",
+    }
+    include_full = not charter_sent_full
+    packet = packet_from_permission(
+        perm_obj,
+        worker_intent=intent,
+        blocker=blk,
+        charter=job_charter,
+        include_charter_full=include_full,
+        ping_reason="permission",
+        risk_tags=["permission"],
+    )
+    if include_full:
+        charter_sent_full = True
+    missing = [
+        req_k
+        for req_k in ("worker_intent", "blocker", "charter_ref")
+        if req_k not in packet or packet[req_k] in (None, "", {})
+    ]
+    if missing:
+        report["notes"].append(f"packet missing {missing}; forcing reject")
+        if _reconfirm_and_reply(sid, pid, "reject", perm_obj, report, "incomplete_packet"):
+            handled_perm_ids.add(pid)
+            ping_deduper.mark_replied_id(pid)
+        return True, charter_sent_full
+
+    pa = packet.get("proposed_action") or {}
+    tclass = pa.get("target_class") or "unknown"
+    path_guess = pa.get("target") or ""
+    tool_guess = pa.get("tool") or ""
+    targets = pa.get("targets") or ([path_guess] if path_guess else [])
+    ws_can = canonicalize(ws)
+    in_ws = all(is_path_within(canonicalize(t, base=ws_can), ws_can) for t in targets) if targets else False
+    # No unconditional once — even ordinary R/W goes to lead
+    if (
+        not should_ping_lead(
+            ping_reason="permission",
+            tool=tool_guess,
+            path=path_guess,
+            target_class=tclass,
+        )
+        and in_ws
+    ):
+        report["notes"].append("ordinary workspace R/W — still requires lead approval (no auto-once)")
+
+    if not ping_deduper.should_emit_id(pid):
+        return False, charter_sent_full
+    ping_deduper.mark_inflight_id(pid)
+    allow_hint = (
+        f"Allowed workspace only: {ws_can}. "
+        "Secret-adjacent / auth workarounds: reject or demand_safe_path, never once. "
+        "Never choose always."
+    )
+    schema = lead_permission_schema()
+    prompt = format_lead_prompt(packet, allow_hint=allow_hint)
+    raw, parsed = call_lead(prompt, schema, ws)
+    report["grok_permission_raw"] = raw
+    decision = None
+    if isinstance(parsed, dict):
+        decision = parsed.get("decision") or (parsed.get("result") or {}).get("decision")
+        so = parsed.get("structuredOutput")
+        if not decision and isinstance(so, dict):
+            decision = so.get("decision")
+        if not decision:
+            for k in ("output", "message", "content", "data"):
+                if isinstance(parsed.get(k), dict) and parsed[k].get("decision"):
+                    decision = parsed[k]["decision"]
+                    break
+    if decision not in ("once", "reject", "deny_job", "demand_safe_path", "always"):
+        m = re.search(r"\b(once|reject|deny_job|demand_safe_path|always)\b", raw or "")
+        decision = m.group(1) if m else "reject"
+    if decision == "always":
+        report["notes"].append("lead said always → coerced to once")
+        decision = "once"
+        if tclass in ("user_secret_store", "env_file", "browser_profile"):
+            decision = "reject"
+            report["notes"].append("secret-adjacent always forbidden → reject")
+    report["grok_permission_decision"] = decision
+    api_reply, map_note = map_lead_decision_to_api(decision)
+    if map_note:
+        report["notes"].append(map_note)
+    if decision == "deny_job":
+        if _reconfirm_and_reply(sid, pid, "reject", perm_obj, report, "deny_job", lead_decision=decision):
+            handled_perm_ids.add(pid)
+            ping_deduper.mark_replied_id(pid)
+        report["state"] = "fail"
+        report["error"] = "lead deny_job"
+        return True, charter_sent_full
+    if _reconfirm_and_reply(
+        sid, pid, api_reply, perm_obj, report, "lead", lead_decision=decision
+    ):
+        handled_perm_ids.add(pid)
+        ping_deduper.mark_replied_id(pid)
+    return True, charter_sent_full
+
+
 def run_job(
     name: str,
     instruction: str,
@@ -394,161 +622,38 @@ def run_job(
         pc, pending = call("GET", "/permission")
         if isinstance(pending, list) and pending:
             report["pending_seen"] = True
-            report["notes"].append(f"pending count={len(pending)}")
+            # Strict sessionID filter — never act on other sessions
+            mine = []
             for p in pending:
-                pid = str(p.get("id") or p.get("requestID") or "")
-                if not pid or pid in handled_perm_ids:
+                if not isinstance(p, dict):
                     continue
-                summary = summarize_permission(p)
-                report["pending_summaries"].append(summary)
-
-                # 1) Hard rules first — obvious credential paths / always+secret → reject, no lead.
-                #    Charter allow_secret_globs / allow_paths may allowlist non-eternal secrets
-                #    → _hard_rule_allowlisted; glue once + notes (legitimate small-risk work).
-                #    Eternal paths (~/.ssh, cookies/profile, gh hosts, .netrc) still reject.
-                perm_obj = p if isinstance(p, dict) else {}
-                hr = hard_rule_decision(perm_obj, charter=job_charter)
-                if hr and hr.get("reply") == "reject":
-                    rc, rj = call("POST", f"/permission/{pid}/reply", body={"reply": "reject"})
-                    report["api_replies"].append(
-                        {"id": pid, "reply": "reject", "via": "hard_rule", "http": rc}
-                    )
-                    report["hard_rule_rejects"].append({"id": pid, "reason": hr.get("reason", "")})
-                    report["notes"].append(f"hard_rule reject: {hr.get('reason', '')}")
-                    report["grok_permission_decision"] = "reject"
-                    handled_perm_ids.add(pid)
+                psid = session_id_of_permission(p)
+                if psid and psid != sid:
                     continue
-                if perm_obj.get("_hard_rule_allowlisted"):
-                    # Explicit charter allowlist: do not reject; once + log (prove legal work).
-                    rc, rj = call("POST", f"/permission/{pid}/reply", body={"reply": "once"})
-                    report["api_replies"].append(
-                        {
-                            "id": pid,
-                            "reply": "once",
-                            "via": "hard_rule_allowlisted",
-                            "http": rc,
-                        }
-                    )
-                    report["notes"].append(
-                        "hard_rule allowlisted (charter allow_secret_globs/allow_paths): "
-                        "once — legitimate small-risk secret path; logged, no lead"
-                    )
-                    report["grok_permission_decision"] = "once"
-                    handled_perm_ids.add(pid)
+                # If upstream omits sessionID, only accept when single-job context (ours)
+                if not psid:
+                    # conservative: skip unscoped permissions
+                    report["notes"].append("skip permission without sessionID")
                     continue
-
-                # 2) Decision packet — must include worker_intent + blocker + charter_ref.
-                intent = (worker_intent or "").strip() or (
-                    f"Worker requests permission to continue job {name!r} "
-                    f"inside workspace; tool/path from pending (see proposed_action)."
+                mine.append(p)
+            report["notes"].append(f"pending count={len(pending)} mine={len(mine)}")
+            for p in mine:
+                handled, charter_sent_full = _handle_permission_for_session(
+                    p,
+                    sid=sid,
+                    ws=ws,
+                    name=name,
+                    job_charter=job_charter,
+                    worker_intent=worker_intent,
+                    blocker=blocker,
+                    ping_deduper=ping_deduper,
+                    charter_sent_full=charter_sent_full,
+                    handled_perm_ids=handled_perm_ids,
+                    report=report,
                 )
-                blk = blocker if blocker is not None else {
-                    "failed_path": "permission_gate",
-                    "detail": "worker awaiting lead decision on pending permission",
-                }
-                include_full = not charter_sent_full
-                packet = packet_from_permission(
-                    p if isinstance(p, dict) else {},
-                    worker_intent=intent,
-                    blocker=blk,
-                    charter=job_charter,
-                    include_charter_full=include_full,
-                    ping_reason="permission",
-                    risk_tags=["permission"],
-                )
-                if include_full:
-                    charter_sent_full = True
-                # Forbid tool+path-only: assert required fields present.
-                missing = [
-                    req_k
-                    for req_k in ("worker_intent", "blocker", "charter_ref")
-                    if req_k not in packet or packet[req_k] in (None, "", {})
-                ]
-                if missing:
-                    report["notes"].append(f"packet missing {missing}; forcing reject")
-                    call("POST", f"/permission/{pid}/reply", body={"reply": "reject"})
-                    report["api_replies"].append({"id": pid, "reply": "reject", "via": "incomplete_packet"})
-                    handled_perm_ids.add(pid)
-                    continue
-
-                pa = packet.get("proposed_action") or {}
-                tclass = pa.get("target_class") or "unknown"
-                ppat = pa.get("path_pattern") or ""
-                if not ping_deduper.should_emit("permission", tclass, ppat):
-                    # Same fork already pinged — conservative reject until charter changes.
-                    call("POST", f"/permission/{pid}/reply", body={"reply": "reject"})
-                    report["api_replies"].append({"id": pid, "reply": "reject", "via": "ping_dedupe"})
-                    report["notes"].append(f"deduped permission ping {tclass}/{ppat}")
-                    handled_perm_ids.add(pid)
-                    continue
-
-                # Ordinary in-workspace source R/W: still need an API reply, but may skip lead
-                # when should_ping_lead is False — default once for tiny workspace edits only.
-                path_guess = pa.get("target") or ""
-                tool_guess = pa.get("tool") or ""
-                if not should_ping_lead(
-                    ping_reason="permission",
-                    tool=tool_guess,
-                    path=path_guess,
-                    target_class=tclass,
-                ) and path_guess.startswith(ws):
-                    rc, rj = call("POST", f"/permission/{pid}/reply", body={"reply": "once"})
-                    report["api_replies"].append(
-                        {"id": pid, "reply": "once", "via": "ordinary_rw_no_lead", "http": rc}
-                    )
-                    report["notes"].append("ordinary workspace R/W — no lead ping")
-                    report["grok_permission_decision"] = "once"
-                    handled_perm_ids.add(pid)
-                    continue
-
-                ping_deduper.mark_inflight("permission", tclass, ppat)
-                allow_hint = (
-                    f"Allowed workspace only: {ws}. "
-                    "Secret-adjacent / auth workarounds: reject or demand_safe_path, never once. "
-                    "Never choose always."
-                )
-                schema = lead_permission_schema()
-                prompt = format_lead_prompt(packet, allow_hint=allow_hint)
-                raw, parsed = call_lead(prompt, schema, ws)
-                report["grok_permission_raw"] = raw
-                decision = None
-                if isinstance(parsed, dict):
-                    decision = parsed.get("decision") or (parsed.get("result") or {}).get("decision")
-                    so = parsed.get("structuredOutput")
-                    if not decision and isinstance(so, dict):
-                        decision = so.get("decision")
-                    if not decision:
-                        for k in ("output", "message", "content", "data"):
-                            if isinstance(parsed.get(k), dict) and parsed[k].get("decision"):
-                                decision = parsed[k]["decision"]
-                                break
-                if decision not in ("once", "reject", "deny_job", "demand_safe_path", "always"):
-                    m = re.search(r"\b(once|reject|deny_job|demand_safe_path|always)\b", raw or "")
-                    decision = m.group(1) if m else "reject"
-                report["grok_permission_decision"] = decision
-                api_reply, map_note = map_lead_decision_to_api(decision)
-                if map_note:
-                    report["notes"].append(map_note)
-                ping_deduper.mark_replied("permission", tclass, ppat)
-                if decision == "deny_job":
-                    call("POST", f"/permission/{pid}/reply", body={"reply": "reject"})
-                    report["api_replies"].append({"id": pid, "reply": "reject", "via": "deny_job"})
-                    handled_perm_ids.add(pid)
-                    report["state"] = "fail"
-                    report["error"] = "lead deny_job"
+                if report.get("error") == "lead deny_job":
                     _write_status(name, report)
                     return report
-                rc, rj = call("POST", f"/permission/{pid}/reply", body={"reply": api_reply})
-                report["api_replies"].append(
-                    {
-                        "id": pid,
-                        "reply": api_reply,
-                        "lead_decision": decision,
-                        "http": rc,
-                        "body": redact(rj) if rj else "",
-                    }
-                )
-                handled_perm_ids.add(pid)
 
         busy = session_busy(status, sid)
         # Early accept: hard-rule path done + artifacts on disk, session still busy.
@@ -655,14 +760,25 @@ def run_job(
                             pc, pending = call("GET", "/permission")
                             if isinstance(pending, list) and pending:
                                 report["pending_seen"] = True
+                                report["notes"].append("redo phase: permissions go through full approval (no auto-once)")
                                 for p in pending:
-                                    pid = str(p.get("id") or "")
-                                    if not pid or pid in handled_perm_ids:
+                                    if not isinstance(p, dict):
                                         continue
-                                    # conservative: once for workspace
-                                    call("POST", f"/permission/{pid}/reply", body={"reply": "once"})
-                                    report["api_replies"].append({"id": pid, "reply": "once", "via": "redo_auto_once"})
-                                    handled_perm_ids.add(pid)
+                                    handled, charter_sent_full = _handle_permission_for_session(
+                                        p,
+                                        sid=sid,
+                                        ws=ws,
+                                        name=name,
+                                        job_charter=job_charter,
+                                        worker_intent=worker_intent,
+                                        blocker=blocker,
+                                        ping_deduper=ping_deduper,
+                                        charter_sent_full=charter_sent_full,
+                                        handled_perm_ids=handled_perm_ids,
+                                        report=report,
+                                    )
+                                    if report.get("error") == "lead deny_job":
+                                        break
                             if not session_busy(status, sid):
                                 break
                             time.sleep(1.5)

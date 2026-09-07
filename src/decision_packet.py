@@ -191,6 +191,86 @@ def build_decision_packet(
     return packet
 
 
+def _collect_all_paths_patterns_ops(permission_dict: dict) -> tuple[list[str], list[str], list[str]]:
+    """Collect *all* paths / patterns / ops from a permission request (not just the first)."""
+    paths: list[str] = []
+    patterns: list[str] = []
+    ops: list[str] = []
+
+    def add_path(v: Any) -> None:
+        if v is None:
+            return
+        if isinstance(v, str) and v.strip():
+            paths.append(v.strip())
+        elif isinstance(v, (list, tuple)):
+            for x in v:
+                add_path(x)
+        elif isinstance(v, dict):
+            for k in ("path", "paths", "file", "filepath", "target", "uri"):
+                if k in v:
+                    add_path(v[k])
+
+    def add_pat(v: Any) -> None:
+        if v is None:
+            return
+        if isinstance(v, str) and v.strip():
+            patterns.append(v.strip())
+        elif isinstance(v, (list, tuple)):
+            for x in v:
+                add_pat(x)
+
+    def add_op(v: Any) -> None:
+        if v is None:
+            return
+        if isinstance(v, str) and v.strip():
+            ops.append(v.strip())
+        elif isinstance(v, (list, tuple)):
+            for x in v:
+                add_op(x)
+
+    if not isinstance(permission_dict, dict):
+        return [], [], []
+
+    for k in ("path", "paths", "file", "filepath", "target", "uri"):
+        if k in permission_dict:
+            add_path(permission_dict[k])
+    for k in ("patterns", "pattern", "glob", "globs"):
+        if k in permission_dict:
+            add_pat(permission_dict[k])
+    for k in ("ops", "operations", "op", "action", "actions"):
+        if k in permission_dict:
+            add_op(permission_dict[k])
+
+    # permission / tool fields as ops hints
+    for k in ("permission", "permissions", "tool", "type"):
+        v = permission_dict.get(k)
+        if isinstance(v, str) and v.strip():
+            if k in ("permission", "permissions", "tool") and v.strip() not in ops:
+                ops.append(v.strip())
+        elif isinstance(v, list):
+            add_op(v)
+
+    for nest_key in ("metadata", "input", "args"):
+        nest = permission_dict.get(nest_key)
+        if isinstance(nest, dict):
+            p2, g2, o2 = _collect_all_paths_patterns_ops(nest)
+            paths.extend(p2)
+            patterns.extend(g2)
+            ops.extend(o2)
+
+    # de-dupe preserving order
+    def uniq(xs: list[str]) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for x in xs:
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
+
+    return uniq(paths), uniq(patterns), uniq(ops)
+
+
 def packet_from_permission(
     permission_dict: dict,
     *,
@@ -204,27 +284,42 @@ def packet_from_permission(
     mismatch: dict | None = None,
     ping_reason: str = "permission",
 ) -> dict:
-    """Build packet from a TeleAgent permission payload — never tool+path only."""
-    # NOTE: parenthesize ternary — bare `a or b or c if cond else d` binds wrong and
-    # drops `path` when `patterns` is absent (else branch returns None).
-    patterns = permission_dict.get("patterns")
-    if isinstance(patterns, list):
-        pattern0 = (patterns or [None])[0]
-    else:
-        pattern0 = patterns
-    path = (
-        permission_dict.get("path")
-        or permission_dict.get("filepath")
-        or pattern0
+    """Build packet from a TeleAgent permission payload — never tool+path only.
+
+    Includes *all* paths / patterns / ops from the request (not just the first item).
+    """
+    paths, patterns, ops = _collect_all_paths_patterns_ops(
+        permission_dict if isinstance(permission_dict, dict) else {}
     )
-    if not path and isinstance(permission_dict.get("metadata"), dict):
-        path = permission_dict["metadata"].get("path") or permission_dict["metadata"].get("filepath")
-    tool = permission_dict.get("tool") or permission_dict.get("permission") or permission_dict.get("type") or "unknown"
+    # primary target: first path, else first pattern
+    path = paths[0] if paths else (patterns[0] if patterns else "")
+    tool = (
+        permission_dict.get("tool")
+        or permission_dict.get("permission")
+        or permission_dict.get("type")
+        or (ops[0] if ops else None)
+        or "unknown"
+    )
+    # worst / most-sensitive target_class among all candidates
+    classes = [target_class_for(p, str(tool)) for p in (paths + patterns) or [None]]
+    priority = ("user_secret_store", "browser_profile", "env_file", "url", "path", "source", "unknown")
+    tclass = "unknown"
+    for cand in priority:
+        if cand in classes:
+            tclass = cand
+            break
+    # path_pattern: join unique patterns for all targets
+    ppats = [path_pattern(p) for p in (paths + patterns) if p]
+    ppats = list(dict.fromkeys([x for x in ppats if x]))
     proposed = {
         "tool": str(tool),
         "target": str(path) if path else "",
-        "target_class": target_class_for(str(path) if path else None, str(tool)),
-        "path_pattern": path_pattern(str(path) if path else None),
+        "targets": list(paths),
+        "patterns": list(patterns),
+        "ops": list(ops),
+        "target_class": tclass,
+        "path_pattern": ppats[0] if len(ppats) == 1 else ("|".join(ppats) if ppats else path_pattern(str(path) if path else None)),
+        "path_patterns": ppats,
         "when": "before_exec",
     }
     tags = list(risk_tags or [])
@@ -284,33 +379,56 @@ def map_lead_decision_to_api(decision: str | None) -> tuple[str, str | None]:
 
 
 class PingDeduper:
-    """Same (ping_reason, target_class, path_pattern) pings only once until lead replies."""
+    """Dedupe by *permission request id* (not target_class/path_pattern).
+
+    Same-class subsequent legitimate requests with a new id may be approved again.
+    Pattern-tuple API kept as no-op compatibility shims so callers do not
+    accidentally suppress follow-up requests.
+    """
 
     def __init__(self) -> None:
-        self._inflight: set[tuple[str, str, str]] = set()
-        self._done: set[tuple[str, str, str]] = set()
+        self._inflight_ids: set[str] = set()
+        self._done_ids: set[str] = set()
 
+    def already_handled(self, request_id: str) -> bool:
+        rid = (request_id or "").strip()
+        return bool(rid) and (rid in self._done_ids or rid in self._inflight_ids)
+
+    def should_emit_id(self, request_id: str) -> bool:
+        rid = (request_id or "").strip()
+        if not rid:
+            return False
+        return rid not in self._done_ids and rid not in self._inflight_ids
+
+    def mark_inflight_id(self, request_id: str) -> None:
+        rid = (request_id or "").strip()
+        if rid:
+            self._inflight_ids.add(rid)
+
+    def mark_replied_id(self, request_id: str) -> None:
+        rid = (request_id or "").strip()
+        if rid:
+            self._inflight_ids.discard(rid)
+            self._done_ids.add(rid)
+
+    # --- backward-compatible shims (always allow; do NOT dedupe by pattern) ---
     @staticmethod
     def key(ping_reason: str, target_class: str, path_pattern_s: str) -> tuple[str, str, str]:
         return (ping_reason or "", target_class or "", path_pattern_s or "")
 
     def should_emit(self, ping_reason: str, target_class: str, path_pattern_s: str) -> bool:
-        k = self.key(ping_reason, target_class, path_pattern_s)
-        if k in self._inflight or k in self._done:
-            return False
+        # Intentionally always True: pattern-based suppress blocked same-class re-asks.
         return True
 
     def mark_inflight(self, ping_reason: str, target_class: str, path_pattern_s: str) -> None:
-        self._inflight.add(self.key(ping_reason, target_class, path_pattern_s))
+        return None
 
     def mark_replied(self, ping_reason: str, target_class: str, path_pattern_s: str) -> None:
-        k = self.key(ping_reason, target_class, path_pattern_s)
-        self._inflight.discard(k)
-        self._done.add(k)
+        return None
 
     def clear(self) -> None:
-        self._inflight.clear()
-        self._done.clear()
+        self._inflight_ids.clear()
+        self._done_ids.clear()
 
 
 def should_ping_lead(
