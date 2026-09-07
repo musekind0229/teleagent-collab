@@ -216,6 +216,7 @@ class TestSchedulerForceLeadAndTimeout(unittest.TestCase):
                 workspaces_root=root / "ws",
                 runs_root=root / "runs",
                 dry_run=True,
+                persist=False,
                 stop_when_idle=True,
                 idle_min=1,
                 idle_max=1,

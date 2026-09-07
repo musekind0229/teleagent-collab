@@ -232,6 +232,27 @@ def validate_charter(data: dict) -> None:
         raise CharterError("done_when must be mapping, list, or string")
     if acceptance is not None and not isinstance(acceptance, str):
         raise CharterError("acceptance must be a string")
+    # 条5 authorization fields (optional; validated when present / by task_kind)
+    try:
+        from task_auth import validate_auth_fields, extract_auth_fields, normalize_task_kind
+    except ImportError:
+        validate_auth_fields = None  # type: ignore
+    if validate_auth_fields is not None:
+        if "task_kind" in data or "install_roots" in data or "network_allow" in data:
+            try:
+                if "task_kind" in data:
+                    normalize_task_kind(data.get("task_kind"))
+                validate_auth_fields(data)
+            except ValueError as e:
+                raise CharterError(str(e)) from e
+        # soft-normalize defaults into a copy? keep original; extract at runtime
+        _ = extract_auth_fields(data)
+    for list_key in ("network_allow", "install_roots", "lead_review_steps", "user_gate_permissions"):
+        if list_key in data and data[list_key] is not None and not isinstance(data[list_key], list):
+            raise CharterError(f"{list_key} must be a list")
+    if "rollback" in data and data["rollback"] is not None:
+        if not isinstance(data["rollback"], (str, dict)):
+            raise CharterError("rollback must be a string or mapping")
 
 
 def charter_for_glue(charter: dict) -> dict:
@@ -241,7 +262,20 @@ def charter_for_glue(charter: dict) -> dict:
         "must": list(charter.get("must") or []),
         "must_not": list(charter.get("must_not") or []),
     }
-    for k in ("allow_secret_globs", "allow_paths", "allow_keys", "allowed_surfaces"):
+    for k in (
+        "allow_secret_globs",
+        "allow_paths",
+        "allow_keys",
+        "allowed_surfaces",
+        "task_kind",
+        "network_allow",
+        "install_roots",
+        "lead_review_steps",
+        "user_gate_permissions",
+        "acceptance",
+        "rollback",
+        "done_when",
+    ):
         if k in charter and charter[k] is not None:
             out[k] = charter[k]
     return out
@@ -317,6 +351,36 @@ def build_instruction(charter: dict) -> str:
         lines.append("")
         lines.append("Acceptance:")
         lines.append(charter["acceptance"].strip())
+
+    # 条5: surface authorization spine (prompt constraint + mechanical hints)
+    try:
+        from task_auth import extract_auth_fields
+        auth = extract_auth_fields(charter)
+        lines.append("")
+        lines.append(f"Task kind: {auth['task_kind']}")
+        if auth["network_allow"]:
+            lines.append("Network allow:")
+            for n in auth["network_allow"]:
+                lines.append(f"- {n}")
+        if auth["install_roots"]:
+            lines.append("Install roots (only these dirs for system installs):")
+            for r in auth["install_roots"]:
+                lines.append(f"- {r}")
+        if auth["user_gate_permissions"]:
+            lines.append("User-gate permissions (must not silently expand):")
+            for g in auth["user_gate_permissions"]:
+                lines.append(f"- {g}")
+        if auth["lead_review_steps"]:
+            lines.append("Steps requiring lead review:")
+            for s in auth["lead_review_steps"]:
+                lines.append(f"- {s}")
+        if auth["rollback"]:
+            lines.append("")
+            lines.append("Rollback:")
+            rb = auth["rollback"]
+            lines.append(rb if isinstance(rb, str) else str(rb))
+    except Exception:
+        pass
 
     if explicit:
         lines.append("")

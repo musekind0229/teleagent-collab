@@ -1,0 +1,76 @@
+# 条5 sample: system_install — NOT a real RustDesk deploy.
+# Declares narrow install_roots + network_allow + user gates + rollback.
+# Lead may approve inside this scope; install ≠ unbounded system rights.
+name: system-install-sample
+task_kind: system_install
+goal: >
+  Prepare (dry documentation only in workspace) an install plan for a remote-desktop
+  helper under the declared install_roots. Do NOT actually install system packages
+  in CI/smoke; write install-plan.md and rollback-notes.md.
+
+must:
+  - Only write under install_roots and the job workspace
+  - Downloads only from network_allow hosts (if any fetch is proposed)
+  - Surface sudo / systemd / firewall as user_gate (never silent lead expand)
+  - Produce acceptance artifacts
+
+must_not:
+  - Interpret this charter as root-anywhere or unbounded install rights
+  - Touch /.ssh, cookies, credential stores
+  - always-approve / yolo
+  - Bind SSH reverse tunnels or change firewall without user_gate
+
+allow_secret_globs: []
+allow_paths: []
+allow_keys: []
+
+network_allow:
+  - github.com
+  - "*.github.com"
+  - objects.githubusercontent.com
+
+# Narrow roots only — example paths under /opt/collab-apps (not /)
+install_roots:
+  - /opt/collab-apps/remote-helper
+  - /var/tmp/collab-apps/remote-helper
+
+lead_review_steps:
+  - install_execute
+  - service_change
+  - permission_grey
+  - outbound_auth
+  - job_end
+
+user_gate_permissions:
+  - sudo
+  - systemd_unit_install
+  - firewall_change
+  - kernel_module
+  - ssh_listen_bind
+  - credential_store_write
+
+allowed_surfaces:
+  - workspace_fs
+  - install_roots
+  - lead_approved_tools
+
+done_when:
+  artifacts:
+    - install-plan.md
+    - rollback-notes.md
+
+acceptance: |
+  install-plan.md lists exact install_roots and network_allow used;
+  rollback-notes.md describes how to remove files under those roots only.
+  No claim of system-wide privilege.
+
+rollback: |
+  1. Delete files created under /opt/collab-apps/remote-helper and
+     /var/tmp/collab-apps/remote-helper.
+  2. Do not leave systemd units or firewall rules (those require user_gate
+     and must be undone by the human if ever applied).
+  3. Remove workspace artifacts install-plan.md / rollback-notes.md if needed.
+
+timeout_sec: 300
+force_lead_review: true
+max_reworks: 1

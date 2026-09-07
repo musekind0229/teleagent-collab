@@ -31,3 +31,5 @@ asar-out/
 jobs/runs/
 # per-job isolated workdirs (scheduler)
 jobs/workspaces/
+# persisted scheduler/job state (条6)
+jobs/state/

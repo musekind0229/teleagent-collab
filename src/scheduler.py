@@ -54,6 +54,8 @@ class JobState(str, Enum):
     STARTING = "starting"
     RUNNING = "running"
     PENDING_APPROVAL = "pending_approval"
+    CANCEL_REQUESTED = "cancel_requested"  # 条6: request received ≠ stopped
+    CANCELLED = "cancelled"                # 条6: execution stopped (this job only)
     DONE = "done"
     FAIL = "fail"
     TIMEOUT = "timeout"
@@ -119,6 +121,12 @@ class JobSlot:
     # dry/sim hooks
     dry: bool = False
     simulated_pending: list[dict] = field(default_factory=list)
+    # 条6 recovery
+    cancel_requested_at: float | None = None
+    cancel_effected_at: float | None = None
+    dispatch_token: str = ""
+    wall_deadline: float | None = None
+    restored: bool = False  # True if hydrated from StateStore (do not re-dispatch)
 
 
 def new_job_id(name: str = "job") -> str:
@@ -180,6 +188,9 @@ class ParallelScheduler:
         busy_min: float = BUSY_POLL_MIN,
         busy_max: float = BUSY_POLL_MAX,
         stop_when_idle: bool = True,
+        state_store: Any = None,
+        state_run_id: str | None = None,
+        persist: bool = True,
     ) -> None:
         if max_parallel < 1:
             raise ValueError("max_parallel must be >= 1")
@@ -200,6 +211,13 @@ class ParallelScheduler:
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._executor = ThreadPoolExecutor(max_workers=max_parallel, thread_name_prefix="collab-job")
+        self.persist = persist
+        self.state_store = state_store
+        if self.persist and self.state_store is None:
+            from state_store import StateStore
+            rid = state_run_id or f"sched-{uuid.uuid4().hex[:8]}"
+            self.state_store = StateStore(run_id=rid)
+        self.state_run_id = getattr(self.state_store, "root", None)
 
     # --- lead / HTTP (lazy glue) -------------------------------------------------
 
@@ -260,6 +278,7 @@ class ParallelScheduler:
             if expected_artifacts is not None
             else resolve_arts(charter, workspace=workdir)
         )
+        timeout_sec = int(300 if charter.get("timeout_sec") is None else charter.get("timeout_sec"))
         slot = JobSlot(
             job_id=jid,
             name=name,
@@ -267,15 +286,17 @@ class ParallelScheduler:
             instruction=instr,
             expected_artifacts=arts,
             workdir=workdir,
-            timeout_sec=int(300 if charter.get("timeout_sec") is None else charter.get("timeout_sec")),
+            timeout_sec=timeout_sec,
             force_lead_review=bool(charter.get("force_lead_review", False)),
             worker_intent=charter.get("worker_intent"),
             blocker=charter.get("blocker"),
             dry=self.dry_run,
             simulated_pending=list(simulated_pending or []),
+            wall_deadline=None,
         )
         with self._lock:
             self.jobs[jid] = slot
+        self._persist_job(slot)
         return slot
 
     def active_count(self) -> int:
@@ -288,6 +309,7 @@ class ParallelScheduler:
                     JobState.STARTING,
                     JobState.RUNNING,
                     JobState.PENDING_APPROVAL,
+                    JobState.CANCEL_REQUESTED,
                 )
             )
 
@@ -326,11 +348,187 @@ class ParallelScheduler:
         self.stats.poll_intervals.append(iv)
         return iv
 
+    # --- persistence / cancel (条6) ---------------------------------------------
+
+    def _persist_job(self, job: JobSlot) -> None:
+        if not self.persist or self.state_store is None:
+            return
+        from state_store import JobRecord
+        rec = JobRecord(
+            job_id=job.job_id,
+            name=job.name,
+            state=job.state.value,
+            session_id=job.session_id,
+            workdir=str(job.workdir),
+            charter_name=job.name,
+            started_at=job.started_at,
+            finished_at=job.finished_at,
+            cancel_requested_at=job.cancel_requested_at,
+            cancel_effected_at=job.cancel_effected_at,
+            timeout_sec=job.timeout_sec,
+            wall_deadline=job.wall_deadline,
+            claimed_session=bool(job.session_id and job.dispatch_token),
+            dispatch_token=job.dispatch_token,
+            notes=list(job.notes),
+            result=dict(job.result or {}),
+            handled_perm_ids=sorted(job.handled_perm_ids),
+        )
+        self.state_store.upsert_job(rec)
+
+    def request_cancel(self, job_id: str) -> dict:
+        """Receive cancel request for one job. Sibling jobs unaffected."""
+        with self._lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                return {"ok": False, "error": "unknown_job"}
+            if job.state in (
+                JobState.DONE,
+                JobState.FAIL,
+                JobState.TIMEOUT,
+                JobState.CANCELLED,
+            ):
+                return {
+                    "ok": True,
+                    "job_id": job_id,
+                    "cancel_requested": False,
+                    "state": job.state.value,
+                    "note": "already_terminal",
+                }
+            job.state = JobState.CANCEL_REQUESTED
+            job.cancel_requested_at = time.time()
+            job.notes.append("cancel_requested received (execution may still be running)")
+        if self.state_store is not None:
+            try:
+                self.state_store.request_cancel(job_id)
+            except KeyError:
+                self._persist_job(job)
+        else:
+            self._persist_job(job)
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "cancel_requested": True,
+            "cancel_effected": False,
+            "state": JobState.CANCEL_REQUESTED.value,
+        }
+
+    def effect_cancel(self, job_id: str, *, error: str = "cancelled by request") -> dict:
+        """Stop this job only. Distinguishes from cancel_requested."""
+        with self._lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                return {"ok": False, "error": "unknown_job"}
+            job.state = JobState.CANCELLED
+            job.cancel_effected_at = time.time()
+            job.finished_at = time.time()
+            job.busy = False
+            job.result = {
+                "ok": False,
+                "state": "cancelled",
+                "error": error,
+                "job_id": job_id,
+                "session_id": job.session_id,
+                "cancel_requested_at": job.cancel_requested_at,
+                "cancel_effected_at": job.cancel_effected_at,
+                "notes": list(job.notes),
+            }
+            job.notes.append("cancel effected — execution stopped for this job_id only")
+        if self.state_store is not None:
+            try:
+                self.state_store.effect_cancel(job_id, error=error)
+            except KeyError:
+                self._persist_job(job)
+        else:
+            self._persist_job(job)
+        self.write_job_report(job)
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "cancel_requested": bool(job.cancel_requested_at),
+            "cancel_effected": True,
+            "state": JobState.CANCELLED.value,
+        }
+
+    def restore_from_store(self) -> dict:
+        """Hydrate slots from StateStore after process restart.
+
+        Does NOT re-dispatch already-started sessions; does NOT re-send decisions.
+        """
+        if self.state_store is None:
+            return {"restored": 0, "plan": {}}
+        from state_store import TERMINAL
+        plan = self.state_store.resume_plan()
+        restored = 0
+        for rec in self.state_store.list_jobs():
+            if rec.job_id in self.jobs:
+                continue
+            # Minimal slot — charter may be missing; mark restored so we skip re-prompt
+            workdir = Path(rec.workdir) if rec.workdir else (self.workspaces_root / rec.job_id)
+            workdir.mkdir(parents=True, exist_ok=True)
+            try:
+                st = JobState(rec.state)
+            except ValueError:
+                st = JobState.FAIL
+            slot = JobSlot(
+                job_id=rec.job_id,
+                name=rec.name or rec.job_id,
+                charter={"goal": "(restored)", "must": [], "must_not": [], "allow_paths": [], "done_when": {}},
+                instruction="",
+                expected_artifacts=[],
+                workdir=workdir,
+                timeout_sec=rec.timeout_sec,
+                state=st,
+                session_id=rec.session_id,
+                started_at=rec.started_at,
+                finished_at=rec.finished_at,
+                cancel_requested_at=rec.cancel_requested_at,
+                cancel_effected_at=rec.cancel_effected_at,
+                dispatch_token=rec.dispatch_token,
+                wall_deadline=rec.wall_deadline,
+                handled_perm_ids=set(rec.handled_perm_ids),
+                notes=list(rec.notes) + ["restored from state_store; no re-dispatch"],
+                result=dict(rec.result or {}),
+                restored=True,
+                dry=self.dry_run,
+            )
+            # Re-apply decisions so we never re-reply
+            for d in self.state_store._decisions.values():
+                if d.job_id == rec.job_id:
+                    slot.handled_perm_ids.add(d.permission_id)
+            with self._lock:
+                self.jobs[rec.job_id] = slot
+            restored += 1
+        # Effect any cancel_requested left mid-flight
+        for jid in plan.get("effect_cancel") or []:
+            self.effect_cancel(jid, error="cancel effected on restore")
+        return {"restored": restored, "plan": plan}
+
     # --- start jobs --------------------------------------------------------------
 
     def _start_job_live(self, job: JobSlot) -> None:
+        from state_store import new_dispatch_token
         g = self._glue()
         ws = str(job.workdir)
+        # Restart safety: never re-prompt an already-dispatched job
+        if job.restored and job.session_id:
+            job.state = JobState.RUNNING
+            job.notes.append(f"resume monitor only session={job.session_id} (no re-dispatch)")
+            self._persist_job(job)
+            return
+        if self.state_store is not None:
+            ok_disp, why = self.state_store.should_dispatch(job.job_id)
+            if not ok_disp:
+                job.notes.append(f"skip dispatch: {why}")
+                if job.session_id:
+                    job.state = JobState.RUNNING
+                else:
+                    job.state = JobState.FAIL
+                    job.result = {"ok": False, "error": why, "state": "fail"}
+                    job.finished_at = time.time()
+                self._persist_job(job)
+                return
+        token = new_dispatch_token()
+        job.dispatch_token = token
         code, created = self.ta_call(
             "POST",
             "/session",
@@ -341,8 +539,21 @@ class ParallelScheduler:
             job.state = JobState.FAIL
             job.result = {"ok": False, "error": f"create session failed: {code}", "state": "fail"}
             job.finished_at = time.time()
+            self._persist_job(job)
             return
         sid = created["id"]
+        if self.state_store is not None:
+            claimed = self.state_store.claim_session(job.job_id, sid, dispatch_token=token)
+            if not claimed:
+                job.state = JobState.FAIL
+                job.result = {
+                    "ok": False,
+                    "error": "session claim failed (would hijack or re-dispatch)",
+                    "state": "fail",
+                }
+                job.finished_at = time.time()
+                self._persist_job(job)
+                return
         job.session_id = sid
         code, _ = self.ta_call(
             "POST",
@@ -354,16 +565,30 @@ class ParallelScheduler:
             job.state = JobState.FAIL
             job.result = {"ok": False, "error": f"prompt_async failed: {code}", "state": "fail"}
             job.finished_at = time.time()
+            self._persist_job(job)
             return
         job.state = JobState.RUNNING
         job.started_at = time.time()
-        job.notes.append(f"started session={sid} workdir={ws}")
+        job.wall_deadline = job.started_at + job.timeout_sec
+        job.notes.append(f"started session={sid} workdir={ws} dispatch_token={token[:8]}")
+        self._persist_job(job)
 
     def _start_job_dry(self, job: JobSlot) -> None:
         """Dry: isolate workdir + optional simulated pending; no TeleAgent."""
+        from state_store import new_dispatch_token
+        if job.restored and job.session_id:
+            job.state = JobState.RUNNING
+            job.notes.append("dry resume: no re-dispatch")
+            self._persist_job(job)
+            return
+        token = new_dispatch_token()
+        job.dispatch_token = token
         job.session_id = f"dry-{job.job_id}"
+        if self.state_store is not None:
+            self.state_store.claim_session(job.job_id, job.session_id, dispatch_token=token)
         job.state = JobState.RUNNING
         job.started_at = time.time()
+        job.wall_deadline = job.started_at + job.timeout_sec
         # Prove isolation: write a marker only in this workdir
         marker = job.workdir / f"_scheduler_marker_{job.job_id}.txt"
         marker.write_text(f"job_id={job.job_id}\nname={job.name}\n", encoding="utf-8")
@@ -375,6 +600,7 @@ class ParallelScheduler:
             art.parent.mkdir(parents=True, exist_ok=True)
             if not art.exists():
                 art.write_text(f"dry-ok from {job.job_id}\n", encoding="utf-8")
+        self._persist_job(job)
 
     def try_start_queued(self) -> list[str]:
         started: list[str] = []
@@ -383,6 +609,18 @@ class ParallelScheduler:
             if not q:
                 break
             job = q[0]
+            if job.restored:
+                # Restored jobs are monitored, never re-queued for fresh dispatch
+                job.notes.append("restored job left queued→running monitor without re-prompt")
+                if job.session_id:
+                    job.state = JobState.RUNNING
+                else:
+                    job.state = JobState.FAIL
+                    job.result = {"ok": False, "error": "restored without session", "state": "fail"}
+                    job.finished_at = time.time()
+                self._persist_job(job)
+                started.append(job.job_id)
+                continue
             job.state = JobState.STARTING
             try:
                 if self.dry_run:
@@ -393,6 +631,7 @@ class ParallelScheduler:
                 job.state = JobState.FAIL
                 job.result = {"ok": False, "error": str(e), "state": "fail"}
                 job.finished_at = time.time()
+                self._persist_job(job)
             started.append(job.job_id)
         return started
 
@@ -462,6 +701,52 @@ class ParallelScheduler:
         pid = str(p.get("id") or p.get("requestID") or "")
         if not pid or pid in job.handled_perm_ids:
             return {"skipped": True, "reason": "already_handled", "id": pid}
+        # 条6: never re-send a decision already recorded in state store
+        if self.state_store is not None:
+            prior = self.state_store.already_decided(pid)
+            if prior is not None:
+                job.handled_perm_ids.add(pid)
+                job.notes.append(f"skip re-send decision for {pid} via={prior.via}")
+                return {
+                    "skipped": True,
+                    "reason": "already_decided_persisted",
+                    "id": pid,
+                    "prior_reply": prior.reply,
+                }
+            from state_store import PendingItem
+            self.state_store.add_pending(
+                PendingItem(
+                    permission_id=pid,
+                    job_id=job.job_id,
+                    session_id=job.session_id,
+                    summary=str(p.get("path") or p.get("tool") or "")[:200],
+                )
+            )
+
+        # 条5: user_gate / install scope — lead must not expand privilege
+        try:
+            from task_auth import authorize_action, lead_may_approve_without_user
+            auth_d = authorize_action(
+                charter=job.charter,
+                path=str(p.get("path") or "") or None,
+                permission=p if isinstance(p, dict) else {},
+                workspace=job.workdir,
+            )
+            if auth_d.needs_user or (not auth_d.allowed and auth_d.via in ("user_gate", "mechanical")):
+                self._reply(job, pid, "reject", via=f"task_auth:{auth_d.via}", original=dict(p) if isinstance(p, dict) else None)
+                job.notes.append(f"task_auth deny: {auth_d.reason}")
+                self.stats.replies += 1
+                return {
+                    "id": pid,
+                    "reply": "reject",
+                    "via": f"task_auth:{auth_d.via}",
+                    "called_lead": False,
+                    "auth": auth_d.to_dict(),
+                }
+            ok_lead, lead_why = lead_may_approve_without_user(job.charter, p if isinstance(p, dict) else {})
+            job.notes.append(f"lead_scope_ok={ok_lead}: {lead_why}")
+        except Exception as e:
+            job.notes.append(f"task_auth check error (continue grey path): {e}")
 
         g = None if self.dry_run else self._glue()
         summary = (
@@ -561,6 +846,11 @@ class ParallelScheduler:
             lead_permission_response_schema,
             validate_lead_decision,
         )
+        try:
+            from task_auth import auth_summary_for_lead
+            auth_extra = {"task_authorization": auth_summary_for_lead(job.charter)}
+        except Exception:
+            auth_extra = None
         req = build_lead_request(
             kind="permission",
             goal=(job.charter or {}).get("goal") or f"job {job.name}",
@@ -571,6 +861,7 @@ class ParallelScheduler:
             or {},
             current_application=packet,
             charter=job.charter,
+            extra=auth_extra,
         )
         schema = lead_permission_response_schema()
         if self._call_lead_fn is not None or self.dry_run:
@@ -692,9 +983,43 @@ class ParallelScheduler:
         # Mark handled only after successful reply
         job.handled_perm_ids.add(pid)
         job.ping_deduper.mark_replied_id(pid)
+        self._record_decision(
+            job,
+            pid,
+            reply,
+            via=via,
+            lead_decision=lead_decision,
+        )
         if job.state == JobState.PENDING_APPROVAL:
             job.state = JobState.RUNNING
+        self._persist_job(job)
         return True
+
+    def _record_decision(
+        self,
+        job: JobSlot,
+        pid: str,
+        reply: str,
+        *,
+        via: str,
+        lead_decision: str | None = None,
+        application_id: str | None = None,
+    ) -> None:
+        if self.state_store is None:
+            return
+        from state_store import DecisionRecord
+        import uuid as _uuid
+        self.state_store.record_decision(
+            DecisionRecord(
+                decision_id=f"dec-{_uuid.uuid4().hex[:12]}",
+                job_id=job.job_id,
+                permission_id=pid,
+                reply=reply,
+                via=via,
+                lead_decision=lead_decision,
+                application_id=application_id,
+            )
+        )
 
     def dispatch_pending_batch(self, pending: list[dict]) -> list[dict]:
         """Batch schedule collected pending, but decide per job_id (one-by-one each).
@@ -733,7 +1058,18 @@ class ParallelScheduler:
             validate_lead_decision,
         )
 
-        if job.state in (JobState.DONE, JobState.FAIL, JobState.TIMEOUT, JobState.QUEUED):
+        if job.state in (
+            JobState.DONE,
+            JobState.FAIL,
+            JobState.TIMEOUT,
+            JobState.CANCELLED,
+            JobState.QUEUED,
+        ):
+            return
+
+        # 条6: cancel_requested → effect cancel for THIS job only
+        if job.state == JobState.CANCEL_REQUESTED:
+            self.effect_cancel(job.job_id)
             return
 
         def _arts_complete() -> tuple[bool, list[str]]:
@@ -759,6 +1095,7 @@ class ParallelScheduler:
                 "force_lead_review": job.force_lead_review,
             }
             job.finished_at = time.time()
+            self._persist_job(job)
 
         def _succeed(arts: list[str], *, state: str = "ok", extra_notes: list | None = None) -> None:
             notes = list(job.notes) + list(extra_notes or [])
@@ -790,6 +1127,7 @@ class ParallelScheduler:
             }
             job.finished_at = time.time()
             job.busy = False
+            self._persist_job(job)
 
         def _run_force_lead_review(arts: list[str]) -> bool:
             """Return True if lead passed and fingerprints stable. Parallel + serial."""
@@ -869,17 +1207,31 @@ class ParallelScheduler:
                 return False
             return verdict == "pass"
 
-        # Wall timeout — NEVER success even if some/all artifacts exist (条2)
-        if job.started_at and (time.time() - job.started_at) > job.timeout_sec:
+        # Wall timeout — NEVER success; scoped to THIS job_id only (条2 + 条6)
+        # Always derive from started_at + timeout_sec so backdated started_at (tests/recovery) wins.
+        deadline = None
+        if job.started_at is not None:
+            deadline = job.started_at + job.timeout_sec
+            job.wall_deadline = deadline
+        elif job.wall_deadline is not None:
+            deadline = job.wall_deadline
+        if deadline is not None and time.time() > deadline:
             complete, arts = _arts_complete()
             _fail(
                 "timeout",
-                "wall clock timeout (not success even with artifacts)",
+                "wall clock timeout (not success even with artifacts; this job only)",
                 arts,
             )
             job.notes.append(
                 f"timeout with artifacts_complete={complete} missing={missing_artifacts(job.expected_artifacts)}"
             )
+            if self.state_store is not None:
+                try:
+                    self.state_store.mark_timeout(job.job_id)
+                except KeyError:
+                    self._persist_job(job)
+            else:
+                self._persist_job(job)
             return
 
         if self.dry_run:
@@ -957,11 +1309,21 @@ class ParallelScheduler:
                 j
                 for j in self.jobs.values()
                 if j.state
-                in (JobState.RUNNING, JobState.PENDING_APPROVAL, JobState.STARTING)
+                in (
+                    JobState.RUNNING,
+                    JobState.PENDING_APPROVAL,
+                    JobState.STARTING,
+                    JobState.CANCEL_REQUESTED,
+                )
             ]
         for j in active:
             self.refresh_job_status(j)
-            if j.state in (JobState.DONE, JobState.FAIL, JobState.TIMEOUT):
+            if j.state in (
+                JobState.DONE,
+                JobState.FAIL,
+                JobState.TIMEOUT,
+                JobState.CANCELLED,
+            ):
                 self.write_job_report(j)
         return {
             "started": started,
@@ -976,7 +1338,13 @@ class ParallelScheduler:
             if not self.jobs:
                 return True
             return all(
-                j.state in (JobState.DONE, JobState.FAIL, JobState.TIMEOUT)
+                j.state
+                in (
+                    JobState.DONE,
+                    JobState.FAIL,
+                    JobState.TIMEOUT,
+                    JobState.CANCELLED,
+                )
                 for j in self.jobs.values()
             )
 
@@ -1000,11 +1368,19 @@ class ParallelScheduler:
                 self.next_poll_interval()
         # finalize any leftovers
         for j in self.jobs.values():
-            if j.state not in (JobState.DONE, JobState.FAIL, JobState.TIMEOUT):
+            if j.state not in (
+                JobState.DONE,
+                JobState.FAIL,
+                JobState.TIMEOUT,
+                JobState.CANCELLED,
+            ):
                 self.refresh_job_status(j)
-            if j.state in (JobState.DONE, JobState.FAIL, JobState.TIMEOUT) and not (
-                self.runs_root / j.job_id / "status.json"
-            ).exists():
+            if j.state in (
+                JobState.DONE,
+                JobState.FAIL,
+                JobState.TIMEOUT,
+                JobState.CANCELLED,
+            ) and not (self.runs_root / j.job_id / "status.json").exists():
                 self.write_job_report(j)
         return {
             "ticks": ticks,
@@ -1042,6 +1418,7 @@ def smoke_parallel_isolation(
         max_parallel=max_parallel,
         workspaces_root=root,
         dry_run=True,
+        persist=False,
         idle_min=10,
         idle_max=12,
         busy_min=1,
@@ -1131,6 +1508,7 @@ def smoke_serial_short_poll() -> dict:
         max_parallel=1,
         workspaces_root=root,
         dry_run=True,
+        persist=False,
         call_lead_fn=fake_lead,
         idle_min=10,
         idle_max=30,
@@ -1149,23 +1527,24 @@ def smoke_serial_short_poll() -> dict:
         "timeout_sec": 60,
     }
     # Two greys that need lead — must be answered one-by-one, not batched into one lead call
-    sim = [
+    job = sched.enqueue_charter(charter, simulated_pending=[])
+    # Paths inside workdir so task_auth file_task allows lead (outside /tmp would be mechanical deny)
+    job.simulated_pending = [
         {
             "id": "ser-1",
-            "path": "/tmp/collab-unknown-tool-target-1",
+            "path": str(job.workdir / "target-1.sh"),
             "tool": "bash",
             "permission": "bash",
             "command": "echo one",
         },
         {
             "id": "ser-2",
-            "path": "/tmp/collab-unknown-tool-target-2",
+            "path": str(job.workdir / "target-2.sh"),
             "tool": "bash",
             "permission": "bash",
             "command": "echo two",
         },
     ]
-    job = sched.enqueue_charter(charter, simulated_pending=sim)
 
     # Tick 1: start + first pending only
     t1 = sched.tick()

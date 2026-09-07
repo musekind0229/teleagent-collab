@@ -20,7 +20,7 @@
 | `allow_secret_globs` / `allow_paths` / `allow_keys` | 秘密路径白名单（至少一个字段出现；无授权用 `[]`） |
 | `done_when` 和/或 `acceptance` | 完成标准（产物路径或验收文案） |
 
-可选：`name`、`instruction`（补充细节，不能替代上表）、`timeout_sec`、`force_lead_review`、`allowed_surfaces`。
+可选：`name`、`instruction`（补充细节，不能替代上表）、`timeout_sec`、`force_lead_review`、`allowed_surfaces`、`task_kind` / `network_allow` / `install_roots` / `lead_review_steps` / `user_gate_permissions` / `rollback`（条5，详见 [`task-authorization.md`](task-authorization.md)）。
 
 样例：[`jobs/examples/hello.charter.yaml`](../jobs/examples/hello.charter.yaml)。
 

@@ -1,0 +1,47 @@
+# 条5 sample: file_task — workspace file work only (no system install privileges).
+name: file-task-sample
+task_kind: file_task
+goal: "Edit only files under the assigned workspace; write result.txt with one line STATUS=ok."
+
+must:
+  - Stay inside the assigned workspace
+  - Produce done_when.artifacts
+  - Prefer lead approval for grey permissions inside charter scope
+
+must_not:
+  - Install packages, touch systemd, sudo, or firewall
+  - Read credentials / .env / ssh / cookies
+  - always-approve / yolo
+
+allow_secret_globs: []
+allow_paths: []
+allow_keys: []
+
+network_allow: []
+install_roots: []
+lead_review_steps:
+  - permission_grey
+  - plan_commit
+  - job_end
+user_gate_permissions:
+  - sudo
+  - systemd_unit_install
+  - firewall_change
+  - credential_store_write
+
+allowed_surfaces:
+  - workspace_fs
+
+done_when:
+  artifacts:
+    - result.txt
+
+acceptance: |
+  result.txt exists in the workspace with exactly one line STATUS=ok.
+
+rollback: |
+  Remove result.txt from the workspace.
+
+timeout_sec: 180
+force_lead_review: false
+max_reworks: 1

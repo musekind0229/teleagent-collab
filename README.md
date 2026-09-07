@@ -17,6 +17,8 @@
 - **完成判定**：缺失/错误/超时/取消 ≠ 成功；返工受 `ReworkBudget` 约束（不可靠重启重置墙钟）
 - **组长适配**：`lead_adapter`（Grok CLI / inprocess 当前对话）；结构化 JSON 绑定 `application_id`（见 `docs/lead-adapter.md`）
 - **编制**：`call_lead_request` + `COLLAB_LEAD_ADAPTER`；Grok 仅为可选后端
+- **任务授权（条5）**：`task_kind` 区分文件 vs 系统安装；`install_roots`/`network_allow`/`user_gate_permissions`；见 `docs/task-authorization.md`（机械隔离 ≠ 提示词约束）
+- **故障恢复（条6）**：`jobs/state` 持久化任务/待决/决定；重启不重派、不重发决定；取消请求 ≠ 执行已停止；见 `docs/fault-recovery.md`
 - **计量**：HTTP 下单需带 `queryID: q_<uuid>`，门户积分按模型档服务端计算（如 **chat-pro**）；缺 `queryID` 时本地有账、门户不计
 
 ## 非目标
@@ -36,6 +38,8 @@ docs/                 # 工人契约、适配层、backlog、发现笔记、永�
 src/                  # glue / scheduler / completion / hard_rules / decision_packet
 src/teleagent_adapter/# Linux local-v1 / Windows blocked / doctor（条4）
 src/lead_adapter/     # 组长协议：grok_cli / inprocess（条3）
+src/task_auth.py      # 任务授权范围（条5）
+src/state_store.py    # 任务/决定持久化与恢复（条6）
 templates/            # 报告模板（脱敏）
 ```
 
