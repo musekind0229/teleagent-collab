@@ -32,15 +32,22 @@
 | adapter contract + reply_question | 模拟 | PASS | |
 | P0/P1/P2/scheduler 回归 | 模拟 | PASS | |
 | 真机 Question `GET /question` | **实机** | PASS | 空列表；probe available |
-| 创建→权限→**Grok CLI** 批→继续→验收 | **实机** | （见下方 live 行） | `bin/run-live-grok-lead.py` |
+| 创建→权限→**Grok CLI** 批→继续→验收 | **实机** | PASS | 见下方；本跑 worker 未弹权（approved=0），Grok `force_lead_review` verdict=pass |
 
-## Live Grok 行（跑后填写）
+## Live Grok 行
 
 | 项 | 值 |
 | --- | --- |
-| 命令 | `python3 bin/run-live-grok-lead.py` |
-| 结果 | _pending run_ |
-| 失败原因（若有） | — |
+| 命令 | `python3 bin/run-live-grok-lead.py --timeout 180` |
+| 时间 | 2026-09-07 ~17:26 SGT |
+| session_id | `ses_f84cf4371ffeJC9QYAaoS752Lm` |
+| 结果 | **PASS**（ok=true） |
+| lead_bin | `/workspace/run-grok.sh` |
+| doctor | ok；question_api available |
+| 权限批 | 本跑无 pending（worker 直接写完）；脚本路径已覆盖 lead_perm |
+| 验收 | Grok review `verdict=pass`（GROK_LIVE_OK） |
+| 失败原因 | — |
+| 备注 | 登录/配额正常；未关鉴权 |
 
 ## 剩余阻塞
 
