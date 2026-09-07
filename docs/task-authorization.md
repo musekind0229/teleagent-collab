@@ -13,6 +13,7 @@
 
 - [`jobs/examples/file-task.charter.yaml`](../jobs/examples/file-task.charter.yaml)
 - [`jobs/examples/system-install-sample.charter.yaml`](../jobs/examples/system-install-sample.charter.yaml)（**文档/计划样例**，不是真装 RustDesk）
+- [`jobs/examples/controlled-fake-install.charter.yaml`](../jobs/examples/controlled-fake-install.charter.yaml)（P3：workdir 内假包；`controlled_install.py`；真装 blocked）
 
 ## 章程字段（扩展）
 

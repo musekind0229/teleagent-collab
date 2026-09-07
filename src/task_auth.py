@@ -211,7 +211,8 @@ def path_in_install_roots(path: str | Path, roots: Iterable[str], *, base: str |
         return False
     target = canonicalize(str(path), base=base)
     for root in roots:
-        r = canonicalize(str(root))
+        # Relative roots resolve against job workdir when base is provided (P3).
+        r = canonicalize(str(root), base=base)
         if is_path_within(target, r) or target == r:
             return True
     return False

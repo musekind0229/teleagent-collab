@@ -146,6 +146,26 @@ def doctor(
             report.status = AdapterStatus.API_INCOMPATIBLE.value
             report.details.append(str(e))
             return report
+        # Question API probe (P3) — gap marked in extras, does not fail doctor alone
+        try:
+            try:
+                from question_api import probe_question_api
+            except ImportError:
+                import sys as _sys
+                from pathlib import Path as _P
+                _src = str(_P(__file__).resolve().parents[1])
+                if _src not in _sys.path:
+                    _sys.path.insert(0, _src)
+                from question_api import probe_question_api
+            qp = probe_question_api(adapter)
+            report.extras["question_api"] = qp.to_dict()
+            if not qp.available:
+                report.details.append("question_api gap: " + "; ".join(qp.details))
+            else:
+                report.details.append("question_api ok")
+        except Exception as e:
+            report.extras["question_api"] = {"available": False, "status": "error", "details": [str(e)]}
+            report.details.append(f"question_api probe error: {e}")
 
     report.status = AdapterStatus.OK.value
     report.details.append("port open" + ("; adapter probe ok" if adapter is not None else ""))

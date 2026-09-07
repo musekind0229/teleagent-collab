@@ -1,31 +1,34 @@
-# Backlog（P1 剩余 + P2 后续）
+# Backlog
 
-## P1（剩余）
+## P3（本轮）
 
-- [ ] Question API 完整编排（`/question` 人机问答 → lead/人）与 session 过滤联调
-- [ ] 真机 Windows 探测：若未来版本出现受支持 local auth，再新增 `windows_local_vN`（替换 blocked）
-- [ ] 调度器 live A/B：多 job 并行 + 真 pending 串行弹权的长稳跑
+- [x] Grok Lead 真机脚本 `bin/run-live-grok-lead.py`（创建→权限→GrokCLI→继续→验收；失败写清原因）
+- [x] Claude/Codex 骨架 stub + docs 待办（不假 PASS）
+- [x] Question API：探测 TeleAgent；接入 list/reply/reject + session 绑定；doctor extras；缺则标缺口
+- [x] 受控安装单：`task_kind=system_install`；workdir 内假包/可回滚；授权字段门控；危险真装 blocked
+- [x] Win：确认仍 blocked（含 question 方法）
+- [x] `docs/p3-test-results.md` + 本 backlog
+
+## P1 / P2 剩余
+
+- [ ] Question API 完整 lead/人编排与 scheduler 对称扫描（基础 list/reply 已在 P3）
+- [ ] 真机 Windows：若未来版本出现受支持 local auth，再新增 `windows_local_vN`
+- [ ] 调度器 live A/B：多 job 并行 + 真 pending 串行弹权长稳跑
 - [ ] 审批 reconfirm 失败时的自动重拉 + 告警指标
+- [ ] Claude Code / Codex CLI **真机** lead（替换 stub）
 
-## P1（已完成，留档）
+## 已完成留档
 
-- [x] 完成判定与验收（条2）
-- [x] 组长可插拔适配（条3）
+- [x] P0：条1 + 条4（teleagent_adapter + 权限硬化）
+- [x] P1：条2 + 条3（完成判定 + lead_adapter）
+- [x] P2：条5 + 条6（任务授权 + 故障恢复）
 
-## P2（本轮已完成）
+## 后续 / 非目标
 
-- [x] 明确任务授权范围（条5）：`task_kind` / `network_allow` / `install_roots` / `lead_review_steps` / `user_gate_permissions` / acceptance / rollback；`docs/task-authorization.md`；样例章程；机械隔离 vs 提示词约束分述
-- [x] 故障恢复与测试（条6）：`state_store` 持久化；重启不重派/不重发决定/不误接管会话；取消请求 vs 执行停止；超时仅本任务；模拟回归 + 真机尽力路径
-
-## P2 / 后续（未做）
-
-- [ ] SSE `/event` 推送替代部分轮询（保留自适应 poll 兜底）
-- [ ] 跨机器 worker 注册表（多 box）与 session 亲和
+- [ ] SSE `/event` 推送替代部分轮询
+- [ ] 跨机器 worker 注册表与 session 亲和
 - [ ] 产物签名 / 供应链校验钩子
-- [ ] 更细的 `doctor` 版本矩阵（SAC `/version` ↔ 包版本）
-- [ ] 权限指纹冲突时的人工升级通道（need_human）
-- [ ] Lead 可插拔：Claude Code / Codex CLI 与 Grok 同一契约的**真机**回归集（协议已就绪，真机回归仍挂后续）
-- [ ] 条6 真机全链路若登录/TeleAgent 卡住：解除阻塞后再补「创建→权限→外部组长批→继续→验收」完整绿通
+- [ ] 更细 doctor 版本矩阵
+- [ ] 权限指纹冲突人工升级通道
 - [ ] 不做 IPv6 服务器部署（明确非目标）
-
-> P0 = 条1 + 条4；P1 = 条2 + 条3；P2 本轮 = 条5 + 条6。
+- [ ] 不做关鉴权 / 假 PASS

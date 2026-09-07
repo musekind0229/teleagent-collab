@@ -10,7 +10,10 @@
 | `src/lead_adapter/schema.py` | `build_lead_request` / `validate_lead_decision` / JSON schema |
 | `src/lead_adapter/grok_cli.py` | Grok CLI 后端（保留 `--disallowed-tools`，**禁止**失败后去掉限制再重试） |
 | `src/lead_adapter/inprocess.py` | 当前 Codex/对话当组长：目录协议 `pending/` + `decisions/`，或 `decision_fn` 进程内回调 |
-| 工厂 | `get_lead_adapter(kind=...)`；环境变量 `COLLAB_LEAD_ADAPTER=grok_cli\|inprocess` |
+| `src/lead_adapter/claude_code.py` | **待办 stub**：`call_failed`，禁止假 PASS |
+| `src/lead_adapter/codex_cli.py` | **待办 stub**：独立 Codex CLI 进程；`codex` 别名仍→inprocess |
+| 工厂 | `get_lead_adapter(kind=...)`；`COLLAB_LEAD_ADAPTER=grok_cli\|inprocess\|claude_code\|codex_cli` |
+| `bin/run-live-grok-lead.py` | 真机：创建→权限→GrokCLI→继续→验收 |
 
 ## 请求（每次决策自包含）
 
@@ -57,3 +60,10 @@ export COLLAB_LEAD_EXCHANGE=/path/to/exchange
 ## 测例
 
 `src/test_p1_completion_lead.py`（simulated）：绑定校验、inprocess 文件协议、无 disallowed-tools 降级、并行 `force_lead_review`。
+
+
+## Claude / Codex 待办
+
+- `claude_code` / `codex_cli` 仅骨架：返回 `_lead_status=call_failed`，**绝不**自动 `once`/`pass`。
+- 对话当组长继续用 `inprocess`（`COLLAB_LEAD_ADAPTER=inprocess` 或历史别名 `codex`）。
+- 真机回归集：Grok 见 `bin/run-live-grok-lead.py`；Claude/Codex CLI 接线后替换 stub。

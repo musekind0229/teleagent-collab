@@ -67,6 +67,12 @@ class TeleAgentAdapter(Protocol):
     def list_questions(self, *, session_id: str | None = None) -> tuple[int, list]:
         ...
 
+    def reply_question(self, request_id: str, answers: list) -> tuple[int, Any]:
+        ...
+
+    def reject_question(self, request_id: str) -> tuple[int, Any]:
+        ...
+
     def reply_permission(self, request_id: str, reply: str) -> tuple[int, Any]:
         ...
 
@@ -103,6 +109,14 @@ class TeleAgentAdapterABC(ABC):
 
     @abstractmethod
     def list_questions(self, *, session_id: str | None = None) -> tuple[int, list]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def reply_question(self, request_id: str, answers: list) -> tuple[int, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def reject_question(self, request_id: str) -> tuple[int, Any]:
         raise NotImplementedError
 
     @abstractmethod

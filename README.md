@@ -18,6 +18,9 @@
 - **组长适配**：`lead_adapter`（Grok CLI / inprocess 当前对话）；结构化 JSON 绑定 `application_id`（见 `docs/lead-adapter.md`）
 - **编制**：`call_lead_request` + `COLLAB_LEAD_ADAPTER`；Grok 仅为可选后端
 - **任务授权（条5）**：`task_kind` 区分文件 vs 系统安装；`install_roots`/`network_allow`/`user_gate_permissions`；见 `docs/task-authorization.md`（机械隔离 ≠ 提示词约束）
+- **Question API（P3）**：`GET /question` + reply/reject + session 绑定；默认 need_human（见 `docs/question-api.md`）
+- **受控安装（P3）**：workdir 内假包 + 授权门控；真装 apt/sudo **blocked**
+- **Grok 真机 lead**：`bin/run-live-grok-lead.py`；Claude/Codex CLI 为 stub 待办
 - **故障恢复（条6）**：`jobs/state` 持久化任务/待决/决定；重启不重派、不重发决定；取消请求 ≠ 执行已停止；见 `docs/fault-recovery.md`
 - **计量**：HTTP 下单需带 `queryID: q_<uuid>`，门户积分按模型档服务端计算（如 **chat-pro**）；缺 `queryID` 时本地有账、门户不计
 

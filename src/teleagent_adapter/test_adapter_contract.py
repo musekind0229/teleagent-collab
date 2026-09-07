@@ -62,6 +62,16 @@ class FakeTransport:
             self.replies.append((pid, reply))
             self.permissions = [p for p in self.permissions if p.get("id") != pid]
             return 200, {"ok": True}
+        if method == "POST" and path.startswith("/question/") and path.endswith("/reply"):
+            qid = path.split("/")[2]
+            self.replies.append((qid, (body or {}).get("answers")))
+            self.questions = [q for q in self.questions if q.get("id") != qid]
+            return 200, True
+        if method == "POST" and path.startswith("/question/") and path.endswith("/reject"):
+            qid = path.split("/")[2]
+            self.replies.append((qid, "reject"))
+            self.questions = [q for q in self.questions if q.get("id") != qid]
+            return 200, True
         if method == "GET" and path == "/session/status":
             return 200, {sid: {"type": "idle"} for sid in self.sessions}
         if method == "POST" and path.endswith("/abort"):
@@ -152,6 +162,20 @@ class TestLinuxSimulated(unittest.TestCase):
         ]
         _, qs = ad.list_questions(session_id="ses_x")
         self.assertEqual(len(qs), 1)
+
+    def test_reply_and_reject_question(self):
+        ad, tr = _sim_adapter()
+        tr.questions = [
+            {"id": "q1", "sessionID": "ses_x", "questions": [{"header": "pick?"}]},
+        ]
+        code, _ = ad.reply_question("q1", [["yes"]])
+        self.assertEqual(code, 200)
+        self.assertEqual(tr.replies[-1][0], "q1")
+        self.assertEqual(tr.replies[-1][1], [["yes"]])
+        tr.questions = [{"id": "q2", "sessionID": "ses_x"}]
+        code, _ = ad.reject_question("q2")
+        self.assertEqual(code, 200)
+        self.assertEqual(len(tr.questions), 0)
 
 
 class TestWindowsBlocked(unittest.TestCase):

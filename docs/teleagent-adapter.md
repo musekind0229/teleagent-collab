@@ -6,7 +6,7 @@
 
 | 文件 | 作用 |
 | --- | --- |
-| `src/teleagent_adapter/base.py` | Protocol / ABC：`create_session` / `prompt` / `list_permissions` / `list_questions` / `reply_permission` / `session_status` / `cancel`；以及 creds refresh / reconnect / resume 规则 |
+| `src/teleagent_adapter/base.py` | Protocol / ABC：`create_session` / `prompt` / `list_permissions` / `list_questions` / `reply_question` / `reject_question` / `reply_permission` / `session_status` / `cancel`；以及 creds refresh / reconnect / resume 规则 |
 | `src/teleagent_adapter/linux_local_v1.py` | Linux：HTTP Basic + `local-v1` HMAC → `http://127.0.0.1:4399`（可从 glue 抽） |
 | `src/teleagent_adapter/windows_blocked.py` | Windows TeleAgent **2.4.1**：无受支持认证入口 → `AdapterStatus.blocked` |
 | `src/teleagent_adapter/doctor.py` | 诊断：`not_running` / `version_incompatible` / `missing_creds` / `auth_failed` / `api_incompatible`（Win → blocked） |
@@ -55,3 +55,8 @@ python3 test_hard_rules.py
 - `glue.get_ta_adapter()` / `glue.call()` → `LinuxLocalV1Adapter.call`
 - `scheduler.ta_call` 优先走同一 adapter
 - dry/smoke **不**要求 TeleAgent 在跑
+
+
+## Question API（P3）
+
+见 [`question-api.md`](question-api.md)。Linux 已接 list/reply/reject；Win blocked；doctor extras 记录探测。

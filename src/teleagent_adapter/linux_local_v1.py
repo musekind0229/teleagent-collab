@@ -194,6 +194,19 @@ class LinuxLocalV1Adapter(TeleAgentAdapterABC):
         items = qs if isinstance(qs, list) else []
         return code, filter_by_session(items, session_id)
 
+    def reply_question(self, request_id: str, answers: list) -> tuple[int, Any]:
+        """POST /question/:id/reply — body.answers is [][]string (SAC 1.2.x)."""
+        norm: list = []
+        for a in answers or []:
+            if isinstance(a, (list, tuple)):
+                norm.append([str(x) for x in a])
+            else:
+                norm.append([str(a)])
+        return self.call("POST", f"/question/{request_id}/reply", body={"answers": norm})
+
+    def reject_question(self, request_id: str) -> tuple[int, Any]:
+        return self.call("POST", f"/question/{request_id}/reject", body={})
+
     def reply_permission(self, request_id: str, reply: str) -> tuple[int, Any]:
         # Default once; never auto-always
         r = (reply or "reject").strip().lower()

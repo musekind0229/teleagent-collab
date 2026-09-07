@@ -1,0 +1,66 @@
+# P3 controlled install — fake package under job workdir ONLY.
+# install_roots are relative to the job workdir (resolved at runtime).
+# Dangerous real installs (apt/sudo/systemd) are BLOCKED — see controlled_install.py.
+name: controlled-fake-install
+task_kind: system_install
+goal: >
+  Install the fake package "collab-fake-pkg" under install_roots inside the job
+  workdir. Produce install-plan.md and rollback-notes.md. Do NOT run apt/dnf/sudo.
+
+must:
+  - Only write under install_roots and the job workspace
+  - Use controlled_install.install_fake_package (fake artifact)
+  - Produce acceptance artifacts
+
+must_not:
+  - apt / dnf / yum / pacman / sudo / systemctl
+  - Touch /.ssh, cookies, credential stores
+  - always-approve / yolo
+  - Interpret install as root-anywhere
+
+allow_secret_globs: []
+allow_paths: []
+allow_keys: []
+
+network_allow: []
+
+# Relative roots — resolved against job workdir by controlled_install
+install_roots:
+  - fake-opt/collab-apps/demo
+
+lead_review_steps:
+  - install_execute
+  - job_end
+
+user_gate_permissions:
+  - sudo
+  - systemd_unit_install
+  - firewall_change
+  - kernel_module
+  - ssh_listen_bind
+  - credential_store_write
+  - package_manager
+
+allowed_surfaces:
+  - workspace_fs
+  - install_roots
+
+done_when:
+  artifacts:
+    - install-plan.md
+    - rollback-notes.md
+
+acceptance: |
+  install-plan.md lists install_roots used; fake package directory exists under
+  fake-opt/collab-apps/demo/collab-fake-pkg with FAKE_PACKAGE.json.
+  rollback-notes.md describes rm -rf of that path only.
+  No real system package manager was invoked.
+
+rollback: |
+  1. rm -rf <workdir>/fake-opt/collab-apps/demo/collab-fake-pkg
+  2. Remove install-plan.md / rollback-notes.md if needed.
+  3. No systemd/firewall/sudo changes should exist (they were blocked).
+
+timeout_sec: 120
+force_lead_review: true
+max_reworks: 1
