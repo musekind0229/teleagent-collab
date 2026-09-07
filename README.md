@@ -13,9 +13,10 @@
 - **工人**：TeleAgent 本地 HTTP（Basic + HMAC），不靠 GUI 点窗口开工
 - **审批环**：`GET /permission`（按 sessionID 过滤）→ 硬规则/组长 → `once|reject`（禁自动 always；批准前 reconfirm）
 - **适配层**：`teleagent_adapter`（Linux Basic+HMAC；Win 2.4.1 blocked）
-- **验收环**：产物 + 统一 `run-evidence.txt`（命令 + stdout/stderr）；组长 `pass|fail`
-- **等待策略**：会话 idle / 产物齐即收；墙钟只做死锁保险丝（避免「货已交仍 timeout」）
-- **编制**：`call_lead` + `COLLAB_LEAD_BIN`，组长可换 Claude Code / Codex 等
+- **验收环**：全部产物齐全 + 统一 `run-evidence.txt`；`force_lead_review` 串/并行生效；批准前 hash/mtime 门闩（见 `docs/completion-criteria.md`）
+- **完成判定**：缺失/错误/超时/取消 ≠ 成功；返工受 `ReworkBudget` 约束（不可靠重启重置墙钟）
+- **组长适配**：`lead_adapter`（Grok CLI / inprocess 当前对话）；结构化 JSON 绑定 `application_id`（见 `docs/lead-adapter.md`）
+- **编制**：`call_lead_request` + `COLLAB_LEAD_ADAPTER`；Grok 仅为可选后端
 - **计量**：HTTP 下单需带 `queryID: q_<uuid>`，门户积分按模型档服务端计算（如 **chat-pro**）；缺 `queryID` 时本地有账、门户不计
 
 ## 非目标
@@ -32,8 +33,9 @@ bin/run-scheduler.py  # 并行调度 + 自适应审批扫描（scan ≠ lead）
 jobs/examples/        # 样例章程（*.charter.yaml）
 jobs/runs/            # 收件目录（status/report；gitignore）
 docs/                 # 工人契约、适配层、backlog、发现笔记、永续骨架
-src/                  # glue / scheduler / hard_rules / decision_packet
+src/                  # glue / scheduler / completion / hard_rules / decision_packet
 src/teleagent_adapter/# Linux local-v1 / Windows blocked / doctor（条4）
+src/lead_adapter/     # 组长协议：grok_cli / inprocess（条3）
 templates/            # 报告模板（脱敏）
 ```
 

@@ -230,7 +230,9 @@ def run_job(tag: str, ws: Path, instruction: str, product_name: str) -> dict:
         "additionalProperties": False,
     }
 
-    deadline = time.time() + WALL_SEC
+    _started = time.time()
+    hard_wall = _started + WALL_SEC + POST_PERM_GRACE_SEC  # absolute ceiling; grace cannot unbounded-extend
+    deadline = _started + WALL_SEC
     handled = set()
     idle_since = None
     ready_since = None
@@ -288,8 +290,10 @@ def run_job(tag: str, ws: Path, instruction: str, product_name: str) -> dict:
             report["api_replies"].append({"id": pid, "reply": reply, "http": rc, "body": g.redact(rj) if rj else ""})
             handled.add(pid)
             if reply == "once":
-                deadline = max(deadline, time.time() + POST_PERM_GRACE_SEC)
-                report["notes"].append(f"extended deadline +{POST_PERM_GRACE_SEC}s after once")
+                deadline = min(hard_wall, max(deadline, time.time() + POST_PERM_GRACE_SEC))
+                report["notes"].append(
+                    f"grace after once (clamped to hard_wall; no unbounded budget reset)"
+                )
         return None
 
     while time.time() < deadline:
@@ -387,6 +391,7 @@ def run_job(tag: str, ws: Path, instruction: str, product_name: str) -> dict:
             return report
 
         report["notes"].append("redo_done")
+        report["notes"].append("rework does not extend wall deadline")
         reason = extract_field(parsed, "reason") or (raw or "")[:500]
         g.call(
             "POST",
@@ -407,7 +412,7 @@ def run_job(tag: str, ws: Path, instruction: str, product_name: str) -> dict:
         )
         idle_since = None
         ready_since = None
-        deadline = max(deadline, time.time() + 240)
+        # 条2: must NOT reset/extend wall budget via redo
         time.sleep(1.5)
 
     # fuse — if artifacts/product ready, still try lead review instead of blind fail
@@ -427,11 +432,13 @@ def run_job(tag: str, ws: Path, instruction: str, product_name: str) -> dict:
         verdict = verdict or "fail"
         report["lead_review_decision"] = verdict
         report["artifacts"] = [str(p) for p in expected if p.exists()]
-        if verdict == "pass":
+        if verdict == "pass" and artifacts_ready(expected):
             report["ok"] = True
             report["state"] = "ok"
             report["error"] = ""
-            report["notes"].append("accepted on fuse with ready artifacts")
+            report["notes"].append("accepted on fuse with ALL ready artifacts + lead pass")
+        elif verdict == "pass":
+            report["notes"].append("fuse lead pass ignored: artifacts incomplete")
             _status(tag, report, expected)
             return report
     report["state"] = "timeout"

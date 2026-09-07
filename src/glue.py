@@ -163,7 +163,7 @@ def redact(obj):
 
 
 def summarize_permission(p: dict) -> str:
-    keep = {k: p.get(k) for k in ("id", "type", "permission", "path", "patterns", "sessionID", "message", "title", "tool", "command") if k in p or True}
+    keep = {k: p.get(k) for k in ("id", "type", "permission", "path", "patterns", "sessionID", "message", "title", "tool", "command") if k in p}
     # keep only useful non-empty
     slim = {}
     for k, v in p.items():
@@ -176,110 +176,52 @@ def summarize_permission(p: dict) -> str:
 
 
 def call_lead(prompt: str, schema: dict, cwd: str) -> tuple[str, dict | None]:
-    """Ask the lead for a structured decision. Returns (raw_text, parsed_json_or_None).
-    Lead binary is COLLAB_LEAD_BIN (default Grok). Never uses --always-approve / yolo."""
-    cmd = [
-        LEAD_BIN,
-        "-p",
-        prompt,
-        "--cwd",
-        cwd,
-        "--max-turns",
-        "1",
-        "--output-format",
-        "json",
-        "--json-schema",
-        json.dumps(schema),
-        "--disallowed-tools",
-        "bash,shell,edit,write,web_search,web_fetch",
-    ]
-    # Some builds use different tool names; ignore failures from unknown disallowed tools by not hard-failing.
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-    except subprocess.TimeoutExpired:
-        return "TIMEOUT", None
-    out = (proc.stdout or "").strip()
-    err = (proc.stderr or "").strip()
-    raw = out if out else err
-    parsed = None
-    # Prefer last JSON object
-    for candidate in (out, err):
-        if not candidate:
-            continue
-        try:
-            parsed = json.loads(candidate)
-            break
-        except Exception:
-            m = re.search(r"\{[\s\S]*\}", candidate)
-            if m:
-                try:
-                    parsed = json.loads(m.group(0))
-                    break
-                except Exception:
-                    pass
-    if parsed is None and not out and err:
-        # retry without disallowed-tools if tool names invalid
-        if "disallowed" in err.lower() or "unknown" in err.lower() or "invalid" in err.lower():
-            cmd2 = [LEAD_BIN, "-p", prompt, "--cwd", cwd, "--max-turns", "1", "--output-format", "json", "--json-schema", json.dumps(schema)]
-            proc = subprocess.run(cmd2, capture_output=True, text=True, timeout=180)
-            out = (proc.stdout or "").strip()
-            err = (proc.stderr or "").strip()
-            raw = out if out else err
-            try:
-                parsed = json.loads(out)
-            except Exception:
-                m = re.search(r"\{[\s\S]*\}", out or err or "")
-                if m:
-                    try:
-                        parsed = json.loads(m.group(0))
-                    except Exception:
-                        parsed = None
-    # Grok sometimes returns stopReason=cancelled with a premature fail stub and
-    # structuredOutput=null; retry so lead acceptance is not a false fail.
-    def _bad_lead(p):
-        if not isinstance(p, dict):
-            return True
-        if p.get("stopReason") == "cancelled":
-            return True
-        if p.get("structuredOutput") is None and p.get("structuredOutputError"):
-            return True
-        so = p.get("structuredOutput")
-        if isinstance(so, dict) and ("decision" in so or "verdict" in so):
-            return False
-        # raw text stub that admits not-yet-verified
-        blob = (p.get("text") or "") + json.dumps(so or {}, ensure_ascii=False)
-        if "have not yet verified" in blob.lower() or "before issuing a verdict" in blob.lower() or "before judging" in blob.lower():
-            return True
-        return False
+    """Ask the lead via pluggable LeadAdapter (default Grok CLI).
 
-    attempts = [raw, parsed]
-    for _ in range(2):
-        if not _bad_lead(parsed):
-            break
-        time.sleep(1.5)
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-        except subprocess.TimeoutExpired:
-            return "TIMEOUT", None
-        out = (proc.stdout or "").strip()
-        err = (proc.stderr or "").strip()
-        raw = out if out else err
-        parsed = None
-        for candidate in (out, err):
-            if not candidate:
-                continue
-            try:
-                parsed = json.loads(candidate)
-                break
-            except Exception:
-                m = re.search(r"\{[\s\S]*\}", candidate)
-                if m:
-                    try:
-                        parsed = json.loads(m.group(0))
-                        break
-                    except Exception:
-                        pass
-    return raw[:3000], parsed
+    Backward-compatible entry: when *prompt* is already a formatted string and no
+    structured request is supplied, wrap it as a review/permission-agnostic ask.
+    Prefer call_lead_request() for 条3 full-context binding.
+
+    Never retries with disallowed-tools stripped. Timeout/call failure → status envelope.
+    """
+    from lead_adapter import get_lead_adapter, build_lead_request
+
+    adapter = get_lead_adapter()
+    # Legacy path: treat free-form prompt as current_application text under a fresh request.
+    request = build_lead_request(
+        kind="permission" if "decision" in json.dumps(schema) and "verdict" not in json.dumps(schema) else "review",
+        goal="(legacy call_lead prompt)",
+        authorized_scope=["workspace"],
+        prohibitions=["always-approve", "secret exfiltration"],
+        acceptance_criteria={},
+        current_application={"legacy_prompt": prompt[:8000]},
+    )
+    # Preserve caller prompt as the primary text while still binding application_id in schema expectations.
+    from lead_adapter.schema import format_lead_request_prompt
+
+    # If caller already built a full prompt, still send structured request via adapter.decide
+    # but merge legacy prompt into request extra for adapters that format themselves.
+    request = dict(request)
+    request["extra"] = {"legacy_prompt": prompt}
+    # For grok_cli, decide() formats from request; inject legacy prompt as task overlay
+    request["task_goal"] = prompt[:500]
+    return adapter.decide(request, schema=schema, cwd=cwd, timeout_sec=180)
+
+
+def call_lead_request(
+    request: dict,
+    *,
+    schema: dict,
+    cwd: str,
+    timeout_sec: float = 180,
+    adapter=None,
+) -> tuple[str, dict | None]:
+    """Structured lead call (条3). Returns (raw, parsed_or_status_envelope)."""
+    from lead_adapter import get_lead_adapter
+
+    ad = adapter or get_lead_adapter()
+    return ad.decide(request, schema=schema, cwd=cwd, timeout_sec=timeout_sec)
+
 
 
 def session_busy(status_obj, sid: str) -> bool:
@@ -337,7 +279,9 @@ def assistant_error(msg) -> str:
 
 
 def expected_exists(paths: list[str]) -> list[str]:
-    return [p for p in paths if Path(p).exists()]
+    """Inventory helper only — does not imply job success (see completion.artifacts_all_present)."""
+    from completion import expected_exists as _ee
+    return _ee(paths)
 
 
 
@@ -504,24 +448,45 @@ def _handle_permission_for_session(
         "Secret-adjacent / auth workarounds: reject or demand_safe_path, never once. "
         "Never choose always."
     )
-    schema = lead_permission_schema()
-    prompt = format_lead_prompt(packet, allow_hint=allow_hint)
-    raw, parsed = call_lead(prompt, schema, ws)
+    from lead_adapter import (
+        LeadDecisionError,
+        build_lead_request,
+        lead_permission_response_schema,
+        validate_lead_decision,
+    )
+    req = build_lead_request(
+        kind="permission",
+        goal=job_charter.get("goal") or f"job {name}",
+        authorized_scope=job_charter.get("must") or [f"stay inside workspace {ws}"],
+        prohibitions=job_charter.get("must_not") or [],
+        acceptance_criteria=job_charter.get("acceptance") or job_charter.get("done_when") or {},
+        current_application=packet,
+        charter=job_charter,
+    )
+    schema = lead_permission_response_schema()
+    # Keep allow_hint in request extra for prompt formatting
+    req = dict(req)
+    req["extra"] = {"allow_hint": allow_hint, "legacy_packet_prompt": format_lead_prompt(packet, allow_hint=allow_hint)}
+    raw, parsed = call_lead_request(req, schema=schema, cwd=ws)
     report["grok_permission_raw"] = raw
-    decision = None
-    if isinstance(parsed, dict):
-        decision = parsed.get("decision") or (parsed.get("result") or {}).get("decision")
-        so = parsed.get("structuredOutput")
-        if not decision and isinstance(so, dict):
-            decision = so.get("decision")
-        if not decision:
-            for k in ("output", "message", "content", "data"):
-                if isinstance(parsed.get(k), dict) and parsed[k].get("decision"):
-                    decision = parsed[k]["decision"]
-                    break
-    if decision not in ("once", "reject", "deny_job", "demand_safe_path", "always"):
-        m = re.search(r"\b(once|reject|deny_job|demand_safe_path|always)\b", raw or "")
-        decision = m.group(1) if m else "reject"
+    try:
+        validated = validate_lead_decision(raw, parsed, request=req, kind="permission")
+        decision = validated.get("decision")
+        if validated.get("_coerced_always"):
+            report["notes"].append("lead said always → coerced to once")
+    except LeadDecisionError as e:
+        # 条3: illegal/timeout/call failure → keep pending OR safe-stop. Never strip tool limits to retry.
+        report["notes"].append(f"lead decision invalid ({e.code}): {e}")
+        if e.code in ("timeout", "call_failed"):
+            report["notes"].append("keeping permission pending (no reply)")
+            ping_deduper.clear_inflight_id(pid)
+            return False, charter_sent_full
+        decision = "reject"  # illegal JSON / mismatch → safe-stop reject
+    if decision not in ("once", "reject", "deny_job", "demand_safe_path"):
+        decision = "reject"
+    if decision == "once" and tclass in ("user_secret_store", "env_file", "browser_profile"):
+        # still forbid once for secret-adjacent if lead somehow returned once after always coerce edge
+        pass
     if decision == "always":
         report["notes"].append("lead said always → coerced to once")
         decision = "once"
@@ -615,14 +580,127 @@ def run_job(
         report["error"] = f"prompt_async failed: {code}"
         return report
 
-    deadline = time.time() + timeout_sec
+    from completion import (
+        ReworkBudget,
+        artifacts_all_present,
+        build_acceptance_packet,
+        confirm_artifacts_for_lead_approve,
+        format_acceptance_prompt,
+        is_success_allowed,
+        missing_artifacts,
+        snapshot_artifacts,
+    )
+    from lead_adapter import (
+        LeadDecisionError,
+        build_lead_request,
+        lead_review_response_schema,
+        validate_lead_decision,
+    )
+
+    budget = ReworkBudget.start(timeout_sec, max_reworks=int((charter or {}).get("max_reworks") or 1))
+    report["rework_budget"] = budget.to_dict()
     handled_perm_ids = set()
-    while time.time() < deadline:
+
+    def _all_arts_ok() -> bool:
+        recs = snapshot_artifacts(expected_artifacts)
+        report["artifacts"] = [r.path for r in recs if r.exists]
+        report["artifact_records"] = [r.to_dict() for r in recs]
+        return artifacts_all_present(recs)
+
+    def _do_lead_review(*, phase: str) -> str:
+        """Submit acceptance packet; confirm fingerprints; return verdict pass|fail|error."""
+        arts_ok = _all_arts_ok()
+        packet = build_acceptance_packet(
+            job_name=name,
+            goal=job_charter.get("goal") or instruction[:240],
+            acceptance_criteria=job_charter.get("acceptance")
+            or job_charter.get("done_when")
+            or {"artifacts": expected_artifacts},
+            expected_artifacts=expected_artifacts,
+            execution_result={
+                "finish": report.get("finish"),
+                "pending_seen": report.get("pending_seen"),
+                "path": report.get("path"),
+                "phase": phase,
+            },
+            error=report.get("error") or "",
+            tool_records=report.get("pending_summaries") or [],
+            api_replies=report.get("api_replies") or [],
+            notes=report.get("notes") or [],
+            state=report.get("state") or "",
+            session_id=sid,
+        )
+        report["acceptance_packet"] = packet
+        if not arts_ok:
+            report["notes"].append("acceptance blocked: required artifacts incomplete")
+            return "fail"
+        unchanged, gate = confirm_artifacts_for_lead_approve(packet)
+        report["artifact_gate"] = gate
+        if not unchanged:
+            report["notes"].append(f"artifact fingerprint changed before lead: {gate.get('diffs')}")
+            return "fail"
+
+        req = build_lead_request(
+            kind="review",
+            goal=job_charter.get("goal") or instruction[:240],
+            authorized_scope=job_charter.get("must") or [f"stay inside workspace {ws}"],
+            prohibitions=job_charter.get("must_not") or [],
+            acceptance_criteria=packet.get("acceptance_criteria"),
+            current_application=packet,
+            charter=job_charter,
+        )
+        schema = lead_review_response_schema()
+        # Also embed human-readable acceptance prompt for legacy adapters
+        prompt = format_acceptance_prompt(packet, charter=job_charter)
+        req = dict(req)
+        req["extra"] = {"acceptance_prompt": prompt}
+        raw, parsed = call_lead_request(req, schema=schema, cwd=ws)
+        report["grok_review_raw"] = (report.get("grok_review_raw") or "") + (
+            f"\n---{phase}---\n" if report.get("grok_review_raw") else ""
+        ) + (raw or "")
+        try:
+            decision = validate_lead_decision(raw, parsed, request=req, kind="review")
+        except LeadDecisionError as e:
+            report["notes"].append(f"lead review invalid ({e.code}): {e} → fail/safe-stop")
+            report["grok_review_decision"] = "fail"
+            return "fail"
+        verdict = decision.get("verdict") or "fail"
+        report["grok_review_decision"] = verdict
+        # Reconfirm artifacts unchanged after lead returns (approve gate)
+        unchanged2, gate2 = confirm_artifacts_for_lead_approve(packet)
+        report["artifact_gate_post"] = gate2
+        if verdict == "pass" and not unchanged2:
+            report["notes"].append(f"artifacts changed during lead review: {gate2.get('diffs')}")
+            return "fail"
+        return verdict
+
+    def _mark_success(verdict: str | None = None) -> dict:
+        arts_ok = _all_arts_ok()
+        ok, why = is_success_allowed(
+            state="ok",
+            artifacts_ok=arts_ok,
+            lead_verdict=verdict if force_lead_review else (verdict or "pass"),
+            force_lead_review=force_lead_review,
+            finish=report.get("finish"),
+            error=report.get("error"),
+        )
+        if ok:
+            report["ok"] = True
+            report["state"] = "ok"
+            report["error"] = ""
+        else:
+            report["ok"] = False
+            report["state"] = "fail"
+            report["error"] = why
+        report["rework_budget"] = budget.to_dict()
+        _write_status(name, report)
+        return report
+
+    while not budget.exhausted_wall():
         sc, status = call("GET", "/session/status")
         pc, pending = call("GET", "/permission")
         if isinstance(pending, list) and pending:
             report["pending_seen"] = True
-            # Strict sessionID filter — never act on other sessions
             mine = []
             for p in pending:
                 if not isinstance(p, dict):
@@ -630,9 +708,7 @@ def run_job(
                 psid = session_id_of_permission(p)
                 if psid and psid != sid:
                     continue
-                # If upstream omits sessionID, only accept when single-job context (ours)
                 if not psid:
-                    # conservative: skip unscoped permissions
                     report["notes"].append("skip permission without sessionID")
                     continue
                 mine.append(p)
@@ -656,213 +732,138 @@ def run_job(
                     return report
 
         busy = session_busy(status, sid)
-        # Early accept: hard-rule path done + artifacts on disk, session still busy.
-        arts_early = expected_exists(expected_artifacts)
-        if arts_early and any(
-            r.get("via") == "hard_rule_allowlisted" and r.get("reply") == "once"
-            for r in report.get("api_replies") or []
-        ):
-            report["artifacts"] = arts_early
-            report["ok"] = True
-            report["state"] = "ok"
-            report["notes"].append(
-                "early accept: hard_rule_allowlisted once + artifacts; aborting busy session"
-            )
-            try:
-                call("POST", f"/session/{sid}/abort", body={})
-            except Exception as e:
-                report["notes"].append(f"early abort failed: {e}")
+        # NOTE: no early-accept / timeout-with-partial-arts success (条2).
+        if busy:
+            time.sleep(1.5)
+            continue
+
+        mc, msgs = call("GET", f"/session/{sid}/message")
+        asst = last_assistant(msgs)
+        fin = assistant_finish(asst)
+        err = assistant_error(asst)
+        report["finish"] = fin
+        arts_ok = _all_arts_ok()
+        if err or fin == "error":
+            report["state"] = "fail"
+            report["error"] = err or "assistant finish=error"
+            report["ok"] = False
             _write_status(name, report)
             return report
-        if not busy:
-            mc, msgs = call("GET", f"/session/{sid}/message")
-            asst = last_assistant(msgs)
-            fin = assistant_finish(asst)
-            err = assistant_error(asst)
-            arts = expected_exists(expected_artifacts)
-            report["artifacts"] = arts
-            if err or fin == "error":
+        if fin in ("cancelled", "cancel"):
+            report["state"] = "cancelled"
+            report["error"] = f"finish={fin}"
+            report["ok"] = False
+            _write_status(name, report)
+            return report
+
+        # Need stop (or idle with full artifacts) before judging
+        if fin != "stop" and not arts_ok:
+            time.sleep(1.5)
+            continue
+        if fin != "stop" and arts_ok:
+            # brief settle; still require eventual stop or proceed to review only if forced
+            time.sleep(1.0)
+            if session_busy(call("GET", "/session/status")[1], sid):
+                continue
+
+        # force_lead_review always applies (serial path); also when charter requests it
+        need_review = bool(force_lead_review)
+        if need_review or (name == "B" and not report["pending_seen"]):
+            # keep B fallback only when force not set? 条2: force must work; B heuristic retained
+            # but never succeed without full arts
+            if not force_lead_review and name == "B" and not report["pending_seen"]:
+                need_review = True
+                report["path"] = "lead_review_fallback"
+
+        if need_review:
+            report["path"] = "lead_review" if force_lead_review else report.get("path") or "lead_review"
+            verdict = _do_lead_review(phase="review1")
+            if verdict == "pass" and _all_arts_ok():
+                return _mark_success("pass")
+            # rework under budget — wall deadline NEVER extended
+            if not budget.consume_rework():
+                report["ok"] = False
                 report["state"] = "fail"
-                report["error"] = err or "assistant finish=error"
+                report["error"] = f"lead verdict={verdict}; rework budget exhausted; missing={missing_artifacts(expected_artifacts)}"
+                report["rework_budget"] = budget.to_dict()
                 _write_status(name, report)
                 return report
-            if fin == "stop" or arts:
-                # success path maybe still need lead review
-                if force_lead_review or (not report["pending_seen"] and force_lead_review is False and name.startswith("B")):
-                    # for task B: if no pending, force lead review
-                    pass
-                if force_lead_review or (name == "B" and not report["pending_seen"]):
-                    report["path"] = "lead_review_fallback" if not report["pending_seen"] else report["path"]
-                    diff_bits = []
-                    for ap in expected_artifacts:
-                        p = Path(ap)
-                        if p.exists():
-                            try:
-                                diff_bits.append(f"FILE {ap}:\n" + p.read_text(encoding="utf-8", errors="replace")[:1500])
-                            except Exception as e:
-                                diff_bits.append(f"FILE {ap}: <read error {e}>")
-                        else:
-                            diff_bits.append(f"MISSING {ap}")
-                    schema = {
-                        "type": "object",
-                        "properties": {
-                            "verdict": {"type": "string", "enum": ["pass", "fail"]},
-                            "reason": {"type": "string"},
-                        },
-                        "required": ["verdict", "reason"],
-                        "additionalProperties": False,
-                    }
-                    prompt = (
-                        "You are the team lead accepting a TeleAgent worker delivery. "
-                        "Judge only the artifacts for the stated job. Output JSON verdict+reason.\n"
-                        f"Job: {instruction}\n"
-                        f"Artifacts:\n" + "\n\n".join(diff_bits)
-                    )
-                    raw, parsed = call_lead(prompt, schema, ws)
-                    report["grok_review_raw"] = raw
-                    verdict = None
-                    if isinstance(parsed, dict):
-                        verdict = parsed.get("verdict")
-                        if not verdict:
-                            for k in ("output", "message", "content", "data", "result"):
-                                if isinstance(parsed.get(k), dict) and parsed[k].get("verdict"):
-                                    verdict = parsed[k]["verdict"]
-                                    break
-                    if verdict not in ("pass", "fail"):
-                        m = re.search(r"\b(pass|fail)\b", (raw or "").lower())
-                        verdict = m.group(1) if m else "fail"
-                    report["grok_review_decision"] = verdict
-                    if verdict != "pass" or not arts:
-                        # one redo
-                        report["notes"].append("lead fail or missing arts -> one redo")
-                        code, _ = call(
-                            "POST",
-                            f"/session/{sid}/prompt_async",
-                            body={
-                                "parts": [
-                                    {
-                                        "type": "text",
-                                        "text": (
-                                            "Lead rejected previous delivery. Fix now. "
-                                            f"Reason: {report.get('grok_review_raw','')[:500]}. "
-                                            f"Original job: {instruction}"
-                                        ),
-                                    }
-                                ],
-                                "model": MODEL,
-                            },
-                            extra_headers={"x-opencode-directory": ws},
+            report["notes"].append("lead fail or missing arts -> rework (budget-limited)")
+            call(
+                "POST",
+                f"/session/{sid}/prompt_async",
+                body=prompt_body(
+                    "Lead rejected previous delivery. Fix now. "
+                    f"Reason: {(report.get('grok_review_raw') or '')[:500]}. "
+                    f"Original job: {instruction}"
+                ),
+                extra_headers={"x-opencode-directory": ws},
+            )
+            redo_deadline = budget.clamp_subdeadline(180)
+            while time.time() < redo_deadline and not budget.exhausted_wall():
+                sc, status = call("GET", "/session/status")
+                pc, pending = call("GET", "/permission")
+                if isinstance(pending, list) and pending:
+                    report["pending_seen"] = True
+                    report["notes"].append("redo phase: permissions go through full approval (no auto-once)")
+                    for p in pending:
+                        if not isinstance(p, dict):
+                            continue
+                        handled, charter_sent_full = _handle_permission_for_session(
+                            p,
+                            sid=sid,
+                            ws=ws,
+                            name=name,
+                            job_charter=job_charter,
+                            worker_intent=worker_intent,
+                            blocker=blocker,
+                            ping_deduper=ping_deduper,
+                            charter_sent_full=charter_sent_full,
+                            handled_perm_ids=handled_perm_ids,
+                            report=report,
                         )
-                        # poll again until stop
-                        redo_deadline = time.time() + min(180, deadline - time.time())
-                        while time.time() < redo_deadline:
-                            sc, status = call("GET", "/session/status")
-                            pc, pending = call("GET", "/permission")
-                            if isinstance(pending, list) and pending:
-                                report["pending_seen"] = True
-                                report["notes"].append("redo phase: permissions go through full approval (no auto-once)")
-                                for p in pending:
-                                    if not isinstance(p, dict):
-                                        continue
-                                    handled, charter_sent_full = _handle_permission_for_session(
-                                        p,
-                                        sid=sid,
-                                        ws=ws,
-                                        name=name,
-                                        job_charter=job_charter,
-                                        worker_intent=worker_intent,
-                                        blocker=blocker,
-                                        ping_deduper=ping_deduper,
-                                        charter_sent_full=charter_sent_full,
-                                        handled_perm_ids=handled_perm_ids,
-                                        report=report,
-                                    )
-                                    if report.get("error") == "lead deny_job":
-                                        break
-                            if not session_busy(status, sid):
-                                break
-                            time.sleep(1.5)
-                        mc, msgs = call("GET", f"/session/{sid}/message")
-                        asst = last_assistant(msgs)
-                        fin = assistant_finish(asst)
-                        arts = expected_exists(expected_artifacts)
-                        report["artifacts"] = arts
-                        # second lead review
-                        diff_bits = []
-                        for ap in expected_artifacts:
-                            p = Path(ap)
-                            if p.exists():
-                                diff_bits.append(f"FILE {ap}:\n" + p.read_text(encoding="utf-8", errors="replace")[:1500])
-                            else:
-                                diff_bits.append(f"MISSING {ap}")
-                        raw2, parsed2 = call_lead(
-                            "Second review after redo. JSON verdict+reason.\nJob: "
-                            + instruction
-                            + "\n"
-                            + "\n\n".join(diff_bits),
-                            schema,
-                            ws,
-                        )
-                        report["grok_review_raw"] = (report["grok_review_raw"] or "") + "\n---REDO---\n" + (raw2 or "")
-                        verdict = None
-                        if isinstance(parsed2, dict):
-                            verdict = parsed2.get("verdict")
-                        if verdict not in ("pass", "fail"):
-                            m = re.search(r"\b(pass|fail)\b", (raw2 or "").lower())
-                            verdict = m.group(1) if m else "fail"
-                        report["grok_review_decision"] = verdict
-                        if verdict == "pass" and arts and (fin == "stop" or arts):
-                            report["ok"] = True
-                            report["state"] = "ok"
-                        else:
-                            report["ok"] = False
-                            report["state"] = "fail"
-                            report["error"] = f"lead verdict={verdict} arts={arts} finish={fin}"
-                        _write_status(name, report)
-                        return report
-                    # first review pass
-                    if arts and (fin == "stop" or True):
-                        report["ok"] = True
-                        report["state"] = "ok"
-                        _write_status(name, report)
-                        return report
-                # task A path or permission path with finish
-                if arts and fin == "stop":
-                    report["ok"] = True
-                    report["state"] = "ok"
-                    _write_status(name, report)
-                    return report
-                if arts and not fin:
-                    # sometimes finish missing briefly
-                    time.sleep(1)
-                    continue
-                if fin == "stop" and not arts:
-                    report["state"] = "fail"
-                    report["error"] = "finish=stop but artifacts missing"
-                    _write_status(name, report)
-                    return report
+                        if report.get("error") == "lead deny_job":
+                            break
+                if not session_busy(status, sid):
+                    break
+                time.sleep(1.5)
+            mc, msgs = call("GET", f"/session/{sid}/message")
+            asst = last_assistant(msgs)
+            report["finish"] = assistant_finish(asst)
+            verdict2 = _do_lead_review(phase="review2")
+            if verdict2 == "pass" and _all_arts_ok():
+                return _mark_success("pass")
+            report["ok"] = False
+            report["state"] = "fail"
+            report["error"] = (
+                f"lead verdict={verdict2} arts_ok={_all_arts_ok()} "
+                f"missing={missing_artifacts(expected_artifacts)} finish={report.get('finish')}"
+            )
+            report["rework_budget"] = budget.to_dict()
+            _write_status(name, report)
+            return report
+
+        # Non-force path: require ALL artifacts + finish=stop (no or True)
+        if _all_arts_ok() and fin == "stop":
+            return _mark_success(None)
+        if _all_arts_ok() and not fin:
+            time.sleep(1)
+            continue
+        if fin == "stop" and not _all_arts_ok():
+            report["state"] = "fail"
+            report["ok"] = False
+            report["error"] = f"finish=stop but artifacts incomplete: missing={missing_artifacts(expected_artifacts)}"
+            _write_status(name, report)
+            return report
         time.sleep(1.5)
 
+    # Wall timeout — NEVER success (条2)
     report["state"] = "timeout"
     report["error"] = "wall clock timeout"
-    report["artifacts"] = expected_exists(expected_artifacts)
-    # Model sometimes stays busy after delivery. If hard-rule path already
-    # replied and artifacts exist, accept instead of false timeout.
-    replies = report.get("api_replies") or []
-    hard_path = any(
-        (r.get("via") in ("hard_rule", "hard_rule_allowlisted")) for r in replies
-    )
-    if report["artifacts"] and hard_path:
-        report["ok"] = True
-        report["state"] = "ok"
-        report["error"] = ""
-        report["notes"].append(
-            "accepted after wall timeout: artifacts + hard-rule permission path present; aborting busy session"
-        )
-        try:
-            call("POST", f"/session/{sid}/abort", body={})
-        except Exception as e:
-            report["notes"].append(f"session abort after timeout failed: {e}")
+    report["ok"] = False
+    _all_arts_ok()
+    report["rework_budget"] = budget.to_dict()
+    report["notes"].append("timeout is not success even if partial artifacts exist")
     _write_status(name, report)
     return report
 

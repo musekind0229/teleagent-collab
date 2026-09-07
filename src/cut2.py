@@ -261,7 +261,7 @@ def run_job(name: str, instruction: str, expected_artifacts: list[str], timeout_
                     if "evidence" in Path(a).name and Path(a).exists():
                         evidence_ok = True
 
-            if verdict == "pass" and arts and evidence_ok and (fin == "stop" or arts):
+            if verdict == "pass" and len(arts) == len(expected_artifacts) and evidence_ok and fin == "stop":
                 report["ok"] = True
                 report["state"] = "ok"
                 _status(name, report)
@@ -332,7 +332,7 @@ def run_job(name: str, instruction: str, expected_artifacts: list[str], timeout_
             evidence_ok = any(Path(a).exists() and "evidence" in Path(a).name for a in expected_artifacts)
             if not evidence_ok:
                 evidence_ok = (COLLAB / "run-evidence.txt").exists()
-            if verdict == "pass" and arts and evidence_ok:
+            if verdict == "pass" and len(arts) == len(expected_artifacts) and evidence_ok:
                 report["ok"] = True
                 report["state"] = "ok"
             else:

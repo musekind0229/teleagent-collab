@@ -62,7 +62,7 @@ python3 src/test_scheduler.py     # unittest 包装
 - 真跑依赖 TeleAgent `:4399` 与 `COLLAB_LEAD_BIN`；dry/smoke 不连网。
 - 全局 `GET /permission` 按 `sessionID` 过滤；若上游不带 session 字段，该条会被跳过（记 notes）。
 - 多路「一批调度」= 同一 tick 内对各 job **各处理一条**；不是把多 job 上下文拼进一次 lead prompt。
-- 验收环 `force_lead_review` 的完整 redo 路径仍以单 job `glue.run_job` 为主；调度器真跑侧重开工 + 审批扫描 + 产物齐即收。
+- `force_lead_review` 在调度器 `refresh_job_status` 与串行 `glue.run_job` 均生效（条2）；超时有产物亦不算成功。完整返工预算见 `docs/completion-criteria.md`。
 - `jobs/workspaces/` 默认 gitignore，勿把沙箱产物推进 Git。
 
 ## 代码

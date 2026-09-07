@@ -411,6 +411,12 @@ class PingDeduper:
             self._inflight_ids.discard(rid)
             self._done_ids.add(rid)
 
+    def clear_inflight_id(self, request_id: str) -> None:
+        """Drop inflight so a later scan may retry (e.g. lead timeout → keep pending)."""
+        rid = (request_id or "").strip()
+        if rid:
+            self._inflight_ids.discard(rid)
+
     # --- backward-compatible shims (always allow; do NOT dedupe by pattern) ---
     @staticmethod
     def key(ping_reason: str, target_class: str, path_pattern_s: str) -> tuple[str, str, str]:

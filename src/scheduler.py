@@ -267,7 +267,7 @@ class ParallelScheduler:
             instruction=instr,
             expected_artifacts=arts,
             workdir=workdir,
-            timeout_sec=int(charter.get("timeout_sec") or 300),
+            timeout_sec=int(300 if charter.get("timeout_sec") is None else charter.get("timeout_sec")),
             force_lead_review=bool(charter.get("force_lead_review", False)),
             worker_intent=charter.get("worker_intent"),
             blocker=charter.get("blocker"),
@@ -555,15 +555,49 @@ class ParallelScheduler:
             "Secret-adjacent / auth workarounds: reject or demand_safe_path, never once. "
             "Never choose always."
         )
-        schema = lead_permission_schema()
-        prompt = format_lead_prompt(packet, allow_hint=allow_hint)
-        raw, parsed = self.call_lead(prompt, schema, ws)
-        decision = None
-        if isinstance(parsed, dict):
-            decision = parsed.get("decision") or (parsed.get("result") or {}).get("decision")
-            so = parsed.get("structuredOutput")
-            if not decision and isinstance(so, dict):
-                decision = so.get("decision")
+        from lead_adapter import (
+            LeadDecisionError,
+            build_lead_request,
+            lead_permission_response_schema,
+            validate_lead_decision,
+        )
+        req = build_lead_request(
+            kind="permission",
+            goal=(job.charter or {}).get("goal") or f"job {job.name}",
+            authorized_scope=(job.charter or {}).get("must") or [],
+            prohibitions=(job.charter or {}).get("must_not") or [],
+            acceptance_criteria=(job.charter or {}).get("acceptance")
+            or (job.charter or {}).get("done_when")
+            or {},
+            current_application=packet,
+            charter=job.charter,
+        )
+        schema = lead_permission_response_schema()
+        if self._call_lead_fn is not None or self.dry_run:
+            raw, parsed = self.call_lead(format_lead_prompt(packet, allow_hint=allow_hint), schema, ws)
+        else:
+            try:
+                raw, parsed = self._glue().call_lead_request(req, schema=schema, cwd=ws)
+            except Exception:
+                raw, parsed = self.call_lead(format_lead_prompt(packet, allow_hint=allow_hint), schema, ws)
+        # Test/dry fakes often omit binding fields — stitch from request so protocol still enforced live.
+        if isinstance(parsed, dict) and "decision" in parsed and "application_id" not in parsed:
+            parsed = {
+                **parsed,
+                "application_id": req["application_id"],
+                "context_summary": req.get("context_summary", ""),
+                "reason": parsed.get("reason") or "dry_or_injected_lead",
+            }
+            raw = __import__("json").dumps(parsed)
+        try:
+            validated = validate_lead_decision(raw, parsed, request=req, kind="permission")
+            decision = validated.get("decision")
+        except LeadDecisionError as e:
+            job.notes.append(f"lead invalid ({e.code}): keep pending or safe reject")
+            if e.code in ("timeout", "call_failed"):
+                job.ping_deduper.clear_inflight_id(pid)
+                return {"skipped": True, "reason": f"lead_{e.code}", "id": pid, "called_lead": True}
+            decision = "reject"
         if decision not in ("once", "reject", "deny_job", "demand_safe_path", "always"):
             decision = "reject"
         # Secret class: never promote to always
@@ -684,84 +718,197 @@ class ParallelScheduler:
     # --- completion --------------------------------------------------------------
 
     def refresh_job_status(self, job: JobSlot) -> None:
+        from completion import (
+            artifacts_all_present,
+            build_acceptance_packet,
+            confirm_artifacts_for_lead_approve,
+            is_success_allowed,
+            missing_artifacts,
+            snapshot_artifacts,
+        )
+        from lead_adapter import (
+            LeadDecisionError,
+            build_lead_request,
+            lead_review_response_schema,
+            validate_lead_decision,
+        )
+
         if job.state in (JobState.DONE, JobState.FAIL, JobState.TIMEOUT, JobState.QUEUED):
             return
-        if job.started_at and (time.time() - job.started_at) > job.timeout_sec:
-            arts = [p for p in job.expected_artifacts if Path(p).exists()]
-            if arts:
-                job.state = JobState.DONE
-                job.result = {
-                    "ok": True,
-                    "state": "ok",
-                    "artifacts": arts,
-                    "notes": job.notes + ["accepted near timeout with artifacts"],
-                    "api_replies": job.api_replies,
-                    "hard_rule_rejects": job.hard_rule_rejects,
-                    "session_id": job.session_id,
-                    "job_id": job.job_id,
-                    "workdir": str(job.workdir),
-                }
-            else:
+
+        def _arts_complete() -> tuple[bool, list[str]]:
+            recs = snapshot_artifacts(job.expected_artifacts)
+            present = [r.path for r in recs if r.exists]
+            return artifacts_all_present(recs), present
+
+        def _fail(state: str, error: str, arts: list[str]) -> None:
+            job.state = JobState.TIMEOUT if state == "timeout" else JobState.FAIL
+            if state == "timeout":
                 job.state = JobState.TIMEOUT
-                job.result = {
-                    "ok": False,
-                    "state": "timeout",
-                    "error": "wall clock timeout",
-                    "artifacts": arts,
-                    "notes": job.notes,
-                    "api_replies": job.api_replies,
-                    "session_id": job.session_id,
-                    "job_id": job.job_id,
-                    "workdir": str(job.workdir),
-                }
-            job.finished_at = time.time()
-            return
-
-        if self.dry_run:
-            # Finish when expected artifacts exist and no more simulated pending
-            if job.simulated_pending:
-                job.busy = True
-                return
-            arts = [p for p in job.expected_artifacts if Path(p).exists()]
-            if arts or not job.expected_artifacts:
-                # also require marker for isolation proof
-                markers = list(job.workdir.glob("_scheduler_marker_*.txt"))
-                job.state = JobState.DONE
-                job.result = {
-                    "ok": True,
-                    "state": "dry_run_ok",
-                    "artifacts": arts,
-                    "markers": [str(m) for m in markers],
-                    "notes": job.notes,
-                    "api_replies": job.api_replies,
-                    "hard_rule_rejects": job.hard_rule_rejects,
-                    "session_id": job.session_id,
-                    "job_id": job.job_id,
-                    "workdir": str(job.workdir),
-                    "dry_run": True,
-                }
-                job.finished_at = time.time()
-                job.busy = False
-            return
-
-        # Live: check session status + artifacts
-        sc, status = self.ta_call("GET", "/session/status")
-        job.busy = self.is_session_busy(status, job.session_id)
-        arts = [p for p in job.expected_artifacts if Path(p).exists()]
-        if not job.busy and arts:
-            job.state = JobState.DONE
             job.result = {
-                "ok": True,
-                "state": "ok",
+                "ok": False,
+                "state": state,
+                "error": error,
                 "artifacts": arts,
-                "notes": job.notes,
+                "notes": list(job.notes),
                 "api_replies": job.api_replies,
                 "hard_rule_rejects": job.hard_rule_rejects,
                 "session_id": job.session_id,
                 "job_id": job.job_id,
                 "workdir": str(job.workdir),
+                "force_lead_review": job.force_lead_review,
             }
             job.finished_at = time.time()
+
+        def _succeed(arts: list[str], *, state: str = "ok", extra_notes: list | None = None) -> None:
+            notes = list(job.notes) + list(extra_notes or [])
+            prior = job.result if isinstance(job.result, dict) else {}
+            verdict = prior.get("lead_review_verdict")
+            ok, why = is_success_allowed(
+                state="ok",
+                artifacts_ok=True,
+                lead_verdict=verdict,
+                force_lead_review=job.force_lead_review,
+            )
+            if not ok:
+                _fail("fail", why, arts)
+                return
+            job.state = JobState.DONE
+            job.result = {
+                "ok": True,
+                "state": state,
+                "artifacts": arts,
+                "notes": notes,
+                "api_replies": job.api_replies,
+                "hard_rule_rejects": job.hard_rule_rejects,
+                "session_id": job.session_id,
+                "job_id": job.job_id,
+                "workdir": str(job.workdir),
+                "force_lead_review": job.force_lead_review,
+                "lead_review_verdict": verdict,
+                "dry_run": self.dry_run,
+            }
+            job.finished_at = time.time()
+            job.busy = False
+
+        def _run_force_lead_review(arts: list[str]) -> bool:
+            """Return True if lead passed and fingerprints stable. Parallel + serial."""
+            packet = build_acceptance_packet(
+                job_name=job.name,
+                goal=(job.charter or {}).get("goal") or job.instruction[:240],
+                acceptance_criteria=(job.charter or {}).get("acceptance")
+                or (job.charter or {}).get("done_when")
+                or {"artifacts": job.expected_artifacts},
+                expected_artifacts=job.expected_artifacts,
+                execution_result={"job_id": job.job_id, "path": "scheduler"},
+                error="",
+                tool_records=job.pending_summaries,
+                api_replies=job.api_replies,
+                notes=job.notes,
+                state=job.state.value,
+                session_id=job.session_id,
+            )
+            unchanged, gate = confirm_artifacts_for_lead_approve(packet)
+            job.notes.append(f"artifact_gate={gate.get('unchanged')} diffs={gate.get('diffs')}")
+            if not unchanged:
+                job.result = {"lead_review_verdict": "fail", "artifact_gate": gate}
+                return False
+            req = build_lead_request(
+                kind="review",
+                goal=(job.charter or {}).get("goal") or job.instruction[:240],
+                authorized_scope=(job.charter or {}).get("must") or [],
+                prohibitions=(job.charter or {}).get("must_not") or [],
+                acceptance_criteria=packet.get("acceptance_criteria"),
+                current_application=packet,
+                charter=job.charter,
+            )
+            schema = lead_review_response_schema()
+            if self._call_lead_fn is not None or self.dry_run:
+                raw, parsed = self.call_lead(
+                    __import__("json").dumps({"_lead_request": req, "prompt_kind": "review"}),
+                    schema,
+                    str(job.workdir),
+                )
+            else:
+                try:
+                    raw, parsed = self._glue().call_lead_request(
+                        req, schema=schema, cwd=str(job.workdir)
+                    )
+                except Exception:
+                    raw, parsed = self.call_lead(
+                        __import__("json").dumps({"_lead_request": req}),
+                        schema,
+                        str(job.workdir),
+                    )
+            if isinstance(parsed, dict):
+                # Map permission-style dry stubs → review verdict; stitch binding fields
+                if "verdict" not in parsed and parsed.get("decision") in ("once", "reject", "deny_job"):
+                    parsed = {
+                        **parsed,
+                        "verdict": "pass" if parsed.get("decision") == "once" else "fail",
+                    }
+                if "verdict" in parsed and "application_id" not in parsed:
+                    parsed = {
+                        **parsed,
+                        "application_id": req["application_id"],
+                        "context_summary": req.get("context_summary", ""),
+                        "reason": parsed.get("reason") or "dry_or_injected_lead",
+                    }
+                    raw = __import__("json").dumps(parsed)
+            try:
+                decision = validate_lead_decision(raw, parsed, request=req, kind="review")
+                verdict = decision.get("verdict") or "fail"
+            except LeadDecisionError as e:
+                job.notes.append(f"force_lead_review invalid ({e.code}): safe-stop")
+                verdict = "fail"
+            job.result = {"lead_review_verdict": verdict, "lead_review_raw": (raw or "")[:1500]}
+            unchanged2, gate2 = confirm_artifacts_for_lead_approve(packet)
+            if verdict == "pass" and not unchanged2:
+                job.notes.append(f"artifacts changed during lead: {gate2.get('diffs')}")
+                job.result["lead_review_verdict"] = "fail"
+                return False
+            return verdict == "pass"
+
+        # Wall timeout — NEVER success even if some/all artifacts exist (条2)
+        if job.started_at and (time.time() - job.started_at) > job.timeout_sec:
+            complete, arts = _arts_complete()
+            _fail(
+                "timeout",
+                "wall clock timeout (not success even with artifacts)",
+                arts,
+            )
+            job.notes.append(
+                f"timeout with artifacts_complete={complete} missing={missing_artifacts(job.expected_artifacts)}"
+            )
+            return
+
+        if self.dry_run:
+            if job.simulated_pending:
+                job.busy = True
+                return
+            complete, arts = _arts_complete()
+            if not complete:
+                return
+            markers = list(job.workdir.glob("_scheduler_marker_*.txt"))
+            if job.force_lead_review:
+                if not _run_force_lead_review(arts):
+                    _fail("fail", "force_lead_review did not pass", arts)
+                    return
+            _succeed(arts, state="dry_run_ok", extra_notes=[f"markers={[str(m) for m in markers]}"])
+            if job.result is not None:
+                job.result["markers"] = [str(m) for m in markers]
+            return
+
+        # Live: session idle + ALL artifacts; force_lead_review before DONE
+        sc, status = self.ta_call("GET", "/session/status")
+        job.busy = self.is_session_busy(status, job.session_id)
+        complete, arts = _arts_complete()
+        if not job.busy and complete:
+            if job.force_lead_review:
+                if not _run_force_lead_review(arts):
+                    _fail("fail", "force_lead_review did not pass", arts)
+                    return
+            _succeed(arts, state="ok")
 
     def write_job_report(self, job: JobSlot) -> Path:
         self.runs_root.mkdir(parents=True, exist_ok=True)
