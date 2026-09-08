@@ -1,6 +1,7 @@
 """Structured lead protocol schemas (条3). Decisions are strict JSON bound to application_id."""
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
@@ -108,20 +109,81 @@ def lead_review_response_schema() -> dict:
     }
 
 
+def pin_lead_response_schema(schema: dict, request: dict) -> dict:
+    """Deep-copy schema and pin application_id / context_summary to exact request values.
+
+    Used so CLI `--json-schema` const-constrains echo. Does not invent ids:
+    const is the request's exact string (empty stays empty; validation still rejects).
+    """
+    if isinstance(schema, dict):
+        pinned = copy.deepcopy(schema)
+    else:
+        pinned = {"type": "object", "properties": {}}
+    props = pinned.get("properties")
+    if not isinstance(props, dict):
+        props = {}
+        pinned["properties"] = props
+    req = request if isinstance(request, dict) else {}
+
+    app_id = req.get("application_id")
+    app_id_s = "" if app_id is None else str(app_id)
+    props["application_id"] = {"type": "string", "const": app_id_s}
+
+    required = pinned.get("required")
+    if not isinstance(required, list):
+        required = []
+    else:
+        required = list(required)
+    if "application_id" not in required:
+        required.append("application_id")
+
+    summary = req.get("context_summary")
+    if summary is not None:
+        props["context_summary"] = {"type": "string", "const": str(summary)}
+    elif "context_summary" not in props:
+        props["context_summary"] = {"type": "string"}
+    if "context_summary" not in required:
+        required.append("context_summary")
+
+    pinned["required"] = required
+    return pinned
+
+
 def format_lead_request_prompt(request: dict, *, allow_hint: str = "") -> str:
     """Stateless prompt: full goal/scope/prohibitions/acceptance + current ask."""
     kind = request.get("kind")
+    app_id = request.get("application_id")
+    summary = request.get("context_summary")
+    app_id_json = json.dumps("" if app_id is None else str(app_id), ensure_ascii=False)
+    summary_json = json.dumps("" if summary is None else str(summary), ensure_ascii=False)
+    echo_rules = (
+        "Copy application_id and context_summary EXACTLY byte-for-byte from the request "
+        "fields above (and from Full request JSON). No rewrite, no whitespace normalize, "
+        "no commentary, no punctuation changes. "
+        "reason/decision/verdict may vary; application_id and context_summary MUST be "
+        "copied verbatim from the request fields above."
+    )
     if kind == "permission":
         out_hint = (
             "Output strict JSON only: "
-            '{"application_id":"...","context_summary":"...","decision":"once|reject|deny_job|demand_safe_path","reason":"..."} '
-            "Bind application_id to the request. Never choose always."
+            "{"
+            f'"application_id":{app_id_json},'
+            f'"context_summary":{summary_json},'
+            '"decision":"once|reject|deny_job|demand_safe_path",'
+            '"reason":"..."'
+            "} "
+            f"{echo_rules} Never choose always."
         )
     else:
         out_hint = (
             "Output strict JSON only: "
-            '{"application_id":"...","context_summary":"...","verdict":"pass|fail","reason":"..."} '
-            "Bind application_id to the request."
+            "{"
+            f'"application_id":{app_id_json},'
+            f'"context_summary":{summary_json},'
+            '"verdict":"pass|fail",'
+            '"reason":"..."'
+            "} "
+            f"{echo_rules}"
         )
     body = json.dumps(request, ensure_ascii=False, indent=2, default=str)
     return (
@@ -159,23 +221,65 @@ def _extract_json_obj(text: str | None) -> dict | None:
     return None
 
 
+_ENVELOPE_KEYS = (
+    "structuredOutput",
+    "output",
+    "message",
+    "content",
+    "data",
+    "result",
+    "response",
+)
+
+
+def _coerce_envelope_value(value: Any) -> dict | None:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        return _extract_json_obj(value)
+    return None
+
+
 def unwrap_structured(parsed: dict | None) -> dict | None:
-    """Normalize Grok/Codex envelopes to the inner decision object."""
+    """Normalize Grok/Codex envelopes to the inner decision object.
+
+    Walks structuredOutput/output/message/content/data/result/response plus one
+    nesting level. Parses JSON-string structuredOutput (and other envelope
+    strings). Prefers the inner object that already has decision/verdict even
+    if application_id is nested oddly. Does not invent application_id.
+    """
     if not isinstance(parsed, dict):
         return None
     if parsed.get("stopReason") == "cancelled":
         return None
     if parsed.get("structuredOutput") is None and parsed.get("structuredOutputError"):
         return None
-    so = parsed.get("structuredOutput")
-    if isinstance(so, dict) and ("decision" in so or "verdict" in so or "application_id" in so):
-        return so
-    for k in ("output", "message", "content", "data", "result"):
-        v = parsed.get(k)
-        if isinstance(v, dict) and ("decision" in v or "verdict" in v or "application_id" in v):
-            return v
-    if "decision" in parsed or "verdict" in parsed or "application_id" in parsed:
-        return parsed
+
+    decision_hit: dict | None = None
+    bind_hit: dict | None = None
+
+    def visit(obj: dict, depth: int) -> None:
+        nonlocal decision_hit, bind_hit
+        if not isinstance(obj, dict):
+            return
+        # Inner envelopes first so structuredOutput wins over an outer wrapper.
+        if depth > 0:
+            for key in _ENVELOPE_KEYS:
+                if key not in obj:
+                    continue
+                child = _coerce_envelope_value(obj.get(key))
+                if child is not None:
+                    visit(child, depth - 1)
+        if decision_hit is None and ("decision" in obj or "verdict" in obj):
+            decision_hit = obj
+        if bind_hit is None and "application_id" in obj:
+            bind_hit = obj
+
+    visit(parsed, 2)
+    if decision_hit is not None:
+        return decision_hit
+    if bind_hit is not None:
+        return bind_hit
     text = parsed.get("text")
     if isinstance(text, str):
         inner = _extract_json_obj(text)
@@ -279,6 +383,7 @@ __all__ = [
     "build_lead_request",
     "lead_permission_response_schema",
     "lead_review_response_schema",
+    "pin_lead_response_schema",
     "format_lead_request_prompt",
     "unwrap_structured",
     "validate_lead_decision",

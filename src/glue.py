@@ -197,7 +197,7 @@ def call_lead(prompt: str, schema: dict, cwd: str) -> tuple[str, dict | None]:
         current_application={"legacy_prompt": prompt[:8000]},
     )
     # Preserve caller prompt as the primary text while still binding application_id in schema expectations.
-    from lead_adapter.schema import format_lead_request_prompt
+    from lead_adapter.schema import format_lead_request_prompt, pin_lead_response_schema
 
     # If caller already built a full prompt, still send structured request via adapter.decide
     # but merge legacy prompt into request extra for adapters that format themselves.
@@ -205,7 +205,12 @@ def call_lead(prompt: str, schema: dict, cwd: str) -> tuple[str, dict | None]:
     request["extra"] = {"legacy_prompt": prompt}
     # For grok_cli, decide() formats from request; inject legacy prompt as task overlay
     request["task_goal"] = prompt[:500]
-    return adapter.decide(request, schema=schema, cwd=cwd, timeout_sec=180)
+    return adapter.decide(
+        request,
+        schema=pin_lead_response_schema(schema, request),
+        cwd=cwd,
+        timeout_sec=180,
+    )
 
 
 def call_lead_request(
@@ -218,9 +223,11 @@ def call_lead_request(
 ) -> tuple[str, dict | None]:
     """Structured lead call (条3). Returns (raw, parsed_or_status_envelope)."""
     from lead_adapter import get_lead_adapter
+    from lead_adapter.schema import pin_lead_response_schema
 
     ad = adapter or get_lead_adapter()
-    return ad.decide(request, schema=schema, cwd=cwd, timeout_sec=timeout_sec)
+    pinned = pin_lead_response_schema(schema, request)
+    return ad.decide(request, schema=pinned, cwd=cwd, timeout_sec=timeout_sec)
 
 
 
@@ -401,6 +408,14 @@ def assistant_finish(msg) -> str | None:
     if isinstance(info, dict):
         return info.get("finish") or (info.get("error") and "error")
     return msg.get("finish")
+
+
+SUCCESSFUL_ASSISTANT_FINISH = frozenset({"stop", "complete", "completed"})
+
+
+def assistant_finish_successful(fin) -> bool:
+    """This-round assistant completed successfully (scheduler/astra gate)."""
+    return fin in SUCCESSFUL_ASSISTANT_FINISH
 
 
 def assistant_error(msg) -> str:
@@ -810,12 +825,23 @@ def run_job(
 
     def _mark_success(verdict: str | None = None) -> dict:
         arts_ok = _all_arts_ok()
+        fin = report.get("finish")
+        if force_lead_review and not assistant_finish_successful(fin):
+            report["ok"] = False
+            report["state"] = "fail"
+            report["error"] = (
+                "force_lead_review requires this-round finish in "
+                f"stop/complete/completed, got {fin!r}"
+            )
+            report["rework_budget"] = budget.to_dict()
+            _write_status(name, report)
+            return report
         ok, why = is_success_allowed(
             state="ok",
             artifacts_ok=arts_ok,
             lead_verdict=verdict if force_lead_review else (verdict or "pass"),
             force_lead_review=force_lead_review,
-            finish=report.get("finish"),
+            finish=fin,
             error=report.get("error"),
         )
         if ok:
@@ -890,15 +916,11 @@ def run_job(
             _write_status(name, report)
             return report
 
-        # Need stop (or idle with full artifacts) before judging
-        if fin != "stop" and not arts_ok:
+        # Require this-round successful finish before judging / force_lead_review.
+        # Arts present is not enough; do not fall back to last_assistant.
+        if not assistant_finish_successful(fin):
             time.sleep(1.5)
             continue
-        if fin != "stop" and arts_ok:
-            # brief settle; still require eventual stop or proceed to review only if forced
-            time.sleep(1.0)
-            if session_busy(call("GET", "/session/status")[1], sid):
-                continue
 
         # force_lead_review always applies (serial path); also when charter requests it
         need_review = bool(force_lead_review)
@@ -958,12 +980,43 @@ def run_job(
                         )
                         if report.get("error") == "lead deny_job":
                             break
-                if not session_busy(status, sid):
+                if report.get("error") == "lead deny_job":
+                    _write_status(name, report)
+                    return report
+                if session_busy(status, sid):
+                    time.sleep(1.5)
+                    continue
+                mc, msgs = call("GET", f"/session/{sid}/message")
+                asst = this_round_assistant(msgs)
+                fin2 = assistant_finish(asst)
+                err2 = assistant_error(asst)
+                report["finish"] = fin2
+                if err2 or fin2 == "error":
+                    report["state"] = "fail"
+                    report["error"] = err2 or "assistant finish=error"
+                    report["ok"] = False
+                    _write_status(name, report)
+                    return report
+                if fin2 in ("cancelled", "cancel"):
+                    report["state"] = "cancelled"
+                    report["error"] = f"finish={fin2}"
+                    report["ok"] = False
+                    _write_status(name, report)
+                    return report
+                if assistant_finish_successful(fin2):
                     break
                 time.sleep(1.5)
-            mc, msgs = call("GET", f"/session/{sid}/message")
-            asst = this_round_assistant(msgs)
-            report["finish"] = assistant_finish(asst)
+            if not assistant_finish_successful(report.get("finish")):
+                report["ok"] = False
+                report["state"] = "fail"
+                report["error"] = (
+                    f"lead verdict={verdict}; redo incomplete "
+                    f"arts_ok={_all_arts_ok()} "
+                    f"missing={missing_artifacts(expected_artifacts)} finish={report.get('finish')}"
+                )
+                report["rework_budget"] = budget.to_dict()
+                _write_status(name, report)
+                return report
             verdict2 = _do_lead_review(phase="review2")
             if verdict2 == "pass" and _all_arts_ok():
                 return _mark_success("pass")
@@ -977,16 +1030,16 @@ def run_job(
             _write_status(name, report)
             return report
 
-        # Non-force path: require ALL artifacts + finish=stop (no or True)
-        if _all_arts_ok() and fin == "stop":
+        # Non-force path: require ALL artifacts + this-round successful finish (no or True)
+        if _all_arts_ok() and assistant_finish_successful(fin):
             return _mark_success(None)
-        if _all_arts_ok() and not fin:
-            time.sleep(1)
-            continue
-        if fin == "stop" and not _all_arts_ok():
+        if assistant_finish_successful(fin) and not _all_arts_ok():
             report["state"] = "fail"
             report["ok"] = False
-            report["error"] = f"finish=stop but artifacts incomplete: missing={missing_artifacts(expected_artifacts)}"
+            report["error"] = (
+                f"finish={fin} but artifacts incomplete: "
+                f"missing={missing_artifacts(expected_artifacts)}"
+            )
             _write_status(name, report)
             return report
         time.sleep(1.5)

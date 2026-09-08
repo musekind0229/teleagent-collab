@@ -8,7 +8,7 @@ import subprocess
 from typing import Any
 
 from lead_adapter.base import LeadAdapterABC, safe_failure
-from lead_adapter.schema import format_lead_request_prompt
+from lead_adapter.schema import format_lead_request_prompt, pin_lead_response_schema
 
 
 class GrokCliLeadAdapter(LeadAdapterABC):
@@ -41,6 +41,7 @@ class GrokCliLeadAdapter(LeadAdapterABC):
         prompt = format_lead_request_prompt(request, allow_hint=hint)
         if isinstance(request.get("extra"), dict) and request["extra"].get("legacy_prompt"):
             prompt = str(request["extra"]["legacy_prompt"]) + "\n\n" + prompt
+        pinned_schema = pin_lead_response_schema(schema, request)
         cmd = [
             self.bin_path,
             "-p",
@@ -52,7 +53,7 @@ class GrokCliLeadAdapter(LeadAdapterABC):
             "--output-format",
             "json",
             "--json-schema",
-            json.dumps(schema),
+            json.dumps(pinned_schema),
             "--disallowed-tools",
             self.disallowed_tools,
         ]

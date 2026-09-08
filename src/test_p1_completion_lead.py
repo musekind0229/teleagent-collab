@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _SRC = Path(__file__).resolve().parent
 if str(_SRC) not in sys.path:
@@ -25,10 +26,14 @@ from lead_adapter import (
     LeadDecisionError,
     build_lead_request,
     get_lead_adapter,
+    lead_permission_response_schema,
+    lead_review_response_schema,
+    pin_lead_response_schema,
     validate_lead_decision,
 )
 from lead_adapter.inprocess import InProcessLeadAdapter
 from lead_adapter.grok_cli import GrokCliLeadAdapter
+from lead_adapter.schema import format_lead_request_prompt, unwrap_structured
 from scheduler import ParallelScheduler, JobState
 
 SIMULATED = True
@@ -289,6 +294,218 @@ class TestSchedulerForceLeadAndTimeout(unittest.TestCase):
                 self.assertEqual(
                     (info.get("result") or {}).get("lead_review_verdict"), "pass"
                 )
+
+
+class TestLiveGrokEchoAndUnwrap(unittest.TestCase):
+    def _req(self, kind="review"):
+        return build_lead_request(
+            kind=kind,
+            goal="stay in ws",
+            authorized_scope=["ws"],
+            prohibitions=["secrets"],
+            acceptance_criteria={"artifacts": ["a.txt"]},
+            current_application={"tool": "write"},
+        )
+
+    def test_pin_lead_response_schema_sets_const(self):
+        req = self._req("review")
+        schema = lead_review_response_schema()
+        pinned = pin_lead_response_schema(schema, req)
+        self.assertIsNot(pinned, schema)
+        self.assertEqual(
+            pinned["properties"]["application_id"],
+            {"type": "string", "const": req["application_id"]},
+        )
+        self.assertEqual(
+            pinned["properties"]["context_summary"],
+            {"type": "string", "const": req["context_summary"]},
+        )
+        self.assertIn("context_summary", pinned["required"])
+        self.assertIn("application_id", pinned["required"])
+        self.assertIn("verdict", pinned["required"])
+        self.assertEqual(schema["properties"]["application_id"], {"type": "string"})
+        perm = pin_lead_response_schema(lead_permission_response_schema(), req)
+        self.assertEqual(perm["properties"]["application_id"]["const"], req["application_id"])
+        self.assertIn("context_summary", perm["required"])
+
+    def test_empty_or_missing_application_id_mismatch_review_and_permission(self):
+        for kind, field, ok_val in (
+            ("review", "verdict", "pass"),
+            ("permission", "decision", "once"),
+        ):
+            req = self._req(kind)
+            missing = {field: ok_val, "reason": "no id"}
+            with self.assertRaises(LeadDecisionError) as cm:
+                validate_lead_decision(json.dumps(missing), missing, request=req, kind=kind)
+            self.assertEqual(cm.exception.code, "application_id_mismatch")
+
+            empty = {
+                "application_id": "",
+                "context_summary": req["context_summary"],
+                field: ok_val,
+                "reason": "empty id",
+            }
+            with self.assertRaises(LeadDecisionError) as cm:
+                validate_lead_decision(json.dumps(empty), empty, request=req, kind=kind)
+            self.assertEqual(cm.exception.code, "application_id_mismatch")
+
+            req_empty = dict(req)
+            req_empty["application_id"] = ""
+            with self.assertRaises(LeadDecisionError) as cm:
+                validate_lead_decision(json.dumps(empty), empty, request=req_empty, kind=kind)
+            self.assertEqual(cm.exception.code, "application_id_mismatch")
+
+    def test_exact_echo_accepted(self):
+        for kind, field, ok_val in (
+            ("review", "verdict", "pass"),
+            ("permission", "decision", "once"),
+        ):
+            req = self._req(kind)
+            good = {
+                "application_id": req["application_id"],
+                "context_summary": req["context_summary"],
+                field: ok_val,
+                "reason": "exact echo",
+            }
+            out = validate_lead_decision(json.dumps(good), good, request=req, kind=kind)
+            self.assertEqual(out["application_id"], req["application_id"])
+            self.assertEqual(out["context_summary"], req["context_summary"])
+            self.assertEqual(out[field], ok_val)
+
+    def test_rewritten_context_summary_mismatch(self):
+        req = self._req("review")
+        req = dict(req)
+        req["context_summary"] = "line1\nline2"
+        rewritten = {
+            "application_id": req["application_id"],
+            "context_summary": "line1 line2 (looks fine)",
+            "verdict": "pass",
+            "reason": "rewrote summary",
+        }
+        with self.assertRaises(LeadDecisionError) as cm:
+            validate_lead_decision(json.dumps(rewritten), rewritten, request=req, kind="review")
+        self.assertEqual(cm.exception.code, "context_summary_mismatch")
+
+    def test_nested_structured_output_unwrap_validates(self):
+        req = self._req("review")
+        inner = {
+            "application_id": req["application_id"],
+            "context_summary": req["context_summary"],
+            "verdict": "pass",
+            "reason": "nested ok",
+        }
+        envelopes = [
+            {"structuredOutput": inner},
+            {"structuredOutput": json.dumps(inner)},
+            {"response": {"structuredOutput": inner}},
+            {"output": {"content": inner}},
+            {"data": {"result": inner}},
+            {"message": {"content": inner}},
+        ]
+        for env in envelopes:
+            unwrapped = unwrap_structured(env)
+            self.assertIsNotNone(unwrapped, env)
+            out = validate_lead_decision("", env, request=req, kind="review")
+            self.assertEqual(out["verdict"], "pass", env)
+            self.assertEqual(out["application_id"], req["application_id"], env)
+
+        missing_id = {"structuredOutput": {"verdict": "pass", "reason": "no id"}}
+        with self.assertRaises(LeadDecisionError) as cm:
+            validate_lead_decision("", missing_id, request=req, kind="review")
+        self.assertEqual(cm.exception.code, "application_id_mismatch")
+
+    def test_prompt_demands_verbatim_echo(self):
+        req = self._req("review")
+        prompt = format_lead_request_prompt(req)
+        self.assertIn("byte-for-byte", prompt)
+        self.assertIn("MUST be copied verbatim", prompt)
+        self.assertIn(f'"application_id":{json.dumps(req["application_id"])}', prompt)
+        self.assertIn(f'"context_summary":{json.dumps(req["context_summary"])}', prompt)
+        self.assertNotIn('"application_id":"..."', prompt)
+        self.assertNotIn('"context_summary":"..."', prompt)
+
+    def test_grok_cli_json_schema_is_const_pinned(self):
+        req = self._req("review")
+        inner = {
+            "application_id": req["application_id"],
+            "context_summary": req["context_summary"],
+            "verdict": "pass",
+            "reason": "ok",
+        }
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            idx = cmd.index("--json-schema")
+            captured["schema"] = json.loads(cmd[idx + 1])
+
+            class P:
+                returncode = 0
+                stdout = json.dumps({"structuredOutput": inner})
+                stderr = ""
+
+            return P()
+
+        ad = GrokCliLeadAdapter(bin_path="/bin/echo")
+        with mock.patch("lead_adapter.grok_cli.subprocess.run", fake_run):
+            ad.decide(req, schema=lead_review_response_schema(), cwd="/tmp")
+        self.assertEqual(
+            captured["schema"]["properties"]["application_id"]["const"],
+            req["application_id"],
+        )
+        self.assertEqual(
+            captured["schema"]["properties"]["context_summary"]["const"],
+            req["context_summary"],
+        )
+        self.assertIn("context_summary", captured["schema"]["required"])
+
+    def test_call_lead_request_pins_schema(self):
+        import glue
+
+        req = self._req("review")
+        captured = {}
+
+        class Fake:
+            def decide(self, request, *, schema, cwd, timeout_sec=180):
+                captured["schema"] = schema
+                body = {
+                    "application_id": request["application_id"],
+                    "context_summary": request["context_summary"],
+                    "verdict": "pass",
+                    "reason": "ok",
+                }
+                return json.dumps(body), body
+
+        glue.call_lead_request(
+            req, schema=lead_review_response_schema(), cwd="/tmp", adapter=Fake()
+        )
+        self.assertEqual(
+            captured["schema"]["properties"]["application_id"]["const"],
+            req["application_id"],
+        )
+        self.assertEqual(
+            captured["schema"]["properties"]["context_summary"]["const"],
+            req["context_summary"],
+        )
+
+
+class TestGlueThisRoundFinish(unittest.TestCase):
+    def test_successful_finish_values(self):
+        from glue import assistant_finish_successful
+
+        self.assertTrue(assistant_finish_successful("stop"))
+        self.assertTrue(assistant_finish_successful("complete"))
+        self.assertTrue(assistant_finish_successful("completed"))
+        self.assertFalse(assistant_finish_successful(None))
+        self.assertFalse(assistant_finish_successful(""))
+        self.assertFalse(assistant_finish_successful("error"))
+        self.assertFalse(assistant_finish_successful("cancelled"))
+
+    def test_run_job_waits_for_successful_finish_before_lead_review(self):
+        text = (Path(__file__).resolve().parent / "glue.py").read_text(encoding="utf-8")
+        self.assertIn("assistant_finish_successful", text)
+        self.assertNotIn("proceed to review only if forced", text)
+        self.assertIn("do not fall back to last_assistant", text)
 
 
 class TestGlueNoLooseSuccess(unittest.TestCase):

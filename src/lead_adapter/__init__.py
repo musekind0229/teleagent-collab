@@ -15,6 +15,7 @@ from lead_adapter.schema import (
     format_lead_request_prompt,
     lead_permission_response_schema,
     lead_review_response_schema,
+    pin_lead_response_schema,
     unwrap_structured,
     validate_lead_decision,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "format_lead_request_prompt",
     "lead_permission_response_schema",
     "lead_review_response_schema",
+    "pin_lead_response_schema",
     "unwrap_structured",
     "validate_lead_decision",
     "get_lead_adapter",

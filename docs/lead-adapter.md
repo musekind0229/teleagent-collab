@@ -7,7 +7,7 @@
 | 文件 | 作用 |
 | --- | --- |
 | `src/lead_adapter/base.py` | `LeadAdapter` Protocol / ABC |
-| `src/lead_adapter/schema.py` | `build_lead_request` / `validate_lead_decision` / JSON schema |
+| `src/lead_adapter/schema.py` | `build_lead_request` / `validate_lead_decision` / `pin_lead_response_schema` / JSON schema |
 | `src/lead_adapter/grok_cli.py` | Grok CLI 后端（保留 `--disallowed-tools`，**禁止**失败后去掉限制再重试） |
 | `src/lead_adapter/inprocess.py` | 当前 Codex/对话当组长：目录协议 `pending/` + `decisions/`，或 `decision_fn` 进程内回调 |
 | `src/lead_adapter/claude_code.py` | **待办 stub**：`call_failed`，禁止假 PASS |
@@ -61,6 +61,12 @@ export COLLAB_LEAD_EXCHANGE=/path/to/exchange
 
 `src/test_p1_completion_lead.py`（simulated）：绑定校验、inprocess 文件协议、无 disallowed-tools 降级、并行 `force_lead_review`。
 
+
+## Live Grok echo reliability
+
+Live Grok CLI must echo `application_id` and `context_summary` **exactly** (byte-for-byte) from the request. `pin_lead_response_schema` sets JSON Schema `const` on both fields (and keeps `context_summary` in `required`) before `--json-schema` spawn so the model cannot rewrite them.
+
+Do not loosen `validate_lead_decision`: empty `application_id` is `application_id_mismatch`; rewritten `context_summary` (newlines→spaces, added commentary, whitespace normalize) is `context_summary_mismatch`. Production glue/scheduler must not stitch these fields — dry_run-only stitch stays dry_run-only.
 
 ## Claude / Codex 待办
 
