@@ -99,6 +99,8 @@ class JobRecord:
     wall_deadline: float | None = None
     claimed_session: bool = False
     dispatch_token: str = ""  # unique per start; restart must not reuse to re-prompt
+    dispatch_user_message_id: str = ""  # user message id for this dispatch turn
+    dispatch_query_id: str = ""  # queryID sent with this dispatch prompt
     notes: list[str] = field(default_factory=list)
     result: dict = field(default_factory=dict)
     handled_perm_ids: list[str] = field(default_factory=list)
@@ -131,6 +133,8 @@ class JobRecord:
             wall_deadline=d.get("wall_deadline"),
             claimed_session=bool(d.get("claimed_session")),
             dispatch_token=str(d.get("dispatch_token") or ""),
+            dispatch_user_message_id=str(d.get("dispatch_user_message_id") or ""),
+            dispatch_query_id=str(d.get("dispatch_query_id") or ""),
             notes=list(d.get("notes") or []),
             result=dict(d.get("result") or {}),
             handled_perm_ids=list(d.get("handled_perm_ids") or []),

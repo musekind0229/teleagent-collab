@@ -576,6 +576,221 @@ class TestUnboundLeadRejected(unittest.TestCase):
             sched.shutdown()
 
 
+
+class TestStopConfirmThreeState(unittest.TestCase):
+    def _cancel_with_status(self, status):
+        calls = []
+
+        def transport(method, path, *a, **k):
+            calls.append((method, path))
+            if method == "POST" and path.endswith("/abort"):
+                return 202, {"accepted": True}
+            return 200, status
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            sched = ParallelScheduler(
+                workspaces_root=root / "ws",
+                runs_root=root / "runs",
+                teleagent_call=transport,
+                persist=False,
+                dry_run=False,
+            )
+            job = sched.enqueue_charter(_charter())
+            job.session_id = "s"
+            job.state = JobState.RUNNING
+            sched.request_cancel(job.job_id)
+            out = sched.effect_cancel(job.job_id)
+            sched.shutdown()
+            return out, job, calls
+
+    def test_error_dict_not_cancel_effected(self):
+        out, job, calls = self._cancel_with_status({"error": "backend not ready"})
+        self.assertFalse(out.get("cancel_effected"))
+        self.assertTrue(out.get("stop_pending_confirm"))
+        self.assertEqual(job.state, JobState.CANCEL_REQUESTED)
+        self.assertTrue(any(p == "/session/status" for _, p in calls))
+
+    def test_unrecognized_state_not_cancel_effected(self):
+        out, job, _ = self._cancel_with_status({"s": {"type": "unrecognized-state"}})
+        self.assertFalse(out.get("cancel_effected"))
+        self.assertEqual(job.state, JobState.CANCEL_REQUESTED)
+
+    def test_empty_map_still_confirms_idle(self):
+        out, job, _ = self._cancel_with_status({})
+        self.assertTrue(out.get("cancel_effected"))
+        self.assertEqual(job.state, JobState.CANCELLED)
+
+    def test_error_dict_blocks_completion(self):
+        def transport(method, path, *a, **k):
+            if path == "/session/status":
+                return 200, {"error": "backend not ready"}
+            if "/message" in path:
+                return 200, [{"info": {"role": "assistant", "finish": "stop"}}]
+            return 200, {}
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            sched = ParallelScheduler(
+                workspaces_root=root / "ws",
+                runs_root=root / "runs",
+                teleagent_call=transport,
+                persist=False,
+                dry_run=False,
+            )
+            job = sched.enqueue_charter(_charter(force_lead_review=False))
+            job.session_id = "s"
+            job.state = JobState.RUNNING
+            job.started_at = time.time()
+            Path(job.expected_artifacts[0]).write_text("OK")
+            sched.refresh_job_status(job)
+            self.assertNotEqual(job.state, JobState.DONE)
+            self.assertTrue(job.busy)
+            sched.shutdown()
+
+    def test_unrecognized_state_blocks_completion(self):
+        def transport(method, path, *a, **k):
+            if path == "/session/status":
+                return 200, {"s": {"type": "unrecognized-state"}}
+            if "/message" in path:
+                return 200, [{"info": {"role": "assistant", "finish": "stop"}}]
+            return 200, {}
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            sched = ParallelScheduler(
+                workspaces_root=root / "ws",
+                runs_root=root / "runs",
+                teleagent_call=transport,
+                persist=False,
+                dry_run=False,
+            )
+            job = sched.enqueue_charter(_charter(force_lead_review=False))
+            job.session_id = "s"
+            job.state = JobState.RUNNING
+            job.started_at = time.time()
+            Path(job.expected_artifacts[0]).write_text("OK")
+            sched.refresh_job_status(job)
+            self.assertNotEqual(job.state, JobState.DONE)
+            sched.shutdown()
+
+
+class TestThisRoundCompletion(unittest.TestCase):
+    def test_previous_turn_stop_not_done(self):
+        msgs = [
+            {"info": {"id": "u-old", "role": "user"}},
+            {"info": {"id": "a-old", "role": "assistant", "parentID": "u-old", "finish": "stop"}},
+            {"info": {"id": "u-new", "role": "user"}},
+        ]
+
+        def transport(method, path, *a, **k):
+            if path == "/session/status":
+                return 200, {}
+            if "/message" in path:
+                return 200, msgs
+            return 200, {}
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            sched = ParallelScheduler(
+                workspaces_root=root / "ws",
+                runs_root=root / "runs",
+                teleagent_call=transport,
+                persist=False,
+                dry_run=False,
+            )
+            job = sched.enqueue_charter(_charter(force_lead_review=False))
+            job.session_id = "s"
+            job.state = JobState.RUNNING
+            job.started_at = time.time()
+            job.dispatch_user_message_id = "u-old"
+            Path(job.expected_artifacts[0]).write_text("OLD")
+            sched.refresh_job_status(job)
+            self.assertNotEqual(job.state, JobState.DONE)
+            self.assertFalse((job.result or {}).get("ok"))
+            sched.shutdown()
+
+    def test_this_turn_stop_allows_done(self):
+        msgs = [
+            {"info": {"id": "u-old", "role": "user"}},
+            {"info": {"id": "a-old", "role": "assistant", "parentID": "u-old", "finish": "stop"}},
+            {"info": {"id": "u-new", "role": "user"}},
+            {"info": {"id": "a-new", "role": "assistant", "parentID": "u-new", "finish": "stop"}},
+        ]
+
+        def transport(method, path, *a, **k):
+            if path == "/session/status":
+                return 200, {"s": {"type": "idle"}}
+            if "/message" in path:
+                return 200, msgs
+            return 200, {}
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            sched = ParallelScheduler(
+                workspaces_root=root / "ws",
+                runs_root=root / "runs",
+                teleagent_call=transport,
+                persist=False,
+                dry_run=False,
+            )
+            job = sched.enqueue_charter(_charter(force_lead_review=False))
+            job.session_id = "s"
+            job.state = JobState.RUNNING
+            job.started_at = time.time()
+            job.dispatch_user_message_id = "u-new"
+            Path(job.expected_artifacts[0]).write_text("NEW")
+            sched.refresh_job_status(job)
+            self.assertEqual(job.state, JobState.DONE)
+            self.assertTrue((job.result or {}).get("ok"))
+            sched.shutdown()
+
+    def test_force_review_previous_turn_not_ok(self):
+        msgs = [
+            {"info": {"id": "u-old", "role": "user"}},
+            {"info": {"id": "a-old", "role": "assistant", "parentID": "u-old", "finish": "stop"}},
+            {"info": {"id": "u-new", "role": "user"}},
+        ]
+
+        def lead(prompt, schema, cwd):
+            req = json.loads(prompt)["_lead_request"]
+            body = {
+                "application_id": req["application_id"],
+                "context_summary": req["context_summary"],
+                "verdict": "pass",
+                "reason": "bound pass",
+            }
+            return json.dumps(body), body
+
+        def transport(method, path, *a, **k):
+            if path == "/session/status":
+                return 200, {}
+            if "/message" in path:
+                return 200, msgs
+            return 200, {}
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            sched = ParallelScheduler(
+                workspaces_root=root / "ws",
+                runs_root=root / "runs",
+                teleagent_call=transport,
+                call_lead_fn=lead,
+                persist=False,
+                dry_run=False,
+            )
+            job = sched.enqueue_charter(_charter(force_lead_review=True))
+            job.session_id = "s"
+            job.state = JobState.RUNNING
+            job.started_at = time.time()
+            job.dispatch_user_message_id = "u-old"
+            Path(job.expected_artifacts[0]).write_text("OLD")
+            sched.refresh_job_status(job)
+            self.assertNotEqual(job.state, JobState.DONE)
+            self.assertFalse((job.result or {}).get("ok"))
+            sched.shutdown()
+
+
 class TestLinuxLoopbackGuard(unittest.TestCase):
     def test_non_loopback_blocked(self):
         from teleagent_adapter.base import AdapterError

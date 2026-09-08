@@ -125,6 +125,8 @@ class JobSlot:
     cancel_requested_at: float | None = None
     cancel_effected_at: float | None = None
     dispatch_token: str = ""
+    dispatch_user_message_id: str = ""
+    dispatch_query_id: str = ""
     wall_deadline: float | None = None
     restored: bool = False  # True if hydrated from StateStore (do not re-dispatch)
 
@@ -248,12 +250,17 @@ class ParallelScheduler:
             return ad.call(method, path, body=body, extra_headers=extra_headers, timeout=timeout)
         return g.call(method, path, body=body, extra_headers=extra_headers, timeout=timeout)
 
-    def is_session_busy(self, status_obj, sid: str) -> bool:
+    def session_activity(self, status_obj, sid: str) -> str:
+        """busy | idle | unknown — shared by cancel confirm and completion."""
         if self._session_busy_fn is not None:
-            return self._session_busy_fn(status_obj, sid)
-        if self.dry_run:
-            return False
-        return self._glue().session_busy(status_obj, sid)
+            return "busy" if self._session_busy_fn(status_obj, sid) else "idle"
+        if self.dry_run and self._teleagent_call is None:
+            return "idle"
+        return self._glue().parse_session_activity(status_obj, sid)
+
+    def is_session_busy(self, status_obj, sid: str) -> bool:
+        """True when not proven idle (busy or unknown)."""
+        return self.session_activity(status_obj, sid) != "idle"
 
     # --- enqueue / workdirs ------------------------------------------------------
 
@@ -369,6 +376,8 @@ class ParallelScheduler:
             wall_deadline=job.wall_deadline,
             claimed_session=bool(job.session_id and job.dispatch_token),
             dispatch_token=job.dispatch_token,
+            dispatch_user_message_id=str(job.dispatch_user_message_id or ""),
+            dispatch_query_id=str(job.dispatch_query_id or ""),
             notes=list(job.notes),
             result=dict(job.result or {}),
             handled_perm_ids=sorted(job.handled_perm_ids),
@@ -419,11 +428,10 @@ class ParallelScheduler:
         }
 
     def _session_stop_confirmed(self, job: JobSlot) -> bool:
-        """True only when status is usable and the session is not busy.
+        """True only when status is HTTP 2xx and activity parses as idle.
 
-        Idle / absent-from-busy-map is not proof that every OS child exited; it is
-        only the stop-confirmation signal this control API exposes. Unknown status
-        (non-2xx, non-dict) means NOT confirmed.
+        Unknown (error dict, unrecognized entry, non-dict, non-2xx) is NOT
+        confirmed — never treat not-busy as idle.
         """
         sid = (job.session_id or "").strip()
         if not sid:
@@ -433,12 +441,16 @@ class ParallelScheduler:
         except Exception as e:
             job.notes.append(f"abort confirm status raised: {e}")
             return False
-        if not isinstance(code, int) or not (200 <= code < 300) or not isinstance(status, dict):
+        if not isinstance(code, int) or not (200 <= code < 300):
             job.notes.append(
                 f"abort confirm status unusable http={code} body_type={type(status).__name__}"
             )
             return False
-        return not self.is_session_busy(status, sid)
+        activity = self.session_activity(status, sid)
+        if activity != "idle":
+            job.notes.append(f"abort confirm activity={activity} (need idle)")
+            return False
+        return True
 
     def _request_session_abort(
         self,
@@ -664,6 +676,8 @@ class ParallelScheduler:
                     cancel_requested_at=rec.cancel_requested_at,
                     cancel_effected_at=rec.cancel_effected_at,
                     dispatch_token=rec.dispatch_token,
+                    dispatch_user_message_id=str(getattr(rec, "dispatch_user_message_id", "") or ""),
+                    dispatch_query_id=str(getattr(rec, "dispatch_query_id", "") or ""),
                     wall_deadline=rec.wall_deadline,
                     handled_perm_ids=set(rec.handled_perm_ids),
                     notes=list(rec.notes)
@@ -705,6 +719,8 @@ class ParallelScheduler:
                 cancel_requested_at=rec.cancel_requested_at,
                 cancel_effected_at=rec.cancel_effected_at,
                 dispatch_token=rec.dispatch_token,
+                dispatch_user_message_id=str(getattr(rec, "dispatch_user_message_id", "") or ""),
+                dispatch_query_id=str(getattr(rec, "dispatch_query_id", "") or ""),
                 wall_deadline=rec.wall_deadline,
                 handled_perm_ids=set(rec.handled_perm_ids),
                 notes=list(rec.notes) + ["restored from state_store; full charter contract; no re-dispatch"],
@@ -777,10 +793,12 @@ class ParallelScheduler:
                 self._persist_job(job)
                 return
         job.session_id = sid
+        prompt = g.prompt_body(job.instruction)
+        job.dispatch_query_id = str(prompt.get("queryID") or "")
         code, _ = self.ta_call(
             "POST",
             f"/session/{sid}/prompt_async",
-            body=g.prompt_body(job.instruction),
+            body=prompt,
             extra_headers={"x-opencode-directory": ws},
         )
         if code not in (200, 204) and code >= 300:
@@ -789,10 +807,22 @@ class ParallelScheduler:
             job.finished_at = time.time()
             self._persist_job(job)
             return
+        # Bind completion evidence to this dispatch's user message when available.
+        try:
+            mc, msgs = self.ta_call("GET", f"/session/{sid}/message")
+            if isinstance(mc, int) and 200 <= mc < 300 and isinstance(msgs, list):
+                uid = g.latest_user_message_id(msgs)
+                if uid:
+                    job.dispatch_user_message_id = uid
+        except Exception as e:
+            job.notes.append(f"dispatch user message id capture failed: {e}")
         job.state = JobState.RUNNING
         job.started_at = time.time()
         job.wall_deadline = job.started_at + job.timeout_sec
-        job.notes.append(f"started session={sid} workdir={ws} dispatch_token={token[:8]}")
+        job.notes.append(
+            f"started session={sid} workdir={ws} dispatch_token={token[:8]}"
+            f" user_msg={job.dispatch_user_message_id or '-'} query={job.dispatch_query_id or '-'}"
+        )
         self._persist_job(job)
 
     def _start_job_dry(self, job: JobSlot) -> None:
@@ -1506,35 +1536,35 @@ class ParallelScheduler:
                 job.result["markers"] = [str(m) for m in markers]
             return
 
-        # Live: require usable status (HTTP 2xx + dict structure), session idle, ALL artifacts,
-        # message read success, and this-round successful finish — BEFORE any acceptance branch
+        # Live: require HTTP 2xx + strict activity==idle, ALL artifacts, message read
+        # success, and this-round successful finish — BEFORE any acceptance branch
         # (including force_lead_review). Lead pass cannot convert hard failures into success.
         sc, status = self.ta_call("GET", "/session/status")
         status_ok = isinstance(sc, int) and 200 <= sc < 300
-        # Valid structure: must be a dict. 200 + string/list must NOT count as idle/usable.
-        status_usable = status_ok and isinstance(status, dict) and not (
-            status.get("error")
-            and job.session_id
-            and job.session_id not in status
-            and not any(
-                isinstance(v, dict) and v.get("sessionID") == job.session_id
-                for v in status.values()
-            )
-        )
-        # Explicit error object / non-2xx / malformed body must NOT be treated as idle.
-        if not status_usable:
+        if not status_ok:
             job.busy = True
             job.notes.append(
                 f"session status unusable http={sc} body_type={type(status).__name__}; not idle"
             )
             return
 
-        job.busy = self.is_session_busy(status, job.session_id)
+        activity = self.session_activity(status, job.session_id)
+        # unknown (error dict / unrecognized entry) and busy both block completion.
+        if activity != "idle":
+            job.busy = True
+            if activity == "unknown":
+                job.notes.append(
+                    f"session status activity=unknown http={sc}; not idle"
+                )
+            return
+
+        job.busy = False
         complete, arts = _arts_complete()
-        if job.busy or not complete:
+        if not complete:
             return
 
         # Fetch this-round assistant finish/error — required for ALL acceptance paths.
+        # Bound to latest user / recorded dispatch user message (never reuse older stop).
         fin = None
         err = ""
         msgs = None
@@ -1553,9 +1583,26 @@ class ParallelScheduler:
                     and 200 <= int(msg_http) < 300
                     and msgs is not None
                 )
-                asst = g.last_assistant(msgs) if messages_ok else None
+                asst = (
+                    g.this_round_assistant(
+                        msgs,
+                        dispatch_user_message_id=job.dispatch_user_message_id or None,
+                    )
+                    if messages_ok
+                    else None
+                )
+                # If we still lack a recorded dispatch user id, capture latest user for persist.
+                if messages_ok and not job.dispatch_user_message_id:
+                    uid = g.latest_user_message_id(msgs)
+                    if uid:
+                        job.dispatch_user_message_id = uid
                 fin = g.assistant_finish(asst) if asst is not None else None
                 err = g.assistant_error(asst) if asst is not None else ""
+                if messages_ok and asst is None:
+                    job.notes.append(
+                        "completion gate: no this-round assistant for latest user "
+                        f"(dispatch_user={job.dispatch_user_message_id or '-'})"
+                    )
             except Exception as e:
                 job.notes.append(f"assistant parse failed: {e}")
                 messages_ok = False

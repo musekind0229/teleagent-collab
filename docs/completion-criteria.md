@@ -43,3 +43,8 @@ python3 -m test_p0_security
 - 看本轮 assistant `finish`/`error`；无 `force_lead_review` 时文件存在也不足以 DONE（需 `finish` in stop/complete）。
 - 验收包使用真实 execution_result / error / 工具证据；生产路径禁止替组长补 `application_id`（仅 dry_run 可 stitch）。
 - Linux adapter：默认仅 loopback；`urlopen` 禁用环境代理，拒绝非 loopback 重定向。
+
+## Astra 第三轮门禁
+
+- 统一三态 `parse_session_activity`：`busy` / `idle` / `unknown`。error 字典、未识别 `type`、非 dict → `unknown`；**仅 `idle`** 可确认停止（cancel）或进入完成验收。取消确认与完成检查共用同一解析器。
+- 完成证据绑定本轮：记录/恢复 `dispatch_user_message_id`（及 `dispatch_query_id`）；`this_round_assistant` 只接受最新 user 的 parentID 对应 assistant；有更新 user 而无其完成 → 不得 DONE。强制/非强制验收前共用。

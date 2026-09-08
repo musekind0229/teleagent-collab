@@ -224,40 +224,176 @@ def call_lead_request(
 
 
 
-def session_busy(status_obj, sid: str) -> bool:
+# Local /session/status contract: busy map or {}. Known entry types only.
+_SESSION_BUSY_TYPES = frozenset({"busy", "running"})
+_SESSION_IDLE_TYPES = frozenset({"idle"})
+
+
+def _message_info(m):
+    if not isinstance(m, dict):
+        return None
+    info = m.get("info")
+    if isinstance(info, dict):
+        return info
+    return m if m.get("role") else None
+
+
+def _entry_activity(entry) -> str:
+    """busy | idle | unknown for one status entry."""
+    if not isinstance(entry, dict):
+        return "unknown"
+    t = entry.get("type") if entry.get("type") is not None else entry.get("status")
+    if t in _SESSION_BUSY_TYPES:
+        return "busy"
+    if t in _SESSION_IDLE_TYPES:
+        return "idle"
+    return "unknown"
+
+
+def _is_valid_status_map(status_obj: dict) -> bool:
+    """True when body is a legitimate session status map (incl. empty {}).
+
+    Error objects and non-entry values are rejected. Every value must be a dict
+    whose type/status is a known busy/idle token (or absent type with sessionID).
+    """
+    if not isinstance(status_obj, dict):
+        return False
     if not status_obj:
-        return False
-    if isinstance(status_obj, dict):
-        # shapes: {sid: {type:busy}} or list
-        if sid in status_obj:
-            st = status_obj[sid]
-            if isinstance(st, dict):
-                return st.get("type") == "busy" or st.get("status") == "busy"
-        for v in status_obj.values():
-            if isinstance(v, dict) and v.get("sessionID") == sid and v.get("type") == "busy":
-                return True
-        return False
-    if isinstance(status_obj, list):
-        for v in status_obj:
-            if isinstance(v, dict) and (v.get("sessionID") == sid or v.get("id") == sid):
-                if v.get("type") == "busy" or v.get("status") == "busy":
-                    return True
-    return False
+        return True
+    # Pure error envelope — not a status map.
+    if "error" in status_obj and not isinstance(status_obj.get("error"), dict):
+        others = [k for k in status_obj.keys() if k != "error"]
+        if not others:
+            return False
+        # error alongside unrelated keys still unusable unless every other value is a session entry
+    for key, val in status_obj.items():
+        if key == "error" and not isinstance(val, dict):
+            return False
+        if not isinstance(val, dict):
+            return False
+        t = val.get("type") if val.get("type") is not None else val.get("status")
+        if t is None:
+            # allow sessionID-shaped rows without type only if they carry sessionID
+            if "sessionID" not in val and "status" not in val and "type" not in val:
+                return False
+            continue
+        if t not in _SESSION_BUSY_TYPES and t not in _SESSION_IDLE_TYPES:
+            return False
+    return True
+
+
+def parse_session_activity(status_obj, sid: str) -> str:
+    """Strict three-state session activity: busy | idle | unknown.
+
+    Per local API contract, a valid empty map or absence of *sid* from a valid
+    busy-map means idle. Error objects, non-dict bodies, and unrecognized entry
+    types are unknown — never treated as idle.
+    """
+    sid = (sid or "").strip()
+    if not isinstance(status_obj, dict):
+        return "unknown"
+    if not _is_valid_status_map(status_obj):
+        return "unknown"
+    if not sid:
+        return "unknown"
+    if sid in status_obj:
+        return _entry_activity(status_obj[sid])
+    for v in status_obj.values():
+        if isinstance(v, dict) and v.get("sessionID") == sid:
+            return _entry_activity(v)
+    # Valid map and sid absent → not busy → idle (contract: busy map or {}).
+    return "idle"
+
+
+def session_busy(status_obj, sid: str) -> bool:
+    """True when activity is busy *or* unknown (not proven idle).
+
+    Prefer parse_session_activity for call sites that must distinguish unknown.
+    """
+    return parse_session_activity(status_obj, sid) != "idle"
 
 
 def last_assistant(messages):
     if not isinstance(messages, list):
         return None
     for m in reversed(messages):
-        info = m.get("info") if isinstance(m, dict) else None
+        info = _message_info(m)
         if not isinstance(info, dict):
-            # sometimes role at top
-            if isinstance(m, dict) and m.get("role") == "assistant":
-                return m
             continue
         if info.get("role") == "assistant":
             return m
     return None
+
+
+def latest_user_message(messages):
+    """Return the last user message dict, or None."""
+    if not isinstance(messages, list):
+        return None
+    for m in reversed(messages):
+        info = _message_info(m)
+        if isinstance(info, dict) and info.get("role") == "user":
+            return m
+    return None
+
+
+def message_id_of(msg) -> str:
+    info = _message_info(msg) if msg is not None else None
+    if not isinstance(info, dict):
+        return ""
+    for k in ("id", "messageID", "message_id"):
+        v = info.get(k)
+        if v:
+            return str(v)
+    return ""
+
+
+def latest_user_message_id(messages) -> str:
+    return message_id_of(latest_user_message(messages))
+
+
+def assistant_for_user(messages, user_message_id: str):
+    """Assistant whose parentID matches the given user message id (latest such)."""
+    if not isinstance(messages, list) or not (user_message_id or "").strip():
+        return None
+    uid = str(user_message_id).strip()
+    found = None
+    for m in messages:
+        info = _message_info(m)
+        if not isinstance(info, dict) or info.get("role") != "assistant":
+            continue
+        parent = info.get("parentID") or info.get("parent_id") or info.get("parentId")
+        if parent is not None and str(parent) == uid:
+            found = m
+    return found
+
+
+def this_round_assistant(messages, *, dispatch_user_message_id: str | None = None):
+    """Assistant completion bound to the current user turn.
+
+    Rules:
+    - If any user message exists, only accept an assistant whose parentID equals
+      the *latest* user message id (newer user without its reply → None).
+    - If dispatch_user_message_id is set and a newer user exists after it,
+      still require the latest user's reply (never reuse an older finish=stop).
+    - If dispatch_user_message_id is set and equals latest user, require that pair.
+    - If there is no user message in the list, fall back to last_assistant
+      (legacy single-assistant probes) unless dispatch_user_message_id is set
+      (then None — cannot prove this-round binding).
+    """
+    if not isinstance(messages, list):
+        return None
+    latest_user = latest_user_message(messages)
+    latest_uid = message_id_of(latest_user) if latest_user is not None else ""
+    dispatch_uid = (dispatch_user_message_id or "").strip()
+
+    if latest_uid:
+        # Newer user than our dispatch (or unknown dispatch) → must complete latest.
+        return assistant_for_user(messages, latest_uid)
+
+    if dispatch_uid:
+        # Recorded dispatch id but messages lack user rows → cannot bind.
+        return None
+    return last_assistant(messages)
 
 
 def assistant_finish(msg) -> str | None:
@@ -738,7 +874,7 @@ def run_job(
             continue
 
         mc, msgs = call("GET", f"/session/{sid}/message")
-        asst = last_assistant(msgs)
+        asst = this_round_assistant(msgs)
         fin = assistant_finish(asst)
         err = assistant_error(asst)
         report["finish"] = fin
@@ -828,7 +964,7 @@ def run_job(
                     break
                 time.sleep(1.5)
             mc, msgs = call("GET", f"/session/{sid}/message")
-            asst = last_assistant(msgs)
+            asst = this_round_assistant(msgs)
             report["finish"] = assistant_finish(asst)
             verdict2 = _do_lead_review(phase="review2")
             if verdict2 == "pass" and _all_arts_ok():
