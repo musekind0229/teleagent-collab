@@ -1,5 +1,8 @@
 # teleagent-collab
 
+> 本地 Windows 适配分支：`windows-codex-lead`。见 [Windows 预览说明](windows/README.zh-CN.md) 和 [原版设计评审](docs/DESIGN-REVIEW.zh-CN.md)。
+> Windows 新入口为 `windows/collab.ps1` / `python -m win_collab`；下方原版 `src/` 仍保留供对照，其安全与验收限制见评审。真实 Windows 鉴权接入尚待验证。
+
 把天翼星辰 **TeleAgent** 当成编排里的便宜工人：用本地 HTTP（`:4399`）下单、等完结、接权限弹窗；**组长/门禁可插拔**（烟测默认 Grok Build），不焊死某一家。
 
 > GitHub About: `Scriptable TeleAgent worker loop: pluggable lead approval, evidence review, and portal-metering via queryID.`

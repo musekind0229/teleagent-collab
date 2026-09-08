@@ -1,0 +1,11 @@
+{
+  "name": "windows-hello",
+  "goal": "Create hello.txt containing exactly Hello from TeleAgent on Windows! followed by a newline.",
+  "must": ["Create only hello.txt in the assigned workspace", "Use a file-writing tool; do not run a shell"],
+  "must_not": ["Access other directories", "Use the network", "Read credentials or change settings"],
+  "artifacts": ["hello.txt"],
+  "acceptance": "The lead independently reads hello.txt and verifies the exact line. A file merely existing is insufficient.",
+  "timeout_sec": 600,
+  "max_lead_requests": 8,
+  "max_redos": 1
+}

@@ -45,3 +45,5 @@ jobs/state/
 jobs/agy-account-pool.json
 jobs/agy_account_pool.json
 !jobs/examples/agy_account_pool.example.json
+.collab-state/
+windows/local/
