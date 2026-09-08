@@ -240,7 +240,10 @@ class TestCompletionStatusGate(unittest.TestCase):
             if path == "/session/status":
                 return 200, {"sess": {"type": "idle"}}
             if "/message" in path:
-                return 200, [{"info": {"role": "assistant", "finish": "stop"}}]
+                return 200, [
+                    {"info": {"role": "user", "id": "u1"}},
+                    {"info": {"role": "assistant", "id": "a1", "parentID": "u1", "finish": "stop"}},
+                ]
             return 200, {}
 
         with tempfile.TemporaryDirectory() as d:
@@ -254,6 +257,7 @@ class TestCompletionStatusGate(unittest.TestCase):
             )
             job = sched.enqueue_charter(_charter(force_lead_review=False))
             job.session_id = "sess"
+            job.dispatch_user_message_id = "u1"
             job.state = JobState.RUNNING
             job.started_at = time.time()
             Path(job.expected_artifacts[0]).write_text("OK")
@@ -305,7 +309,10 @@ class TestCompletionStatusGate(unittest.TestCase):
             if path == "/session/status":
                 return 200, {"sess": {"type": "idle"}}
             if "/message" in path:
-                return 200, [{"info": {"role": "assistant", "finish": "cancelled"}}]
+                return 200, [
+                    {"info": {"role": "user", "id": "u1"}},
+                    {"info": {"role": "assistant", "id": "a1", "parentID": "u1", "finish": "cancelled"}},
+                ]
             return 200, {}
 
         with tempfile.TemporaryDirectory() as d:
@@ -320,6 +327,7 @@ class TestCompletionStatusGate(unittest.TestCase):
             )
             job = sched.enqueue_charter(_charter(force_lead_review=True))
             job.session_id = "sess"
+            job.dispatch_user_message_id = "u1"
             job.state = JobState.RUNNING
             job.started_at = time.time()
             Path(job.expected_artifacts[0]).write_text("OK")
@@ -847,6 +855,65 @@ class TestLinuxLoopbackGuard(unittest.TestCase):
             for server in (source, sink):
                 server.shutdown()
                 server.server_close()
+
+
+
+class TestBindingFallbackNoLastAssistant(unittest.TestCase):
+    """Missing turn identity must not fall back to last_assistant / DONE."""
+
+    def _run(self, messages, *, force=False, dispatch_id=None):
+        def transport(method, path, *a, **k):
+            if path == "/session/status":
+                return 200, {"sess": {"type": "idle"}}
+            if "/message" in path:
+                return 200, messages
+            return 200, {}
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            sched = ParallelScheduler(
+                workspaces_root=root / "ws",
+                runs_root=root / "runs",
+                teleagent_call=transport,
+                persist=False,
+                dry_run=False,
+            )
+            job = sched.enqueue_charter(_charter(force_lead_review=force))
+            job.session_id = "sess"
+            if dispatch_id is not None:
+                job.dispatch_user_message_id = dispatch_id
+            job.state = JobState.RUNNING
+            job.started_at = time.time()
+            Path(job.expected_artifacts[0]).write_text("OK")
+            sched.refresh_job_status(job)
+            self.assertNotEqual(job.state, JobState.DONE)
+            self.assertIsNot(True, (job.result or {}).get("ok"))
+            sched.shutdown()
+
+    def test_no_user_rows_not_done(self):
+        self._run([{"info": {"role": "assistant", "id": "old", "finish": "stop", "parentID": "old-user"}}])
+
+    def test_no_user_rows_force_not_done(self):
+        self._run(
+            [{"info": {"role": "assistant", "id": "old", "finish": "stop", "parentID": "old-user"}}],
+            force=True,
+        )
+
+    def test_latest_user_without_id_not_done(self):
+        self._run(
+            [
+                {"info": {"role": "assistant", "id": "old", "finish": "stop", "parentID": "old-user"}},
+                {"info": {"role": "user"}},
+            ]
+        )
+
+    def test_missing_dispatch_id_restore_unbound_not_done(self):
+        # Simulate restore without captured dispatch id; only unbound assistant.
+        self._run(
+            [{"info": {"role": "assistant", "id": "old", "finish": "stop", "parentID": "old-user"}}],
+            dispatch_id="",
+        )
+
 
 
 if __name__ == "__main__":

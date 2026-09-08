@@ -371,14 +371,14 @@ def this_round_assistant(messages, *, dispatch_user_message_id: str | None = Non
     """Assistant completion bound to the current user turn.
 
     Rules:
-    - If any user message exists, only accept an assistant whose parentID equals
-      the *latest* user message id (newer user without its reply → None).
+    - If any user message exists with an id, only accept an assistant whose
+      parentID equals the *latest* user message id (newer user without its
+      reply → None).
     - If dispatch_user_message_id is set and a newer user exists after it,
       still require the latest user's reply (never reuse an older finish=stop).
     - If dispatch_user_message_id is set and equals latest user, require that pair.
-    - If there is no user message in the list, fall back to last_assistant
-      (legacy single-assistant probes) unless dispatch_user_message_id is set
-      (then None — cannot prove this-round binding).
+    - If latest_uid and dispatch_uid both cannot prove turn binding → None.
+      Never fall back to last_assistant (no production backdoor).
     """
     if not isinstance(messages, list):
         return None
@@ -390,10 +390,8 @@ def this_round_assistant(messages, *, dispatch_user_message_id: str | None = Non
         # Newer user than our dispatch (or unknown dispatch) → must complete latest.
         return assistant_for_user(messages, latest_uid)
 
-    if dispatch_uid:
-        # Recorded dispatch id but messages lack user rows → cannot bind.
-        return None
-    return last_assistant(messages)
+    # Missing latest user id and/or no dispatch id: cannot prove this-round bind.
+    return None
 
 
 def assistant_finish(msg) -> str | None:
