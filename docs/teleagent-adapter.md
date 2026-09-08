@@ -60,3 +60,7 @@ python3 test_hard_rules.py
 ## Question API（P3）
 
 见 [`question-api.md`](question-api.md)。Linux 已接 list/reply/reject；Win blocked；doctor extras 记录探测。
+
+## Loopback / proxy (Astra P1)
+
+`LinuxLocalV1Adapter` defaults to loopback-only `base_url` (127.0.0.1/localhost/::1). HTTP calls use a ProxyHandler that ignores env proxies; redirects off loopback are refused unless `allow_non_loopback=True`.

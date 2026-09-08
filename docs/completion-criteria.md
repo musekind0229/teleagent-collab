@@ -36,3 +36,10 @@ python3 -m test_p0_security
 ```
 
 真机：需 TeleAgent `:4399` + lead 适配器；本仓库 P1 验收以模拟测例为准。
+
+## Astra P1 完成判定加固
+
+- `/session/status` 非 2xx / 无效 body（含纯 error 对象）**不得**当 idle。
+- 看本轮 assistant `finish`/`error`；无 `force_lead_review` 时文件存在也不足以 DONE（需 `finish` in stop/complete）。
+- 验收包使用真实 execution_result / error / 工具证据；生产路径禁止替组长补 `application_id`（仅 dry_run 可 stitch）。
+- Linux adapter：默认仅 loopback；`urlopen` 禁用环境代理，拒绝非 loopback 重定向。

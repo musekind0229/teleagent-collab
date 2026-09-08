@@ -353,7 +353,7 @@ class ParallelScheduler:
     def _persist_job(self, job: JobSlot) -> None:
         if not self.persist or self.state_store is None:
             return
-        from state_store import JobRecord
+        from state_store import CONTRACT_VERSION, JobRecord
         rec = JobRecord(
             job_id=job.job_id,
             name=job.name,
@@ -372,6 +372,12 @@ class ParallelScheduler:
             notes=list(job.notes),
             result=dict(job.result or {}),
             handled_perm_ids=sorted(job.handled_perm_ids),
+            contract_version=CONTRACT_VERSION,
+            charter=dict(job.charter or {}),
+            instruction=str(job.instruction or ""),
+            expected_artifacts=list(job.expected_artifacts or []),
+            force_lead_review=bool(job.force_lead_review),
+            rework_budget=dict((job.result or {}).get("rework_budget") or {}),
         )
         self.state_store.upsert_job(rec)
 
@@ -412,12 +418,95 @@ class ParallelScheduler:
             "state": JobState.CANCEL_REQUESTED.value,
         }
 
+    def _request_session_abort(self, job: JobSlot) -> dict:
+        """Ask the worker to stop via adapter.cancel / POST /session/{id}/abort.
+
+        Receiving the cancel request is NOT the same as execution stopped.
+        Returns ok=True only when abort is confirmed (2xx) or there is no session.
+        """
+        sid = (job.session_id or "").strip()
+        if not sid:
+            return {"attempted": False, "ok": True, "note": "no_session_to_abort"}
+        path = f"/session/{sid}/abort"
+        # dry_run without injected transport: local stop only (no live worker)
+        if self.dry_run and self._teleagent_call is None:
+            job.notes.append(f"dry abort assumed ok path={path}")
+            return {"attempted": True, "ok": True, "http": 200, "path": path, "note": "dry_local"}
+        try:
+            code, body = self.ta_call("POST", path, body={})
+        except Exception as e:
+            job.notes.append(f"abort raised: {e}")
+            return {"attempted": True, "ok": False, "error": str(e), "path": path}
+        ok = isinstance(code, int) and 200 <= code < 300
+        job.notes.append(f"abort http={code} path={path} ok={ok}")
+        return {"attempted": True, "ok": ok, "http": code, "body": body, "path": path}
+
     def effect_cancel(self, job_id: str, *, error: str = "cancelled by request") -> dict:
-        """Stop this job only. Distinguishes from cancel_requested."""
+        """Stop this job only. Distinguishes cancel_requested from execution stopped.
+
+        Always attempts session abort first when a session exists. Abort failure /
+        unknown status keeps the job in cancel_requested (stop pending confirm);
+        cancel_effected is True only after abort is confirmed (or no session).
+        """
         with self._lock:
             job = self.jobs.get(job_id)
             if job is None:
                 return {"ok": False, "error": "unknown_job"}
+            if job.state == JobState.CANCELLED and job.cancel_effected_at:
+                return {
+                    "ok": True,
+                    "job_id": job_id,
+                    "cancel_requested": bool(job.cancel_requested_at),
+                    "cancel_effected": True,
+                    "state": JobState.CANCELLED.value,
+                    "note": "already_cancelled",
+                }
+            if job.state not in (JobState.CANCEL_REQUESTED, JobState.RUNNING, JobState.PENDING_APPROVAL, JobState.STARTING):
+                if job.state in (JobState.DONE, JobState.FAIL, JobState.TIMEOUT):
+                    return {
+                        "ok": True,
+                        "job_id": job_id,
+                        "cancel_requested": bool(job.cancel_requested_at),
+                        "cancel_effected": False,
+                        "state": job.state.value,
+                        "note": "already_terminal",
+                    }
+            if job.state != JobState.CANCEL_REQUESTED:
+                job.state = JobState.CANCEL_REQUESTED
+                job.cancel_requested_at = job.cancel_requested_at or time.time()
+
+        abort = self._request_session_abort(job)
+        if not abort.get("ok"):
+            # Keep stop-pending: request received ≠ process stopped
+            with self._lock:
+                job.state = JobState.CANCEL_REQUESTED
+                job.notes.append(
+                    "abort failed/unknown — stop pending confirm; not marking cancel_effected"
+                )
+                job.result = {
+                    "ok": False,
+                    "state": "cancel_requested",
+                    "error": error,
+                    "abort": abort,
+                    "stop_pending_confirm": True,
+                    "job_id": job_id,
+                    "session_id": job.session_id,
+                    "cancel_requested_at": job.cancel_requested_at,
+                    "cancel_effected_at": None,
+                    "notes": list(job.notes),
+                }
+            self._persist_job(job)
+            return {
+                "ok": False,
+                "job_id": job_id,
+                "cancel_requested": True,
+                "cancel_effected": False,
+                "stop_pending_confirm": True,
+                "abort": abort,
+                "state": JobState.CANCEL_REQUESTED.value,
+            }
+
+        with self._lock:
             job.state = JobState.CANCELLED
             job.cancel_effected_at = time.time()
             job.finished_at = time.time()
@@ -426,6 +515,7 @@ class ParallelScheduler:
                 "ok": False,
                 "state": "cancelled",
                 "error": error,
+                "abort": abort,
                 "job_id": job_id,
                 "session_id": job.session_id,
                 "cancel_requested_at": job.cancel_requested_at,
@@ -446,6 +536,7 @@ class ParallelScheduler:
             "job_id": job_id,
             "cancel_requested": bool(job.cancel_requested_at),
             "cancel_effected": True,
+            "abort": abort,
             "state": JobState.CANCELLED.value,
         }
 
@@ -453,30 +544,79 @@ class ParallelScheduler:
         """Hydrate slots from StateStore after process restart.
 
         Does NOT re-dispatch already-started sessions; does NOT re-send decisions.
+        Missing / version-incompatible charter contracts BLOCK resume (no empty constraints).
         """
         if self.state_store is None:
-            return {"restored": 0, "plan": {}}
-        from state_store import TERMINAL
+            return {"restored": 0, "blocked": 0, "plan": {}}
+        from state_store import CONTRACT_VERSION, TERMINAL
         plan = self.state_store.resume_plan()
         restored = 0
+        blocked = 0
+        blocked_ids: list[str] = []
         for rec in self.state_store.list_jobs():
             if rec.job_id in self.jobs:
                 continue
-            # Minimal slot — charter may be missing; mark restored so we skip re-prompt
             workdir = Path(rec.workdir) if rec.workdir else (self.workspaces_root / rec.job_id)
             workdir.mkdir(parents=True, exist_ok=True)
             try:
                 st = JobState(rec.state)
             except ValueError:
                 st = JobState.FAIL
+            ok_contract, why = rec.contract_ok(expect_version=CONTRACT_VERSION)
+            if not ok_contract:
+                # Block: never continue with empty must/must_not/artifacts
+                blocked += 1
+                blocked_ids.append(rec.job_id)
+                slot = JobSlot(
+                    job_id=rec.job_id,
+                    name=rec.name or rec.job_id,
+                    charter=dict(rec.charter or {"goal": "(blocked-restore)", "must": [], "must_not": []}),
+                    instruction=str(rec.instruction or ""),
+                    expected_artifacts=list(rec.expected_artifacts or []),
+                    workdir=workdir,
+                    timeout_sec=rec.timeout_sec,
+                    force_lead_review=bool(rec.force_lead_review),
+                    state=JobState.FAIL,
+                    session_id=rec.session_id,
+                    started_at=rec.started_at,
+                    finished_at=time.time(),
+                    cancel_requested_at=rec.cancel_requested_at,
+                    cancel_effected_at=rec.cancel_effected_at,
+                    dispatch_token=rec.dispatch_token,
+                    wall_deadline=rec.wall_deadline,
+                    handled_perm_ids=set(rec.handled_perm_ids),
+                    notes=list(rec.notes)
+                    + [f"restore BLOCKED: {why}; refusing empty-constraint resume"],
+                    result={
+                        "ok": False,
+                        "state": "fail",
+                        "error": f"restore_contract_blocked:{why}",
+                        "contract_version": rec.contract_version,
+                    },
+                    restored=True,
+                    dry=self.dry_run,
+                )
+                with self._lock:
+                    self.jobs[rec.job_id] = slot
+                self._persist_job(slot)
+                continue
+            arts = list(rec.expected_artifacts or [])
+            if not arts:
+                # Prefer resolving from restored charter against workdir
+                try:
+                    from charter import expected_artifacts as resolve_arts
+                    arts = resolve_arts(rec.charter, workspace=workdir)
+                except Exception:
+                    arts = []
             slot = JobSlot(
                 job_id=rec.job_id,
                 name=rec.name or rec.job_id,
-                charter={"goal": "(restored)", "must": [], "must_not": [], "allow_paths": [], "done_when": {}},
-                instruction="",
-                expected_artifacts=[],
+                charter=dict(rec.charter),
+                instruction=str(rec.instruction or ""),
+                expected_artifacts=arts,
                 workdir=workdir,
                 timeout_sec=rec.timeout_sec,
+                force_lead_review=bool(rec.force_lead_review),
                 state=st,
                 session_id=rec.session_id,
                 started_at=rec.started_at,
@@ -486,22 +626,23 @@ class ParallelScheduler:
                 dispatch_token=rec.dispatch_token,
                 wall_deadline=rec.wall_deadline,
                 handled_perm_ids=set(rec.handled_perm_ids),
-                notes=list(rec.notes) + ["restored from state_store; no re-dispatch"],
+                notes=list(rec.notes) + ["restored from state_store; full charter contract; no re-dispatch"],
                 result=dict(rec.result or {}),
                 restored=True,
                 dry=self.dry_run,
             )
-            # Re-apply decisions so we never re-reply
             for d in self.state_store._decisions.values():
                 if d.job_id == rec.job_id:
                     slot.handled_perm_ids.add(d.permission_id)
             with self._lock:
                 self.jobs[rec.job_id] = slot
             restored += 1
-        # Effect any cancel_requested left mid-flight
+        # Effect any cancel_requested left mid-flight (will abort worker)
         for jid in plan.get("effect_cancel") or []:
+            if jid in blocked_ids:
+                continue
             self.effect_cancel(jid, error="cancel effected on restore")
-        return {"restored": restored, "plan": plan}
+        return {"restored": restored, "blocked": blocked, "blocked_ids": blocked_ids, "plan": plan}
 
     # --- start jobs --------------------------------------------------------------
 
@@ -871,13 +1012,18 @@ class ParallelScheduler:
                 raw, parsed = self._glue().call_lead_request(req, schema=schema, cwd=ws)
             except Exception:
                 raw, parsed = self.call_lead(format_lead_prompt(packet, allow_hint=allow_hint), schema, ws)
-        # Test/dry fakes often omit binding fields — stitch from request so protocol still enforced live.
-        if isinstance(parsed, dict) and "decision" in parsed and "application_id" not in parsed:
+        # dry_run ONLY: stitch binding fields for test fakes. Production must reject unbound output.
+        if (
+            self.dry_run
+            and isinstance(parsed, dict)
+            and "decision" in parsed
+            and "application_id" not in parsed
+        ):
             parsed = {
                 **parsed,
                 "application_id": req["application_id"],
                 "context_summary": req.get("context_summary", ""),
-                "reason": parsed.get("reason") or "dry_or_injected_lead",
+                "reason": parsed.get("reason") or "dry_injected_lead",
             }
             raw = __import__("json").dumps(parsed)
         try:
@@ -1129,8 +1275,16 @@ class ParallelScheduler:
             job.busy = False
             self._persist_job(job)
 
-        def _run_force_lead_review(arts: list[str]) -> bool:
+        def _run_force_lead_review(arts: list[str], *, execution_result: dict | None = None, error: str = "") -> bool:
             """Return True if lead passed and fingerprints stable. Parallel + serial."""
+            # Real evidence only — never fixed fake execution_result / empty error placeholders.
+            exec_res = dict(execution_result or {})
+            exec_res.setdefault("job_id", job.job_id)
+            exec_res.setdefault("session_id", job.session_id)
+            exec_res.setdefault("artifacts", arts)
+            tool_evidence = list(job.api_replies or []) + [
+                {"summary": s} if isinstance(s, str) else s for s in (job.pending_summaries or [])
+            ]
             packet = build_acceptance_packet(
                 job_name=job.name,
                 goal=(job.charter or {}).get("goal") or job.instruction[:240],
@@ -1138,9 +1292,9 @@ class ParallelScheduler:
                 or (job.charter or {}).get("done_when")
                 or {"artifacts": job.expected_artifacts},
                 expected_artifacts=job.expected_artifacts,
-                execution_result={"job_id": job.job_id, "path": "scheduler"},
-                error="",
-                tool_records=job.pending_summaries,
+                execution_result=exec_res,
+                error=error or str((job.result or {}).get("error") or ""),
+                tool_records=tool_evidence,
                 api_replies=job.api_replies,
                 notes=job.notes,
                 state=job.state.value,
@@ -1178,8 +1332,9 @@ class ParallelScheduler:
                         schema,
                         str(job.workdir),
                     )
-            if isinstance(parsed, dict):
-                # Map permission-style dry stubs → review verdict; stitch binding fields
+            if isinstance(parsed, dict) and self.dry_run:
+                # dry_run ONLY: map permission-style stubs + stitch binding fields for tests.
+                # Production path must reject missing/wrong application_id or context.
                 if "verdict" not in parsed and parsed.get("decision") in ("once", "reject", "deny_job"):
                     parsed = {
                         **parsed,
@@ -1190,7 +1345,7 @@ class ParallelScheduler:
                         **parsed,
                         "application_id": req["application_id"],
                         "context_summary": req.get("context_summary", ""),
-                        "reason": parsed.get("reason") or "dry_or_injected_lead",
+                        "reason": parsed.get("reason") or "dry_injected_lead",
                     }
                     raw = __import__("json").dumps(parsed)
             try:
@@ -1217,11 +1372,30 @@ class ParallelScheduler:
             deadline = job.wall_deadline
         if deadline is not None and time.time() > deadline:
             complete, arts = _arts_complete()
+            # Must still ask the worker to stop; timeout ≠ silent slot release.
+            abort = self._request_session_abort(job)
+            if not abort.get("ok"):
+                job.notes.append(
+                    "timeout abort failed/unknown — stop pending confirm before releasing slot"
+                )
+                job.result = {
+                    **(job.result if isinstance(job.result, dict) else {}),
+                    "ok": False,
+                    "state": "timeout_stop_pending",
+                    "error": "wall clock timeout; abort not confirmed",
+                    "abort": abort,
+                    "stop_pending_confirm": True,
+                    "artifacts": arts,
+                }
+                # Stay non-terminal (RUNNING) so a later refresh retries abort; do not free the slot.
+                self._persist_job(job)
+                return
             _fail(
                 "timeout",
                 "wall clock timeout (not success even with artifacts; this job only)",
                 arts,
             )
+            job.result["abort"] = abort
             job.notes.append(
                 f"timeout with artifacts_complete={complete} missing={missing_artifacts(job.expected_artifacts)}"
             )
@@ -1251,16 +1425,90 @@ class ParallelScheduler:
                 job.result["markers"] = [str(m) for m in markers]
             return
 
-        # Live: session idle + ALL artifacts; force_lead_review before DONE
+        # Live: require usable status (HTTP 2xx + valid body), session idle, ALL artifacts,
+        # and this-round assistant finish/error. Files alone are never DONE.
         sc, status = self.ta_call("GET", "/session/status")
+        status_ok = isinstance(sc, int) and 200 <= sc < 300
+        status_usable = status_ok and status is not None and not (
+            isinstance(status, dict)
+            and status.get("error")
+            and job.session_id
+            and job.session_id not in status
+            and not any(
+                isinstance(v, dict) and v.get("sessionID") == job.session_id
+                for v in status.values()
+                if isinstance(status, dict)
+            )
+        )
+        # Explicit error object / non-2xx must NOT be treated as idle.
+        if not status_usable:
+            job.busy = True
+            job.notes.append(
+                f"session status unusable http={sc} body_type={type(status).__name__}; not idle"
+            )
+            return
+
         job.busy = self.is_session_busy(status, job.session_id)
         complete, arts = _arts_complete()
-        if not job.busy and complete:
-            if job.force_lead_review:
-                if not _run_force_lead_review(arts):
-                    _fail("fail", "force_lead_review did not pass", arts)
-                    return
-            _succeed(arts, state="ok")
+        if job.busy or not complete:
+            return
+
+        # Fetch this-round assistant finish/error — required for non-force path.
+        fin = None
+        err = ""
+        msgs = None
+        msg_http = None
+        if job.session_id:
+            try:
+                msg_http, msgs = self.ta_call("GET", f"/session/{job.session_id}/message")
+            except Exception as e:
+                job.notes.append(f"message fetch raised: {e}")
+                msg_http, msgs = None, None
+            try:
+                g = self._glue()
+                asst = g.last_assistant(msgs) if msg_http and 200 <= int(msg_http) < 300 else None
+                fin = g.assistant_finish(asst) if asst is not None else None
+                err = g.assistant_error(asst) if asst is not None else ""
+            except Exception as e:
+                job.notes.append(f"assistant parse failed: {e}")
+
+        if err or fin == "error":
+            _fail("fail", err or "assistant finish=error", arts)
+            if isinstance(job.result, dict):
+                job.result["finish"] = fin
+                job.result["status_http"] = sc
+            return
+
+        exec_snapshot = {
+            "job_id": job.job_id,
+            "session_id": job.session_id,
+            "status_http": sc,
+            "message_http": msg_http,
+            "finish": fin,
+            "assistant_error": err,
+            "path": "scheduler_live",
+        }
+
+        if job.force_lead_review:
+            if not _run_force_lead_review(arts, execution_result=exec_snapshot, error=err or ""):
+                _fail("fail", "force_lead_review did not pass", arts)
+                return
+            _succeed(arts, state="ok", extra_notes=[f"finish={fin}"])
+            if isinstance(job.result, dict):
+                job.result["finish"] = fin
+                job.result["status_http"] = sc
+            return
+
+        # Non-force: require explicit successful finish — presence of files is not enough.
+        if fin not in ("stop", "complete", "completed"):
+            job.notes.append(
+                f"artifacts present but finish={fin!r} (need stop/complete); not DONE"
+            )
+            return
+        _succeed(arts, state="ok", extra_notes=[f"finish={fin}"])
+        if isinstance(job.result, dict):
+            job.result["finish"] = fin
+            job.result["status_http"] = sc
 
     def write_job_report(self, job: JobSlot) -> Path:
         self.runs_root.mkdir(parents=True, exist_ok=True)
@@ -1296,10 +1544,53 @@ class ParallelScheduler:
 
     # --- main loop ---------------------------------------------------------------
 
+    def scan_questions(self) -> list[dict]:
+        """Skeleton: list open questions bound to active sessions (no auto-answer).
+
+        Marks need_human on the job when a question is present. Full lead/human
+        reply wiring is follow-up work — this only brings Question into the tick path.
+        """
+        if self.dry_run and self._teleagent_call is None:
+            return []
+        try:
+            code, body = self.ta_call("GET", "/question")
+        except Exception as e:
+            return [{"error": str(e)}]
+        if not isinstance(code, int) or code >= 300 or not isinstance(body, list):
+            return []
+        with self._lock:
+            sid_to_job = {
+                j.session_id: j
+                for j in self.jobs.values()
+                if j.session_id
+                and j.state
+                in (
+                    JobState.RUNNING,
+                    JobState.PENDING_APPROVAL,
+                    JobState.STARTING,
+                )
+            }
+        found: list[dict] = []
+        for q in body:
+            if not isinstance(q, dict):
+                continue
+            sid = session_id_of_permission(q)
+            job = sid_to_job.get(sid) if sid else None
+            qid = str(q.get("id") or q.get("requestID") or "")
+            item = {"id": qid, "session_id": sid, "job_id": job.job_id if job else None}
+            if job is not None:
+                note = f"question_pending id={qid} need_human"
+                if note not in job.notes:
+                    job.notes.append(note)
+                item["need_human"] = True
+            found.append(item)
+        return found
+
     def tick(self) -> dict:
-        """One scheduler tick: start slots → scan pending → dispatch → refresh."""
+        """One scheduler tick: start slots → scan pending → questions → dispatch → refresh."""
         started = self.try_start_queued()
         pending = self.scan_pending()
+        questions = self.scan_questions()
         dispatched: list[dict] = []
         if pending:
             # 有请求才处理；禁止空扫描叫 lead
@@ -1328,6 +1619,8 @@ class ParallelScheduler:
         return {
             "started": started,
             "pending_count": len(pending),
+            "questions_count": len(questions),
+            "questions": questions,
             "dispatched": dispatched,
             "active": self.active_count(),
             "stats": self.stats.to_dict(),

@@ -69,12 +69,28 @@ class LinuxLocalV1Adapter(TeleAgentAdapterABC):
         *,
         find_creds_fn: FindCredsFn | None = None,
         lazy_creds: bool = True,
+        allow_non_loopback: bool = False,
     ) -> None:
         self.base_url = (base_url or "http://127.0.0.1:4399").rstrip("/")
+        self._allow_non_loopback = bool(allow_non_loopback)
+        self._assert_loopback_base()
         self._find_creds = find_creds_fn or default_find_creds
         self._creds: tuple[str, str, str] | None = None
         if not lazy_creds:
             self.refresh_creds()
+
+    def _assert_loopback_base(self) -> None:
+        """Refuse non-loopback base_url unless explicitly allowed (auth headers stay local)."""
+        if self._allow_non_loopback:
+            return
+        n = urlparse(self.base_url)
+        host = (n.hostname or "").lower()
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            raise AdapterError(
+                AdapterStatus.BLOCKED,
+                f"linux adapter base_url must be loopback (got host={host!r}); "
+                "pass allow_non_loopback=True only for deliberate exceptions",
+            )
 
     def refresh_creds(self) -> None:
         self._creds = self._find_creds()
@@ -92,6 +108,7 @@ class LinuxLocalV1Adapter(TeleAgentAdapterABC):
         # Prefer IPv4 loopback explicitly
         if "localhost" in self.base_url:
             self.base_url = self.base_url.replace("localhost", "127.0.0.1")
+        self._assert_loopback_base()
         self.refresh_creds()
 
     def sign_headers(self, method: str, url: str) -> dict[str, str]:
@@ -138,8 +155,22 @@ class LinuxLocalV1Adapter(TeleAgentAdapterABC):
             h.update(extra_headers)
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(url, headers=h, method=method, data=data)
+        # Do not honor HTTP(S)_PROXY for local TeleAgent — auth headers must not leave the box.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with opener.open(req, timeout=timeout) as resp:
+                # Reject redirects that leave loopback when hardening is on
+                final = resp.geturl() if hasattr(resp, "geturl") else url
+                final_host = (urlparse(final).hostname or "").lower()
+                if (
+                    not self._allow_non_loopback
+                    and final_host
+                    and final_host not in ("127.0.0.1", "localhost", "::1")
+                ):
+                    raise AdapterError(
+                        AdapterStatus.BLOCKED,
+                        f"refusing non-loopback redirect host={final_host!r}",
+                    )
                 raw = resp.read()
                 if not raw:
                     return resp.status, None

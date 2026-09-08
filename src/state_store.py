@@ -27,6 +27,8 @@ DEFAULT_STATE_ROOT = Path(__file__).resolve().parents[1] / "jobs" / "state"
 
 TERMINAL = frozenset({"done", "fail", "timeout", "cancelled"})
 ACTIVE = frozenset({"queued", "starting", "running", "pending_approval", "cancel_requested"})
+# Persist/restore job contract; bump when JobRecord charter schema changes incompatibly.
+CONTRACT_VERSION = 1
 
 
 @dataclass
@@ -101,6 +103,13 @@ class JobRecord:
     result: dict = field(default_factory=dict)
     handled_perm_ids: list[str] = field(default_factory=list)
     updated_at: float = field(default_factory=time.time)
+    # Full task contract (条6 / astra P1 restore)
+    contract_version: int = CONTRACT_VERSION
+    charter: dict = field(default_factory=dict)
+    instruction: str = ""
+    expected_artifacts: list[str] = field(default_factory=list)
+    force_lead_review: bool = False
+    rework_budget: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -126,7 +135,27 @@ class JobRecord:
             result=dict(d.get("result") or {}),
             handled_perm_ids=list(d.get("handled_perm_ids") or []),
             updated_at=float(d.get("updated_at") or time.time()),
+            contract_version=int(d.get("contract_version") or 0),
+            charter=dict(d.get("charter") or {}),
+            instruction=str(d.get("instruction") or ""),
+            expected_artifacts=list(d.get("expected_artifacts") or []),
+            force_lead_review=bool(d.get("force_lead_review")),
+            rework_budget=dict(d.get("rework_budget") or {}),
         )
+
+    def contract_ok(self, *, expect_version: int = CONTRACT_VERSION) -> tuple[bool, str]:
+        """Whether persisted charter is complete enough to resume safely."""
+        if int(self.contract_version or 0) != int(expect_version):
+            return False, f"contract_version_mismatch got={self.contract_version} want={expect_version}"
+        if not isinstance(self.charter, dict) or not self.charter:
+            return False, "charter_missing"
+        # Require core constraint keys so empty-constraint resume is impossible
+        for key in ("goal", "must", "must_not"):
+            if key not in self.charter:
+                return False, f"charter_missing_key:{key}"
+        if not isinstance(self.charter.get("must"), list) or not isinstance(self.charter.get("must_not"), list):
+            return False, "charter_constraints_invalid"
+        return True, "ok"
 
 
 class StateStore:
@@ -401,6 +430,7 @@ __all__ = [
     "DEFAULT_STATE_ROOT",
     "TERMINAL",
     "ACTIVE",
+    "CONTRACT_VERSION",
     "DecisionRecord",
     "PendingItem",
     "JobRecord",

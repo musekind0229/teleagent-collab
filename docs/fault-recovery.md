@@ -48,3 +48,9 @@ API：`scheduler.request_cancel(job_id)` → `effect_cancel(job_id)`（refresh �
 
 见交付报告中的测试表。本机 Linux TeleAgent **2.5.0**、SAC HTTP `:4399`；lead 可用 `COLLAB_LEAD_ADAPTER=inprocess` 或 grok。  
 卡住（登录/会话）须如实标阻塞，勿假装通过。
+
+## Astra P1 修复（ac1279a 复核）
+
+- 取消/超时：`effect_cancel` 与墙钟超时先 `POST /session/{id}/abort`；abort 失败保留 `cancel_requested` / `stop_pending_confirm`，不得把请求收到当成已停止。
+- 恢复合同：`JobRecord` 持久化完整 charter（must/must_not/产物/force_lead_review/授权/预算）+ `contract_version`；缺失或不兼容 → restore **阻塞**（FAIL），禁止空约束续跑。
+- 回归：`src/test_astra_p1_fixes.py`、`review/reproduce_ac1279a.py`。
