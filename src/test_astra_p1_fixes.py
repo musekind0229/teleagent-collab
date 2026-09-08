@@ -94,11 +94,16 @@ class TestCancelAbort(unittest.TestCase):
 
     def test_timeout_requests_abort(self):
         calls = []
+        aborted = {"v": False}
 
         def transport(method, path, *a, **k):
             calls.append((method, path))
             if method == "POST" and path.endswith("/abort"):
+                aborted["v"] = True
                 return 200, {}
+            # After abort accepted, status goes idle so stop can be confirmed.
+            if aborted["v"]:
+                return 200, {"sess-t": {"type": "idle"}}
             return 200, {"sess-t": {"type": "busy"}}
 
         with tempfile.TemporaryDirectory() as d:
@@ -118,6 +123,65 @@ class TestCancelAbort(unittest.TestCase):
             sched.refresh_job_status(job)
             self.assertEqual(job.state, JobState.TIMEOUT)
             self.assertTrue(any(p.endswith("/abort") for _, p in calls))
+            sched.shutdown()
+
+    def test_abort_202_busy_not_cancel_effected(self):
+        calls = []
+
+        def transport(method, path, *a, **k):
+            calls.append((method, path))
+            if path.endswith("/abort"):
+                return 202, {"accepted": True}
+            return 200, {"probe-session": {"type": "busy"}}
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            sched = ParallelScheduler(
+                workspaces_root=root / "ws",
+                runs_root=root / "runs",
+                teleagent_call=transport,
+                persist=False,
+                dry_run=False,
+            )
+            job = sched.enqueue_charter(_charter())
+            job.session_id = "probe-session"
+            job.state = JobState.RUNNING
+            sched.request_cancel(job.job_id)
+            out = sched.effect_cancel(job.job_id)
+            self.assertFalse(out.get("cancel_effected"))
+            self.assertTrue(out.get("stop_pending_confirm"))
+            self.assertEqual(job.state, JobState.CANCEL_REQUESTED)
+            self.assertTrue(any(p.endswith("/abort") for _, p in calls))
+            self.assertTrue(any(p == "/session/status" for _, p in calls))
+            sched.shutdown()
+
+    def test_timeout_abort_202_busy_stays_pending(self):
+        calls = []
+
+        def transport(method, path, *a, **k):
+            calls.append((method, path))
+            if path.endswith("/abort"):
+                return 202, {"accepted": True}
+            return 200, {"sess-t": {"type": "busy"}}
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            sched = ParallelScheduler(
+                workspaces_root=root / "ws",
+                runs_root=root / "runs",
+                teleagent_call=transport,
+                persist=False,
+                dry_run=False,
+            )
+            job = sched.enqueue_charter(_charter(timeout_sec=2, force_lead_review=False))
+            job.session_id = "sess-t"
+            job.state = JobState.RUNNING
+            job.started_at = time.time() - 10
+            Path(job.expected_artifacts[0]).write_text("x")
+            sched.refresh_job_status(job)
+            self.assertNotEqual(job.state, JobState.TIMEOUT)
+            self.assertNotEqual(job.state, JobState.CANCELLED)
+            self.assertTrue((job.result or {}).get("stop_pending_confirm"))
             sched.shutdown()
 
 
@@ -196,6 +260,100 @@ class TestCompletionStatusGate(unittest.TestCase):
             sched.refresh_job_status(job)
             self.assertEqual(job.state, JobState.DONE)
             self.assertTrue((job.result or {}).get("ok"))
+            sched.shutdown()
+
+    def _lead_pass(self, prompt, schema, cwd):
+        req = json.loads(prompt)["_lead_request"]
+        body = {
+            "application_id": req["application_id"],
+            "context_summary": req["context_summary"],
+            "verdict": "pass",
+            "reason": "bound pass",
+        }
+        return json.dumps(body), body
+
+    def test_force_review_message_500_not_ok(self):
+        def transport(method, path, *a, **k):
+            if path == "/session/status":
+                return 200, {"sess": {"type": "idle"}}
+            if "/message" in path:
+                return 500, {"error": "unavailable"}
+            return 200, {}
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            sched = ParallelScheduler(
+                workspaces_root=root / "ws",
+                runs_root=root / "runs",
+                teleagent_call=transport,
+                call_lead_fn=self._lead_pass,
+                persist=False,
+                dry_run=False,
+            )
+            job = sched.enqueue_charter(_charter(force_lead_review=True))
+            job.session_id = "sess"
+            job.state = JobState.RUNNING
+            job.started_at = time.time()
+            Path(job.expected_artifacts[0]).write_text("OK")
+            sched.refresh_job_status(job)
+            self.assertNotEqual(job.state, JobState.DONE)
+            self.assertFalse((job.result or {}).get("ok"))
+            sched.shutdown()
+
+    def test_force_review_cancelled_not_ok(self):
+        def transport(method, path, *a, **k):
+            if path == "/session/status":
+                return 200, {"sess": {"type": "idle"}}
+            if "/message" in path:
+                return 200, [{"info": {"role": "assistant", "finish": "cancelled"}}]
+            return 200, {}
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            sched = ParallelScheduler(
+                workspaces_root=root / "ws",
+                runs_root=root / "runs",
+                teleagent_call=transport,
+                call_lead_fn=self._lead_pass,
+                persist=False,
+                dry_run=False,
+            )
+            job = sched.enqueue_charter(_charter(force_lead_review=True))
+            job.session_id = "sess"
+            job.state = JobState.RUNNING
+            job.started_at = time.time()
+            Path(job.expected_artifacts[0]).write_text("OK")
+            sched.refresh_job_status(job)
+            self.assertNotEqual(job.state, JobState.DONE)
+            self.assertFalse((job.result or {}).get("ok"))
+            self.assertEqual((job.result or {}).get("finish"), "cancelled")
+            sched.shutdown()
+
+    def test_malformed_status_string_not_done(self):
+        def transport(method, path, *a, **k):
+            if path == "/session/status":
+                return 200, "not a status object"
+            if "/message" in path:
+                return 200, [{"info": {"role": "assistant", "finish": "stop"}}]
+            return 200, {}
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            sched = ParallelScheduler(
+                workspaces_root=root / "ws",
+                runs_root=root / "runs",
+                teleagent_call=transport,
+                persist=False,
+                dry_run=False,
+            )
+            job = sched.enqueue_charter(_charter(force_lead_review=False))
+            job.session_id = "sess"
+            job.state = JobState.RUNNING
+            job.started_at = time.time()
+            Path(job.expected_artifacts[0]).write_text("OK")
+            sched.refresh_job_status(job)
+            self.assertNotEqual(job.state, JobState.DONE)
+            self.assertFalse((job.result or {}).get("ok"))
             sched.shutdown()
 
 
@@ -425,6 +583,55 @@ class TestLinuxLoopbackGuard(unittest.TestCase):
 
         with self.assertRaises(AdapterError):
             LinuxLocalV1Adapter(base_url="http://example.com:4399")
+
+    def test_redirect_sends_zero_credentials_to_sink(self):
+        """Refuse redirect before a second hop sees auth headers."""
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        from teleagent_adapter.base import AdapterError
+        from teleagent_adapter.linux_local_v1 import LinuxLocalV1Adapter
+
+        received = []
+
+        class Sink(BaseHTTPRequestHandler):
+            def do_GET(self):
+                received.append({
+                    "authorization_present": bool(self.headers.get("Authorization")),
+                    "signature_present": bool(self.headers.get("X-SA-Signature")),
+                })
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args):
+                pass
+
+        class Redirect(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.2:{sink.server_port}/sink")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        sink = ThreadingHTTPServer(("127.0.0.2", 0), Sink)
+        source = ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+        for server in (source, sink):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            adapter = LinuxLocalV1Adapter(
+                base_url=f"http://127.0.0.1:{source.server_port}",
+                find_creds_fn=lambda: ("synthetic-user", "synthetic-password", "synthetic-key"),
+            )
+            with self.assertRaises(AdapterError):
+                adapter.call("GET", "/probe", timeout=3)
+            self.assertEqual(received, [])
+        finally:
+            for server in (source, sink):
+                server.shutdown()
+                server.server_close()
 
 
 if __name__ == "__main__":

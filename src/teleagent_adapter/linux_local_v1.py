@@ -156,21 +156,20 @@ class LinuxLocalV1Adapter(TeleAgentAdapterABC):
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(url, headers=h, method=method, data=data)
         # Do not honor HTTP(S)_PROXY for local TeleAgent — auth headers must not leave the box.
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        # Forbid auto-follow: reject redirects BEFORE a second request (with auth) is issued.
+        class _RejectRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: N802
+                raise AdapterError(
+                    AdapterStatus.BLOCKED,
+                    f"refusing to follow HTTP redirect ({code}) to {newurl!r}",
+                )
+
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            _RejectRedirect,
+        )
         try:
             with opener.open(req, timeout=timeout) as resp:
-                # Reject redirects that leave loopback when hardening is on
-                final = resp.geturl() if hasattr(resp, "geturl") else url
-                final_host = (urlparse(final).hostname or "").lower()
-                if (
-                    not self._allow_non_loopback
-                    and final_host
-                    and final_host not in ("127.0.0.1", "localhost", "::1")
-                ):
-                    raise AdapterError(
-                        AdapterStatus.BLOCKED,
-                        f"refusing non-loopback redirect host={final_host!r}",
-                    )
                 raw = resp.read()
                 if not raw:
                     return resp.status, None

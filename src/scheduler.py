@@ -418,28 +418,109 @@ class ParallelScheduler:
             "state": JobState.CANCEL_REQUESTED.value,
         }
 
-    def _request_session_abort(self, job: JobSlot) -> dict:
-        """Ask the worker to stop via adapter.cancel / POST /session/{id}/abort.
+    def _session_stop_confirmed(self, job: JobSlot) -> bool:
+        """True only when status is usable and the session is not busy.
 
-        Receiving the cancel request is NOT the same as execution stopped.
-        Returns ok=True only when abort is confirmed (2xx) or there is no session.
+        Idle / absent-from-busy-map is not proof that every OS child exited; it is
+        only the stop-confirmation signal this control API exposes. Unknown status
+        (non-2xx, non-dict) means NOT confirmed.
         """
         sid = (job.session_id or "").strip()
         if not sid:
-            return {"attempted": False, "ok": True, "note": "no_session_to_abort"}
+            return True
+        try:
+            code, status = self.ta_call("GET", "/session/status")
+        except Exception as e:
+            job.notes.append(f"abort confirm status raised: {e}")
+            return False
+        if not isinstance(code, int) or not (200 <= code < 300) or not isinstance(status, dict):
+            job.notes.append(
+                f"abort confirm status unusable http={code} body_type={type(status).__name__}"
+            )
+            return False
+        return not self.is_session_busy(status, sid)
+
+    def _request_session_abort(
+        self,
+        job: JobSlot,
+        *,
+        max_polls: int = 5,
+        poll_interval: float = 0.05,
+    ) -> dict:
+        """Ask the worker to stop via adapter.cancel / POST /session/{id}/abort.
+
+        Distinguishes request-received from stop-confirmed:
+        - non-2xx / raise → not received, ok=False
+        - 202 (or any 2xx) while still busy → received but not confirmed; ok=False
+        - ok=True only after bounded status polls show the session is not busy
+          (or there is no session / dry_local). Never treat bare 2xx as CANCELLED.
+        """
+        sid = (job.session_id or "").strip()
+        if not sid:
+            return {"attempted": False, "ok": True, "confirmed": True, "note": "no_session_to_abort"}
         path = f"/session/{sid}/abort"
         # dry_run without injected transport: local stop only (no live worker)
         if self.dry_run and self._teleagent_call is None:
             job.notes.append(f"dry abort assumed ok path={path}")
-            return {"attempted": True, "ok": True, "http": 200, "path": path, "note": "dry_local"}
+            return {
+                "attempted": True,
+                "ok": True,
+                "received": True,
+                "confirmed": True,
+                "http": 200,
+                "path": path,
+                "note": "dry_local",
+            }
         try:
             code, body = self.ta_call("POST", path, body={})
         except Exception as e:
             job.notes.append(f"abort raised: {e}")
-            return {"attempted": True, "ok": False, "error": str(e), "path": path}
-        ok = isinstance(code, int) and 200 <= code < 300
-        job.notes.append(f"abort http={code} path={path} ok={ok}")
-        return {"attempted": True, "ok": ok, "http": code, "body": body, "path": path}
+            return {
+                "attempted": True,
+                "ok": False,
+                "received": False,
+                "confirmed": False,
+                "error": str(e),
+                "path": path,
+            }
+        received = isinstance(code, int) and 200 <= code < 300
+        if not received:
+            job.notes.append(f"abort http={code} path={path} received=False")
+            return {
+                "attempted": True,
+                "ok": False,
+                "received": False,
+                "confirmed": False,
+                "http": code,
+                "body": body,
+                "path": path,
+            }
+        # Request accepted (incl. 202) ≠ stop confirmed — bounded status poll.
+        confirmed = False
+        polls = 0
+        for i in range(max(1, int(max_polls))):
+            polls = i + 1
+            if self._session_stop_confirmed(job):
+                confirmed = True
+                break
+            if i + 1 < max_polls:
+                time.sleep(max(0.0, float(poll_interval)))
+        ok = confirmed
+        note = None if confirmed else "accepted_not_confirmed"
+        job.notes.append(
+            f"abort http={code} path={path} received=True confirmed={confirmed} polls={polls}"
+        )
+        return {
+            "attempted": True,
+            "ok": ok,
+            "received": True,
+            "confirmed": confirmed,
+            "http": code,
+            "body": body,
+            "path": path,
+            "polls": polls,
+            "note": note,
+        }
 
     def effect_cancel(self, job_id: str, *, error: str = "cancelled by request") -> dict:
         """Stop this job only. Distinguishes cancel_requested from execution stopped.
@@ -1425,22 +1506,22 @@ class ParallelScheduler:
                 job.result["markers"] = [str(m) for m in markers]
             return
 
-        # Live: require usable status (HTTP 2xx + valid body), session idle, ALL artifacts,
-        # and this-round assistant finish/error. Files alone are never DONE.
+        # Live: require usable status (HTTP 2xx + dict structure), session idle, ALL artifacts,
+        # message read success, and this-round successful finish — BEFORE any acceptance branch
+        # (including force_lead_review). Lead pass cannot convert hard failures into success.
         sc, status = self.ta_call("GET", "/session/status")
         status_ok = isinstance(sc, int) and 200 <= sc < 300
-        status_usable = status_ok and status is not None and not (
-            isinstance(status, dict)
-            and status.get("error")
+        # Valid structure: must be a dict. 200 + string/list must NOT count as idle/usable.
+        status_usable = status_ok and isinstance(status, dict) and not (
+            status.get("error")
             and job.session_id
             and job.session_id not in status
             and not any(
                 isinstance(v, dict) and v.get("sessionID") == job.session_id
                 for v in status.values()
-                if isinstance(status, dict)
             )
         )
-        # Explicit error object / non-2xx must NOT be treated as idle.
+        # Explicit error object / non-2xx / malformed body must NOT be treated as idle.
         if not status_usable:
             job.busy = True
             job.notes.append(
@@ -1453,11 +1534,12 @@ class ParallelScheduler:
         if job.busy or not complete:
             return
 
-        # Fetch this-round assistant finish/error — required for non-force path.
+        # Fetch this-round assistant finish/error — required for ALL acceptance paths.
         fin = None
         err = ""
         msgs = None
         msg_http = None
+        messages_ok = False
         if job.session_id:
             try:
                 msg_http, msgs = self.ta_call("GET", f"/session/{job.session_id}/message")
@@ -1466,17 +1548,41 @@ class ParallelScheduler:
                 msg_http, msgs = None, None
             try:
                 g = self._glue()
-                asst = g.last_assistant(msgs) if msg_http and 200 <= int(msg_http) < 300 else None
+                messages_ok = (
+                    isinstance(msg_http, int)
+                    and 200 <= int(msg_http) < 300
+                    and msgs is not None
+                )
+                asst = g.last_assistant(msgs) if messages_ok else None
                 fin = g.assistant_finish(asst) if asst is not None else None
                 err = g.assistant_error(asst) if asst is not None else ""
             except Exception as e:
                 job.notes.append(f"assistant parse failed: {e}")
+                messages_ok = False
 
         if err or fin == "error":
             _fail("fail", err or "assistant finish=error", arts)
             if isinstance(job.result, dict):
                 job.result["finish"] = fin
                 job.result["status_http"] = sc
+                job.result["message_http"] = msg_http
+            return
+
+        if fin in ("cancelled", "canceled"):
+            _fail("fail", f"assistant finish={fin}", arts)
+            if isinstance(job.result, dict):
+                job.result["finish"] = fin
+                job.result["status_http"] = sc
+                job.result["message_http"] = msg_http
+            return
+
+        # Hard completion gate — precedes force_lead_review and non-force success.
+        successful_finish = fin in ("stop", "complete", "completed")
+        if not messages_ok or not successful_finish:
+            job.notes.append(
+                f"completion gate blocked: messages_ok={messages_ok} "
+                f"message_http={msg_http} finish={fin!r}; not DONE"
+            )
             return
 
         exec_snapshot = {
@@ -1497,18 +1603,15 @@ class ParallelScheduler:
             if isinstance(job.result, dict):
                 job.result["finish"] = fin
                 job.result["status_http"] = sc
+                job.result["message_http"] = msg_http
             return
 
-        # Non-force: require explicit successful finish — presence of files is not enough.
-        if fin not in ("stop", "complete", "completed"):
-            job.notes.append(
-                f"artifacts present but finish={fin!r} (need stop/complete); not DONE"
-            )
-            return
+        # Non-force: gate already required successful finish.
         _succeed(arts, state="ok", extra_notes=[f"finish={fin}"])
         if isinstance(job.result, dict):
             job.result["finish"] = fin
             job.result["status_http"] = sc
+            job.result["message_http"] = msg_http
 
     def write_job_report(self, job: JobSlot) -> Path:
         self.runs_root.mkdir(parents=True, exist_ok=True)
