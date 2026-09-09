@@ -1,8 +1,10 @@
 import copy
+import hashlib
 import json
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from win_collab.core import Engine, Store, contained, validate_charter
@@ -199,6 +201,39 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.store.get(j['id'])['handled'],['escape'])
         self.assertTrue(any(c[1]=='/permission/escape/reply' and c[2]=={'reply':'reject'}
                             for c in self.client.calls))
+
+    def test_hash_pinned_repository_input_can_receive_once_approval(self):
+        source=Path(self.tmp.name)/'approved-input.json';source.write_text('{"value":1}',encoding='utf-8')
+        c=charter();c['external_inputs']=[{
+            'path':str(source.resolve()),
+            'sha256':hashlib.sha256(source.read_bytes()).hexdigest(),
+        }];c['min_approved_permissions']=1
+        with mock.patch('win_collab.core.REPO',Path(self.tmp.name)):
+            j=self.engine.submit(c)
+        self.engine.tick();j=self.store.get(j['id'])
+        self.client.pending=[{'id':'external-input','sessionID':j['session_id'],
+                              'permission':'external_directory','patterns':[str(source.parent/'*')],
+                              'metadata':{'filepath':str(source.resolve())}}]
+        self.rescan(j)
+        p=self.store.inbox()[0]
+        self.answer(p,'once')
+        self.assertEqual(self.store.get(j['id'])['approved_permissions'],1)
+
+    def test_changed_external_input_cannot_be_approved(self):
+        source=Path(self.tmp.name)/'approved-input.json';source.write_text('first',encoding='utf-8')
+        c=charter();c['external_inputs']=[{
+            'path':str(source.resolve()),
+            'sha256':hashlib.sha256(source.read_bytes()).hexdigest(),
+        }]
+        with mock.patch('win_collab.core.REPO',Path(self.tmp.name)):
+            j=self.engine.submit(c)
+        self.engine.tick();j=self.store.get(j['id']);source.write_text('changed',encoding='utf-8')
+        self.client.pending=[{'id':'changed-input','sessionID':j['session_id'],
+                              'permission':'external_directory','patterns':[str(source.parent/'*')],
+                              'metadata':{'filepath':str(source.resolve())}}]
+        self.rescan(j)
+        self.assertFalse(self.store.inbox())
+        self.assertEqual(self.store.get(j['id'])['handled'],['changed-input'])
 
     def test_completed_forbidden_tool_prevents_acceptance(self):
         c=charter();c['forbidden_tools']=['powershell']
