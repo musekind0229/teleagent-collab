@@ -59,6 +59,14 @@ def validate_charter(data):
         value = data.get(field, default)
         if type(value) is not int or not low <= value <= high:
             raise ValueError(f'Invalid {field}')
+    forbidden = data.get('forbidden_tools', [])
+    if (not isinstance(forbidden, list) or len(forbidden) > 32 or
+            len(forbidden) != len(set(forbidden)) or
+            not all(isinstance(x, str) and x.strip() for x in forbidden)):
+        raise ValueError('forbidden_tools must be a unique list of non-empty tool names')
+    minimum = data.get('min_approved_permissions', 0)
+    if type(minimum) is not int or not 0 <= minimum <= data.get('max_lead_requests', 12):
+        raise ValueError('Invalid min_approved_permissions')
     # No implicit conversion of legacy secret allowlists into authority.
     if any(data.get(k) for k in ('allow_secret_globs', 'allow_keys', 'allow_paths')):
         raise ValueError('This preview does not support secret or external path allowlists')
@@ -87,11 +95,29 @@ def permission_owner(p):
     return None
 
 
-def hard_reject(p):
+def hard_reject(p, workspace=None):
     """Conservative secret prefilter only. All other requests go to the lead."""
     text = json.dumps(p, ensure_ascii=True).lower().replace('\\\\', '/')
     if re.search(r'\.env(?:[.\s"/]|$)|\.ssh|\.netrc|auth\.json|credentials|cookies|id_ed25519|id_rsa|login data', text):
         return 'Credential-like target is outside this preview task contract'
+    if workspace and p.get('permission') == 'external_directory':
+        root = Path(workspace).resolve()
+        patterns = p.get('patterns')
+        if not isinstance(patterns, list) or not patterns:
+            return 'External-directory request has no bounded path patterns'
+        for pattern in patterns:
+            if not isinstance(pattern, str) or not pattern.strip():
+                return 'External-directory request contains an invalid path pattern'
+            # A wildcard may only widen descendants inside the exact job workspace.
+            prefix = re.split(r'[?*\[]', pattern, maxsplit=1)[0].rstrip('/\\')
+            if not prefix:
+                return 'External-directory request is not bounded to the job workspace'
+            try:
+                candidate = Path(prefix).resolve()
+                if not candidate.is_relative_to(root):
+                    return 'External-directory request escapes the assigned job workspace'
+            except (OSError, ValueError):
+                return 'External-directory request path cannot be verified'
     return None
 
 
@@ -155,7 +181,8 @@ class Engine:
         job = {'id': jid, 'run_id': uuid.uuid4().hex, 'state': 'queued', 'charter': charter,
                'charter_hash': digest(charter), 'workspace': str(workspace), 'session_id': None,
                'created_at': time.time(), 'deadline': None, 'next_scan': 0, 'scans': 0,
-               'lead_requests': 0, 'redos': 0, 'handled': [], 'error': None, 'backend': None}
+               'lead_requests': 0, 'approved_permissions': 0, 'redos': 0,
+               'handled': [], 'error': None, 'backend': None}
         with self.store.transaction():
             self.store.save(job)
             self.store.event(job, 'submitted', {'charter_hash': job['charter_hash']})
@@ -223,12 +250,26 @@ class Engine:
         if job['session_id']:
             job['state'] = 'stopping'
             job['stop_target'] = state
+            if not job.get('abort_sent'):
+                try:
+                    self.api(job, 'POST', f'/session/{job["session_id"]}/abort', {})
+                    job['abort_sent'] = True
+                    job['abort_sent_at'] = time.time()
+                except Exception:
+                    self.store.event(job, 'abort_unconfirmed', {})
+                    return
             try:
-                self.api(job, 'POST', f'/session/{job["session_id"]}/abort', {})
+                statuses = self.api(job, 'GET', '/session/status')
+                if not isinstance(statuses, dict):
+                    raise RuntimeError('Invalid session status response while stopping')
+                remote = statuses.get(job['session_id'])
+                if remote is not None and remote.get('type', 'busy') != 'idle':
+                    self.store.event(job, 'stop_pending', {'remote_state': remote.get('type')})
+                    return
             except Exception:
-                self.store.event(job, 'abort_unconfirmed', {})
+                self.store.event(job, 'stop_unconfirmed', {})
                 return
-        # Abort is an API acknowledgement, not proof of OS process termination.
+        # Idle or absent from the server status map is independent stop confirmation.
         job['state'] = state
         job['finished_at'] = time.time()
         self.store.db.execute('UPDATE requests SET resolved=1 WHERE job_id=?', (job['id'],))
@@ -313,7 +354,7 @@ class Engine:
             pid = p.get('id')
             if not pid or pid in job['handled']:
                 continue
-            reason = hard_reject(p)
+            reason = hard_reject(p, job['workspace'])
             if reason:
                 self.api(job, 'POST', f'/permission/{pid}/reply', {'reply': 'reject'})
                 job['handled'].append(pid)
@@ -374,9 +415,18 @@ class Engine:
                     s = part.get('state', {})
                     tools.append({'tool': part.get('tool'), 'status': s.get('status'),
                                   'input': s.get('input'), 'output': str(s.get('output', ''))[:6000]})
+        forbidden = set(job['charter'].get('forbidden_tools', []))
+        violations = [
+            {'tool': item['tool'], 'status': item['status']}
+            for item in tools
+            if item['tool'] in forbidden and item['status'] == 'completed'
+        ]
         self.request(job, 'review', {'artifacts': artifacts, 'artifact_hash': digest(artifacts),
                                   'artifact_error': missing, 'tools': tools[-30:],
-                                  'tools_truncated': len(tools)>30, 'finish': 'stop'})
+                                  'tools_truncated': len(tools)>30,
+                                  'policy_violations': violations,
+                                  'approved_permissions': job.get('approved_permissions', 0),
+                                  'finish': 'stop'})
         if job['state'] not in TERMINAL | {'stopping'}:
             job['state'] = 'awaiting_review'
 
@@ -407,10 +457,12 @@ class Engine:
                 current = next((x for x in pending if x.get('id') == p['id'] and permission_owner(x) == job['session_id']), None)
                 if current is None or digest(current) != digest(p):
                     raise ValueError('Permission changed or is no longer pending')
-                if choice == 'once' and hard_reject(current):
+                if choice == 'once' and hard_reject(current, job['workspace']):
                     raise ValueError('Lead cannot override hard rejection')
                 self.api(job, 'POST', f'/permission/{p["id"]}/reply', {'reply': 'once' if choice == 'once' else 'reject'})
                 job['handled'].append(p['id'])
+                if choice == 'once':
+                    job['approved_permissions'] = job.get('approved_permissions', 0) + 1
                 job['state'] = 'running'
                 if choice == 'deny_job':
                     self.stop(job, 'failed', decision['reason'])
@@ -439,6 +491,11 @@ class Engine:
                     current = snapshot(job['workspace'], job['charter']['artifacts'])
                     if packet['payload']['artifact_error'] or digest(current) != packet['payload']['artifact_hash']:
                         raise ValueError('Artifacts changed or incomplete; cannot accept stale review')
+                    if packet['payload'].get('policy_violations'):
+                        raise ValueError('Completed forbidden tools prevent acceptance')
+                    required = job['charter'].get('min_approved_permissions', 0)
+                    if job.get('approved_permissions', 0) < required:
+                        raise ValueError('Required permission approvals were not observed')
                     job['state'] = 'passed'
                     job['finished_at'] = time.time()
                     job['accepted_artifacts'] = {n:v['sha256'] for n,v in current.items()}

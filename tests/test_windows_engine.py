@@ -18,7 +18,7 @@ class FakeClient:
     base='http://127.0.0.1:4397'
     def __init__(self):
         self.pending=[]; self.questions=[]; self.status={}; self.messages={}; self.calls=[]
-        self.fail_reply=False; self.ack_policy=True; self.count=0
+        self.fail_reply=False; self.ack_policy=True; self.abort_stays_busy=False; self.count=0
 
     def call(self, method, path, body=None, workspace=None):
         self.calls.append((method,path,copy.deepcopy(body),workspace))
@@ -41,7 +41,8 @@ class FakeClient:
             self.pending=[p for p in self.pending if p['id']!=pid]
             return True
         if path.endswith('/abort'):
-            self.status[path.split('/')[2]]={'type':'idle'}
+            if not self.abort_stays_busy:
+                self.status[path.split('/')[2]]={'type':'idle'}
             return True
         raise AssertionError((method,path))
 
@@ -73,11 +74,12 @@ class Tests(unittest.TestCase):
         return self.engine.decide({'request_id':p['request_id'],'context_hash':p['context_hash'],
                                   'decision':choice,'reason':'Independently checked task scope',**extra})
 
-    def deliver(self,j,all_files=True):
+    def deliver(self,j,all_files=True,parts=None):
         for name in ('a.txt','b.txt') if all_files else ('a.txt',):
             (Path(j['workspace'])/name).write_text('verified\n')
         self.client.status[j['session_id']]={'type':'idle'}
-        self.client.messages[j['session_id']].append({'info':{'role':'assistant','finish':'stop'},'parts':[]})
+        self.client.messages[j['session_id']].append(
+            {'info':{'role':'assistant','finish':'stop'},'parts':parts or []})
         self.rescan(j)
         return self.store.inbox()[0]
 
@@ -187,9 +189,52 @@ class Tests(unittest.TestCase):
         self.assertFalse(self.store.inbox())
         self.assertEqual(self.store.get(j['id'])['handled'],['secret'])
 
+    def test_external_directory_escape_is_rejected_before_lead(self):
+        j=self.start()
+        parent=str(Path(j['workspace']).parent).replace('\\','/')
+        self.client.pending=[{'id':'escape','sessionID':j['session_id'],
+                              'permission':'external_directory','patterns':[parent+'/*']}]
+        self.rescan(j)
+        self.assertFalse(self.store.inbox())
+        self.assertEqual(self.store.get(j['id'])['handled'],['escape'])
+        self.assertTrue(any(c[1]=='/permission/escape/reply' and c[2]=={'reply':'reject'}
+                            for c in self.client.calls))
+
+    def test_completed_forbidden_tool_prevents_acceptance(self):
+        c=charter();c['forbidden_tools']=['powershell']
+        j=self.engine.submit(c);self.engine.tick();j=self.store.get(j['id'])
+        tool={'type':'tool','tool':'powershell','state':{'status':'completed','input':{'command':'Get-Location'}}}
+        p=self.deliver(j,parts=[tool])
+        self.assertEqual(p['payload']['policy_violations'],[{'tool':'powershell','status':'completed'}])
+        with self.assertRaisesRegex(ValueError,'forbidden tools'):self.answer(p,'pass')
+
+    def test_minimum_permission_approvals_prevents_zero_approval_pass(self):
+        c=charter();c['min_approved_permissions']=1
+        j=self.engine.submit(c);self.engine.tick();j=self.store.get(j['id'])
+        p=self.deliver(j)
+        self.assertEqual(p['payload']['approved_permissions'],0)
+        with self.assertRaisesRegex(ValueError,'Required permission approvals'):self.answer(p,'pass')
+
+    def test_once_decision_counts_approved_permission(self):
+        c=charter();c['min_approved_permissions']=1
+        j=self.engine.submit(c);self.engine.tick();j=self.store.get(j['id'])
+        p=self.pending(j);self.answer(p,'once')
+        self.assertEqual(self.store.get(j['id'])['approved_permissions'],1)
+
     def test_cancel_invalidates_outstanding_decisions(self):
         j=self.start();p=self.pending(j);self.engine.cancel(j['id'])
         with self.assertRaises(ValueError):self.answer(p)
+
+    def test_abort_ack_does_not_finish_until_remote_is_idle(self):
+        j=self.start();self.client.abort_stays_busy=True
+        result=self.engine.cancel(j['id'])
+        self.assertEqual(result['state'],'stopping')
+        aborts=[c for c in self.client.calls if c[1].endswith('/abort')]
+        self.assertEqual(len(aborts),1)
+        self.client.status[j['session_id']]={'type':'idle'}
+        self.engine.tick()
+        self.assertEqual(self.store.get(j['id'])['state'],'cancelled')
+        self.assertEqual(len([c for c in self.client.calls if c[1].endswith('/abort')]),1)
 
     def test_same_port_new_backend_cannot_receive_old_decision(self):
         self.client.instance_id='first'

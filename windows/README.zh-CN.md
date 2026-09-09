@@ -5,11 +5,11 @@
 
 ## 当前状态
 
-控制器与回归测试已完成，真实 TeleAgent 鉴权仍待接通。**这不是已通过实机验收的发行版。**
-本机 TeleAgent 2.4.1 的运行进程没有原版 Linux 脚本所需的认证环境变量；仅改端口无效。
-需要通过应用合法提供的本地连接信息完成初始化，再跑 `doctor` 和实际小任务。
+控制器已接通本机 TeleAgent 2.4.1 / 后端 1.2.27，并完成真实单工人试运行。**这仍是预览，不是生产级权限沙箱。**
+Windows 适配器从已验证的 TeleAgent runtime Node 进程环境中只选取三项本机 API 值，并单独验证 4390–4410 范围内唯一监听进程是已安装的 SAC；值只保存在进程内存，不写报告。
+`doctor` 已返回健康状态。进程重启后会重新发现，旧任务还会校验后端实例身份，避免误发给新实例。
 已在用户明确授权后验证临时诊断方式：本发行版未开放 Node/Electron 调试入口，安装包存在清理调试参数的逻辑；已恢复无诊断参数启动，9235 未监听。详情见 [实机验证记录](../docs/WINDOWS-VALIDATION.zh-CN.md)。
-启动前若 `doctor` 失败，停止于诊断，不会为通单改动全局权限或自动放行。
+启动前若 `doctor` 失败，停止于诊断，不会为通单改动全局权限或自动放行。当前发现方式是对已安装版本的兼容适配，并非厂商承诺的稳定外部 API；升级后必须重新跑兼容性验证。
 
 ## 当前对话里的 Codex 当组长
 
@@ -54,6 +54,9 @@
 - 验收：`pass | fail`；必须全部产物存在，hash 未变化，工人 idle。缺证据时应 fail 并给具体返工要求。
 - 问题：`answer | deny_job`；answer 另带 `answers: [["第一题回答"], ["第二题回答"]]`。
 - 当前控制器不支持凭据/外部目录白名单；需要此类任务时先设计明确授权，不默默放行。
+- `forbidden_tools` 可列出章程禁止使用的工具；工具即使被 TeleAgent 自动执行，带有已完成违规工具的工单也不能通过验收。
+- `min_approved_permissions` 可要求通过前至少观察到指定次数的真实 `once` 批准，防止用零审批运行冒充审批闭环。
+- `external_directory` 请求只要越出本工单的精确工作区就自动拒绝；父级 `workspaces/*` 和兄弟工单均不能由组长覆盖放行。
 
 ## 换组长
 
@@ -82,8 +85,9 @@ Codex 适配使用 `exec --sandbox read-only --ephemeral --ignore-user-config --
 - 也支持 `TELEAGENT_URL` 与 `OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD` / `SUPER_AGENT_LOCAL_SESSION_KEY`，仅用于已合法取得的本地连接信息。不要把值发进聊天或提交仓库。
 - `COLLAB_PYTHON` 指定 Python 路径；`COLLAB_AUTH_FILE` 可指定 DPAPI 文件；`--home` 可换控制器数据目录。
 
-当前是**监督式命令行预览**。目录和 session 隔离并非操作系统沙箱，同用户运行的工人仍可能具有更大的系统权限。
-本入口请求每个新 session 的 `ask` 策略并要求服务器确认，但是否覆盖所有 Windows 工具/子进程仍须实测。
+当前是**监督式命令行预览**。目录和 session 隔离并非完整的操作系统安全边界；TeleAgent 的 `powershell` 使用 `workspace_offline` 沙箱，但其代理配置明确为自动允许，内置 `write` 也没有产生权限请求。
+本入口请求每个新 session 的 `ask` 策略并要求服务器回显。实测证明回显只是必要的协议检查，不能证明所有工具的有效规则都是 `ask`。只有 `/permission` 实际返回且被绑定到本 session 的请求，才算真实审批。
+文本写入还可能被 TeleAgent 注入 U+200B/U+200D 与“AI生成”标记；要求原始字节完全相等的工单应改用兼容的产物格式或保持失败，不能暗中剥离水印后通过。
 生产级权限隔离、无人值守后台服务、自动唤醒当前 Codex 对话、精确 token/积分总预算、existing repo/worktree 合并均不在本次已验证能力中。
 
 ## 验证

@@ -1,6 +1,6 @@
 """Local TeleAgent HTTP adapter. Credentials stay in memory, never in reports.
 
-Windows discovery reads only the environment block of the verified SAC process,
+Windows discovery reads only the environment block of verified TeleAgent runtime processes,
 using normal OS read permissions. It does not elevate or dump process memory.
 The three local API values can alternatively be supplied by environment variables.
 """
@@ -22,9 +22,41 @@ import urllib.request
 from pathlib import Path
 
 KEYS = ('OPENCODE_SERVER_USERNAME', 'OPENCODE_SERVER_PASSWORD', 'SUPER_AGENT_LOCAL_SESSION_KEY')
+ALIASES = {
+    'OPENCODE_SERVER_USERNAME': ('OPENCODE_SERVER_USERNAME', 'SUPER_AGENT_OPENCODE_USERNAME'),
+    'OPENCODE_SERVER_PASSWORD': ('OPENCODE_SERVER_PASSWORD', 'SUPER_AGENT_OPENCODE_PASSWORD'),
+    'SUPER_AGENT_LOCAL_SESSION_KEY': ('SUPER_AGENT_LOCAL_SESSION_KEY',),
+}
 
 
-def windows_environment(pid: int) -> dict:
+def windows_process_image(pid: int, *, expected_images: tuple[Path, ...]) -> Path:
+    """Resolve and verify a PID without reading its command line or environment."""
+    if os.name != 'nt':
+        raise RuntimeError('Windows required for TeleAgent process discovery')
+    from ctypes import wintypes as w
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.OpenProcess.argtypes = [w.DWORD, w.BOOL, w.DWORD]
+    kernel.OpenProcess.restype = w.HANDLE
+    kernel.CloseHandle.argtypes = [w.HANDLE]
+    kernel.QueryFullProcessImageNameW.argtypes = [w.HANDLE, w.DWORD, w.LPWSTR, ctypes.POINTER(w.DWORD)]
+    # PROCESS_QUERY_LIMITED_INFORMATION is sufficient and avoids requesting VM_READ.
+    handle = kernel.OpenProcess(0x1000, False, pid)
+    if not handle:
+        raise PermissionError(f'Cannot inspect TeleAgent process {pid}: WinError {ctypes.get_last_error()}')
+    try:
+        size = w.DWORD(32768)
+        image = ctypes.create_unicode_buffer(size.value)
+        if not kernel.QueryFullProcessImageNameW(handle, 0, image, ctypes.byref(size)):
+            raise PermissionError('Cannot verify TeleAgent process image')
+        resolved = Path(image.value).resolve()
+        if resolved not in {path.resolve() for path in expected_images}:
+            raise ValueError('PID is not a verified installed TeleAgent runtime executable')
+        return resolved
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def windows_environment(pid: int, *, expected_images: tuple[Path, ...] | None = None) -> dict:
     if os.name != 'nt' or struct.calcsize('P') != 8:
         raise RuntimeError('Windows x64 Python required for process environment discovery')
     from ctypes import wintypes as w
@@ -45,9 +77,13 @@ def windows_environment(pid: int) -> dict:
         image = ctypes.create_unicode_buffer(size.value)
         if not kernel.QueryFullProcessImageNameW(handle, 0, image, ctypes.byref(size)):
             raise PermissionError('Cannot verify TeleAgent process image')
-        expected = Path.home() / '.local/share/TeleAgent/runtimes/super-agent-code/bin/TeleAgent.exe'
-        if Path(image.value).resolve() != expected.resolve():
-            raise ValueError('PID is not the installed TeleAgent SAC executable')
+        runtime = Path.home() / '.local/share/TeleAgent/runtimes'
+        expected_images = expected_images or (
+            runtime / 'super-agent-code/bin/TeleAgent.exe',
+            runtime / 'node/node.exe',
+        )
+        if Path(image.value).resolve() not in {p.resolve() for p in expected_images}:
+            raise ValueError('PID is not a verified installed TeleAgent runtime executable')
 
         def read(address, length):
             buf = ctypes.create_string_buffer(length)
@@ -64,19 +100,30 @@ def windows_environment(pid: int) -> dict:
         env = struct.unpack('<Q', read(params + 0x80, 8))[0]
         # Environment block only; bounded to 1 MiB, never scan the process heap.
         block = bytearray()
-        for offset in range(0, 1024 * 1024, 2):
-            block.extend(read(env + offset, 2))
-            if len(block) >= 4 and block[-4:] == b'\0\0\0\0':
+        for offset in range(0, 1024 * 1024, 4096):
+            chunk = read(env + offset, min(4096, 1024 * 1024 - offset))
+            block.extend(chunk)
+            scan_from = max(0, len(block) - len(chunk) - 4)
+            if scan_from % 2:
+                scan_from += 1
+            end = next((i for i in range(scan_from, len(block) - 3, 2)
+                        if block[i:i + 4] == b'\0\0\0\0'), -1)
+            if end >= 0:
+                block = block[:end + 4]
                 break
         else:
             raise RuntimeError('TeleAgent environment exceeds discovery limit')
-        selected = {}
+        raw_selected = {}
         for item in block.decode('utf-16-le').split('\0'):
             key, sep, value = item.partition('=')
-            if sep and key in KEYS:
-                selected[key] = value
+            if sep and any(key in names for names in ALIASES.values()):
+                raw_selected[key] = value
+        selected = {
+            canonical: next((raw_selected.get(name, '') for name in names if raw_selected.get(name)), '')
+            for canonical, names in ALIASES.items()
+        }
         if not all(selected.get(k) for k in KEYS):
-            raise RuntimeError('Local API keys are unavailable in this TeleAgent process. Bootstrap or explicit local credentials required.')
+            raise RuntimeError('Local API keys are unavailable in this verified TeleAgent runtime process.')
         return selected
     finally:
         kernel.CloseHandle(handle)
@@ -92,24 +139,50 @@ def discover() -> tuple[str, dict]:
         return load(protected)
     if os.name != 'nt':
         raise RuntimeError('Supply TELEAGENT_URL and local API environment keys on non-Windows hosts')
-    # List just the SAC image, never command lines (which may contain credentials).
-    script = "Get-Process TeleAgent -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '*runtimes*super-agent-code*bin*TeleAgent.exe' } | Select-Object -ExpandProperty Id"
+    runtime = Path.home() / '.local/share/TeleAgent/runtimes'
+    sac_image = runtime / 'super-agent-code/bin/TeleAgent.exe'
+    node_image = runtime / 'node/node.exe'
+    # List only exact installed runtime images; never command lines (which may contain credentials).
+    script = (
+        "$sac=[IO.Path]::GetFullPath('" + str(sac_image).replace("'", "''") + "');"
+        "$node=[IO.Path]::GetFullPath('" + str(node_image).replace("'", "''") + "');"
+        "Get-Process TeleAgent,node -ErrorAction SilentlyContinue | Where-Object {"
+        "$_.Path -and ([IO.Path]::GetFullPath($_.Path) -ieq $sac -or "
+        "[IO.Path]::GetFullPath($_.Path) -ieq $node)} | Select-Object -ExpandProperty Id"
+    )
     result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', script],
-                            capture_output=True, text=True, timeout=15,
+                            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=15,
                             creationflags=subprocess.CREATE_NO_WINDOW)
     pids = [int(x) for x in result.stdout.split() if x.isdigit()]
-    if len(pids) != 1:
-        raise RuntimeError(f'Expected one running TeleAgent SAC process, found {len(pids)}')
-    pid = pids[0]
-    creds = windows_environment(pid)
+    credential_sources = []
+    for candidate in pids:
+        try:
+            credential_sources.append((candidate, windows_environment(
+                candidate, expected_images=(sac_image, node_image))))
+        except (PermissionError, RuntimeError, ValueError):
+            continue
+    if len(credential_sources) != 1:
+        raise RuntimeError(
+            f'Expected one verified TeleAgent credential source, found {len(credential_sources)}')
+    _, creds = credential_sources[0]
+    # Find the listener first, then require its process image to be the exact SAC executable.
     result = subprocess.run(['netstat.exe', '-ano', '-p', 'tcp'], capture_output=True,
-                            text=True, timeout=15, creationflags=subprocess.CREATE_NO_WINDOW)
+                            text=True, encoding='mbcs', errors='replace', timeout=15,
+                            creationflags=subprocess.CREATE_NO_WINDOW)
     ports = []
     for line in result.stdout.splitlines():
         row = line.split()
-        if len(row) == 5 and row[0] == 'TCP' and row[-1] == str(pid) and row[-2] == 'LISTENING':
-            port = int(row[1].rsplit(':', 1)[1])
+        if len(row) == 5 and row[0] == 'TCP' and row[-2] == 'LISTENING':
+            try:
+                port = int(row[1].rsplit(':', 1)[1])
+                listener_pid = int(row[-1])
+            except ValueError:
+                continue
             if 4390 <= port <= 4410:
+                try:
+                    windows_process_image(listener_pid, expected_images=(sac_image,))
+                except (PermissionError, RuntimeError, ValueError):
+                    continue
                 ports.append(port)
     if len(set(ports)) != 1:
         raise RuntimeError('Cannot identify unique TeleAgent API listener in 4390..4410')
