@@ -58,6 +58,17 @@ Windows 适配器从已验证的 TeleAgent runtime Node 进程环境中只选取
 - `min_approved_permissions` 可要求通过前至少观察到指定次数的真实 `once` 批准，防止用零审批运行冒充审批闭环。
 - `external_directory` 请求只允许本工单精确工作区，或元数据精确指向仍满足路径与哈希约束的 `external_inputs` 文件；其余请求自动拒绝。父级 `workspaces/*`、兄弟工单和仅靠宽泛 pattern 命中的文件均不能由组长覆盖放行。
 
+### Windows 系统安装两阶段门禁
+
+`task_kind=system_install` 使用单独的动作状态机，目前只支持哈希固定的 MSI：
+
+1. 工人先生成 `system-action-request.json` 并停止；批准前若执行 PowerShell/shell，工单失败。
+2. 组长只能批准与章程逐字段相同的动作。批准瞬间重新核验源 MSI，随后才复制到工单工作区并恢复同一 session。
+3. MSI 必须声明 `elevation=runas`、有限的静默参数、允许效果、敏感效果的 `user_authorized_effects` 和回滚计划。
+4. 模糊的恢复请求不会自动重放；系统安装禁止自动返工，最终验收要求已绑定的动作 hash，并检查工具记录中只有一次带 `-Verb RunAs` 的批准调用。
+
+该流程仍依赖 TeleAgent 工人遵守指令，不能替代 Windows 容器或完整 capability 沙箱；但安装包在动作批准前不会进入工单目录，且 TeleAgent 对提权调用会再产生可绑定的 `remote_guard` 请求。
+
 ## 换组长
 
 默认是文件队列协议，任何有权限读取队列并按契约输出决定的 agent 都可接入。
@@ -88,7 +99,7 @@ Codex 适配使用 `exec --sandbox read-only --ephemeral --ignore-user-config --
 当前是**监督式命令行预览**。目录和 session 隔离并非完整的操作系统安全边界；TeleAgent 的 `powershell` 使用 `workspace_offline` 沙箱，但其代理配置明确为自动允许，内置 `write` 也没有产生权限请求。
 本入口请求每个新 session 的 `ask` 策略并要求服务器回显。实测证明回显只是必要的协议检查，不能证明所有工具的有效规则都是 `ask`。只有 `/permission` 实际返回且被绑定到本 session 的请求，才算真实审批。
 文本写入还可能被 TeleAgent 注入 U+200B/U+200D 与“AI生成”标记；要求原始字节完全相等的工单应改用兼容的产物格式或保持失败，不能暗中剥离水印后通过。
-生产级权限隔离、无人值守后台服务、自动唤醒当前 Codex 对话、精确 token/积分总预算、existing repo/worktree 合并均不在本次已验证能力中。
+生产级权限隔离、自动唤醒当前 Codex 对话、精确 token/积分总预算、existing repo/worktree 合并均不在本次已验证能力中。RustDesk 的服务安装已验证，但没有配置永久密码或无人值守凭据。
 
 ## 验证
 

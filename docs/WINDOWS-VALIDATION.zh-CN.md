@@ -8,6 +8,11 @@
 - 工单 `38f12ea49b2e4494b2c7a4face96f8d7` 跑通真实 `once` 权限链。TeleAgent 为精确输入文件提出 `external_directory` 请求，虽然 pattern 覆盖所在目录，组长决定只对当前调用生效；工具轨迹只有 `read`、`write`、`read` 和 `report_final_files`。
 - 产物 `approval-result.json` 经组长独立解析，与固定输入的 `nonce` 和数值完全一致，无额外字段；`policy_violations=[]`、`approved_permissions=1`，最终验收通过。
 - 变更后 33 项单元测试通过，另有回归覆盖输入文件在提交后被修改时无法批准。
+- Windows 控制器新增 MSI 系统安装两阶段门禁：工人先提交精确动作；组长批准后才核验并投放安装包；动作申请、MSI 或参数变化都会使批准失效；模糊 dispatch 不自动重放；系统安装不自动返工。
+- 第一张 RustDesk 执行工单 `e743813f51dc48c893a5e9fcb3e8304c` 暴露出协议未编码 UAC 提权：工人以普通权限执行一次，得到 1603 / Error 1925，并正确报告无系统效果。组长独立确认后判定 `fail`，没有重试或冒充成功。
+- 增加 `elevation=runas` 后，第二张工单 `7140a6829eb345d297a07b40b69c2b69` 完成完整链路：准备工人只写动作申请；组长批准固定动作；TeleAgent 为精确 `Start-Process ... -Verb RunAs` 调用生成 `remote_guard`；组长回写一次性批准；工人安装并交付报告；组长独立验收后 `pass`。
+- RustDesk MSI 返回 0。独立检查确认注册表版本 1.4.9.29722256、`C:\Program Files\RustDesk\rustdesk.exe` 文件版本 1.4.9+67 且 Authenticode 有效、RustDesk 服务为 Running/Automatic、开始菜单和启动快捷方式存在，防火墙注册表中存在针对该程序的入站/出站启用 Allow 规则。没有设置或读取永久密码、ID、token、自建服务器配置。
+- 最终 40 项单元测试通过，覆盖敏感效果显式授权、批准前系统工具阻断、申请/MSI 变更失效、提权调用证据和模糊 dispatch 防重放。
 
 ## 2026-09-09 实机更新
 
@@ -40,7 +45,7 @@
 - 诊断结束后重新以**无诊断参数**的方式启动 TeleAgent，并检查 9235 没有监听。
 - 未修改 TeleAgent 可执行文件、asar、认证机制或全局权限配置；未创建真实 worker session。
 
-## 2026-09-09 RustDesk 安装停点
+## 2026-09-09 RustDesk 安装停点（已由 2026-09-10 实机闭环取代）
 
 - 工人计划工单 `87b6682abddd47179ca2a47ad6a72b10` 已通过：标准客户端、无永久密码、无人值守和自建服务器不在范围内。
 - 已下载 `G:\codex\teleagent-windows-migration\.downloads\rustdesk-1.4.9-x86_64.msi`。Grok 复核：24,825,856 字节；SHA-256 `c87d2f4cef2a5acd6003b6507dcfbf5d5168a256db082cd90b54d35193224aaa` 与计划一致；Authenticode `Valid`，签名者 `CN=PURSLANE, O=PURSLANE, ...`。
@@ -55,4 +60,4 @@
 - Windows 真实三路并行、账号侧并发额度、独立 Codex CLI 组长调用。
 - 操作系统级文件/网络/凭据隔离、恶意工人无法篡改控制器状态、abort 后子进程停止。
 
-因此当前交付是**已接通实机并跑过监督工单的 Windows 控制器预览**。连接、一次性批准、拒绝、返工和独立验收已验证；对自动允许工具的事前门禁、跨版本兼容和系统安装动作仍需补齐，不能称为生产版。
+因此当前交付是**已接通实机并跑过监督工单的 Windows 控制器预览**。连接、两阶段系统动作、一次性批准、拒绝、返工和独立验收已验证；普通自动允许工具仍缺少通用的操作系统级事前隔离，跨版本兼容也未解决，不能称为生产版。

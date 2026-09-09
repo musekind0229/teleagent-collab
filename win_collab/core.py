@@ -11,6 +11,7 @@ import hmac
 import json
 import os
 import re
+import shutil
 import sqlite3
 import time
 import uuid
@@ -19,6 +20,8 @@ from pathlib import Path, PureWindowsPath
 TERMINAL = {'passed', 'failed', 'cancelled', 'timed_out'}
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_HOME = REPO / '.collab-state'
+SYSTEM_EFFECTS = {'install_files', 'service_change', 'firewall_change', 'shortcuts'}
+USER_GATED_EFFECTS = {'service_change', 'firewall_change'}
 
 
 def digest(value):
@@ -31,6 +34,93 @@ def credential_like(value):
         r'\.env(?:[.\s"/]|$)|\.ssh|\.netrc|auth\.json|credentials|cookies|id_ed25519|id_rsa|login data',
         text,
     ))
+
+
+def file_sha256(path):
+    value = hashlib.sha256()
+    with Path(path).open('rb') as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b''):
+            value.update(chunk)
+    return value.hexdigest()
+
+
+def public_system_action(action):
+    """The exact action a worker may propose; the private source path stays lead-side."""
+    return {
+        'type': action['type'],
+        'elevation': action['elevation'],
+        'package': {
+            'filename': action['package']['filename'],
+            'sha256': action['package']['sha256'].lower(),
+        },
+        'arguments': list(action['arguments']),
+        'allowed_effects': list(action['allowed_effects']),
+    }
+
+
+def verified_msi_source(action):
+    package = action['package']
+    declared = Path(package['source'])
+    resolved = declared.resolve()
+    if (declared.is_symlink() or (hasattr(declared, 'is_junction') and declared.is_junction()) or
+            not resolved.is_relative_to(REPO.resolve()) or credential_like(resolved) or
+            not resolved.is_file() or resolved.stat().st_size > 256 * 1024 * 1024):
+        raise ValueError('MSI source must be a non-sensitive regular file inside this repository')
+    if not hmac.compare_digest(file_sha256(resolved), package['sha256'].lower()):
+        raise ValueError('MSI package hash mismatch')
+    return resolved
+
+
+def validate_system_action(data):
+    kind = data.get('task_kind', 'file_task')
+    if kind not in ('file_task', 'system_install'):
+        raise ValueError('task_kind must be file_task or system_install')
+    system_fields = ('system_action', 'rollback', 'user_authorized_effects', 'action_request_artifact')
+    if kind == 'file_task':
+        if any(field in data for field in system_fields):
+            raise ValueError('System action fields require task_kind=system_install')
+        return
+    data.setdefault('max_redos', 0)
+    if data.get('max_redos', 0) != 0:
+        raise ValueError('system_install requires max_redos=0 to prevent automatic re-execution')
+    if not isinstance(data.get('rollback'), str) or not data['rollback'].strip():
+        raise ValueError('system_install requires a rollback plan')
+    request_name = data.get('action_request_artifact', 'system-action-request.json')
+    contained(Path.cwd(), request_name)
+    action = data.get('system_action')
+    if not isinstance(action, dict) or set(action) != {
+            'type', 'elevation', 'package', 'arguments', 'allowed_effects'}:
+        raise ValueError('system_action requires type, elevation, package, arguments and allowed_effects only')
+    if action['type'] != 'msi_install':
+        raise ValueError('Windows preview supports only msi_install system actions')
+    if action['elevation'] != 'runas':
+        raise ValueError('MSI system action requires elevation=runas')
+    package = action['package']
+    if not isinstance(package, dict) or set(package) != {'source', 'filename', 'sha256'}:
+        raise ValueError('system_action package requires source, filename and sha256 only')
+    source, filename, expected = package['source'], package['filename'], package['sha256']
+    if (not isinstance(source, str) or not Path(source).is_absolute() or
+            not isinstance(filename, str) or Path(filename).name != filename or
+            not filename.lower().endswith('.msi') or
+            not isinstance(expected, str) or not re.fullmatch(r'[0-9a-fA-F]{64}', expected)):
+        raise ValueError('Invalid MSI package declaration')
+    verified_msi_source(action)
+    arguments = action['arguments']
+    if (not isinstance(arguments, list) or len(arguments) > 16 or
+            not all(isinstance(arg, str) and 0 < len(arg) <= 160 and
+                    (re.fullmatch(r'/(?:qn|norestart)', arg, re.IGNORECASE) or
+                     re.fullmatch(r'[A-Z][A-Z0-9_]{0,63}=[A-Za-z0-9._-]{1,128}', arg))
+                    for arg in arguments)):
+        raise ValueError('MSI arguments must be bounded silent switches or simple public properties')
+    effects = action['allowed_effects']
+    authorized = data.get('user_authorized_effects')
+    if (not isinstance(effects, list) or not effects or len(effects) != len(set(effects)) or
+            not set(effects) <= SYSTEM_EFFECTS):
+        raise ValueError('Invalid or duplicate allowed_effects')
+    if (not isinstance(authorized, list) or len(authorized) != len(set(authorized)) or
+            not set(authorized) <= SYSTEM_EFFECTS or
+            not (set(effects) & USER_GATED_EFFECTS) <= set(authorized)):
+        raise ValueError('Sensitive system effects require explicit user_authorized_effects')
 
 
 def contained(root, relative):
@@ -87,10 +177,11 @@ def validate_charter(data):
         if (not isinstance(path, str) or not Path(path).is_absolute() or
                 not isinstance(expected, str) or not re.fullmatch(r'[0-9a-fA-F]{64}', expected)):
             raise ValueError('Invalid pinned external input')
-        resolved = Path(path).resolve()
+        declared = Path(path)
+        resolved = declared.resolve()
         key = str(resolved).lower()
         if (key in seen_inputs or not resolved.is_relative_to(REPO.resolve()) or
-                resolved.is_symlink() or (hasattr(resolved, 'is_junction') and resolved.is_junction()) or
+                declared.is_symlink() or (hasattr(declared, 'is_junction') and declared.is_junction()) or
                 not resolved.is_file() or resolved.stat().st_size > 512 * 1024 or credential_like(resolved)):
             raise ValueError('External input must be a unique, non-sensitive regular file inside this repository')
         if hashlib.sha256(resolved.read_bytes()).hexdigest().lower() != expected.lower():
@@ -99,6 +190,7 @@ def validate_charter(data):
     # No implicit conversion of legacy secret allowlists into authority.
     if any(data.get(k) for k in ('allow_secret_globs', 'allow_keys', 'allow_paths')):
         raise ValueError('This preview does not support secret or external path allowlists')
+    validate_system_action(data)
     return data
 
 
@@ -163,6 +255,27 @@ def hard_reject(p, workspace=None, external_inputs=()):
             except (OSError, ValueError):
                 return 'External-directory request path cannot be verified'
     return None
+
+
+def system_action_trace_violations(job, tools):
+    if job['charter'].get('task_kind', 'file_task') != 'system_install':
+        return []
+    action = public_system_action(job['charter']['system_action'])
+    installs = []
+    for item in tools:
+        command = str((item.get('input') or {}).get('command', ''))
+        if item.get('tool') == 'powershell' and item.get('status') == 'completed' and 'msiexec' in command.lower():
+            installs.append(command)
+    if len(installs) != 1:
+        return [{'system_action': 'expected exactly one completed msiexec PowerShell call'}]
+    command = installs[0]
+    lower = command.lower()
+    required = ['start-process', '-verb runas', '-wait', '-passthru',
+                action['package']['filename'].lower()]
+    required.extend(arg.lower() for arg in action['arguments'])
+    missing = [token for token in required if token not in lower]
+    return ([{'system_action': 'approved MSI invocation is missing required tokens',
+              'missing': missing}] if missing else [])
 
 
 class Store:
@@ -235,8 +348,38 @@ class Engine:
     def api(self, job, method, path, body=None):
         return self.client.call(method, path, body, workspace=job['workspace'])
 
-    def prompt(self, job, feedback=None):
+    def prompt(self, job, feedback=None, phase=None):
         c = job['charter']
+        if c.get('task_kind', 'file_task') == 'system_install':
+            action = public_system_action(c['system_action'])
+            request_name = c.get('action_request_artifact', 'system-action-request.json')
+            if phase == 'execute':
+                package = contained(job['workspace'], action['package']['filename'])
+                text = (
+                    'You are the execution worker for an approved Windows system-install action. '
+                    'Execute only the exact action below. The package has been staged only after lead approval. '
+                    'Recompute its SHA-256 before execution and stop without executing if it differs. '
+                    'Use PowerShell only for this exact MSI action and read-only verification. '
+                    'Launch msiexec.exe with Start-Process -Verb RunAs -Wait -PassThru so Windows requests elevation. '
+                    'Do not download anything, change the command, add MSI properties, set unattended-access '
+                    'credentials, or repeat the installation. Write only the required report artifacts in the '
+                    'assigned workspace, then stop. A Windows UAC prompt may require the human to approve elevation.\n'
+                    f'WORKSPACE: {job["workspace"]}\nPACKAGE: {package}\n'
+                    'APPROVED_ACTION:\n' + json.dumps(action, ensure_ascii=True) + '\n'
+                    'ROLLBACK:\n' + c['rollback'] + '\n'
+                    'FINAL_ARTIFACTS:\n' + json.dumps(c['artifacts'], ensure_ascii=True) + '\n'
+                    'ACCEPTANCE:\n' + c['acceptance'])
+            else:
+                text = (
+                    'You are the preparation worker for a supervised Windows system-install task. '
+                    'Do not execute an installer, shell, PowerShell, network request, service change, or firewall change. '
+                    f'Create only {request_name} in the assigned workspace, containing exactly the JSON action below, '
+                    'then stop. The installer is deliberately unavailable until the lead approves this exact request.\n'
+                    f'WORKSPACE: {job["workspace"]}\nPROPOSED_ACTION:\n' +
+                    json.dumps(action, ensure_ascii=True))
+            return {'parts': [{'type': 'text', 'text': text}],
+                    'model': {'providerID': c.get('provider', 'NewApi'), 'modelID': c.get('model', 'chat-lite')},
+                    'agent': c.get('agent', 'opencowork-default'), 'queryID': 'q_' + uuid.uuid4().hex}
         inputs = c.get('external_inputs', [])
         boundary = ('Work only in the assigned directory. ' if not inputs else
                     'Write only in the assigned directory. You may additionally read only the exact '
@@ -251,6 +394,19 @@ class Engine:
         return {'parts': [{'type': 'text', 'text': text}],
                 'model': {'providerID': c.get('provider', 'NewApi'), 'modelID': c.get('model', 'chat-lite')},
                 'agent': c.get('agent', 'opencowork-default'), 'queryID': 'q_' + uuid.uuid4().hex}
+
+    def action_journal(self, job, data=None):
+        directory = self.store.home / 'action-intents'
+        directory.mkdir(exist_ok=True)
+        path = directory / (job['id'] + '.json')
+        if data is None:
+            return json.loads(path.read_text(encoding='utf-8')) if path.exists() else None
+        temp = path.with_suffix('.tmp')
+        with temp.open('w', encoding='utf-8') as out:
+            json.dump(data, out)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temp, path)
 
     def start_journal(self, job, data=None):
         """Outside SQLite transaction: survives a crash after remote side effects.
@@ -373,7 +529,7 @@ class Engine:
                     self.stop(job, job.get('stop_target', 'failed'), job['error'])
                     self.store.save(job)
                     continue
-                if job['state'] == 'awaiting_review' or time.time() < job['next_scan']:
+                if job['state'] in ('awaiting_review', 'awaiting_action') or time.time() < job['next_scan']:
                     continue
                 try:
                     self.scan(job)
@@ -450,6 +606,51 @@ class Engine:
             return
         if last.get('finish') != 'stop':
             return
+        if job['charter'].get('task_kind', 'file_task') == 'system_install' and not job.get('action_dispatched'):
+            tools = []
+            for message in messages[last_user+1:]:
+                for part in message.get('parts', []):
+                    if part.get('type') == 'tool':
+                        state = part.get('state', {})
+                        tools.append({'tool': part.get('tool'), 'status': state.get('status'),
+                                      'input': state.get('input'), 'output': str(state.get('output', ''))[:6000]})
+            forbidden_before_approval = {'powershell', 'bash', 'shell', 'exec'}
+            violations = [item for item in tools
+                          if item['status'] == 'completed' and item['tool'] in forbidden_before_approval]
+            if violations:
+                self.stop(job, 'failed', 'Worker executed a system-capable tool before action approval')
+                return
+            request_name = job['charter'].get('action_request_artifact', 'system-action-request.json')
+            try:
+                request_path = contained(job['workspace'], request_name)
+                raw = request_path.read_bytes()
+                if len(raw) > 32 * 1024:
+                    raise ValueError('System action request is too large')
+                proposed = json.loads(raw.decode('utf-8-sig'))
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+                self.stop(job, 'failed', f'Invalid system action request: {error}')
+                return
+            expected = public_system_action(job['charter']['system_action'])
+            if proposed != expected:
+                self.stop(job, 'failed', 'Worker system action request differs from the charter')
+                return
+            try:
+                package = verified_msi_source(job['charter']['system_action'])
+            except ValueError:
+                self.stop(job, 'failed', 'MSI package changed before action approval')
+                return
+            self.request(job, 'system_action', {
+                'proposal': proposed,
+                'proposal_sha256': hashlib.sha256(raw).hexdigest(),
+                'package_bytes': package.stat().st_size,
+                'package_sha256': file_sha256(package),
+                'preapproval_tools': tools,
+                'user_authorized_effects': job['charter']['user_authorized_effects'],
+                'rollback': job['charter']['rollback'],
+            })
+            if job['state'] not in TERMINAL | {'stopping'}:
+                job['state'] = 'awaiting_action'
+            return
         try:
             artifacts = snapshot(job['workspace'], job['charter']['artifacts'])
             missing = None
@@ -469,11 +670,13 @@ class Engine:
             for item in tools
             if item['tool'] in forbidden and item['status'] == 'completed'
         ]
+        violations.extend(system_action_trace_violations(job, tools))
         self.request(job, 'review', {'artifacts': artifacts, 'artifact_hash': digest(artifacts),
                                   'artifact_error': missing, 'tools': tools[-30:],
                                   'tools_truncated': len(tools)>30,
                                   'policy_violations': violations,
                                   'approved_permissions': job.get('approved_permissions', 0),
+                                  'approved_system_action_hash': job.get('approved_system_action_hash'),
                                   'finish': 'stop'})
         if job['state'] not in TERMINAL | {'stopping'}:
             job['state'] = 'awaiting_review'
@@ -541,7 +744,18 @@ class Engine:
                     if packet['payload']['artifact_error'] or digest(current) != packet['payload']['artifact_hash']:
                         raise ValueError('Artifacts changed or incomplete; cannot accept stale review')
                     if packet['payload'].get('policy_violations'):
-                        raise ValueError('Completed forbidden tools prevent acceptance')
+                        raise ValueError('Policy violations prevent acceptance')
+                    if (job['charter'].get('task_kind', 'file_task') == 'system_install' and
+                            (not job.get('action_dispatched') or
+                             packet['payload'].get('approved_system_action_hash') !=
+                             job.get('approved_system_action_hash'))):
+                        raise ValueError('System install lacks a bound approved action')
+                    if job['charter'].get('task_kind', 'file_task') == 'system_install':
+                        action = job['charter']['system_action']
+                        staged = contained(job['workspace'], action['package']['filename'])
+                        if (not staged.is_file() or not hmac.compare_digest(
+                                file_sha256(staged), action['package']['sha256'].lower())):
+                            raise ValueError('Staged MSI changed before final acceptance')
                     required = job['charter'].get('min_approved_permissions', 0)
                     if job.get('approved_permissions', 0) < required:
                         raise ValueError('Required permission approvals were not observed')
@@ -554,6 +768,45 @@ class Engine:
                     job['state'] = 'running'
                 else:
                     self.stop(job, 'failed', decision['reason'])
+            elif row['kind'] == 'system_action':
+                if choice not in ('approve', 'reject', 'deny_job'):
+                    raise ValueError('System action decisions: approve/reject/deny_job only')
+                if choice != 'approve':
+                    self.stop(job, 'failed', decision['reason'])
+                else:
+                    if job.get('action_dispatched'):
+                        raise ValueError('System action was already dispatched')
+                    if self.action_journal(job):
+                        raise ValueError('Interrupted system action dispatch; refusing automatic replay')
+                    request_name = job['charter'].get('action_request_artifact', 'system-action-request.json')
+                    raw = contained(job['workspace'], request_name).read_bytes()
+                    if (hashlib.sha256(raw).hexdigest() != packet['payload']['proposal_sha256'] or
+                            json.loads(raw.decode('utf-8-sig')) != packet['payload']['proposal']):
+                        raise ValueError('System action request changed after review')
+                    action = job['charter']['system_action']
+                    try:
+                        source = verified_msi_source(action)
+                    except ValueError as error:
+                        raise ValueError('MSI package changed after review') from error
+                    expected = action['package']['sha256'].lower()
+                    destination = contained(job['workspace'], action['package']['filename'])
+                    if destination.exists():
+                        raise ValueError('Staged MSI destination already exists')
+                    intent = {'action_hash': digest(packet['payload']['proposal']), 'stage': 'staging'}
+                    self.action_journal(job, intent)
+                    shutil.copyfile(source, destination)
+                    if not hmac.compare_digest(file_sha256(destination), expected):
+                        raise RuntimeError('Staged MSI hash mismatch')
+                    intent['stage'] = 'dispatching'
+                    self.action_journal(job, intent)
+                    self.api(job, 'POST', f'/session/{job["session_id"]}/prompt_async',
+                             self.prompt(job, phase='execute'))
+                    intent['stage'] = 'dispatched'
+                    self.action_journal(job, intent)
+                    job['action_dispatched'] = True
+                    job['approved_system_action_hash'] = intent['action_hash']
+                    job['staged_package_sha256'] = expected
+                    job['state'] = 'running'
             else:
                 raise ValueError('Unsupported request kind')
             self.store.db.execute('UPDATE requests SET resolved=1 WHERE id=?', (decision['request_id'],))

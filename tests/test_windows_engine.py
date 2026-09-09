@@ -16,11 +16,41 @@ def charter():
             'timeout_sec':60,'max_redos':1}
 
 
+def install_charter(source):
+    source = Path(source)
+    return {
+        'goal': 'Install a pinned test MSI after a separate lead action approval',
+        'must': ['Prepare an exact action request before execution'],
+        'must_not': ['Use system tools before approval', 'Use the network'],
+        'artifacts': ['install-result.json'],
+        'acceptance': 'The result records the bounded execution outcome',
+        'timeout_sec': 120,
+        'max_lead_requests': 4,
+        'max_redos': 0,
+        'task_kind': 'system_install',
+        'action_request_artifact': 'system-action-request.json',
+        'system_action': {
+            'type': 'msi_install',
+            'elevation': 'runas',
+            'package': {
+                'source': str(source.resolve()),
+                'filename': 'test-package.msi',
+                'sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+            },
+            'arguments': ['/qn', '/norestart', 'INSTALLPRINTER=N'],
+            'allowed_effects': ['install_files', 'service_change', 'firewall_change'],
+        },
+        'user_authorized_effects': ['service_change', 'firewall_change'],
+        'rollback': 'Uninstall the test product and remove its service and firewall rules.',
+    }
+
+
 class FakeClient:
     base='http://127.0.0.1:4397'
     def __init__(self):
         self.pending=[]; self.questions=[]; self.status={}; self.messages={}; self.calls=[]
-        self.fail_reply=False; self.ack_policy=True; self.abort_stays_busy=False; self.count=0
+        self.fail_reply=False; self.fail_prompt=False; self.ack_policy=True
+        self.abort_stays_busy=False; self.count=0
 
     def call(self, method, path, body=None, workspace=None):
         self.calls.append((method,path,copy.deepcopy(body),workspace))
@@ -29,6 +59,7 @@ class FakeClient:
             self.status[sid]={'type':'busy'}; self.messages[sid]=[]
             return {'id':sid,'permission':body.get('permission') if self.ack_policy else None}
         if path.endswith('/prompt_async'):
+            if self.fail_prompt: raise RuntimeError('ambiguous prompt failure')
             sid=path.split('/')[2]
             self.messages[sid].append({'info':{'role':'user'}})
             self.status[sid]={'type':'busy'}
@@ -241,7 +272,7 @@ class Tests(unittest.TestCase):
         tool={'type':'tool','tool':'powershell','state':{'status':'completed','input':{'command':'Get-Location'}}}
         p=self.deliver(j,parts=[tool])
         self.assertEqual(p['payload']['policy_violations'],[{'tool':'powershell','status':'completed'}])
-        with self.assertRaisesRegex(ValueError,'forbidden tools'):self.answer(p,'pass')
+        with self.assertRaisesRegex(ValueError,'Policy violations'):self.answer(p,'pass')
 
     def test_minimum_permission_approvals_prevents_zero_approval_pass(self):
         c=charter();c['min_approved_permissions']=1
@@ -286,6 +317,107 @@ class Tests(unittest.TestCase):
         self.client.questions=[]
         self.rescan(j);self.assertEqual(self.store.inbox(),[])
         self.assertEqual(self.store.get(j['id'])['state'],'running')
+
+    def prepare_install(self):
+        source=Path(self.tmp.name)/'source.msi';source.write_bytes(b'fixed-msi-fixture')
+        with mock.patch('win_collab.core.REPO',Path(self.tmp.name)):
+            j=self.engine.submit(install_charter(source))
+        self.engine.tick();j=self.store.get(j['id'])
+        proposal={
+            'type':'msi_install',
+            'elevation':'runas',
+            'package':{'filename':'test-package.msi',
+                       'sha256':hashlib.sha256(source.read_bytes()).hexdigest()},
+            'arguments':['/qn','/norestart','INSTALLPRINTER=N'],
+            'allowed_effects':['install_files','service_change','firewall_change'],
+        }
+        (Path(j['workspace'])/'system-action-request.json').write_text(
+            json.dumps(proposal),encoding='utf-8')
+        self.client.status[j['session_id']]={'type':'idle'}
+        self.client.messages[j['session_id']].append(
+            {'info':{'role':'assistant','finish':'stop'},'parts':[
+                {'type':'tool','tool':'write','state':{'status':'completed','input':{}}}
+            ]})
+        with mock.patch('win_collab.core.REPO',Path(self.tmp.name)):
+            self.rescan(j)
+        return source,self.store.get(j['id']),self.store.inbox()[0]
+
+    def test_system_action_approval_stages_package_then_resumes_worker(self):
+        source,j,p=self.prepare_install()
+        self.assertEqual(p['kind'],'system_action')
+        self.assertFalse((Path(j['workspace'])/'test-package.msi').exists())
+        with mock.patch('win_collab.core.REPO',Path(self.tmp.name)):
+            result=self.answer(p,'approve')
+        staged=Path(j['workspace'])/'test-package.msi'
+        self.assertEqual(staged.read_bytes(),source.read_bytes())
+        self.assertTrue(result['action_dispatched'])
+        prompts=[c for c in self.client.calls if c[1].endswith('/prompt_async')]
+        self.assertEqual(len(prompts),2)
+        self.assertIn('APPROVED_ACTION',prompts[-1][2]['parts'][0]['text'])
+
+    def test_system_install_review_requires_bound_runas_invocation(self):
+        _source,j,p=self.prepare_install()
+        with mock.patch('win_collab.core.REPO',Path(self.tmp.name)):
+            self.answer(p,'approve')
+        (Path(j['workspace'])/'install-result.json').write_text('{}',encoding='utf-8')
+        self.client.status[j['session_id']]={'type':'idle'}
+        self.client.messages[j['session_id']].append(
+            {'info':{'role':'assistant','finish':'stop'},'parts':[
+                {'type':'tool','tool':'powershell','state':{
+                    'status':'completed','input':{'command':'Start-Process msiexec.exe -Wait -PassThru'}}}
+            ]})
+        self.rescan(j);review=self.store.inbox()[0]
+        self.assertTrue(review['payload']['policy_violations'])
+        with self.assertRaisesRegex(ValueError,'Policy violations'):
+            self.answer(review,'pass')
+
+    def test_changed_system_action_request_invalidates_approval(self):
+        _source,j,p=self.prepare_install()
+        request=Path(j['workspace'])/'system-action-request.json'
+        request.write_text(request.read_text()+' ',encoding='utf-8')
+        with self.assertRaisesRegex(ValueError,'changed after review'):
+            self.answer(p,'approve')
+        self.assertFalse((Path(j['workspace'])/'test-package.msi').exists())
+
+    def test_changed_msi_invalidates_action_approval(self):
+        source,j,p=self.prepare_install();source.write_bytes(b'changed')
+        with self.assertRaisesRegex(ValueError,'MSI package changed'):
+            self.answer(p,'approve')
+        self.assertFalse((Path(j['workspace'])/'test-package.msi').exists())
+
+    def test_ambiguous_system_action_dispatch_is_not_replayed(self):
+        _source,j,p=self.prepare_install();self.client.fail_prompt=True
+        with mock.patch('win_collab.core.REPO',Path(self.tmp.name)),self.assertRaisesRegex(
+                RuntimeError,'ambiguous prompt failure'):
+            self.answer(p,'approve')
+        self.client.fail_prompt=False
+        with self.assertRaisesRegex(ValueError,'refusing automatic replay'):
+            self.answer(p,'approve')
+        action_prompts=[c for c in self.client.calls
+                        if c[1].endswith('/prompt_async') and
+                        'APPROVED_ACTION' in c[2]['parts'][0]['text']]
+        self.assertEqual(len(action_prompts),1)
+
+    def test_system_tool_before_action_approval_fails_job(self):
+        source=Path(self.tmp.name)/'source.msi';source.write_bytes(b'fixed-msi-fixture')
+        with mock.patch('win_collab.core.REPO',Path(self.tmp.name)):
+            j=self.engine.submit(install_charter(source))
+        self.engine.tick();j=self.store.get(j['id'])
+        self.client.status[j['session_id']]={'type':'idle'}
+        self.client.messages[j['session_id']].append(
+            {'info':{'role':'assistant','finish':'stop'},'parts':[
+                {'type':'tool','tool':'powershell','state':{'status':'completed','input':{}}}
+            ]})
+        self.rescan(j)
+        self.assertEqual(self.store.get(j['id'])['state'],'failed')
+        self.assertFalse((Path(j['workspace'])/'test-package.msi').exists())
+
+    def test_system_install_requires_explicit_sensitive_effect_authorization(self):
+        source=Path(self.tmp.name)/'source.msi';source.write_bytes(b'fixed-msi-fixture')
+        c=install_charter(source);c['user_authorized_effects']=[]
+        with mock.patch('win_collab.core.REPO',Path(self.tmp.name)),self.assertRaisesRegex(
+                ValueError,'explicit user_authorized_effects'):
+            self.engine.submit(c)
 
 
 if __name__=='__main__':unittest.main()
