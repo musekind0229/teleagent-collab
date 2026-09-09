@@ -33,6 +33,14 @@
 - 诊断结束后重新以**无诊断参数**的方式启动 TeleAgent，并检查 9235 没有监听。
 - 未修改 TeleAgent 可执行文件、asar、认证机制或全局权限配置；未创建真实 worker session。
 
+## 2026-09-09 RustDesk 安装停点
+
+- 工人计划工单 `87b6682abddd47179ca2a47ad6a72b10` 已通过：标准客户端、无永久密码、无人值守和自建服务器不在范围内。
+- 已下载 `G:\codex\teleagent-windows-migration\.downloads\rustdesk-1.4.9-x86_64.msi`。Grok 复核：24,825,856 字节；SHA-256 `c87d2f4cef2a5acd6003b6507dcfbf5d5168a256db082cd90b54d35193224aaa` 与计划一致；Authenticode `Valid`，签名者 `CN=PURSLANE, O=PURSLANE, ...`。
+- 普通权限 `msiexec` 返回 1603 / Error 1925，安装器已回滚。本机没有 RustDesk 安装痕迹。
+- 管理员重试被 Codex 自动审批拦住：MSI 含创建服务和 `AddFirewallRules`，现有官方参数没有“禁止改防火墙”开关。未绕过 UAC，也未改安装包。
+- 安装包不要提交仓库。`.downloads/` 已加入 gitignore。
+
 ## 仍未验证，不能报完成
 
 - 厂商支持且跨版本稳定的 Windows 外部认证入口；当前是受限兼容发现。

@@ -47,3 +47,5 @@ jobs/agy_account_pool.json
 !jobs/examples/agy_account_pool.example.json
 .collab-state/
 windows/local/
+# local installer cache; never commit vendor binaries
+.downloads/
