@@ -136,10 +136,20 @@ def run_inprocess_charter(
             enforce_named_deps=completed is not None,
         )
         if not gate.get("ready") and gate.get("reason") == "unsatisfied_deps":
-            return queued_for_deps_result(
+            unsatisfied = list(gate.get("unsatisfied_deps") or [])
+            out = queued_for_deps_result(
                 name=job,
-                unsatisfied=list(gate.get("unsatisfied_deps") or []),
+                unsatisfied=unsatisfied,
                 charter=charter,
+            )
+            return _wire_outbox_task(
+                workdir,
+                charter=charter,
+                name=job,
+                new_state="queued",
+                reason="unsatisfied_deps",
+                extra={"unsatisfied_deps": unsatisfied},
+                result=out,
             )
 
     def _run() -> dict[str, Any]:
@@ -176,9 +186,55 @@ def run_inprocess_charter(
     # claim() mints a holder_id when empty; release must use that id.
     hid = outcome.requester_id
     if not outcome.granted:
-        return blocked_inprocess_result(outcome=outcome, name=job, charter=charter)
+        status = outcome.status if outcome.status in ("blocked", "queued") else "blocked"
+        out = blocked_inprocess_result(outcome=outcome, name=job, charter=charter)
+        return _wire_outbox_task(
+            workdir,
+            charter=charter,
+            name=job,
+            new_state=status,
+            reason="workdir_occupied",
+            extra={"occupancy": out.get("occupancy")},
+            result=out,
+        )
     try:
         result = _run()
         return attach_claim(result, outcome)
     finally:
         reg.release(workdir, hid)
+
+
+def _wire_outbox_task(
+    workdir: str | Path,
+    *,
+    charter: dict | None,
+    name: str,
+    new_state: str,
+    reason: str,
+    extra: Mapping[str, Any] | None = None,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Best-effort task state + outbox row. Never flips ok/fail."""
+    try:
+        from framework.outbox import (
+            attach_outbox,
+            ids_for_outbox,
+            open_outbox,
+            record_transition,
+        )
+
+        gid, tid = ids_for_outbox(charter, name)
+        result.setdefault("goal_id", gid)
+        result.setdefault("task_id", tid)
+        record_transition(
+            workdir,
+            {"kind": "task", "task_id": tid, "goal_id": gid},
+            new_state,
+            reason=reason,
+            extra=extra,
+            goal_id=gid,
+            task_id=tid,
+        )
+        return attach_outbox(result, open_outbox(workdir))
+    except Exception:  # noqa: BLE001 — outbox must not fail the job
+        return result

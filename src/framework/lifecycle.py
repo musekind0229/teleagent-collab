@@ -18,6 +18,17 @@ TASK_STATES = frozenset(
     }
 )
 
+GOAL_STATES = frozenset(
+    {
+        "queued",
+        "running",
+        "blocked",
+        "completed",
+        "failed",
+        "cancelled",
+    }
+)
+
 RUN_STATES = frozenset(
     {
         "starting",
@@ -84,7 +95,15 @@ def map_error_class(*, kind: str = "", lead_code: str = "") -> str:
 # Conservative edges for the skeleton — expand later without rewriting glue.
 _TASK_EDGES = {
     "queued": {"running", "cancelled", "blocked", "failed"},
-    "running": {"awaiting_decision", "review", "failed", "cancel_requested", "unknown", "blocked"},
+    "running": {
+        "awaiting_decision",
+        "review",
+        "succeeded",
+        "failed",
+        "cancel_requested",
+        "unknown",
+        "blocked",
+    },
     "awaiting_decision": {"running", "blocked", "failed", "cancel_requested", "unknown"},
     "review": {"succeeded", "failed", "running", "awaiting_decision"},
     "blocked": {"queued", "running", "cancelled", "failed"},
@@ -95,19 +114,33 @@ _TASK_EDGES = {
     "cancelled": set(),
 }
 
+_GOAL_EDGES = {
+    "queued": {"running", "blocked", "failed", "cancelled", "completed"},
+    "running": {"completed", "failed", "blocked", "cancelled"},
+    "blocked": {"queued", "running", "failed", "cancelled"},
+    "completed": set(),
+    "failed": {"queued"},
+    "cancelled": set(),
+}
+
 
 class LifecycleError(ValueError):
     pass
 
 
 def assert_transition(kind: str, src: str, dst: str) -> None:
-    if kind != "task":
-        raise LifecycleError(f"unsupported kind={kind!r} (only task skeleton today)")
-    if src not in TASK_STATES or dst not in TASK_STATES:
-        raise LifecycleError(f"unknown state {src!r} -> {dst!r}")
-    allowed = _TASK_EDGES.get(src, set())
+    k = (kind or "").strip().lower()
+    if k == "task":
+        states, edges, label = TASK_STATES, _TASK_EDGES, "task"
+    elif k == "goal":
+        states, edges, label = GOAL_STATES, _GOAL_EDGES, "goal"
+    else:
+        raise LifecycleError(f"unsupported kind={kind!r} (task or goal)")
+    if src not in states or dst not in states:
+        raise LifecycleError(f"unknown {label} state {src!r} -> {dst!r}")
+    allowed = edges.get(src, set())
     if dst not in allowed:
-        raise LifecycleError(f"illegal task transition {src} -> {dst}")
+        raise LifecycleError(f"illegal {label} transition {src} -> {dst}")
 
 
 # Scheduler JobState.value → public Task/Run vocabulary (read-only projection).

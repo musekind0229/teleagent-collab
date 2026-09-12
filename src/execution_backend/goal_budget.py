@@ -930,13 +930,29 @@ def simulate_scheduler_goal_deps(
                     )
                     failed_this.append(slot)
                 else:
-                    # unsatisfied deps / workdir: stay queued
+                    # unsatisfied deps / workdir: stay queued (blocked when claim refuses)
+                    wait_state = "queued"
+                    if reason == REASON_WORKDIR_OCCUPIED and str(on_conflict).lower() in (
+                        "block",
+                        "blocked",
+                        "fail",
+                        "reject",
+                    ):
+                        wait_state = "blocked"
+                    _sim_outbox_task(
+                        shared_persist,
+                        slot,
+                        wait_state,
+                        reason,
+                        extra={"unsatisfied_deps": (gate.get("unsatisfied_deps") or [])},
+                    )
                     queued_this.append(slot)
                 continue
             mark_enter_running()
             slot["entered_running"] = True
             slot["state"] = "running"
             slot["reason"] = REASON_READY
+            _sim_outbox_task(shared_persist, slot, "running", REASON_READY)
             started.append(slot)
 
         executed: list[dict[str, Any]] = []
@@ -1041,6 +1057,9 @@ def simulate_scheduler_goal_deps(
                 consumer_like["name"] in (first.get("started") or []) and not first.get("queued")
             ) and (producer_like is not None)
 
+    if all_ok and not any_false_success and goal_budget is not None:
+        _sim_outbox_goal(shared_persist, str(goal_budget.goal_id), "completed", "all_tasks_succeeded")
+
     return {
         "ok": all_ok and not any_false_success,
         "slots": slots,
@@ -1126,6 +1145,69 @@ def run_dependent_inprocess_jobs(
     report["producer_slot"] = prod
     report["consumer_slot"] = cons
     return report
+
+
+def _sim_outbox_ids(slot: Mapping[str, Any]) -> tuple[str, str]:
+    try:
+        from framework.outbox import ids_for_outbox
+
+        gid = str(slot.get("goal_id") or "")
+        charter = slot.get("charter") if isinstance(slot.get("charter"), Mapping) else {}
+        g2, tid = ids_for_outbox(charter, str(slot.get("name") or slot.get("job_id") or "job"))
+        return gid or g2, tid
+    except Exception:  # noqa: BLE001
+        return str(slot.get("goal_id") or ""), str(slot.get("job_id") or "")
+
+
+def _sim_outbox_task(
+    persist_dir: str | Path | None,
+    slot: Mapping[str, Any],
+    new_state: str,
+    reason: str,
+    *,
+    from_state: str | None = None,
+    extra: Mapping[str, Any] | None = None,
+) -> None:
+    if persist_dir is None:
+        return
+    try:
+        from framework.outbox import record_transition
+
+        gid, tid = _sim_outbox_ids(slot)
+        record_transition(
+            persist_dir,
+            {"kind": "task", "task_id": tid, "goal_id": gid},
+            new_state,
+            from_state=from_state,
+            reason=str(reason or ""),
+            extra=extra,
+            goal_id=gid,
+            task_id=tid,
+        )
+    except Exception:  # noqa: BLE001
+        return
+
+
+def _sim_outbox_goal(
+    persist_dir: str | Path | None,
+    goal_id: str,
+    new_state: str,
+    reason: str,
+) -> None:
+    if persist_dir is None or not goal_id:
+        return
+    try:
+        from framework.outbox import record_transition
+
+        record_transition(
+            persist_dir,
+            {"kind": "goal", "goal_id": goal_id},
+            new_state,
+            reason=reason,
+            goal_id=goal_id,
+        )
+    except Exception:  # noqa: BLE001
+        return
 
 
 __all__ = [

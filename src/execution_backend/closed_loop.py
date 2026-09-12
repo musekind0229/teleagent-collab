@@ -372,7 +372,17 @@ def run_inprocess_closed_loop(
             )
             out["task_id"] = task_id
             out["goal_id"] = goal_id
-            return out
+            _record_outbox(
+                root,
+                kind="task",
+                entity_id=task_id,
+                new_state="queued",
+                goal_id=goal_id,
+                task_id=task_id,
+                reason="unsatisfied_deps",
+                extra={"unsatisfied_deps": list(gate.get("unsatisfied_deps") or [])},
+            )
+            return _attach_outbox(out, root)
 
     parent = goal_budget
     if parent is None and not skip_budget:
@@ -392,6 +402,25 @@ def run_inprocess_closed_loop(
         "closed_loop=stage-2 artifact_review+rework" if need_review else "closed_loop=execute-only (force_lead_review false)",
         f"goal_budget={parent.goal_id if parent is not None else 'off'} skip_budget={skip_budget}",
     ]
+    _record_outbox(
+        root,
+        kind="task",
+        entity_id=task_id,
+        new_state="running",
+        from_state="queued",
+        goal_id=goal_id,
+        task_id=task_id,
+        reason="enter_running",
+    )
+    _record_outbox(
+        root,
+        kind="goal",
+        entity_id=goal_id,
+        new_state="running",
+        from_state="queued",
+        goal_id=goal_id,
+        reason="task_enter_running",
+    )
     attempts: list[dict[str, Any]] = []
     last_raw: dict[str, Any] = {}
     last_review: dict[str, Any] | None = None
@@ -671,13 +700,52 @@ def run_inprocess_closed_loop(
             report["state"] = "fail"
             report["error_class"] = map_error_class(kind="budget_exhausted")
             report["error"] = "goal budget over; success refused"
+    if report.get("ok"):
+        _record_outbox(
+            root,
+            kind="task",
+            entity_id=task_id,
+            new_state="succeeded",
+            from_state="running",
+            goal_id=goal_id,
+            task_id=task_id,
+            run_id=str(report.get("run_id") or ""),
+            reason="task_succeeded",
+        )
+        _record_outbox(
+            root,
+            kind="goal",
+            entity_id=goal_id,
+            new_state="completed",
+            from_state="running",
+            goal_id=goal_id,
+            reason="goal_completed",
+        )
     try:
         from framework.project_report import attach_framework_projection
 
         attach_framework_projection(report, charter)
     except Exception as e:  # noqa: BLE001
         report.setdefault("notes", []).append(f"framework_projection skipped: {e}")
-    return report
+    return _attach_outbox(report, root)
+
+
+def _record_outbox(workdir: str | Path, **kwargs: Any) -> None:
+    try:
+        from framework.outbox import record_transition
+
+        record_transition(workdir, **kwargs)
+    except Exception:  # noqa: BLE001
+        return
+
+
+def _attach_outbox(result: dict[str, Any], workdir: str | Path) -> dict[str, Any]:
+    try:
+        from framework.outbox import attach_outbox, open_outbox
+
+        return attach_outbox(result, open_outbox(workdir))
+    except Exception:  # noqa: BLE001
+        return result
 
 
 __all__ = [

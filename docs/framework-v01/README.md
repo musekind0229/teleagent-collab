@@ -13,3 +13,4 @@ Knife 9: two independent inprocess jobs isolated **by workdir** (not by process 
 Knife 10: same workdir / write path is **claimed** (queue or block) with occupancy; isolated workdirs still run in parallel — `docs/framework-v01/knife10-workdir-claim.md`.
 Knife 11: Goal-level total budget (reserve / reconcile, child costs roll up, new ids do not reset) and Task `depends_on` (unready stay queued) — `docs/framework-v01/knife11-goal-budget-deps.md`.
 Knife 12: one effective coordinator per Goal + ownership version; plan revisions via structured proposal (kernel legality then commit); stale instance submits rejected; handoff bumps version — `docs/framework-v01/knife12-goal-ownership.md`.
+Knife 13: state change + outbox row in one journal txn; durable outbox pending→sent; receiver dedup by event id / delivery key; crash-replay does not lose pending; at-least-once ≠ exactly-once side effect — `docs/framework-v01/knife13-outbox-dedup.md`.

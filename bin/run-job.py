@@ -79,6 +79,7 @@ def write_reports(out_dir: Path, charter: dict, result: dict, instruction: str) 
         "goal_budget",
         "unsatisfied_deps",
         "gate_reason",
+        "outbox",
     ):
         if extra_key in result and result.get(extra_key) is not None:
             status[extra_key] = result.get(extra_key)
@@ -138,6 +139,7 @@ def write_reports(out_dir: Path, charter: dict, result: dict, instruction: str) 
                     "artifact_review",
                     "backend",
                     "used_public_api_only",
+                    "outbox",
                 )
                 if k in result
             },
