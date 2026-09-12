@@ -26,6 +26,21 @@ from execution_backend.run_job_wire import (
     resolve_run_job_backend,
     run_inprocess_charter,
 )
+from execution_backend.two_job_isolation import (
+    ARTIFACT_A as ISO_ARTIFACT_A,
+    ARTIFACT_B as ISO_ARTIFACT_B,
+    ISO_A_CHARTER,
+    ISO_B_CHARTER,
+    IsolationError,
+    allocate_isolated_workdirs,
+    check_workdir_isolation,
+    isolation_report,
+    prove_shared_workdir_is_not_isolation,
+    prove_shared_workspace_collides,
+    require_distinct_workdirs,
+    run_one_inprocess_job,
+    run_two_jobs_isolated,
+)
 
 __all__ = [
     "BackendCapability",
@@ -49,6 +64,19 @@ __all__ = [
     "make_decision_channel_fail",
     "make_fail_once_then_pass",
     "run_inprocess_closed_loop",
+    "ISO_A_CHARTER",
+    "ISO_B_CHARTER",
+    "ISO_ARTIFACT_A",
+    "ISO_ARTIFACT_B",
+    "IsolationError",
+    "allocate_isolated_workdirs",
+    "check_workdir_isolation",
+    "isolation_report",
+    "prove_shared_workdir_is_not_isolation",
+    "prove_shared_workspace_collides",
+    "require_distinct_workdirs",
+    "run_one_inprocess_job",
+    "run_two_jobs_isolated",
 ]
 
 
