@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://musekind.local/contracts/task.v0.1-draft.json",
+  "title": "Task",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "task_id",
+    "goal_id",
+    "title",
+    "inputs",
+    "expected_artifacts",
+    "done_when",
+    "status"
+  ],
+  "properties": {
+    "contract_version": {
+      "const": "contract.v0.1-draft"
+    },
+    "task_id": {
+      "type": "string"
+    },
+    "goal_id": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    },
+    "depends_on": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "inputs": {
+      "type": "object"
+    },
+    "expected_artifacts": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "done_when": {
+      "type": "object"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "running",
+        "awaiting_decision",
+        "review",
+        "blocked",
+        "unknown",
+        "succeeded",
+        "failed",
+        "cancel_requested",
+        "cancelled"
+      ]
+    },
+    "assignee_role": {
+      "type": "string"
+    },
+    "backend_requirement": {
+      "type": "string"
+    },
+    "environment_id": {
+      "type": "string"
+    },
+    "authz_snapshot_ref": {
+      "type": "string",
+      "description": "指向冻结的授权合同版本；缺失则不得开工"
+    }
+  }
+}

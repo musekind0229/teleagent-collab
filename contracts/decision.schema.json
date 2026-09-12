@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://musekind.local/contracts/decision.v0.1-draft.json",
+  "title": "Decision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "request_id",
+    "kind",
+    "goal_id",
+    "task_id",
+    "run_id",
+    "binding",
+    "verdict",
+    "reason"
+  ],
+  "properties": {
+    "contract_version": {
+      "const": "contract.v0.1-draft"
+    },
+    "request_id": {
+      "type": "string"
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "action_approval",
+        "question",
+        "artifact_review",
+        "plan_review"
+      ]
+    },
+    "goal_id": {
+      "type": "string"
+    },
+    "task_id": {
+      "type": "string"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "binding": {
+      "type": "object",
+      "required": [
+        "application_id",
+        "context_digest"
+      ],
+      "properties": {
+        "application_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "context_digest": {
+          "type": "string",
+          "minLength": 1,
+          "description": "控制器生成；非法响应不得事后补齐生效"
+        },
+        "legacy_context_summary": {
+          "type": "string",
+          "description": "兼容旧 lead 逐字回显；可选"
+        }
+      }
+    },
+    "verdict": {
+      "type": "string"
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "scope": {
+      "type": "object"
+    },
+    "expires_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "producer": {
+      "type": "string",
+      "enum": [
+        "model",
+        "human",
+        "rule"
+      ]
+    }
+  }
+}

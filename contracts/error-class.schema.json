@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://musekind.local/contracts/error-class.v0.1-draft.json",
+  "title": "ErrorClass",
+  "type": "string",
+  "enum": [
+    "implementation_failed",
+    "acceptance_failed",
+    "decision_channel_failed",
+    "backend_unavailable",
+    "budget_exhausted",
+    "awaiting_user",
+    "unknown"
+  ],
+  "description": "决定重试哪一段；不得一律重跑工人。decision_channel_failed 时不得因协议错误重写已完成产物。"
+}

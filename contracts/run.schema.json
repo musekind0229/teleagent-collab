@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://musekind.local/contracts/run.v0.1-draft.json",
+  "title": "Run",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "run_id",
+    "task_id",
+    "attempt",
+    "backend",
+    "contract_fingerprint",
+    "state"
+  ],
+  "properties": {
+    "contract_version": {
+      "const": "contract.v0.1-draft"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "task_id": {
+      "type": "string"
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "backend": {
+      "type": "string",
+      "examples": [
+        "teleagent.linux.local_v1",
+        "hermes.profile",
+        "inprocess"
+      ]
+    },
+    "native_handle": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "dispatch_id": {
+      "type": "string"
+    },
+    "contract_fingerprint": {
+      "type": "string",
+      "description": "输入合同哈希；返工必须换新 Run 并记录"
+    },
+    "workspace_id": {
+      "type": "string"
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "starting",
+        "running",
+        "awaiting_decision",
+        "observing",
+        "collecting",
+        "succeeded",
+        "failed",
+        "cancel_requested",
+        "cancelled",
+        "unknown"
+      ]
+    },
+    "error_class": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "usage": {
+      "type": "object"
+    },
+    "artifact_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://musekind.local/contracts/goal.v0.1-draft.json",
+  "title": "Goal",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "goal_id",
+    "title",
+    "desired_outcome",
+    "boundaries",
+    "acceptance",
+    "budget"
+  ],
+  "properties": {
+    "contract_version": {
+      "const": "contract.v0.1-draft"
+    },
+    "goal_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "idempotency_key": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "desired_outcome": {
+      "type": "string",
+      "minLength": 1
+    },
+    "boundaries": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "must",
+        "must_not"
+      ],
+      "properties": {
+        "must": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "must_not": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allow_secret_globs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allow_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allow_keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allowed_surfaces": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "user_gate_permissions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "acceptance": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "wall_sec"
+      ],
+      "properties": {
+        "wall_sec": {
+          "type": "number",
+          "minimum": 1
+        },
+        "max_reworks": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_lead_calls": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cost_hint": {
+          "type": "string"
+        }
+      }
+    },
+    "role_hints": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "capability_requirements": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "platform_allowlist": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "linux",
+          "windows",
+          "macos"
+        ]
+      },
+      "description": "macos 可出现在名单中但实现必须返回 unsupported，不得按 linux 跑"
+    },
+    "context_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "source_charter_path": {
+      "type": "string"
+    }
+  }
+}

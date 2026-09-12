@@ -1,0 +1,45 @@
+name: mini-live-hello
+task_kind: file_task
+goal: >
+  Mini live acceptance after astra. In THIS workspace only:
+  (1) Use Read on /etc/hostname (may prompt external_directory — wait for once-approval).
+  (2) Write hello-mini.txt with exactly one line: mini-live-ok
+  (3) Write run-evidence.txt with the hostname you read and the exact write command notes.
+  Then stop.
+
+must:
+  - Stay writes inside the assigned workspace
+  - Create hello-mini.txt and run-evidence.txt
+  - Wait for once-approval if permission is requested for reading /etc/hostname
+
+must_not:
+  - always-approve / yolo / global auto-approve
+  - Read credentials, tokens, cookies, or secret files
+  - Install packages or change services
+  - Write outside this workspace
+
+allow_secret_globs: []
+allow_paths: []
+allow_keys: []
+network_allow: []
+install_roots: []
+lead_review_steps:
+  - permission
+  - job_end
+user_gate_permissions:
+  - sudo
+  - credential_store_write
+allowed_surfaces:
+  - workspace_fs
+  - lead_approved_tools
+done_when:
+  artifacts:
+    - hello-mini.txt
+    - run-evidence.txt
+acceptance: |
+  hello-mini.txt exists with exactly one line: mini-live-ok
+  run-evidence.txt exists and is non-empty
+rollback: |
+  Delete hello-mini.txt and run-evidence.txt from the workspace
+timeout_sec: 360
+force_lead_review: true

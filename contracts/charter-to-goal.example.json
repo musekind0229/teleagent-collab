@@ -1,0 +1,81 @@
+{
+  "note": "旧 mini-live-hello.charter.yaml → 单工单 Goal/Task；allow_* 空数组保留，不补成允许一切秘密",
+  "source_charter": "jobs/examples/mini-live-hello.charter.yaml",
+  "goal": {
+    "contract_version": "contract.v0.1-draft",
+    "goal_id": "goal_mini_live_hello",
+    "title": "mini-live-hello",
+    "desired_outcome": "In THIS workspace only: read /etc/hostname (once-approval ok), write hello-mini.txt=mini-live-ok and non-empty run-evidence.txt, then stop.",
+    "boundaries": {
+      "must": [
+        "Stay writes inside the assigned workspace",
+        "Create hello-mini.txt and run-evidence.txt",
+        "Wait for once-approval if permission is requested for reading /etc/hostname"
+      ],
+      "must_not": [
+        "always-approve / yolo / global auto-approve",
+        "Read credentials, tokens, cookies, or secret files",
+        "Install packages or change services",
+        "Write outside this workspace"
+      ],
+      "allow_secret_globs": [],
+      "allow_paths": [],
+      "allow_keys": [],
+      "allowed_surfaces": [
+        "workspace_fs",
+        "lead_approved_tools"
+      ],
+      "user_gate_permissions": [
+        "sudo",
+        "credential_store_write"
+      ]
+    },
+    "acceptance": {
+      "artifacts": [
+        "hello-mini.txt",
+        "run-evidence.txt"
+      ],
+      "text": "hello-mini.txt exists with exactly one line: mini-live-ok; run-evidence.txt non-empty"
+    },
+    "budget": {
+      "wall_sec": 360,
+      "max_reworks": 1
+    },
+    "capability_requirements": [
+      "teleagent.permission_loop",
+      "force_lead_review"
+    ],
+    "platform_allowlist": [
+      "linux"
+    ],
+    "source_charter_path": "jobs/examples/mini-live-hello.charter.yaml"
+  },
+  "task": {
+    "contract_version": "contract.v0.1-draft",
+    "task_id": "task_mini_live_hello_1",
+    "goal_id": "goal_mini_live_hello",
+    "title": "file_task implementation",
+    "depends_on": [],
+    "inputs": {
+      "task_kind": "file_task",
+      "force_lead_review": true,
+      "lead_review_steps": [
+        "permission",
+        "job_end"
+      ]
+    },
+    "expected_artifacts": [
+      "hello-mini.txt",
+      "run-evidence.txt"
+    ],
+    "done_when": {
+      "artifacts": [
+        "hello-mini.txt",
+        "run-evidence.txt"
+      ]
+    },
+    "status": "queued",
+    "assignee_role": "executor",
+    "backend_requirement": "teleagent.linux.local_v1"
+  }
+}
