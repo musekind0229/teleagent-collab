@@ -24,5 +24,5 @@ JSON Schema 文件：
 
 ## Execution backends
 
-- `teleagent.linux.local_v1` — existing TeleAgent worker (unchanged entrypoints).
-- `inprocess.local_v1` — deterministic second backend under `src/execution_backend/` (public observe/start/collect; not Hermes ledger).
+- `teleagent.linux.local_v1` — existing TeleAgent worker (default `bin/run-job.py` path).
+- `inprocess.local_v1` — deterministic second backend under `src/execution_backend/` (public observe/start/collect; not Hermes ledger). Select via `bin/run-job.py --backend inprocess` or `COLLAB_EXECUTION_BACKEND=inprocess.local_v1`.

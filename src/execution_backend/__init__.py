@@ -10,6 +10,13 @@ from execution_backend.base import (
     unsupported,
 )
 from execution_backend.inprocess_v1 import InProcessExecutionBackend, run_file_job_via_public_api
+from execution_backend.run_job_wire import (
+    ENV_NAME as COLLAB_EXECUTION_BACKEND_ENV,
+    KIND_INPROCESS,
+    KIND_TELEAGENT,
+    resolve_run_job_backend,
+    run_inprocess_charter,
+)
 
 __all__ = [
     "BackendCapability",
@@ -21,6 +28,11 @@ __all__ = [
     "unsupported",
     "run_file_job_via_public_api",
     "get_execution_backend",
+    "COLLAB_EXECUTION_BACKEND_ENV",
+    "KIND_INPROCESS",
+    "KIND_TELEAGENT",
+    "resolve_run_job_backend",
+    "run_inprocess_charter",
 ]
 
 

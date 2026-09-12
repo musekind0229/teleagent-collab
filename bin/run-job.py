@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Eternal → worker entry: load charter, call glue.run_job, land status/report.
+"""Eternal → worker entry: load charter, run via selected backend, land status/report.
 
 Usage:
   python3 bin/run-job.py jobs/examples/hello.charter.yaml
   python3 bin/run-job.py --dry-run jobs/examples/hello.charter.yaml
+  python3 bin/run-job.py --backend inprocess jobs/examples/hello.charter.yaml
+  COLLAB_EXECUTION_BACKEND=inprocess.local_v1 python3 bin/run-job.py jobs/examples/hello.charter.yaml
 
-Reports land under jobs/runs/<name>-<utc>/ (status.json, report.json, report.md).
+Default backend is TeleAgent (glue). inprocess uses ExecutionBackend public API only
+(no TeleAgent HTTP). Reports land under jobs/runs/<name>-<utc>/.
 """
 from __future__ import annotations
 
@@ -179,6 +182,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Validate charter + write reports without calling TeleAgent/glue.run_job",
     )
     ap.add_argument(
+        "--backend",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Execution backend: teleagent (default) or inprocess. "
+            "Overrides env COLLAB_EXECUTION_BACKEND. "
+            "Dry-run ignores this and never calls a backend."
+        ),
+    )
+    ap.add_argument(
         "--runs-dir",
         default=str(REPO / "jobs" / "runs"),
         help="Directory for status/report outputs (default: jobs/runs)",
@@ -192,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--workspace",
         default=None,
-        help="Per-job workdir (default: glue.COLLAB). Use distinct dirs for parallel jobs.",
+        help="Per-job workdir (default: glue.COLLAB for teleagent; jobs/workspaces/<name>-inproc-<utc> for inprocess).",
     )
     args = ap.parse_args(argv)
 
@@ -206,43 +219,84 @@ def main(argv: list[str] | None = None) -> int:
     instruction = build_instruction(charter)
     glue_charter = charter_for_glue(charter)
 
+    backend_kind = None
+    workspace_used = None
+
     # Lazy import: dry-run works even if TeleAgent creds missing.
+    # Dry-run always stays on the charter-validate path (ignores --backend / env).
     if args.dry_run:
         arts = expected_artifacts(charter, workspace=None)
         # Prefer relative names in dry-run when no workspace
         result = dry_run_result(charter, instruction, arts)
     else:
-        import glue as g
-
-        ws = Path(args.workspace) if args.workspace else Path(g.COLLAB)
-        ws.mkdir(parents=True, exist_ok=True)
-        arts = expected_artifacts(charter, workspace=ws)
-        # Clean expected artifacts so sample jobs are repeatable
-        for apath in arts:
-            p = Path(apath)
-            if p.exists() and p.is_file():
-                p.unlink()
-
-        timeout = args.timeout_sec
-        if timeout is None:
-            timeout = int(charter.get("timeout_sec") or 300)
-        force_review = bool(charter.get("force_lead_review", False))
-
-        t0 = time.time()
-        result = g.run_job(
-            name,
-            instruction,
-            arts,
-            force_lead_review=force_review,
-            timeout_sec=timeout,
-            charter=glue_charter,
-            worker_intent=charter.get("worker_intent")
-            or f"Execute charter job {name!r}: {charter['goal'][:200]}",
-            blocker=charter.get("blocker"),
-            workspace=ws,
+        from execution_backend.base import BackendError
+        from execution_backend.run_job_wire import (
+            KIND_INPROCESS,
+            resolve_run_job_backend,
+            run_inprocess_charter,
         )
-        result.setdefault("notes", []).append(f"wall_sec={time.time() - t0:.1f}")
-        result["dry_run"] = False
+
+        try:
+            backend_kind = resolve_run_job_backend(args.backend)
+        except BackendError as e:
+            print(f"backend error: {e}", file=sys.stderr)
+            return 2
+
+        if backend_kind == KIND_INPROCESS:
+            ws = (
+                Path(args.workspace)
+                if args.workspace
+                else REPO / "jobs" / "workspaces" / f"{name}-inproc-{_utc_stamp()}"
+            )
+            ws.mkdir(parents=True, exist_ok=True)
+            workspace_used = str(ws)
+            arts = expected_artifacts(charter, workspace=ws)
+            for apath in arts:
+                p = Path(apath)
+                if p.exists() and p.is_file():
+                    p.unlink()
+            t0 = time.time()
+            result = run_inprocess_charter(
+                charter=charter,
+                workdir=ws,
+                instruction=instruction,
+                name=name,
+            )
+            result.setdefault("notes", []).append(f"wall_sec={time.time() - t0:.1f}")
+            result["dry_run"] = False
+        else:
+            import glue as g
+
+            ws = Path(args.workspace) if args.workspace else Path(g.COLLAB)
+            ws.mkdir(parents=True, exist_ok=True)
+            workspace_used = str(ws)
+            arts = expected_artifacts(charter, workspace=ws)
+            # Clean expected artifacts so sample jobs are repeatable
+            for apath in arts:
+                p = Path(apath)
+                if p.exists() and p.is_file():
+                    p.unlink()
+
+            timeout = args.timeout_sec
+            if timeout is None:
+                timeout = int(charter.get("timeout_sec") or 300)
+            force_review = bool(charter.get("force_lead_review", False))
+
+            t0 = time.time()
+            result = g.run_job(
+                name,
+                instruction,
+                arts,
+                force_lead_review=force_review,
+                timeout_sec=timeout,
+                charter=glue_charter,
+                worker_intent=charter.get("worker_intent")
+                or f"Execute charter job {name!r}: {charter['goal'][:200]}",
+                blocker=charter.get("blocker"),
+                workspace=ws,
+            )
+            result.setdefault("notes", []).append(f"wall_sec={time.time() - t0:.1f}")
+            result["dry_run"] = False
 
     out_dir = _run_dir(name, Path(args.runs_dir))
     write_reports(out_dir, charter, result, instruction)
@@ -255,6 +309,14 @@ def main(argv: list[str] | None = None) -> int:
         "report_md": str(out_dir / "report.md"),
         "report_json": str(out_dir / "report.json"),
     }
+    if backend_kind:
+        summary["backend"] = backend_kind
+        if result.get("used_public_api_only") is not None:
+            summary["used_public_api_only"] = bool(result.get("used_public_api_only"))
+        if result.get("backend"):
+            summary["backend_id"] = result.get("backend")
+    if workspace_used:
+        summary["workspace"] = workspace_used
     print(json.dumps(summary, ensure_ascii=False))
     if args.dry_run:
         return 0
