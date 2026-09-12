@@ -18,13 +18,16 @@ def attach_framework_projection(report: dict, charter: dict | None) -> None:
     prev_error = report.get("error")
     try:
         out = map_charter_to_goal_task(charter)
-        report["framework_projection"] = {
+        proj: dict[str, Any] = {
             "goal": out["goal"],
             "task": out["task"],
             "warnings": out.get("warnings") or [],
             "allow_fields_missing": out.get("_allow_fields_missing") or [],
             "readonly": True,
         }
+        if out.get("coordinator_id"):
+            proj["coordinator_id"] = out["coordinator_id"]
+        report["framework_projection"] = proj
     except CharterMapError as e:
         report.setdefault("notes", []).append(f"framework_projection skipped: {e}")
     except Exception as e:  # noqa: BLE001 — projection must never break the job

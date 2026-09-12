@@ -119,6 +119,12 @@ def map_charter_to_goal_task(
     if charter.get("force_lead_review"):
         goal["capability_requirements"].append("force_lead_review")
 
+    coordinator = str(charter.get("coordinator_id") or "").strip()
+    if coordinator:
+        # Kernel-owned identity lives on GoalOwnership; role_hints is the
+        # projection-safe hint (Goal schema has no coordinator field).
+        goal["role_hints"] = {"coordinator": coordinator}
+
     expected = []
     if isinstance(acceptance.get("artifacts"), list):
         expected = list(acceptance["artifacts"])
@@ -149,4 +155,12 @@ def map_charter_to_goal_task(
         "backend_requirement": "teleagent.linux.local_v1",
     }
 
-    return {"goal": goal, "task": task, "warnings": warnings, "_allow_fields_missing": missing_allow}
+    out: dict[str, Any] = {
+        "goal": goal,
+        "task": task,
+        "warnings": warnings,
+        "_allow_fields_missing": missing_allow,
+    }
+    if coordinator:
+        out["coordinator_id"] = coordinator
+    return out
