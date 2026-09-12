@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from framework.delegation import autonomy_is_known, normalize_autonomy
 from framework.models import CONTRACT_VERSION, new_goal_id, new_task_id
 from framework.task_deps import depends_on_strings
 
@@ -120,10 +121,25 @@ def map_charter_to_goal_task(
         goal["capability_requirements"].append("force_lead_review")
 
     coordinator = str(charter.get("coordinator_id") or "").strip()
+    submitter = str(charter.get("submitter_id") or charter.get("submitter") or "").strip()
+    ext_ref = str(charter.get("external_goal_ref") or "").strip()
+    raw_auto = charter.get("autonomy")
+    if raw_auto is None and isinstance(charter.get("delegation"), dict):
+        dlg = charter["delegation"]
+        raw_auto = dlg.get("autonomy") if dlg.get("autonomy") is not None else dlg.get("mode") or dlg
+
+    hints: dict[str, str] = {}
     if coordinator:
         # Kernel-owned identity lives on GoalOwnership; role_hints is the
         # projection-safe hint (Goal schema has no coordinator field).
-        goal["role_hints"] = {"coordinator": coordinator}
+        hints["coordinator"] = coordinator
+    if submitter:
+        hints["submitter"] = submitter
+    spec = normalize_autonomy(raw_auto) if raw_auto is not None else None
+    if spec is not None and autonomy_is_known(spec):
+        hints["autonomy"] = str(spec["mode"])
+    if hints:
+        goal["role_hints"] = hints
 
     expected = []
     if isinstance(acceptance.get("artifacts"), list):
@@ -163,4 +179,10 @@ def map_charter_to_goal_task(
     }
     if coordinator:
         out["coordinator_id"] = coordinator
+    if submitter:
+        out["submitter_id"] = submitter
+    if ext_ref:
+        out["external_goal_ref"] = ext_ref
+    if spec is not None and autonomy_is_known(spec):
+        out["autonomy"] = spec
     return out

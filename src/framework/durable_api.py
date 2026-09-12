@@ -26,6 +26,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from framework.delegation import (
+    ESCALATE_KINDS,
+    EVENT_CLASS_DECISION,
+    EVENT_CLASS_STATUS,
+    KIND_ESCALATE_INSUFFICIENT_AUTH,
+    KIND_ESCALATE_OUT_OF_SCOPE,
+    KIND_ESCALATE_OVER_BUDGET,
+    REASON_AUTONOMY_DENIED,
+    REASON_UNKNOWN_AUTONOMY,
+    REASON_UNKNOWN_ESCALATE,
+    autonomy_is_known,
+    event_class_for,
+    is_escalate_kind,
+    normalize_autonomy,
+    normalize_escalate_kind,
+    undeclared_autonomy,
+)
 from framework.lifecycle import (
     GOAL_STATES,
     TASK_STATES,
@@ -61,10 +78,20 @@ REASON_ACTOR_REQUIRED = "actor_required"
 REASON_NOT_COORDINATOR = "not_coordinator"
 REASON_STALE_OWNERSHIP = "stale_ownership"
 REASON_ACTOR_NOT_AUTHORIZED = "actor_not_authorized"
+REASON_NO_OWNER = "no_owner"
 
 DECISION_KINDS = frozenset(
-    {"action_approval", "question", "artifact_review", "plan_review"}
-)
+    {
+        "action_approval",
+        "question",
+        "artifact_review",
+        "plan_review",
+        KIND_ESCALATE_OVER_BUDGET,
+        KIND_ESCALATE_OUT_OF_SCOPE,
+        KIND_ESCALATE_INSUFFICIENT_AUTH,
+        "return_to_upper",
+    }
+) | set(ESCALATE_KINDS)
 
 _IN_FLIGHT_TASK = frozenset({"running", "awaiting_decision", "review"})
 _TERMINAL_GOAL = frozenset({"completed", "failed", "cancelled"})
@@ -285,6 +312,10 @@ def _submit_content_fingerprint(
     desired_outcome: str,
     goal: Mapping[str, Any] | None,
     tasks: Sequence[Mapping[str, Any]] | None,
+    submitter_id: str = "",
+    external_goal_ref: str = "",
+    autonomy: Any = None,
+    coordinator_id: str = "",
 ) -> str:
     """Stable fingerprint of submit payload (ids / submit_key excluded)."""
     body = _default_goal_body(
@@ -296,6 +327,16 @@ def _submit_content_fingerprint(
     body.pop("goal_id", None)
     body.pop("idempotency_key", None)
     body.pop("contract_version", None)
+    hints = dict(body.get("role_hints") or {}) if isinstance(body.get("role_hints"), Mapping) else {}
+    cid = _norm_key(coordinator_id)
+    if cid:
+        hints["coordinator"] = cid
+    spec = normalize_autonomy(autonomy)
+    if autonomy_is_known(spec):
+        hints["autonomy"] = spec["mode"]
+        body["role_hints"] = hints
+    elif hints:
+        body["role_hints"] = hints
     task_rows: list[dict[str, Any]] = []
     for item in tasks or []:
         if not isinstance(item, Mapping):
@@ -306,7 +347,21 @@ def _submit_content_fingerprint(
         if not _norm_key(item.get("task_id")):
             rec.pop("task_id", None)
         task_rows.append(rec)
-    return contract_fingerprint({"goal": body, "tasks": task_rows})
+    payload: dict[str, Any] = {"goal": body, "tasks": task_rows}
+    sid = _norm_key(submitter_id)
+    if sid:
+        payload["submitter_id"] = sid
+    xref = _norm_key(external_goal_ref)
+    if xref:
+        payload["external_goal_ref"] = xref
+    if autonomy_is_known(spec):
+        payload["autonomy"] = {
+            "mode": spec["mode"],
+            "allow_local_plan": bool(spec.get("allow_local_plan")),
+            "allow_rework": bool(spec.get("allow_rework")),
+            "allow_reassign": bool(spec.get("allow_reassign")),
+        }
+    return contract_fingerprint(payload)
 
 
 def _fingerprint_of_snap(snap: Mapping[str, Any]) -> str:
@@ -360,15 +415,41 @@ def _authorize_resolve_actor(
     *,
     actor_id: str,
     ownership_version: Any = None,
+    decision_kind: str = "",
+    return_to_upper: bool = False,
+    submitter_id: str = "",
 ) -> tuple[bool, str]:
-    """If the Goal has a coordinator, actor must be that live instance."""
+    """Bind resolve to a caller identity.
+
+    P0: if the Goal has a coordinator, actor must be that live instance.
+    P1 return-to-upper / escalate: the recorded submitter (upper) may resolve,
+    as may the live coordinator. Silent retry is not an authorization path.
+    """
     store = _ownership_store_if_present(persist_root, goal_id)
-    if store is None:
+    own = store.current() if store is not None else None
+    coordinator = ""
+    if own is not None and own.coordinator_id and int(own.version) > 0:
+        coordinator = own.coordinator_id
+
+    escalate = is_escalate_kind(decision_kind, return_to_upper=return_to_upper)
+    if escalate:
+        allowed = {x for x in (_norm_key(submitter_id), _norm_key(coordinator)) if x}
+        if not allowed:
+            return True, REASON_READY
+        if actor_id not in allowed:
+            return False, REASON_ACTOR_NOT_AUTHORIZED
+        if coordinator and actor_id == coordinator and ownership_version not in (None, ""):
+            try:
+                ver = int(ownership_version)
+            except (TypeError, ValueError):
+                return False, REASON_STALE_OWNERSHIP
+            if own is not None and ver != int(own.version):
+                return False, REASON_STALE_OWNERSHIP
         return True, REASON_READY
-    own = store.current()
-    if not own.coordinator_id or int(own.version) <= 0:
+
+    if store is None or not coordinator:
         return True, REASON_READY
-    if actor_id != own.coordinator_id:
+    if actor_id != coordinator:
         return False, REASON_NOT_COORDINATOR
     if ownership_version is None or ownership_version == "":
         return True, REASON_READY
@@ -376,7 +457,7 @@ def _authorize_resolve_actor(
         ver = int(ownership_version)
     except (TypeError, ValueError):
         return False, REASON_STALE_OWNERSHIP
-    if ver != int(own.version):
+    if own is not None and ver != int(own.version):
         return False, REASON_STALE_OWNERSHIP
     return True, REASON_READY
 
@@ -415,6 +496,27 @@ def _default_goal_body(
     for extra_key in ("capability_requirements", "platform_allowlist", "context_refs", "source_charter_path"):
         if extra_key in src:
             body[extra_key] = src[extra_key]
+    return body
+
+
+def _apply_delegation_hints(
+    body: dict[str, Any],
+    *,
+    coordinator_id: str = "",
+    autonomy: Mapping[str, Any] | None = None,
+    submitter_id: str = "",
+) -> dict[str, Any]:
+    hints = dict(body.get("role_hints") or {}) if isinstance(body.get("role_hints"), Mapping) else {}
+    cid = _norm_key(coordinator_id)
+    if cid:
+        hints["coordinator"] = cid
+    if autonomy_is_known(autonomy):
+        hints["autonomy"] = str(autonomy.get("mode") or "")
+    sid = _norm_key(submitter_id)
+    if sid:
+        hints["submitter"] = sid
+    if hints:
+        body["role_hints"] = hints
     return body
 
 
@@ -457,6 +559,9 @@ def _empty_snapshot(*, goal_id: str, submit_key: str, goal: Mapping[str, Any]) -
         "resolved_decisions": [],
         "history": [],
         "notes": [],
+        "submitter_id": "",
+        "external_goal_ref": "",
+        "autonomy": undeclared_autonomy(),
         "created_at": now,
         "created_at_iso": _iso(now),
         "updated_at": now,
@@ -465,6 +570,56 @@ def _empty_snapshot(*, goal_id: str, submit_key: str, goal: Mapping[str, Any]) -
         "cancel_requested_at_iso": "",
         "cancelled_at": None,
         "cancelled_at_iso": "",
+    }
+
+
+def _delegation_fields_from(
+    *,
+    extra: Mapping[str, Any] | None,
+    goal: Mapping[str, Any] | None,
+    submitter_id: str = "",
+    external_goal_ref: str = "",
+    autonomy: Any = None,
+    coordinator_id: str = "",
+) -> dict[str, Any]:
+    extra = extra if isinstance(extra, Mapping) else {}
+    src = goal if isinstance(goal, Mapping) else {}
+    hints = src.get("role_hints") if isinstance(src.get("role_hints"), Mapping) else {}
+    sid = _norm_key(
+        submitter_id
+        or extra.get("submitter_id")
+        or extra.get("submitter")
+        or src.get("submitter_id")
+        or src.get("submitter")
+        or hints.get("submitter")
+    )
+    xref = _norm_key(
+        external_goal_ref
+        or extra.get("external_goal_ref")
+        or extra.get("external_ref")
+        or src.get("external_goal_ref")
+    )
+    raw_auto = (
+        autonomy
+        if autonomy is not None
+        else extra.get("autonomy")
+        if extra.get("autonomy") is not None
+        else src.get("autonomy")
+        if src.get("autonomy") is not None
+        else hints.get("autonomy")
+    )
+    cid = _norm_key(
+        coordinator_id
+        or extra.get("coordinator_id")
+        or extra.get("coordinator")
+        or src.get("coordinator_id")
+        or hints.get("coordinator")
+    )
+    return {
+        "submitter_id": sid,
+        "external_goal_ref": xref,
+        "autonomy": raw_auto,
+        "coordinator_id": cid,
     }
 
 
@@ -562,6 +717,8 @@ class DurableLayer:
         ]
         out["history"] = [dict(h) for h in (snap.get("history") or []) if isinstance(h, Mapping)]
         out["notes"] = list(snap.get("notes") or [])
+        if isinstance(snap.get("autonomy"), Mapping):
+            out["autonomy"] = dict(snap.get("autonomy") or {})
         return out
 
     def _touch(self, snap: dict[str, Any], *, now: float | None = None) -> None:
@@ -602,12 +759,18 @@ class DurableLayer:
         goal: Mapping[str, Any] | None = None,
         tasks: Sequence[Mapping[str, Any]] | None = None,
         extra: Mapping[str, Any] | None = None,
+        submitter_id: str = "",
+        external_goal_ref: str = "",
+        autonomy: Any = None,
+        coordinator_id: str = "",
     ) -> dict[str, Any]:
         """Open a Goal, or return the existing one for this submit key.
 
         Duplicate submit with the same key does **not** open a second Goal.
         Same key + different payload fingerprint is ``submit_content_conflict``
         (the first Goal is kept; the new payload is not applied).
+        P1: records submitter / external ref / autonomy; claims coordinator
+        when ``coordinator_id`` is provided (existing claim/handoff).
         """
         key = _norm_key(submit_key)
         if not key:
@@ -635,11 +798,31 @@ class DurableLayer:
                     "error": hit,
                     "created": False,
                 }
+        fields = _delegation_fields_from(
+            extra=extra,
+            goal=goal,
+            submitter_id=submitter_id,
+            external_goal_ref=external_goal_ref,
+            autonomy=autonomy,
+            coordinator_id=coordinator_id,
+        )
+        spec = normalize_autonomy(fields["autonomy"])
+        if spec.get("unknown"):
+            return {
+                "ok": False,
+                "reason": REASON_UNKNOWN_AUTONOMY,
+                "error": f"unknown autonomy mode {spec.get('mode')!r}",
+                "created": False,
+            }
         incoming_fp = _submit_content_fingerprint(
             title=title or key,
             desired_outcome=desired_outcome,
             goal=goal,
             tasks=list(tasks) if tasks else None,
+            submitter_id=fields["submitter_id"],
+            external_goal_ref=fields["external_goal_ref"],
+            autonomy=spec if autonomy_is_known(spec) else None,
+            coordinator_id=fields["coordinator_id"],
         )
         with self._mu:
             existing_id = self.submit_keys.get(key)
@@ -686,8 +869,17 @@ class DurableLayer:
                 goal=goal,
             )
             body["idempotency_key"] = key
+            _apply_delegation_hints(
+                body,
+                coordinator_id=fields["coordinator_id"],
+                autonomy=spec,
+                submitter_id=fields["submitter_id"],
+            )
             snap = _empty_snapshot(goal_id=gid, submit_key=key, goal=body)
             snap["submit_fingerprint"] = incoming_fp
+            snap["submitter_id"] = fields["submitter_id"]
+            snap["external_goal_ref"] = fields["external_goal_ref"]
+            snap["autonomy"] = spec
             child_tasks: list[dict[str, Any]] = []
             for item in tasks or []:
                 if isinstance(item, Mapping):
@@ -695,21 +887,69 @@ class DurableLayer:
             snap["tasks"] = child_tasks
             if child_tasks:
                 self._set_state(snap, "running")
-            self._append_history(snap, "submit_goal", submit_key=key, task_count=len(child_tasks))
+            claimed = None
+            if fields["coordinator_id"]:
+                from framework.goal_ownership import GoalOwnershipStore, extract_goal_contract
+
+                store = GoalOwnershipStore.open(gid, self.persist_root)
+                initial_plan = None
+                if child_tasks:
+                    initial_plan = {
+                        "goal_id": gid,
+                        "tasks": [dict(t) for t in child_tasks],
+                        "title": body.get("title"),
+                        "desired_outcome": body.get("desired_outcome"),
+                        "acceptance": body.get("acceptance"),
+                    }
+                claimed = store.claim(
+                    fields["coordinator_id"],
+                    initial_plan=initial_plan,
+                    autonomy=spec,
+                    goal_contract=extract_goal_contract(body) or body,
+                )
+                if not claimed.get("ok"):
+                    return {
+                        "ok": False,
+                        "reason": claimed.get("reason") or "claim_failed",
+                        "error": claimed.get("error") or "coordinator claim refused",
+                        "created": False,
+                        "ownership": (claimed.get("ownership") or {}),
+                    }
+            self._append_history(
+                snap,
+                "submit_goal",
+                submit_key=key,
+                task_count=len(child_tasks),
+                submitter_id=fields["submitter_id"],
+                autonomy_mode=spec.get("mode"),
+                coordinator_id=fields["coordinator_id"],
+            )
             snap["notes"] = list(snap.get("notes") or []) + [f"opened via submit_key={key}"]
             self.goals[gid] = snap
             self.submit_keys[key] = gid
             self._persist_unlocked()
-            return {
+            copied = self._copy_goal(snap)
+            out = {
                 "ok": True,
                 "reason": REASON_READY,
                 "created": True,
                 "duplicate": False,
                 "opened": True,
                 "goal_id": gid,
-                "goal": self._copy_goal(snap),
+                "goal": copied,
                 "goal_count": len(self.goals),
+                "submitter_id": fields["submitter_id"],
+                "external_goal_ref": fields["external_goal_ref"],
+                "autonomy": dict(spec),
             }
+            proj = _ownership_projection(self.persist_root, gid)
+            if proj:
+                out["ownership"] = proj["ownership"]
+                out["plan_revision"] = proj["plan_revision"]
+                copied["ownership"] = proj["ownership"]
+                copied["plan_revision"] = proj["plan_revision"]
+                out["goal"] = copied
+            return out
 
     def get_goal(self, goal_id: str) -> dict[str, Any]:
         """Read the current Goal snapshot."""
@@ -724,6 +964,7 @@ class DurableLayer:
                     "goal_id": gid,
                 }
             copied = self._copy_goal(snap)
+            auto = copied.get("autonomy") if isinstance(copied.get("autonomy"), Mapping) else undeclared_autonomy()
             out = {
                 "ok": True,
                 "reason": REASON_READY,
@@ -732,6 +973,9 @@ class DurableLayer:
                 "cancel_requested": bool(copied.get("cancel_requested")),
                 "cancelled": bool(copied.get("cancelled")) or copied.get("state") == "cancelled",
                 "goal": copied,
+                "submitter_id": copied.get("submitter_id") or "",
+                "external_goal_ref": copied.get("external_goal_ref") or "",
+                "autonomy": dict(auto),
             }
             proj = _ownership_projection(self.persist_root, gid)
             if proj:
@@ -739,6 +983,7 @@ class DurableLayer:
                 out["plan_revision"] = proj["plan_revision"]
                 copied["ownership"] = proj["ownership"]
                 copied["plan_revision"] = proj["plan_revision"]
+                out["goal"] = copied
             return out
 
     def add_child_task(
@@ -847,10 +1092,14 @@ class DurableLayer:
         request_id: str = "",
         actions: Sequence[Mapping[str, Any]] | None = None,
         title: str = "",
+        return_to_upper: bool = False,
+        details: Mapping[str, Any] | None = None,
+        reason: str = "",
     ) -> dict[str, Any]:
         """Record one pending decision (test/kernel helper; not a transport)."""
         gid = _norm_key(goal_id)
-        knd = _norm_key(kind) or "action_approval"
+        escalated = normalize_escalate_kind(kind)
+        knd = escalated or _norm_key(kind) or "action_approval"
         if knd not in DECISION_KINDS:
             return {"ok": False, "reason": "unknown_kind", "error": f"unknown decision kind {knd!r}"}
         with self._mu:
@@ -866,6 +1115,7 @@ class DurableLayer:
                     row.setdefault("decision_id", did)
                     row.setdefault("request_id", rid)
                     related.append(row)
+            to_upper = bool(return_to_upper) or is_escalate_kind(knd)
             rec = {
                 "contract_version": CONTRACT_VERSION,
                 "decision_id": did,
@@ -878,14 +1128,25 @@ class DurableLayer:
                 "title": _norm_key(title),
                 "actions": related,
                 "verdict": "",
-                "reason": "",
+                "reason": _norm_key(reason),
                 "created_at": _utc_now(),
                 "created_at_iso": _iso(),
+                "return_to_upper": to_upper,
+                "silent_retry": False if to_upper else None,
+                "event_class": EVENT_CLASS_DECISION if to_upper else EVENT_CLASS_STATUS,
+                "details": dict(details) if isinstance(details, Mapping) else {},
             }
             pending = [dict(d) for d in (snap.get("pending_decisions") or []) if isinstance(d, Mapping)]
             pending.append(rec)
             snap["pending_decisions"] = pending
-            self._append_history(snap, "open_decision", decision_id=did, kind=knd)
+            self._append_history(
+                snap,
+                "open_decision",
+                decision_id=did,
+                kind=knd,
+                return_to_upper=to_upper,
+                event_class=rec["event_class"],
+            )
             self._touch(snap)
             self._persist_unlocked()
             return {"ok": True, "reason": REASON_READY, "decision": rec, "pending_count": len(pending)}
@@ -968,24 +1229,6 @@ class DurableLayer:
             snap = self.goals.get(gid)
             if snap is None:
                 return {"ok": False, "reason": REASON_UNKNOWN_GOAL, "error": f"unknown goal_id {gid!r}"}
-            authed, auth_why = _authorize_resolve_actor(
-                self.persist_root,
-                gid,
-                actor_id=actor,
-                ownership_version=own_ver,
-            )
-            if not authed:
-                return {
-                    "ok": False,
-                    "reason": auth_why,
-                    "error": (
-                        "stale ownership instance; resolve refused"
-                        if auth_why == REASON_STALE_OWNERSHIP
-                        else f"actor {actor!r} is not authorized to resolve"
-                    ),
-                    "goal_id": gid,
-                    "actor_id": actor,
-                }
             pending = [dict(d) for d in (snap.get("pending_decisions") or []) if isinstance(d, Mapping)]
             resolved = [dict(d) for d in (snap.get("resolved_decisions") or []) if isinstance(d, Mapping)]
             target = None
@@ -1032,6 +1275,27 @@ class DurableLayer:
                         "pending_count": len(pending),
                     }
                 target = pending[0]
+            authed, auth_why = _authorize_resolve_actor(
+                self.persist_root,
+                gid,
+                actor_id=actor,
+                ownership_version=own_ver,
+                decision_kind=str(target.get("kind") or ""),
+                return_to_upper=bool(target.get("return_to_upper")),
+                submitter_id=_norm_key(snap.get("submitter_id")),
+            )
+            if not authed:
+                return {
+                    "ok": False,
+                    "reason": auth_why,
+                    "error": (
+                        "stale ownership instance; resolve refused"
+                        if auth_why == REASON_STALE_OWNERSHIP
+                        else f"actor {actor!r} is not authorized to resolve"
+                    ),
+                    "goal_id": gid,
+                    "actor_id": actor,
+                }
             # Related actions must share this decision's id.
             target_ids = {_norm_key(target.get("decision_id")), _norm_key(target.get("request_id"))} - {""}
             for item in action_list:
@@ -1077,6 +1341,173 @@ class DurableLayer:
                 "decision": dict(target),
                 "pending_count": len(remaining),
             }
+
+    def escalate_to_upper(
+        self,
+        goal_id: str,
+        *,
+        kind: str,
+        reason: str,
+        details: Mapping[str, Any] | None = None,
+        task_id: str = "",
+        decision_id: str = "",
+        title: str = "",
+    ) -> dict[str, Any]:
+        """Open a return-to-upper pending decision. Does not retry local work."""
+        gid = _norm_key(goal_id)
+        knd = normalize_escalate_kind(kind)
+        if not knd:
+            return {
+                "ok": False,
+                "reason": REASON_UNKNOWN_ESCALATE,
+                "error": f"unknown escalate kind {kind!r}",
+                "goal_id": gid,
+            }
+        rsn = _norm_key(reason)
+        if not rsn:
+            return {
+                "ok": False,
+                "reason": REASON_EMPTY_VERDICT,
+                "error": "escalate reason required",
+                "goal_id": gid,
+            }
+        opened = self.open_decision(
+            gid,
+            kind=knd,
+            task_id=task_id,
+            decision_id=decision_id,
+            title=title or knd,
+            return_to_upper=True,
+            details=details,
+            reason=rsn,
+        )
+        if not opened.get("ok"):
+            return opened
+        with self._mu:
+            snap = self.goals.get(gid)
+            if snap is not None:
+                self._append_history(
+                    snap,
+                    "escalate_to_upper",
+                    decision_id=(opened.get("decision") or {}).get("decision_id"),
+                    kind=knd,
+                    reason=rsn,
+                    return_to_upper=True,
+                    silent_retry=False,
+                    event_class=EVENT_CLASS_DECISION,
+                )
+                self._touch(snap)
+                self._persist_unlocked()
+        rec = dict(opened.get("decision") or {})
+        rec["silent_retry"] = False
+        rec["return_to_upper"] = True
+        return {
+            "ok": True,
+            "reason": REASON_READY,
+            "goal_id": gid,
+            "decision": rec,
+            "pending_count": opened.get("pending_count"),
+            "event_class": EVENT_CLASS_DECISION,
+            "silent_retry": False,
+            "return_to_upper": True,
+        }
+
+    def list_events(self, goal_id: str) -> dict[str, Any]:
+        """History + pending notifications. Escalations are decision_required."""
+        gid = _norm_key(goal_id)
+        with self._mu:
+            snap = self.goals.get(gid)
+            if snap is None:
+                return {
+                    "ok": False,
+                    "reason": REASON_UNKNOWN_GOAL,
+                    "error": f"unknown goal_id {gid!r}",
+                    "goal_id": gid,
+                }
+            events: list[dict[str, Any]] = []
+            for h in snap.get("history") or []:
+                if not isinstance(h, Mapping):
+                    continue
+                rec = dict(h)
+                rec["event_class"] = event_class_for(
+                    kind=str(rec.get("kind") or ""),
+                    op=str(rec.get("op") or ""),
+                    return_to_upper=bool(rec.get("return_to_upper")),
+                )
+                rec["source"] = "history"
+                events.append(rec)
+            pending: list[dict[str, Any]] = []
+            for d in snap.get("pending_decisions") or []:
+                if not isinstance(d, Mapping):
+                    continue
+                row = dict(d)
+                to_upper = bool(row.get("return_to_upper")) or is_escalate_kind(row.get("kind"))
+                row["event_class"] = EVENT_CLASS_DECISION if to_upper else EVENT_CLASS_STATUS
+                row["silent_retry"] = False if to_upper else row.get("silent_retry")
+                pending.append(row)
+            return {
+                "ok": True,
+                "reason": REASON_READY,
+                "goal_id": gid,
+                "events": events,
+                "pending": pending,
+                "pending_count": len(pending),
+            }
+
+    def handoff_coordinator(
+        self,
+        goal_id: str,
+        *,
+        from_coordinator_id: str,
+        to_coordinator_id: str,
+        expected_version: int | None = None,
+    ) -> dict[str, Any]:
+        """Wire existing ownership handoff into the durable layer."""
+        gid = _norm_key(goal_id)
+        with self._mu:
+            snap = self.goals.get(gid)
+            if snap is None:
+                return {
+                    "ok": False,
+                    "reason": REASON_UNKNOWN_GOAL,
+                    "error": f"unknown goal_id {gid!r}",
+                    "goal_id": gid,
+                }
+            from framework.goal_ownership import GoalOwnershipStore, persist_path
+
+            path = persist_path(self.persist_root, gid)
+            if not path.is_file():
+                return {
+                    "ok": False,
+                    "reason": REASON_NO_OWNER,
+                    "error": "no coordinator to hand off",
+                    "goal_id": gid,
+                }
+            store = GoalOwnershipStore.open(gid, self.persist_root)
+            out = store.handoff(
+                from_coordinator_id,
+                to_coordinator_id,
+                expected_version=expected_version,
+            )
+            if out.get("ok"):
+                self._append_history(
+                    snap,
+                    "handoff_coordinator",
+                    from_coordinator_id=_norm_key(from_coordinator_id),
+                    to_coordinator_id=_norm_key(to_coordinator_id),
+                    version=(out.get("ownership") or {}).get("version"),
+                )
+                self._touch(snap)
+                self._persist_unlocked()
+            copied = self._copy_goal(snap)
+            result = dict(out)
+            result["goal_id"] = gid
+            proj = _ownership_projection(self.persist_root, gid)
+            if proj:
+                result["ownership"] = proj["ownership"]
+                result["plan_revision"] = proj["plan_revision"]
+            result["goal"] = copied
+            return result
 
     def cancel_goal(self, goal_id: str, *, reason: str = "") -> dict[str, Any]:
         """Request cancel: close admission + terminate-request in-flight.
@@ -1228,6 +1659,7 @@ class DurableLayer:
                 st = str(t.get("status") or "unknown")
                 counts[st] = counts.get(st, 0) + 1
             state = str(copied.get("state") or "")
+            auto = copied.get("autonomy") if isinstance(copied.get("autonomy"), Mapping) else undeclared_autonomy()
             report = {
                 "contract_version": CONTRACT_VERSION,
                 "goal_id": gid,
@@ -1251,9 +1683,16 @@ class DurableLayer:
                 "updated_at_iso": copied.get("updated_at_iso"),
                 "cancel_requested_at_iso": copied.get("cancel_requested_at_iso") or "",
                 "cancelled_at_iso": copied.get("cancelled_at_iso") or "",
+                "submitter_id": copied.get("submitter_id") or "",
+                "external_goal_ref": copied.get("external_goal_ref") or "",
+                "autonomy": dict(auto),
                 "readonly": True,
                 "kernel_promotes_identity_memory": False,
             }
+            proj = _ownership_projection(self.persist_root, gid)
+            if proj:
+                report["ownership"] = proj["ownership"]
+                report["plan_revision"] = proj["plan_revision"]
             return {
                 "ok": True,
                 "reason": REASON_READY,
@@ -1262,6 +1701,8 @@ class DurableLayer:
                 "state": state,
                 "cancel_requested": report["cancel_requested"],
                 "cancelled": report["cancelled"],
+                "submitter_id": report["submitter_id"],
+                "autonomy": report["autonomy"],
             }
 
 
@@ -1291,3 +1732,15 @@ def get_report(persist_dir_root: str | Path, goal_id: str) -> dict[str, Any]:
 
 def effect_cancel(persist_dir_root: str | Path, goal_id: str, **kwargs: Any) -> dict[str, Any]:
     return DurableLayer.open(persist_dir_root).effect_cancel(goal_id, **kwargs)
+
+
+def list_events(persist_dir_root: str | Path, goal_id: str) -> dict[str, Any]:
+    return DurableLayer.open(persist_dir_root).list_events(goal_id)
+
+
+def escalate_to_upper(persist_dir_root: str | Path, goal_id: str, **kwargs: Any) -> dict[str, Any]:
+    return DurableLayer.open(persist_dir_root).escalate_to_upper(goal_id, **kwargs)
+
+
+def handoff_coordinator(persist_dir_root: str | Path, goal_id: str, **kwargs: Any) -> dict[str, Any]:
+    return DurableLayer.open(persist_dir_root).handoff_coordinator(goal_id, **kwargs)

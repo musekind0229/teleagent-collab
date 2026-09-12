@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Thin CLI for knife-14 durable/perpetual Goal layer (file-backed, no transport).
+"""Thin CLI for the durable Goal layer (file-backed, no transport).
+
+Knife 14 five ops plus v0.2 P1 delegation fields (submitter, autonomy,
+ownership claim, events, return-to-upper escalate).
 
 Usage:
-  python3 bin/durable-cli.py --persist DIR submit --submit-key KEY --title T --outcome O
+  python3 bin/durable-cli.py --persist DIR submit --submit-key KEY --submitter ID \\
+      --autonomy bounded_autonomy --coordinator CID --title T --outcome O
   python3 bin/durable-cli.py --persist DIR get GOAL_ID
-  python3 bin/durable-cli.py --persist DIR resolve GOAL_ID --decision-id D --verdict V --reason R
+  python3 bin/durable-cli.py --persist DIR events GOAL_ID
+  python3 bin/durable-cli.py --persist DIR escalate GOAL_ID --kind over_budget --reason R
+  python3 bin/durable-cli.py --persist DIR resolve GOAL_ID --decision-id D --verdict V --actor-id ID
   python3 bin/durable-cli.py --persist DIR cancel GOAL_ID
   python3 bin/durable-cli.py --persist DIR report GOAL_ID
 """
@@ -30,6 +36,12 @@ def _print(payload: dict) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
 
 
+def _json_flag(raw: str):
+    if not raw:
+        return None
+    return json.loads(raw)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Durable Goal layer (file-backed). Does not bind a transport.",
@@ -46,9 +58,37 @@ def main(argv: list[str] | None = None) -> int:
     p_sub.add_argument("--title", default="")
     p_sub.add_argument("--outcome", default="")
     p_sub.add_argument("--goal-json", default="", help="optional Goal object JSON")
+    p_sub.add_argument("--submitter", default="", help="submitter id (audit)")
+    p_sub.add_argument("--external-goal-ref", default="", help="upper-layer goal reference")
+    p_sub.add_argument(
+        "--autonomy",
+        default="",
+        help="explicit_plan | bounded_autonomy (optional JSON object)",
+    )
+    p_sub.add_argument("--coordinator", default="", help="claim this coordinator on submit")
+    p_sub.add_argument("--budget-json", default="", help='e.g. {"wall_sec": 60}')
+    p_sub.add_argument("--boundaries-json", default="", help='e.g. {"must":[],"must_not":[]}')
+    p_sub.add_argument("--tasks-json", default="", help="optional tasks list JSON")
 
     p_get = sub.add_parser("get", help="get_goal snapshot")
     p_get.add_argument("goal_id")
+
+    p_evt = sub.add_parser("events", help="list history + pending (status vs decision_required)")
+    p_evt.add_argument("goal_id")
+
+    p_pend = sub.add_parser("pending", help="pending decisions only")
+    p_pend.add_argument("goal_id")
+
+    p_esc = sub.add_parser("escalate", help="open a return-to-upper pending (no silent retry)")
+    p_esc.add_argument("goal_id")
+    p_esc.add_argument(
+        "--kind",
+        required=True,
+        help="over_budget | out_of_scope | insufficient_auth",
+    )
+    p_esc.add_argument("--reason", required=True)
+    p_esc.add_argument("--details-json", default="")
+    p_esc.add_argument("--task-id", default="")
 
     p_res = sub.add_parser("resolve", help="resolve exactly one pending decision")
     p_res.add_argument("goal_id")
@@ -82,24 +122,72 @@ def main(argv: list[str] | None = None) -> int:
     p_add.add_argument("--title", default="child")
     p_add.add_argument("--status", default="queued")
 
+    p_hand = sub.add_parser("handoff", help="handoff coordinator (bumps ownership version)")
+    p_hand.add_argument("goal_id")
+    p_hand.add_argument("--from-coordinator", required=True)
+    p_hand.add_argument("--to-coordinator", required=True)
+    p_hand.add_argument("--version", default="", help="expected ownership version")
+
     args = parser.parse_args(argv)
     layer = DurableLayer.open(args.persist)
 
     if args.cmd == "submit":
-        goal = None
-        if args.goal_json:
-            goal = json.loads(args.goal_json)
+        goal = _json_flag(args.goal_json) if args.goal_json else {}
+        if not isinstance(goal, dict):
+            goal = {}
+        if args.budget_json:
+            goal["budget"] = json.loads(args.budget_json)
+        if args.boundaries_json:
+            goal["boundaries"] = json.loads(args.boundaries_json)
+        autonomy = args.autonomy
+        if autonomy and autonomy.strip().startswith("{"):
+            autonomy = json.loads(autonomy)
+        tasks = json.loads(args.tasks_json) if args.tasks_json else None
         out = layer.submit_goal(
             submit_key=args.submit_key,
             title=args.title,
             desired_outcome=args.outcome,
-            goal=goal,
+            goal=goal or None,
+            tasks=tasks,
+            submitter_id=args.submitter,
+            external_goal_ref=args.external_goal_ref,
+            autonomy=autonomy or None,
+            coordinator_id=args.coordinator,
         )
         _print(out)
         return 0 if out.get("ok") else 1
 
     if args.cmd == "get":
         out = layer.get_goal(args.goal_id)
+        _print(out)
+        return 0 if out.get("ok") else 1
+
+    if args.cmd == "events":
+        out = layer.list_events(args.goal_id)
+        _print(out)
+        return 0 if out.get("ok") else 1
+
+    if args.cmd == "pending":
+        out = layer.list_events(args.goal_id)
+        if out.get("ok"):
+            out = {
+                "ok": True,
+                "goal_id": out.get("goal_id"),
+                "pending": out.get("pending") or [],
+                "pending_count": out.get("pending_count") or 0,
+            }
+        _print(out)
+        return 0 if out.get("ok") else 1
+
+    if args.cmd == "escalate":
+        details = json.loads(args.details_json) if args.details_json else None
+        out = layer.escalate_to_upper(
+            args.goal_id,
+            kind=args.kind,
+            reason=args.reason,
+            details=details,
+            task_id=args.task_id,
+        )
         _print(out)
         return 0 if out.get("ok") else 1
 
@@ -154,6 +242,22 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "add-task":
         out = layer.add_child_task(args.goal_id, title=args.title, status=args.status)
+        _print(out)
+        return 0 if out.get("ok") else 1
+
+    if args.cmd == "handoff":
+        ver = None
+        if args.version != "":
+            try:
+                ver = int(args.version)
+            except ValueError:
+                ver = None
+        out = layer.handoff_coordinator(
+            args.goal_id,
+            from_coordinator_id=args.from_coordinator,
+            to_coordinator_id=args.to_coordinator,
+            expected_version=ver,
+        )
         _print(out)
         return 0 if out.get("ok") else 1
 

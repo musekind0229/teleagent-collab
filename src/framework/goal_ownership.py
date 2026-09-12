@@ -21,6 +21,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from framework.delegation import (
+    REASON_AUTONOMY_DENIED as DELEGATION_AUTONOMY_DENIED,
+    check_plan_against_autonomy,
+    normalize_autonomy,
+    undeclared_autonomy,
+)
 from framework.lifecycle import TASK_STATES, LifecycleError, assert_transition
 
 OWNERSHIP_DIRNAME = ".collab-goal-ownership"
@@ -39,6 +45,7 @@ REASON_STALE_PROPOSAL = "stale_proposal"
 REASON_UNKNOWN_PROPOSAL = "unknown_proposal"
 REASON_EMPTY_COORDINATOR = "empty_coordinator"
 REASON_CONTRACT_EXPANSION = "contract_expansion"
+REASON_AUTONOMY_DENIED = DELEGATION_AUTONOMY_DENIED
 
 # Plan documents must not rewrite kernel-owned identity.
 _FORBIDDEN_PLAN_KEYS = frozenset(
@@ -302,6 +309,7 @@ def validate_plan_revision(
     current_plan: Mapping[str, Any] | None = None,
     goal_contract: Mapping[str, Any] | None = None,
     enforce_contract_ceiling: bool = True,
+    autonomy: Mapping[str, Any] | None = None,
 ) -> tuple[bool, str]:
     """Kernel legality for a Goal plan document.
 
@@ -309,6 +317,7 @@ def validate_plan_revision(
     the public Task lifecycle. Active tasks cannot be dropped.
     Plan revisions must not expand Goal contract auth/budget
     (``budget``, ``allow_*``, ``boundaries``); tightening is allowed.
+    Declared autonomy (explicit plan vs bounded) is respected when set.
     """
     if not isinstance(plan, Mapping):
         return False, "plan must be an object"
@@ -373,6 +382,9 @@ def validate_plan_revision(
         ok_ceil, why_ceil = _check_contract_ceiling(plan, ceiling)
         if not ok_ceil:
             return False, why_ceil
+    ok_auto, why_auto = check_plan_against_autonomy(autonomy, current_plan, plan)
+    if not ok_auto:
+        return False, why_auto
     return True, REASON_READY
 
 
@@ -473,6 +485,7 @@ class GoalOwnershipStore:
         self.plan: dict[str, Any] = empty_plan(self.goal_id)
         self.plan_revision: int = 0
         self.goal_contract: dict[str, Any] = {}
+        self.autonomy: dict[str, Any] = undeclared_autonomy()
         self.proposals: dict[str, PlanRevisionProposal] = {}
         self.history: list[dict[str, Any]] = []
         self.notes: list[str] = []
@@ -519,11 +532,21 @@ class GoalOwnershipStore:
                 return False, REASON_STALE_OWNERSHIP
             return False, REASON_NOT_COORDINATOR
 
+    def set_autonomy(self, autonomy: Any) -> dict[str, Any]:
+        """Store declared autonomy scope. Does not bump ownership version."""
+        spec = normalize_autonomy(autonomy)
+        with self._mu:
+            self.autonomy = spec
+            self._persist_unlocked()
+            return {"ok": True, "autonomy": dict(self.autonomy)}
+
     def claim(
         self,
         coordinator_id: str,
         *,
         initial_plan: Mapping[str, Any] | None = None,
+        autonomy: Any = None,
+        goal_contract: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """First coordinator at version=1. Same coordinator is idempotent (no bump)."""
         cid = str(coordinator_id or "").strip()
@@ -555,12 +578,15 @@ class GoalOwnershipStore:
                     "ownership": own.to_dict(),
                 }
             now = _utc_now()
+            if autonomy is not None:
+                self.autonomy = normalize_autonomy(autonomy)
             if initial_plan is not None:
                 ok, why = validate_plan_revision(
                     initial_plan,
                     goal_id=self.goal_id,
                     current_plan=self.plan,
                     enforce_contract_ceiling=False,
+                    autonomy=undeclared_autonomy(),
                 )
                 if not ok:
                     return {
@@ -574,6 +600,10 @@ class GoalOwnershipStore:
                     self.plan["goal_id"] = self.goal_id
                 self.goal_contract = extract_goal_contract(self.plan)
                 self.plan_revision = 1 if self.plan.get("tasks") else 0
+            if isinstance(goal_contract, Mapping) and goal_contract:
+                extracted = extract_goal_contract(goal_contract)
+                if extracted:
+                    self.goal_contract = extracted
             self.ownership = GoalOwnership(
                 goal_id=self.goal_id,
                 coordinator_id=cid,
@@ -750,13 +780,15 @@ class GoalOwnershipStore:
                 goal_id=self.goal_id,
                 current_plan=self.plan,
                 goal_contract=self.goal_contract,
+                autonomy=self.autonomy,
             )
             if not legal:
-                reject = (
-                    REASON_CONTRACT_EXPANSION
-                    if "expands Goal contract" in detail
-                    else REASON_ILLEGAL_PLAN
-                )
+                if "expands Goal contract" in detail:
+                    reject = REASON_CONTRACT_EXPANSION
+                elif detail == REASON_AUTONOMY_DENIED or "forbids" in detail or "autonomy" in detail:
+                    reject = REASON_AUTONOMY_DENIED
+                else:
+                    reject = REASON_ILLEGAL_PLAN
                 rec.status = STATUS_REJECTED
                 rec.reject_reason = reject
                 rec.reason = rec.reason or detail
@@ -886,13 +918,15 @@ class GoalOwnershipStore:
                 goal_id=self.goal_id,
                 current_plan=self.plan,
                 goal_contract=self.goal_contract,
+                autonomy=self.autonomy,
             )
             if not legal:
-                reject = (
-                    REASON_CONTRACT_EXPANSION
-                    if "expands Goal contract" in detail
-                    else REASON_ILLEGAL_PLAN
-                )
+                if "expands Goal contract" in detail:
+                    reject = REASON_CONTRACT_EXPANSION
+                elif detail == REASON_AUTONOMY_DENIED or "forbids" in detail or "autonomy" in detail:
+                    reject = REASON_AUTONOMY_DENIED
+                else:
+                    reject = REASON_ILLEGAL_PLAN
                 rec.status = STATUS_REJECTED
                 rec.reject_reason = reject
                 self.history.append(
@@ -988,6 +1022,7 @@ class GoalOwnershipStore:
                 "plan_revision": int(self.plan_revision),
                 "plan": dict(self.plan),
                 "goal_contract": dict(self.goal_contract),
+                "autonomy": dict(self.autonomy),
                 "proposals": {k: v.to_dict() for k, v in self.proposals.items()},
                 "history": list(self.history),
                 "notes": list(self.notes),
@@ -1005,6 +1040,7 @@ class GoalOwnershipStore:
                 "plan_revision": int(self.plan_revision),
                 "plan": dict(self.plan),
                 "goal_contract": dict(self.goal_contract),
+                "autonomy": dict(self.autonomy),
                 "proposals": {k: v.to_dict() for k, v in self.proposals.items()},
                 "history": list(self.history)[-200:],
                 "notes": list(self.notes)[-50:],
@@ -1032,6 +1068,7 @@ class GoalOwnershipStore:
             self.plan = dict(plan) if plan is not None else empty_plan(self.goal_id)
             contract = payload.get("goal_contract") if isinstance(payload.get("goal_contract"), Mapping) else None
             self.goal_contract = dict(contract) if contract is not None else extract_goal_contract(self.plan)
+            self.autonomy = normalize_autonomy(payload.get("autonomy"))
             self.proposals = {}
             raw = payload.get("proposals") if isinstance(payload.get("proposals"), Mapping) else {}
             for k, v in raw.items():

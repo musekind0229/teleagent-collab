@@ -1,14 +1,26 @@
 """Path-B framework skeleton: Goal/Task/Run contracts without owning TeleAgent HTTP."""
 
 from framework.charter_map import CharterMapError, map_charter_to_goal_task
+from framework.delegation import (
+    AUTONOMY_BOUNDED,
+    AUTONOMY_EXPLICIT_PLAN,
+    ESCALATE_KINDS,
+    KIND_ESCALATE_INSUFFICIENT_AUTH,
+    KIND_ESCALATE_OUT_OF_SCOPE,
+    KIND_ESCALATE_OVER_BUDGET,
+    normalize_autonomy,
+)
 from framework.durable_api import (
     DurableError,
     DurableLayer,
     cancel_goal,
     effect_cancel,
+    escalate_to_upper,
     get_goal,
     get_report,
+    handoff_coordinator,
     kernel_promotes_identity_memory,
+    list_events,
     open_durable,
     reset_durable_cache,
     resolve_decision,
@@ -59,8 +71,14 @@ from framework.task_deps import (
 )
 
 __all__ = [
+    "AUTONOMY_BOUNDED",
+    "AUTONOMY_EXPLICIT_PLAN",
     "CONTRACT_VERSION",
     "CharterMapError",
+    "ESCALATE_KINDS",
+    "KIND_ESCALATE_INSUFFICIENT_AUTH",
+    "KIND_ESCALATE_OUT_OF_SCOPE",
+    "KIND_ESCALATE_OVER_BUDGET",
     "DECISION_CHANNEL_LEAD_CODES",
     "DurableError",
     "DurableLayer",
@@ -86,13 +104,17 @@ __all__ = [
     "commit_transitions",
     "deps_satisfied",
     "effect_cancel",
+    "escalate_to_upper",
     "get_goal",
     "get_report",
+    "handoff_coordinator",
     "kernel_promotes_identity_memory",
+    "list_events",
     "map_charter_to_goal_task",
     "map_error_class",
     "new_run_id",
     "new_task_id",
+    "normalize_autonomy",
     "open_durable",
     "open_goal_ownership",
     "open_outbox",
