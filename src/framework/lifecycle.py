@@ -45,6 +45,42 @@ ERROR_CLASSES = frozenset(
     }
 )
 
+# Lead protocol / binding failures — never consume business rework (new worker Run).
+DECISION_CHANNEL_LEAD_CODES = frozenset(
+    {
+        "timeout",
+        "call_failed",
+        "error",
+        "illegal_json",
+        "application_id_mismatch",
+        "context_summary_mismatch",
+        "illegal_verdict",
+        "illegal_decision",
+        "missing_reason",
+        "unknown_kind",
+    }
+)
+
+
+def map_error_class(*, kind: str = "", lead_code: str = "") -> str:
+    """Map a failure source onto the public error_class enum.
+
+    decision_channel_failed is for protocol/binding errors, not semantic review fail.
+    """
+    k = (kind or "").strip()
+    if k in ERROR_CLASSES:
+        return k
+    code = (lead_code or "").strip()
+    if code in DECISION_CHANNEL_LEAD_CODES or k in ("lead_protocol", "decision_channel"):
+        return "decision_channel_failed"
+    if k in ("review_fail", "verdict_fail", "artifact_gate"):
+        return "acceptance_failed"
+    if k in ("collect_fail", "worker_fail"):
+        return "implementation_failed"
+    if k in ("wall", "rework_denied"):
+        return "budget_exhausted"
+    return "unknown"
+
 # Conservative edges for the skeleton — expand later without rewriting glue.
 _TASK_EDGES = {
     "queued": {"running", "cancelled", "blocked"},

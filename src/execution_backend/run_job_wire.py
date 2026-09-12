@@ -4,16 +4,20 @@ Default remains TeleAgent (glue). inprocess.local_v1 uses only the public
 ExecutionBackend surface: start_run / observe_run / collect_result plus
 empty list_pending_actions. reply_permission stays unsupported — never
 invent once/approve. Hermes is not offered.
+
+Knife 8: inprocess path runs a stage-2 closed loop (independent artifact_review
++ same-Task new-Run rework) when force_lead_review is set. Wall budget is
+never reset; decision_channel_failed does not consume business rework.
 """
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
 from execution_backend.base import BackendError, BackendStatus
-from execution_backend.inprocess_v1 import run_file_job_via_public_api
+from execution_backend.closed_loop import decision_fn_from_env, run_inprocess_closed_loop
 
 ENV_NAME = "COLLAB_EXECUTION_BACKEND"
 KIND_TELEAGENT = "teleagent"
@@ -71,47 +75,32 @@ def run_inprocess_charter(
     workdir: str | Path,
     instruction: str = "",
     name: str = "",
+    timeout_sec: float | None = None,
+    lead: Any | None = None,
+    decision_fn: Callable[[dict, dict], dict] | None = None,
+    force_lead_review: bool | None = None,
+    max_reworks: int | None = None,
+    exchange_dir: str | Path | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Run a charter through inprocess.local_v1 public API only (no glue, no TA HTTP)."""
-    raw = run_file_job_via_public_api(workdir=workdir, charter=charter)
-    notes: list[str] = [
-        "backend=inprocess.local_v1 public API only (start_run/observe_run/collect_result)",
-        "list_pending_actions empty; reply_permission unsupported (not called as approve)",
-        f"used_public_api_only={bool(raw.get('used_public_api_only'))}",
-        f"pending_count={raw.get('pending_count', 0)}",
-        f"native_handle={raw.get('native_handle') or ''}",
-    ]
-    if instruction:
-        notes.append(f"instruction_chars={len(instruction)}")
-    if raw.get("error"):
-        notes.append(f"backend_error={raw.get('error')}")
-    report: dict[str, Any] = {
-        "name": name or str(charter.get("name") or "job"),
-        "session_id": raw.get("run_id") or "",
-        "pending_seen": False,
-        "pending_summaries": [],
-        "grok_permission_decision": "",
-        "grok_review_decision": "",
-        "api_replies": [],
-        "hard_rule_rejects": [],
-        "artifacts": list(raw.get("artifacts") or []),
-        "state": raw.get("state") or ("ok" if raw.get("ok") else "fail"),
-        "ok": bool(raw.get("ok")),
-        "error": raw.get("error") or "",
-        "path": "inprocess.local_v1",
-        "notes": notes,
-        "dry_run": False,
-        "backend": raw.get("backend") or "inprocess.local_v1",
-        "used_public_api_only": bool(raw.get("used_public_api_only")),
-        "native_handle": raw.get("native_handle") or "",
-        "run_observation": raw.get("run_observation") or {},
-        "pending_count": int(raw.get("pending_count") or 0),
-    }
-    # Read-only Goal/Task projection — must not flip ok/state
-    try:
-        from framework.project_report import attach_framework_projection
+    """Run a charter through inprocess.local_v1 public API only (no glue, no TA HTTP).
 
-        attach_framework_projection(report, charter)
-    except Exception as e:  # noqa: BLE001
-        report.setdefault("notes", []).append(f"framework_projection skipped: {e}")
-    return report
+    Stage-2 closed loop: independent artifact_review when force_lead_review,
+    rework as a new Run on the same Task. Optional COLLAB_INPROCESS_REVIEW_STUB
+    (fail_once / channel_fail) is a test/demo hook only.
+    """
+    fn = decision_fn
+    if fn is None and lead is None:
+        fn = decision_fn_from_env(dict(environ) if environ is not None else None)
+    return run_inprocess_closed_loop(
+        charter=charter,
+        workdir=workdir,
+        instruction=instruction,
+        name=name,
+        lead=lead,
+        decision_fn=fn,
+        timeout_sec=timeout_sec,
+        force_lead_review=force_lead_review,
+        max_reworks=max_reworks,
+        exchange_dir=exchange_dir,
+    )

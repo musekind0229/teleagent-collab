@@ -62,6 +62,20 @@ def write_reports(out_dir: Path, charter: dict, result: dict, instruction: str) 
         "job_name": job_name(charter),
         "dry_run": bool(result.get("dry_run")),
     }
+    for extra_key in (
+        "error_class",
+        "task_id",
+        "goal_id",
+        "attempt",
+        "run_id",
+        "rework_used_new_run",
+        "wall_deadline_unchanged",
+        "force_lead_review",
+        "used_public_api_only",
+        "backend",
+    ):
+        if extra_key in result and result.get(extra_key) is not None:
+            status[extra_key] = result.get(extra_key)
     (out_dir / "status.json").write_text(
         json.dumps(status, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
@@ -81,24 +95,46 @@ def write_reports(out_dir: Path, charter: dict, result: dict, instruction: str) 
         },
         "instruction": instruction,
         "result": {
-            k: result.get(k)
-            for k in (
-                "ok",
-                "state",
-                "session_id",
-                "artifacts",
-                "error",
-                "notes",
-                "path",
-                "pending_seen",
-                "grok_permission_decision",
-                "grok_review_decision",
-                "api_replies",
-                "hard_rule_rejects",
-                "dry_run",
-                "framework_projection",
-            )
-            if k in result or True
+            **{
+                k: result.get(k)
+                for k in (
+                    "ok",
+                    "state",
+                    "session_id",
+                    "artifacts",
+                    "error",
+                    "notes",
+                    "path",
+                    "pending_seen",
+                    "grok_permission_decision",
+                    "grok_review_decision",
+                    "api_replies",
+                    "hard_rule_rejects",
+                    "dry_run",
+                    "framework_projection",
+                )
+                if k in result or True
+            },
+            **{
+                k: result.get(k)
+                for k in (
+                    "error_class",
+                    "task_id",
+                    "goal_id",
+                    "attempt",
+                    "run_id",
+                    "run_ids",
+                    "backend_run_ids",
+                    "rework_budget",
+                    "rework_used_new_run",
+                    "wall_deadline_unchanged",
+                    "closed_loop",
+                    "artifact_review",
+                    "backend",
+                    "used_public_api_only",
+                )
+                if k in result
+            },
         },
     }
     (out_dir / "report.json").write_text(
@@ -255,12 +291,16 @@ def main(argv: list[str] | None = None) -> int:
                 p = Path(apath)
                 if p.exists() and p.is_file():
                     p.unlink()
+            timeout = args.timeout_sec
+            if timeout is None:
+                timeout = int(charter.get("timeout_sec") or 300)
             t0 = time.time()
             result = run_inprocess_charter(
                 charter=charter,
                 workdir=ws,
                 instruction=instruction,
                 name=name,
+                timeout_sec=timeout,
             )
             result.setdefault("notes", []).append(f"wall_sec={time.time() - t0:.1f}")
             result["dry_run"] = False

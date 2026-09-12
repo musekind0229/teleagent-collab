@@ -8,3 +8,4 @@ Boss locked **B: evolve collab kernel** (2026-09-12).
 
 Old entrypoints `bin/run-job.py` / `bin/run-scheduler.py` stay valid.
 `bin/run-job.py --backend inprocess` (or `COLLAB_EXECUTION_BACKEND=inprocess.local_v1`) selects the knife-6 inprocess backend; default remains TeleAgent.
+Knife 8 adds an inprocess stage-2 closed loop: independent `artifact_review` + same-Task new-Run rework (`docs/framework-v01/knife8-inprocess-closed-loop.md`).

@@ -9,6 +9,15 @@ from execution_backend.base import (
     ExecutionBackendABC,
     unsupported,
 )
+from execution_backend.closed_loop import (
+    REVIEW_STUB_ENV,
+    artifact_review,
+    decision_fn_from_env,
+    local_rules_artifact_review,
+    make_decision_channel_fail,
+    make_fail_once_then_pass,
+    run_inprocess_closed_loop,
+)
 from execution_backend.inprocess_v1 import InProcessExecutionBackend, run_file_job_via_public_api
 from execution_backend.run_job_wire import (
     ENV_NAME as COLLAB_EXECUTION_BACKEND_ENV,
@@ -33,6 +42,13 @@ __all__ = [
     "KIND_TELEAGENT",
     "resolve_run_job_backend",
     "run_inprocess_charter",
+    "REVIEW_STUB_ENV",
+    "artifact_review",
+    "decision_fn_from_env",
+    "local_rules_artifact_review",
+    "make_decision_channel_fail",
+    "make_fail_once_then_pass",
+    "run_inprocess_closed_loop",
 ]
 
 

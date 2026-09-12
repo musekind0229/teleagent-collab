@@ -25,4 +25,4 @@ JSON Schema 文件：
 ## Execution backends
 
 - `teleagent.linux.local_v1` — existing TeleAgent worker (default `bin/run-job.py` path).
-- `inprocess.local_v1` — deterministic second backend under `src/execution_backend/` (public observe/start/collect; not Hermes ledger). Select via `bin/run-job.py --backend inprocess` or `COLLAB_EXECUTION_BACKEND=inprocess.local_v1`.
+- `inprocess.local_v1` — deterministic second backend under `src/execution_backend/` (public observe/start/collect; not Hermes ledger). Select via `bin/run-job.py --backend inprocess` or `COLLAB_EXECUTION_BACKEND=inprocess.local_v1`. Knife 8 closed loop: independent `artifact_review` + rework as a new Run on the same Task; `decision_channel_failed` does not consume business rework.
