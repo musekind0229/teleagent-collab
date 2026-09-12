@@ -25,6 +25,7 @@ GOAL_STATES = frozenset(
         "blocked",
         "completed",
         "failed",
+        "cancel_requested",
         "cancelled",
     }
 )
@@ -115,9 +116,10 @@ _TASK_EDGES = {
 }
 
 _GOAL_EDGES = {
-    "queued": {"running", "blocked", "failed", "cancelled", "completed"},
-    "running": {"completed", "failed", "blocked", "cancelled"},
-    "blocked": {"queued", "running", "failed", "cancelled"},
+    "queued": {"running", "blocked", "failed", "cancelled", "completed", "cancel_requested"},
+    "running": {"completed", "failed", "blocked", "cancelled", "cancel_requested"},
+    "blocked": {"queued", "running", "failed", "cancelled", "cancel_requested"},
+    "cancel_requested": {"cancelled", "failed"},
     "completed": set(),
     "failed": {"queued"},
     "cancelled": set(),
