@@ -15,6 +15,7 @@ from teleagent_adapter.base import (
 from teleagent_adapter.doctor import DoctorReport, doctor
 from teleagent_adapter.linux_local_v1 import LinuxLocalV1Adapter
 from teleagent_adapter.native_handle import session_id_of, wrap_session_handle
+from teleagent_adapter.permission_view import list_public_permissions, to_public_permission, to_native_for_rules
 from teleagent_adapter.windows_blocked import WindowsBlockedAdapter
 
 __all__ = [
@@ -31,6 +32,9 @@ __all__ = [
     "resume_policy",
     "session_id_of",
     "wrap_session_handle",
+    "list_public_permissions",
+    "to_public_permission",
+    "to_native_for_rules",
 ]
 
 

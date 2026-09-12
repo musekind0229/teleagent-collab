@@ -706,6 +706,13 @@ def run_job(
         "notes": [],
         "hard_rule_rejects": [],
     }
+    # Path-B: optional read-only Goal/Task projection — must not affect ok/fail semantics
+    try:
+        from framework.project_report import attach_framework_projection
+
+        attach_framework_projection(report, job_charter)
+    except Exception as e:  # noqa: BLE001
+        report.setdefault("notes", []).append(f"framework_projection import/attach failed: {e}")
 
     code, created = call(
         "POST",

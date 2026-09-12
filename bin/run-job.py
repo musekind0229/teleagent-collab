@@ -93,6 +93,7 @@ def write_reports(out_dir: Path, charter: dict, result: dict, instruction: str) 
                 "api_replies",
                 "hard_rule_rejects",
                 "dry_run",
+                "framework_projection",
             )
             if k in result or True
         },
@@ -132,7 +133,7 @@ def write_reports(out_dir: Path, charter: dict, result: dict, instruction: str) 
 
 
 def dry_run_result(charter: dict, instruction: str, arts: list[str]) -> dict:
-    return {
+    result = {
         "name": job_name(charter),
         "session_id": "",
         "pending_seen": False,
@@ -153,6 +154,20 @@ def dry_run_result(charter: dict, instruction: str, arts: list[str]) -> dict:
         ],
         "dry_run": True,
     }
+    # Read-only Goal/Task projection (path B); must not flip ok/state
+    try:
+        import sys
+
+        src = str(REPO / "src")
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from framework.project_report import attach_framework_projection
+        from charter import charter_for_glue
+
+        attach_framework_projection(result, charter_for_glue(charter))
+    except Exception as e:  # noqa: BLE001
+        result.setdefault("notes", []).append(f"framework_projection skipped: {e}")
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:

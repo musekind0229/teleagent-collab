@@ -160,8 +160,16 @@ def choose_poll_interval(
 
 
 def session_id_of_permission(p: dict) -> str:
-    for k in ("sessionID", "session_id", "sessionId"):
+    """Accept raw TeleAgent permission or public PendingAction."""
+    if not isinstance(p, dict):
+        return ""
+    for k in ("session_id", "sessionID", "sessionId"):
         v = p.get(k)
+        if v:
+            return str(v)
+    native = p.get("native") if isinstance(p.get("native"), dict) else {}
+    for k in ("sessionID", "session_id", "sessionId"):
+        v = native.get(k)
         if v:
             return str(v)
     meta = p.get("metadata") if isinstance(p.get("metadata"), dict) else {}
@@ -900,11 +908,13 @@ class ParallelScheduler:
                         continue
                     while job.simulated_pending:
                         # serial: expose at most one pending per job per scan
+                        from teleagent_adapter.permission_view import to_public_permission
+
                         p = job.simulated_pending.pop(0)
                         p = dict(p)
                         p.setdefault("sessionID", job.session_id)
                         p.setdefault("id", p.get("id") or f"sim-{uuid.uuid4().hex[:8]}")
-                        pending.append(p)
+                        pending.append(to_public_permission(p))
                         job.last_pending_at = time.time()
                         break  # one-by-one per job this scan
             if not pending:
@@ -917,7 +927,9 @@ class ParallelScheduler:
         if not isinstance(pending, list) or not pending:
             self.stats.empty_scans += 1
             return []
-        # Filter to our sessions only
+        # Filter to our sessions only; expose public PendingAction (TA fields under native)
+        from teleagent_adapter.permission_view import to_public_permission
+
         with self._lock:
             ours = {j.session_id: j for j in self.jobs.values() if j.session_id}
         filtered = []
@@ -926,7 +938,7 @@ class ParallelScheduler:
                 continue
             sid = session_id_of_permission(p)
             if sid and sid in ours:
-                filtered.append(p)
+                filtered.append(to_public_permission(p))
                 ours[sid].last_pending_at = time.time()
                 ours[sid].state = JobState.PENDING_APPROVAL
         if not filtered:
@@ -946,11 +958,22 @@ class ParallelScheduler:
     def handle_one_permission(self, p: dict) -> dict:
         """Process exactly one pending (serial弹权). Hard rules first; lead only if needed."""
         self.stats.serial_one_by_one += 1
-        job = self._job_for_permission(p)
+        from teleagent_adapter.permission_view import to_native_for_rules
+
+        public = p if isinstance(p, dict) else {}
+        p = to_native_for_rules(public)  # hard_rules / fingerprints still see TA-shaped dict
+        job = self._job_for_permission(public if public.get("session_id") else p)
+        if job is None:
+            job = self._job_for_permission(p)
         if job is None:
             return {"skipped": True, "reason": "unknown_session"}
 
-        pid = str(p.get("id") or p.get("requestID") or "")
+        pid = str(
+            public.get("request_id")
+            or p.get("id")
+            or p.get("requestID")
+            or ""
+        )
         if not pid or pid in job.handled_perm_ids:
             return {"skipped": True, "reason": "already_handled", "id": pid}
         # 条6: never re-send a decision already recorded in state store

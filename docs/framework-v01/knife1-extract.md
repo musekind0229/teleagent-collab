@@ -19,3 +19,9 @@ Date: 2026-09-12
 ## Old entrypoints
 
 `bin/run-job.py` / `bin/run-scheduler.py` unchanged in behavior.
+
+## Knife 2 (2026-09-12)
+
+- `attach_framework_projection` into glue/run-job report (`framework_projection`, readonly)
+- `teleagent_adapter.permission_view`: public PendingAction; scheduler scan returns public view; rules use `to_native_for_rules`
+- `list_pending_actions` on Linux/Windows adapters

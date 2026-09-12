@@ -15,6 +15,7 @@ import urllib.request
 from typing import Any, Callable
 from urllib.parse import urlparse
 
+from teleagent_adapter.permission_view import list_public_permissions, to_public_permission
 from teleagent_adapter.base import (
     AdapterError,
     AdapterStatus,
@@ -218,6 +219,11 @@ class LinuxLocalV1Adapter(TeleAgentAdapterABC):
         code, pending = self.call("GET", "/permission")
         items = pending if isinstance(pending, list) else []
         return code, filter_by_session(items, session_id)
+
+    def list_pending_actions(self, *, session_id: str | None = None) -> tuple[int, list]:
+        """Public PendingAction list — TeleAgent fields stay under each item['native']."""
+        code, items = self.list_permissions(session_id=session_id)
+        return code, list_public_permissions(items, session_id=None)
 
     def list_questions(self, *, session_id: str | None = None) -> tuple[int, list]:
         code, qs = self.call("GET", "/question")

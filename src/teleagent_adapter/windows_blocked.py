@@ -39,6 +39,9 @@ class WindowsBlockedAdapter(TeleAgentAdapterABC):
     def list_permissions(self, *, session_id: str | None = None) -> tuple[int, list]:
         self._blocked()
 
+    def list_pending_actions(self, *, session_id: str | None = None) -> tuple[int, list]:
+        self._blocked()
+
     def list_questions(self, *, session_id: str | None = None) -> tuple[int, list]:
         self._blocked()
 
