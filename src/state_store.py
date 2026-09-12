@@ -41,21 +41,35 @@ class DecisionRecord:
     lead_decision: str | None = None
     sent_at: float = field(default_factory=time.time)
     application_id: str | None = None
+    request_id: str = ""  # public id; defaults to permission_id
+    goal_id: str = ""  # optional readonly projection
+    task_id: str = ""  # optional readonly projection
+
+    def __post_init__(self) -> None:
+        if not self.request_id:
+            self.request_id = self.permission_id
+        if not self.permission_id and self.request_id:
+            self.permission_id = self.request_id
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "DecisionRecord":
+        pid = str(d.get("permission_id") or d.get("request_id") or "")
+        rid = str(d.get("request_id") or pid)
         return cls(
             decision_id=str(d.get("decision_id") or ""),
             job_id=str(d.get("job_id") or ""),
-            permission_id=str(d.get("permission_id") or ""),
+            permission_id=pid,
             reply=str(d.get("reply") or ""),
             via=str(d.get("via") or ""),
             lead_decision=d.get("lead_decision"),
             sent_at=float(d.get("sent_at") or time.time()),
             application_id=d.get("application_id"),
+            request_id=rid,
+            goal_id=str(d.get("goal_id") or ""),
+            task_id=str(d.get("task_id") or ""),
         )
 
 
@@ -124,6 +138,8 @@ class JobRecord:
     expected_artifacts: list[str] = field(default_factory=list)
     force_lead_review: bool = False
     rework_budget: dict = field(default_factory=dict)
+    goal_id: str = ""  # readonly charter→Goal projection id
+    task_id: str = ""  # readonly Task projection id
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -157,6 +173,8 @@ class JobRecord:
             expected_artifacts=list(d.get("expected_artifacts") or []),
             force_lead_review=bool(d.get("force_lead_review")),
             rework_budget=dict(d.get("rework_budget") or {}),
+            goal_id=str(d.get("goal_id") or ""),
+            task_id=str(d.get("task_id") or ""),
         )
 
     def contract_ok(self, *, expect_version: int = CONTRACT_VERSION) -> tuple[bool, str]:
@@ -354,7 +372,7 @@ class StateStore:
     def already_decided(self, permission_id: str) -> DecisionRecord | None:
         with self._lock:
             for d in self._decisions.values():
-                if d.permission_id == permission_id:
+                if d.permission_id == permission_id or d.request_id == permission_id:
                     return d
             return None
 

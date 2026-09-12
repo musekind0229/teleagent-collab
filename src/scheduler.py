@@ -129,6 +129,8 @@ class JobSlot:
     dispatch_query_id: str = ""
     wall_deadline: float | None = None
     restored: bool = False  # True if hydrated from StateStore (do not re-dispatch)
+    goal_id: str = ""  # readonly framework projection
+    task_id: str = ""  # readonly framework projection
 
 
 def new_job_id(name: str = "job") -> str:
@@ -294,6 +296,9 @@ class ParallelScheduler:
             else resolve_arts(charter, workspace=workdir)
         )
         timeout_sec = int(300 if charter.get("timeout_sec") is None else charter.get("timeout_sec"))
+        from framework.id_projection import stable_goal_task_ids
+
+        gid, tid = stable_goal_task_ids(jid, charter if isinstance(charter, dict) else {})
         slot = JobSlot(
             job_id=jid,
             name=name,
@@ -308,6 +313,8 @@ class ParallelScheduler:
             dry=self.dry_run,
             simulated_pending=list(simulated_pending or []),
             wall_deadline=None,
+            goal_id=gid,
+            task_id=tid,
         )
         with self._lock:
             self.jobs[jid] = slot
@@ -395,6 +402,8 @@ class ParallelScheduler:
             expected_artifacts=list(job.expected_artifacts or []),
             force_lead_review=bool(job.force_lead_review),
             rework_budget=dict((job.result or {}).get("rework_budget") or {}),
+            goal_id=str(getattr(job, "goal_id", "") or ""),
+            task_id=str(getattr(job, "task_id", "") or ""),
         )
         self.state_store.upsert_job(rec)
 
@@ -654,11 +663,17 @@ class ParallelScheduler:
         restored = 0
         blocked = 0
         blocked_ids: list[str] = []
+        from framework.id_projection import stable_goal_task_ids
+
         for rec in self.state_store.list_jobs():
             if rec.job_id in self.jobs:
                 continue
             workdir = Path(rec.workdir) if rec.workdir else (self.workspaces_root / rec.job_id)
             workdir.mkdir(parents=True, exist_ok=True)
+            _gid = str(getattr(rec, "goal_id", "") or "")
+            _tid = str(getattr(rec, "task_id", "") or "")
+            if not _gid or not _tid:
+                _gid, _tid = stable_goal_task_ids(rec.job_id, rec.charter if isinstance(rec.charter, dict) else {})
             try:
                 st = JobState(rec.state)
             except ValueError:
@@ -696,6 +711,8 @@ class ParallelScheduler:
                         "error": f"restore_contract_blocked:{why}",
                         "contract_version": rec.contract_version,
                     },
+                    goal_id=_gid,
+                    task_id=_tid,
                     restored=True,
                     dry=self.dry_run,
                 )
@@ -733,6 +750,8 @@ class ParallelScheduler:
                 handled_perm_ids=set(rec.handled_perm_ids),
                 notes=list(rec.notes) + ["restored from state_store; full charter contract; no re-dispatch"],
                 result=dict(rec.result or {}),
+                goal_id=_gid,
+                task_id=_tid,
                 restored=True,
                 dry=self.dry_run,
             )
@@ -1302,10 +1321,13 @@ class ParallelScheduler:
                 decision_id=f"dec-{_uuid.uuid4().hex[:12]}",
                 job_id=job.job_id,
                 permission_id=pid,
+                request_id=pid,
                 reply=reply,
                 via=via,
                 lead_decision=lead_decision,
                 application_id=application_id,
+                goal_id=str(getattr(job, "goal_id", "") or ""),
+                task_id=str(getattr(job, "task_id", "") or ""),
             )
         )
 
@@ -1330,7 +1352,35 @@ class ParallelScheduler:
 
     # --- completion --------------------------------------------------------------
 
+    def _attach_lifecycle_projection(self, job: JobSlot) -> None:
+        """Read-only Task/Run vocabulary on job.result — never flips ok/state."""
+        try:
+            from framework.lifecycle import project_scheduler_state
+        except Exception as e:  # noqa: BLE001
+            job.notes.append(f"framework_lifecycle import failed: {e}")
+            return
+        if not isinstance(job.result, dict):
+            job.result = {}
+        prev_ok = job.result.get("ok")
+        prev_err = job.result.get("error")
+        try:
+            job.result["framework_lifecycle"] = project_scheduler_state(
+                job.state.value,
+                busy=bool(job.busy),
+                force_lead_review=bool(job.force_lead_review),
+                goal_id=str(getattr(job, "goal_id", "") or ""),
+                task_id=str(getattr(job, "task_id", "") or ""),
+            )
+        except Exception as e:  # noqa: BLE001
+            job.notes.append(f"framework_lifecycle error: {e}")
+            return
+        if "ok" in job.result and prev_ok is not None:
+            job.result["ok"] = prev_ok
+        if "error" in job.result and prev_err is not None:
+            job.result["error"] = prev_err
+
     def refresh_job_status(self, job: JobSlot) -> None:
+
         from completion import (
             artifacts_all_present,
             build_acceptance_packet,
@@ -1353,6 +1403,7 @@ class ParallelScheduler:
             JobState.CANCELLED,
             JobState.QUEUED,
         ):
+            self._attach_lifecycle_projection(job)
             return
 
         # 条6: cancel_requested → effect cancel for THIS job only
@@ -1384,6 +1435,7 @@ class ParallelScheduler:
             }
             job.finished_at = time.time()
             self._persist_job(job)
+            self._attach_lifecycle_projection(job)
 
         def _succeed(arts: list[str], *, state: str = "ok", extra_notes: list | None = None) -> None:
             notes = list(job.notes) + list(extra_notes or [])
@@ -1416,6 +1468,7 @@ class ParallelScheduler:
             job.finished_at = time.time()
             job.busy = False
             self._persist_job(job)
+            self._attach_lifecycle_projection(job)
 
         def _run_force_lead_review(arts: list[str], *, execution_result: dict | None = None, error: str = "") -> bool:
             """Return True if lead passed and fingerprints stable. Parallel + serial."""
@@ -1577,6 +1630,7 @@ class ParallelScheduler:
             job.notes.append(
                 f"session status unusable http={sc} body_type={type(status).__name__}; not idle"
             )
+            self._attach_lifecycle_projection(job)
             return
 
         activity = self.session_activity(status, job.session_id)
@@ -1587,11 +1641,13 @@ class ParallelScheduler:
                 job.notes.append(
                     f"session status activity=unknown http={sc}; not idle"
                 )
+            self._attach_lifecycle_projection(job)
             return
 
         job.busy = False
         complete, arts = _arts_complete()
         if not complete:
+            self._attach_lifecycle_projection(job)
             return
 
         # Fetch this-round assistant finish/error — required for ALL acceptance paths.
@@ -1661,6 +1717,7 @@ class ParallelScheduler:
                 f"completion gate blocked: messages_ok={messages_ok} "
                 f"message_http={msg_http} finish={fin!r}; not DONE"
             )
+            self._attach_lifecycle_projection(job)
             return
 
         exec_snapshot = {
@@ -1690,6 +1747,7 @@ class ParallelScheduler:
             job.result["finish"] = fin
             job.result["status_http"] = sc
             job.result["message_http"] = msg_http
+        self._attach_lifecycle_projection(job)
 
     def write_job_report(self, job: JobSlot) -> Path:
         self.runs_root.mkdir(parents=True, exist_ok=True)
