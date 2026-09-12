@@ -67,24 +67,10 @@ def to_public_permission(raw: dict) -> dict[str, Any]:
         "path": str(path or ""),
         "tool": str(tool_name or ""),
         "summary": " ".join(x for x in summary_bits if x).strip()[:240],
-        # Opaque native for adapter reconfirm — kernel must not parse TA fields from here
-        "native": {
-            k: raw[k]
-            for k in raw
-            if k
-            in (
-                "id",
-                "sessionID",
-                "permission",
-                "patterns",
-                "metadata",
-                "tool",
-                "message",
-                "title",
-                "command",
-                "type",
-            )
-        },
+        # Opaque native for adapter reconfirm — keep full TA raw (no auth-field drop).
+        # Kernel must not parse TA fields from here; missing public fields stay
+        # empty strings, never mapped to allow.
+        "native": dict(raw),
     }
     return public
 

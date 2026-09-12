@@ -32,7 +32,7 @@ from framework.lifecycle import (
     LifecycleError,
     assert_transition,
 )
-from framework.models import CONTRACT_VERSION, new_goal_id, new_task_id
+from framework.models import CONTRACT_VERSION, contract_fingerprint, new_goal_id, new_task_id
 
 DURABLE_DIRNAME = ".collab-durable"
 STORE_FILENAME = "store.json"
@@ -56,6 +56,11 @@ REASON_NOT_CANCEL_REQUESTED = "not_cancel_requested"
 REASON_IDENTITY_MEMORY_FORBIDDEN = "identity_memory_forbidden"
 REASON_ILLEGAL_STATE = "illegal_state"
 REASON_EMPTY_VERDICT = "empty_verdict"
+REASON_SUBMIT_CONTENT_CONFLICT = "submit_content_conflict"
+REASON_ACTOR_REQUIRED = "actor_required"
+REASON_NOT_COORDINATOR = "not_coordinator"
+REASON_STALE_OWNERSHIP = "stale_ownership"
+REASON_ACTOR_NOT_AUTHORIZED = "actor_not_authorized"
 
 DECISION_KINDS = frozenset(
     {"action_approval", "question", "artifact_review", "plan_review"}
@@ -272,6 +277,108 @@ def _unrelated_batch_reason(
     if len(collected) > 1 and len(ids) == 0 and len(kinds) > 1:
         return REASON_UNRELATED_BATCH
     return None
+
+
+def _submit_content_fingerprint(
+    *,
+    title: str,
+    desired_outcome: str,
+    goal: Mapping[str, Any] | None,
+    tasks: Sequence[Mapping[str, Any]] | None,
+) -> str:
+    """Stable fingerprint of submit payload (ids / submit_key excluded)."""
+    body = _default_goal_body(
+        goal_id="_fp",
+        title=title,
+        desired_outcome=desired_outcome,
+        goal=goal,
+    )
+    body.pop("goal_id", None)
+    body.pop("idempotency_key", None)
+    body.pop("contract_version", None)
+    task_rows: list[dict[str, Any]] = []
+    for item in tasks or []:
+        if not isinstance(item, Mapping):
+            continue
+        rec = _task_record(item, goal_id="_fp")
+        rec.pop("goal_id", None)
+        rec.pop("contract_version", None)
+        if not _norm_key(item.get("task_id")):
+            rec.pop("task_id", None)
+        task_rows.append(rec)
+    return contract_fingerprint({"goal": body, "tasks": task_rows})
+
+
+def _fingerprint_of_snap(snap: Mapping[str, Any]) -> str:
+    stored = _norm_key(snap.get("submit_fingerprint"))
+    if stored:
+        return stored
+    g = snap.get("goal") if isinstance(snap.get("goal"), Mapping) else {}
+    return _submit_content_fingerprint(
+        title=str(g.get("title") or ""),
+        desired_outcome=str(g.get("desired_outcome") or ""),
+        goal=g if isinstance(g, Mapping) else None,
+        tasks=[t for t in (snap.get("tasks") or []) if isinstance(t, Mapping)],
+    )
+
+
+def _ownership_store_if_present(persist_root: str | Path, goal_id: str):
+    """Open Goal ownership only when a store file already exists (do not mint)."""
+    from framework.goal_ownership import GoalOwnershipStore, persist_path
+
+    path = persist_path(persist_root, goal_id)
+    if not path.is_file():
+        return None
+    return GoalOwnershipStore.open(goal_id, persist_root)
+
+
+def _ownership_projection(persist_root: str | Path, goal_id: str) -> dict[str, Any] | None:
+    store = _ownership_store_if_present(persist_root, goal_id)
+    if store is None:
+        return None
+    own = store.current()
+    if not own.coordinator_id and int(own.version) <= 0 and int(store.plan_revision) <= 0:
+        return None
+    cid = own.coordinator_id
+    return {
+        "ownership": {
+            "coordinator_id": cid,
+            "version": int(own.version),
+            "readonly": True,
+        },
+        "plan_revision": {
+            "coordinator_id": cid,
+            "version": int(store.plan_revision),
+            "readonly": True,
+        },
+    }
+
+
+def _authorize_resolve_actor(
+    persist_root: str | Path,
+    goal_id: str,
+    *,
+    actor_id: str,
+    ownership_version: Any = None,
+) -> tuple[bool, str]:
+    """If the Goal has a coordinator, actor must be that live instance."""
+    store = _ownership_store_if_present(persist_root, goal_id)
+    if store is None:
+        return True, REASON_READY
+    own = store.current()
+    if not own.coordinator_id or int(own.version) <= 0:
+        return True, REASON_READY
+    if actor_id != own.coordinator_id:
+        return False, REASON_NOT_COORDINATOR
+    if ownership_version is None or ownership_version == "":
+        return True, REASON_READY
+    try:
+        ver = int(ownership_version)
+    except (TypeError, ValueError):
+        return False, REASON_STALE_OWNERSHIP
+    if ver != int(own.version):
+        return False, REASON_STALE_OWNERSHIP
+    return True, REASON_READY
 
 
 def _default_goal_body(
@@ -499,6 +606,8 @@ class DurableLayer:
         """Open a Goal, or return the existing one for this submit key.
 
         Duplicate submit with the same key does **not** open a second Goal.
+        Same key + different payload fingerprint is ``submit_content_conflict``
+        (the first Goal is kept; the new payload is not applied).
         """
         key = _norm_key(submit_key)
         if not key:
@@ -526,10 +635,34 @@ class DurableLayer:
                     "error": hit,
                     "created": False,
                 }
+        incoming_fp = _submit_content_fingerprint(
+            title=title or key,
+            desired_outcome=desired_outcome,
+            goal=goal,
+            tasks=list(tasks) if tasks else None,
+        )
         with self._mu:
             existing_id = self.submit_keys.get(key)
             if existing_id and existing_id in self.goals:
-                snap = self._copy_goal(self.goals[existing_id])
+                stored = self.goals[existing_id]
+                stored_fp = _fingerprint_of_snap(stored)
+                if stored_fp != incoming_fp:
+                    snap = self._copy_goal(stored)
+                    return {
+                        "ok": False,
+                        "reason": REASON_SUBMIT_CONTENT_CONFLICT,
+                        "error": (
+                            "submit_key bound to a different payload; "
+                            "content conflict is not a silent replay"
+                        ),
+                        "created": False,
+                        "duplicate": False,
+                        "opened": False,
+                        "goal_id": existing_id,
+                        "goal": snap,
+                        "goal_count": len(self.goals),
+                    }
+                snap = self._copy_goal(stored)
                 return {
                     "ok": True,
                     "reason": REASON_DUPLICATE_SUBMIT,
@@ -554,6 +687,7 @@ class DurableLayer:
             )
             body["idempotency_key"] = key
             snap = _empty_snapshot(goal_id=gid, submit_key=key, goal=body)
+            snap["submit_fingerprint"] = incoming_fp
             child_tasks: list[dict[str, Any]] = []
             for item in tasks or []:
                 if isinstance(item, Mapping):
@@ -590,7 +724,7 @@ class DurableLayer:
                     "goal_id": gid,
                 }
             copied = self._copy_goal(snap)
-            return {
+            out = {
                 "ok": True,
                 "reason": REASON_READY,
                 "goal_id": gid,
@@ -599,6 +733,13 @@ class DurableLayer:
                 "cancelled": bool(copied.get("cancelled")) or copied.get("state") == "cancelled",
                 "goal": copied,
             }
+            proj = _ownership_projection(self.persist_root, gid)
+            if proj:
+                out["ownership"] = proj["ownership"]
+                out["plan_revision"] = proj["plan_revision"]
+                copied["ownership"] = proj["ownership"]
+                copied["plan_revision"] = proj["plan_revision"]
+            return out
 
     def add_child_task(
         self,
@@ -761,7 +902,13 @@ class DurableLayer:
         extra: Mapping[str, Any] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """Resolve exactly one pending decision. Unrelated batches are refused."""
+        """Resolve exactly one pending decision. Unrelated batches are refused.
+
+        ``actor_id`` is required. If the Goal has a coordinator, the actor
+        must be that coordinator (optional ``ownership_version`` must match
+        when supplied). The actor is recorded on the resolution; this is not
+        identity/memory promotion.
+        """
         gid = _norm_key(goal_id)
         extra_map: dict[str, Any] = dict(extra) if isinstance(extra, Mapping) else {}
         extra_map.update(kwargs)
@@ -774,6 +921,21 @@ class DurableLayer:
                 "ok": False,
                 "reason": REASON_IDENTITY_MEMORY_FORBIDDEN,
                 "error": forbidden,
+            }
+        actor = _norm_key(extra_map.get("actor_id") or extra_map.get("actor"))
+        own_ver = extra_map.get("ownership_version")
+        if own_ver is None:
+            own_ver = extra_map.get("ownership_ver")
+        extra_map.pop("actor_id", None)
+        extra_map.pop("actor", None)
+        extra_map.pop("ownership_version", None)
+        extra_map.pop("ownership_ver", None)
+        if not actor:
+            return {
+                "ok": False,
+                "reason": REASON_ACTOR_REQUIRED,
+                "error": "actor_id required",
+                "goal_id": gid,
             }
         batch_why = _unrelated_batch_reason(
             decision_id=decision_id,
@@ -806,6 +968,24 @@ class DurableLayer:
             snap = self.goals.get(gid)
             if snap is None:
                 return {"ok": False, "reason": REASON_UNKNOWN_GOAL, "error": f"unknown goal_id {gid!r}"}
+            authed, auth_why = _authorize_resolve_actor(
+                self.persist_root,
+                gid,
+                actor_id=actor,
+                ownership_version=own_ver,
+            )
+            if not authed:
+                return {
+                    "ok": False,
+                    "reason": auth_why,
+                    "error": (
+                        "stale ownership instance; resolve refused"
+                        if auth_why == REASON_STALE_OWNERSHIP
+                        else f"actor {actor!r} is not authorized to resolve"
+                    ),
+                    "goal_id": gid,
+                    "actor_id": actor,
+                }
             pending = [dict(d) for d in (snap.get("pending_decisions") or []) if isinstance(d, Mapping)]
             resolved = [dict(d) for d in (snap.get("resolved_decisions") or []) if isinstance(d, Mapping)]
             target = None
@@ -866,6 +1046,12 @@ class DurableLayer:
             target["status"] = STATUS_RESOLVED
             target["verdict"] = vdict
             target["reason"] = rsn or "resolved"
+            target["actor_id"] = actor
+            if own_ver is not None and own_ver != "":
+                try:
+                    target["ownership_version"] = int(own_ver)
+                except (TypeError, ValueError):
+                    target["ownership_version"] = own_ver
             target["resolved_at"] = _utc_now()
             target["resolved_at_iso"] = _iso()
             if action_list:
@@ -879,12 +1065,14 @@ class DurableLayer:
                 "resolve_decision",
                 decision_id=target.get("decision_id"),
                 verdict=vdict,
+                actor_id=actor,
             )
             self._touch(snap)
             self._persist_unlocked()
             return {
                 "ok": True,
                 "reason": REASON_READY,
+                "actor_id": actor,
                 "goal_id": gid,
                 "decision": dict(target),
                 "pending_count": len(remaining),

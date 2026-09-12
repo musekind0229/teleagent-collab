@@ -21,9 +21,13 @@ if str(SRC) not in sys.path:
 
 from framework.durable_api import (  # noqa: E402
     DURABLE_DIRNAME,
+    REASON_ACTOR_REQUIRED,
     REASON_ADMISSION_CLOSED,
     REASON_DUPLICATE_SUBMIT,
     REASON_IDENTITY_MEMORY_FORBIDDEN,
+    REASON_NOT_COORDINATOR,
+    REASON_STALE_OWNERSHIP,
+    REASON_SUBMIT_CONTENT_CONFLICT,
     REASON_UNRELATED_BATCH,
     DurableLayer,
     cancel_goal,
@@ -35,6 +39,10 @@ from framework.durable_api import (  # noqa: E402
     reset_durable_cache,
     resolve_decision,
     submit_goal,
+)
+from framework.goal_ownership import (  # noqa: E402
+    open_goal_ownership,
+    reset_goal_ownership_cache,
 )
 from framework.lifecycle import GOAL_STATES, LifecycleError, assert_transition  # noqa: E402
 
@@ -54,9 +62,11 @@ def _load_run_job():
 class _DurableCase(unittest.TestCase):
     def setUp(self):
         reset_durable_cache()
+        reset_goal_ownership_cache()
 
     def tearDown(self):
         reset_durable_cache()
+        reset_goal_ownership_cache()
 
 
 class TestGoalCancelLifecycle(_DurableCase):
@@ -87,8 +97,8 @@ class TestSubmitGoalIdempotent(_DurableCase):
 
             second = layer.submit_goal(
                 submit_key="sk-hello",
-                title="hello again",
-                desired_outcome="should not open another",
+                title="hello",
+                desired_outcome="write hello",
             )
             self.assertTrue(second["ok"], second)
             self.assertFalse(second["created"])
@@ -97,6 +107,17 @@ class TestSubmitGoalIdempotent(_DurableCase):
             self.assertEqual(second["goal_id"], gid)
             self.assertEqual(layer.goal_count(), 1)
             self.assertFalse(second.get("opened"))
+
+            conflict = layer.submit_goal(
+                submit_key="sk-hello",
+                title="hello again",
+                desired_outcome="should not open another",
+            )
+            self.assertFalse(conflict["ok"], conflict)
+            self.assertEqual(conflict["reason"], REASON_SUBMIT_CONTENT_CONFLICT)
+            self.assertEqual(conflict["goal_id"], gid)
+            self.assertEqual(layer.goal_count(), 1)
+            self.assertEqual(layer.get_goal(gid)["goal"]["goal"]["title"], "hello")
 
             snap = layer.get_goal(gid)
             self.assertTrue(snap["ok"], snap)
@@ -116,17 +137,30 @@ class TestSubmitGoalIdempotent(_DurableCase):
             reset_durable_cache()
             reopened = DurableLayer.open(td)
             self.assertEqual(reopened.goal_count(), 2)
-            again = reopened.submit_goal(submit_key="sk-hello", title="x", desired_outcome="y")
+            again = reopened.submit_goal(
+                submit_key="sk-hello", title="hello", desired_outcome="write hello"
+            )
             self.assertEqual(again["goal_id"], gid)
             self.assertFalse(again["created"])
+            self.assertEqual(reopened.goal_count(), 2)
+            conflict_reload = reopened.submit_goal(
+                submit_key="sk-hello", title="x", desired_outcome="y"
+            )
+            self.assertFalse(conflict_reload["ok"], conflict_reload)
+            self.assertEqual(conflict_reload["reason"], REASON_SUBMIT_CONTENT_CONFLICT)
             self.assertEqual(reopened.goal_count(), 2)
 
     def test_module_functions_same_key(self):
         with tempfile.TemporaryDirectory() as td:
             a = submit_goal(td, submit_key="k", title="t", desired_outcome="o")
-            b = submit_goal(td, submit_key="k", title="t2", desired_outcome="o2")
+            b = submit_goal(td, submit_key="k", title="t", desired_outcome="o")
             self.assertEqual(a["goal_id"], b["goal_id"])
+            self.assertTrue(b["duplicate"])
+            conflict = submit_goal(td, submit_key="k", title="t2", desired_outcome="o2")
+            self.assertFalse(conflict["ok"], conflict)
+            self.assertEqual(conflict["reason"], REASON_SUBMIT_CONTENT_CONFLICT)
             self.assertEqual(get_goal(td, a["goal_id"])["goal_id"], a["goal_id"])
+            self.assertEqual(get_goal(td, a["goal_id"])["goal"]["goal"]["title"], "t")
 
 
 class TestResolveDecisionOneAtATime(_DurableCase):
@@ -144,6 +178,7 @@ class TestResolveDecisionOneAtATime(_DurableCase):
 
             batch = layer.resolve_decision(
                 gid,
+                actor_id="tester",
                 verdict="allow",
                 reason="nope",
                 actions=[
@@ -157,6 +192,7 @@ class TestResolveDecisionOneAtATime(_DurableCase):
 
             listed = layer.resolve_decision(
                 gid,
+                actor_id="tester",
                 verdict="allow",
                 reason="nope",
                 decisions=[
@@ -169,6 +205,7 @@ class TestResolveDecisionOneAtATime(_DurableCase):
 
             mixed = layer.resolve_decision(
                 gid,
+                actor_id="tester",
                 decision_id=id1,
                 verdict="allow",
                 reason="nope",
@@ -177,13 +214,16 @@ class TestResolveDecisionOneAtATime(_DurableCase):
             self.assertFalse(mixed["ok"], mixed)
             self.assertEqual(mixed["reason"], REASON_UNRELATED_BATCH)
 
-            unnamed = layer.resolve_decision(gid, verdict="allow", reason="pick one")
+            unnamed = layer.resolve_decision(
+                gid, actor_id="tester", verdict="allow", reason="pick one"
+            )
             self.assertFalse(unnamed["ok"], unnamed)
             self.assertEqual(unnamed["reason"], "ambiguous_pending")
 
             via_mod = resolve_decision(
                 td,
                 gid,
+                actor_id="tester",
                 actions=[
                     {"decision_id": id1, "kind": "action_approval"},
                     {"decision_id": id2, "kind": "question"},
@@ -196,6 +236,7 @@ class TestResolveDecisionOneAtATime(_DurableCase):
 
             ok_one = layer.resolve_decision(
                 gid,
+                actor_id="tester",
                 decision_id=id1,
                 verdict="allow",
                 reason="this one only",
@@ -203,6 +244,8 @@ class TestResolveDecisionOneAtATime(_DurableCase):
             )
             self.assertTrue(ok_one["ok"], ok_one)
             self.assertEqual(ok_one["pending_count"], 1)
+            self.assertEqual(ok_one["actor_id"], "tester")
+            self.assertEqual(ok_one["decision"]["actor_id"], "tester")
             pending = layer.get_goal(gid)["goal"]["pending_decisions"]
             self.assertEqual(len(pending), 1)
             self.assertEqual(pending[0]["decision_id"], id2)
@@ -219,6 +262,7 @@ class TestResolveDecisionOneAtATime(_DurableCase):
             did = opened["decision"]["decision_id"]
             out = layer.resolve_decision(
                 gid,
+                actor_id="tester",
                 decision_id=did,
                 verdict="allow",
                 reason="same decision",
@@ -327,6 +371,7 @@ class TestNoIdentityMemoryPromotion(_DurableCase):
             layer.open_decision(gid)
             refused = layer.resolve_decision(
                 gid,
+                actor_id="tester",
                 verdict="allow",
                 reason="x",
                 extra={"promote_identity": True},
@@ -357,6 +402,118 @@ class TestGetGoalAndReport(_DurableCase):
             self.assertTrue(report["readonly"])
             self.assertFalse(report["kernel_promotes_identity_memory"])
 
+    def test_get_goal_projects_ownership_and_plan_revision_when_present(self):
+        reset_goal_ownership_cache()
+        with tempfile.TemporaryDirectory() as td:
+            layer = DurableLayer.open(td)
+            gid = layer.submit_goal(submit_key="own", title="owned", desired_outcome="o")[
+                "goal_id"
+            ]
+            bare = layer.get_goal(gid)
+            self.assertTrue(bare["ok"], bare)
+            self.assertNotIn("ownership", bare)
+            self.assertNotIn("plan_revision", bare)
+
+            store = open_goal_ownership(gid, td, coordinator_id="coord_a")
+            plan = {
+                "goal_id": gid,
+                "tasks": [{"task_id": "t1", "goal_id": gid, "status": "queued"}],
+            }
+            committed = store.submit_plan_revision(
+                coordinator_id="coord_a",
+                ownership_version=1,
+                plan=plan,
+                reason="first",
+            )
+            self.assertTrue(committed["ok"], committed)
+
+            got = layer.get_goal(gid)
+            self.assertTrue(got["ok"], got)
+            self.assertEqual(got["ownership"]["coordinator_id"], "coord_a")
+            self.assertEqual(got["ownership"]["version"], 1)
+            self.assertTrue(got["ownership"]["readonly"])
+            self.assertEqual(got["plan_revision"]["coordinator_id"], "coord_a")
+            self.assertEqual(got["plan_revision"]["version"], 1)
+            self.assertTrue(got["plan_revision"]["readonly"])
+            self.assertEqual(got["goal"]["ownership"]["coordinator_id"], "coord_a")
+            self.assertTrue(got["goal"]["ownership"]["readonly"])
+            self.assertTrue(got["goal"]["plan_revision"]["readonly"])
+        reset_goal_ownership_cache()
+
+
+class TestResolveDecisionActor(_DurableCase):
+    def test_resolve_requires_actor_and_records_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            layer = DurableLayer.open(td)
+            gid = layer.submit_goal(submit_key="act", title="a", desired_outcome="a")["goal_id"]
+            opened = layer.open_decision(gid, kind="action_approval")
+            did = opened["decision"]["decision_id"]
+
+            missing = layer.resolve_decision(gid, decision_id=did, verdict="allow", reason="x")
+            self.assertFalse(missing["ok"], missing)
+            self.assertEqual(missing["reason"], REASON_ACTOR_REQUIRED)
+            self.assertEqual(len(layer.get_goal(gid)["goal"]["pending_decisions"]), 1)
+
+            ok = layer.resolve_decision(
+                gid,
+                actor_id="human-1",
+                decision_id=did,
+                verdict="allow",
+                reason="ok",
+            )
+            self.assertTrue(ok["ok"], ok)
+            self.assertEqual(ok["actor_id"], "human-1")
+            self.assertEqual(ok["decision"]["actor_id"], "human-1")
+            hist = layer.get_goal(gid)["goal"]["history"]
+            resolve_ops = [h for h in hist if h.get("op") == "resolve_decision"]
+            self.assertEqual(resolve_ops[-1]["actor_id"], "human-1")
+
+    def test_resolve_refuses_unauthorized_actor_when_goal_has_coordinator(self):
+        reset_goal_ownership_cache()
+        with tempfile.TemporaryDirectory() as td:
+            layer = DurableLayer.open(td)
+            gid = layer.submit_goal(submit_key="auth", title="a", desired_outcome="a")[
+                "goal_id"
+            ]
+            open_goal_ownership(gid, td, coordinator_id="coord_a")
+            opened = layer.open_decision(gid)
+            did = opened["decision"]["decision_id"]
+
+            intruder = layer.resolve_decision(
+                gid,
+                actor_id="intruder",
+                decision_id=did,
+                verdict="allow",
+                reason="nope",
+            )
+            self.assertFalse(intruder["ok"], intruder)
+            self.assertEqual(intruder["reason"], REASON_NOT_COORDINATOR)
+            self.assertEqual(len(layer.get_goal(gid)["goal"]["pending_decisions"]), 1)
+
+            stale = layer.resolve_decision(
+                gid,
+                actor_id="coord_a",
+                ownership_version=99,
+                decision_id=did,
+                verdict="allow",
+                reason="stale",
+            )
+            self.assertFalse(stale["ok"], stale)
+            self.assertEqual(stale["reason"], REASON_STALE_OWNERSHIP)
+
+            ok = layer.resolve_decision(
+                gid,
+                actor_id="coord_a",
+                ownership_version=1,
+                decision_id=did,
+                verdict="allow",
+                reason="coord",
+            )
+            self.assertTrue(ok["ok"], ok)
+            self.assertEqual(ok["decision"]["actor_id"], "coord_a")
+            self.assertEqual(ok["decision"]["ownership_version"], 1)
+        reset_goal_ownership_cache()
+
 
 class TestDurableCli(_DurableCase):
     def test_cli_submit_get_cancel_report(self):
@@ -378,7 +535,7 @@ class TestDurableCli(_DurableCase):
             submitted = run("submit", "--submit-key", "cli-k", "--title", "cli", "--outcome", "o")
             self.assertTrue(submitted["created"])
             gid = submitted["goal_id"]
-            dup = run("submit", "--submit-key", "cli-k", "--title", "cli2", "--outcome", "o2")
+            dup = run("submit", "--submit-key", "cli-k", "--title", "cli", "--outcome", "o")
             self.assertEqual(dup["goal_id"], gid)
             self.assertFalse(dup["created"])
             got = run("get", gid)

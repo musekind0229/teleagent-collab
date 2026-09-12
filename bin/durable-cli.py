@@ -58,6 +58,8 @@ def main(argv: list[str] | None = None) -> int:
     p_res.add_argument("--reason", default="")
     p_res.add_argument("--actions-json", default="", help="optional JSON list of related actions")
     p_res.add_argument("--extra-json", default="", help="optional extra JSON (batch keys are refused)")
+    p_res.add_argument("--actor-id", default="", help="caller identity (required by kernel)")
+    p_res.add_argument("--ownership-version", default="", help="optional ownership version if Goal has a coordinator")
 
     p_open = sub.add_parser("open-decision", help="open one pending decision (kernel helper)")
     p_open.add_argument("goal_id")
@@ -104,6 +106,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "resolve":
         actions = json.loads(args.actions_json) if args.actions_json else None
         extra = json.loads(args.extra_json) if args.extra_json else None
+        resolve_extra = extra if isinstance(extra, dict) else {}
+        if args.actor_id:
+            resolve_extra["actor_id"] = args.actor_id
+        if args.ownership_version != "":
+            try:
+                resolve_extra["ownership_version"] = int(args.ownership_version)
+            except ValueError:
+                resolve_extra["ownership_version"] = args.ownership_version
         out = layer.resolve_decision(
             args.goal_id,
             decision_id=args.decision_id,
@@ -111,7 +121,8 @@ def main(argv: list[str] | None = None) -> int:
             verdict=args.verdict,
             reason=args.reason,
             actions=actions,
-            extra=extra if isinstance(extra, dict) else None,
+            extra=resolve_extra or None,
+            actor_id=args.actor_id,
         )
         _print(out)
         return 0 if out.get("ok") else 1

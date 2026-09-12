@@ -11,6 +11,7 @@ Public kernel path only. No TeleAgent HTTP. No Hermes ledger. No glue rewrite.
 """
 from __future__ import annotations
 
+import fnmatch
 import json
 import threading
 import time
@@ -37,10 +38,27 @@ REASON_ILLEGAL_PLAN = "illegal_plan"
 REASON_STALE_PROPOSAL = "stale_proposal"
 REASON_UNKNOWN_PROPOSAL = "unknown_proposal"
 REASON_EMPTY_COORDINATOR = "empty_coordinator"
+REASON_CONTRACT_EXPANSION = "contract_expansion"
 
 # Plan documents must not rewrite kernel-owned identity.
 _FORBIDDEN_PLAN_KEYS = frozenset(
     {"coordinator_id", "ownership_version", "ownership", "version"}
+)
+
+# Goal-contract auth/budget ceiling. Plan may tighten; expansion is refused.
+_ALLOW_KEYS = (
+    "allow_secret_globs",
+    "allow_paths",
+    "allow_keys",
+    "allowed_surfaces",
+    "user_gate_permissions",
+)
+_BUDGET_LIMIT_KEYS = (
+    "wall_sec",
+    "max_reworks",
+    "max_lead_calls",
+    "max_attempts",
+    "max_usage",
 )
 
 _ACTIVE_TASK_STATUSES = frozenset(
@@ -113,16 +131,184 @@ def _tasks_by_id(plan: Mapping[str, Any] | None) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _as_str_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, list):
+        return [str(x) for x in value if str(x).strip()]
+    return []
+
+
+def extract_goal_contract(src: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Pull Goal-contract auth/budget fields used as the plan-revision ceiling."""
+    src = src if isinstance(src, Mapping) else {}
+    nested = src.get("goal") if isinstance(src.get("goal"), Mapping) else {}
+    contract: dict[str, Any] = {}
+    budget = src.get("budget") if isinstance(src.get("budget"), Mapping) else None
+    if budget is None and isinstance(nested.get("budget"), Mapping):
+        budget = nested.get("budget")
+    if isinstance(budget, Mapping):
+        contract["budget"] = dict(budget)
+    boundaries = src.get("boundaries") if isinstance(src.get("boundaries"), Mapping) else None
+    if boundaries is None and isinstance(nested.get("boundaries"), Mapping):
+        boundaries = nested.get("boundaries")
+    b: dict[str, Any] = dict(boundaries) if isinstance(boundaries, Mapping) else {}
+    for k in _ALLOW_KEYS:
+        if k in src and k not in b:
+            b[k] = list(src[k]) if isinstance(src[k], list) else src[k]
+        elif k in nested and k not in b:
+            b[k] = list(nested[k]) if isinstance(nested[k], list) else nested[k]
+    if b:
+        contract["boundaries"] = b
+    return contract
+
+
+def _allow_item_covered(item: str, ceiling: list[str]) -> bool:
+    item_n = str(item or "").replace("\\", "/").strip()
+    if not item_n:
+        return True
+    for raw in ceiling:
+        c_n = str(raw or "").replace("\\", "/").strip()
+        if not c_n:
+            continue
+        if item_n == c_n:
+            return True
+        if c_n in ("/**", "**", "*"):
+            return True
+        if c_n.endswith("/**"):
+            prefix = c_n[:-3].rstrip("/")
+            if not prefix or item_n == prefix or item_n.startswith(prefix + "/"):
+                return True
+        try:
+            if fnmatch.fnmatch(item_n, c_n):
+                return True
+        except Exception:
+            pass
+        if c_n.endswith("/") and item_n.startswith(c_n):
+            return True
+        if item_n.startswith(c_n.rstrip("/") + "/"):
+            return True
+    return False
+
+
+def _collect_allow_lists(plan: Mapping[str, Any]) -> dict[str, list[str]]:
+    found: dict[str, list[str]] = {k: [] for k in _ALLOW_KEYS}
+
+    def _extend(src: Mapping[str, Any] | None) -> None:
+        if not isinstance(src, Mapping):
+            return
+        for k in _ALLOW_KEYS:
+            if k in src:
+                found[k].extend(_as_str_list(src.get(k)))
+        nested = src.get("boundaries") if isinstance(src.get("boundaries"), Mapping) else {}
+        for k in _ALLOW_KEYS:
+            if k in nested:
+                found[k].extend(_as_str_list(nested.get(k)))
+        inputs = src.get("inputs") if isinstance(src.get("inputs"), Mapping) else {}
+        for k in _ALLOW_KEYS:
+            if k in inputs:
+                found[k].extend(_as_str_list(inputs.get(k)))
+
+    _extend(plan)
+    nested_goal = plan.get("goal") if isinstance(plan.get("goal"), Mapping) else {}
+    _extend(nested_goal)
+    tasks = plan.get("tasks") if isinstance(plan.get("tasks"), list) else []
+    for item in tasks:
+        if isinstance(item, Mapping):
+            _extend(item)
+    return found
+
+
+def _check_contract_ceiling(
+    plan: Mapping[str, Any],
+    ceiling: Mapping[str, Any] | None,
+) -> tuple[bool, str]:
+    """Refuse plan revisions that expand Goal contract auth/budget.
+
+    Tightening (lower numeric caps, fewer/narrower allow_*, extra must/must_not)
+    is allowed. Introducing or widening budget / allow_* / boundaries is not.
+    Contract expansion stays a separate, currently unsupported path.
+    """
+    ceiling = ceiling if isinstance(ceiling, Mapping) else {}
+    ceil_budget = ceiling.get("budget") if isinstance(ceiling.get("budget"), Mapping) else {}
+    plan_budget = plan.get("budget") if isinstance(plan.get("budget"), Mapping) else None
+    nested = plan.get("goal") if isinstance(plan.get("goal"), Mapping) else {}
+    if plan_budget is None and isinstance(nested.get("budget"), Mapping):
+        plan_budget = nested.get("budget")
+    if isinstance(plan_budget, Mapping):
+        if not ceil_budget:
+            return False, "plan expands Goal contract budget (no budget on contract)"
+        for k in _BUDGET_LIMIT_KEYS:
+            if k not in plan_budget:
+                continue
+            try:
+                new_v = float(plan_budget[k])
+            except (TypeError, ValueError):
+                return False, f"plan expands Goal contract budget (invalid {k})"
+            if k not in ceil_budget:
+                return False, f"plan expands Goal contract budget (new limit {k})"
+            try:
+                ceil_v = float(ceil_budget[k])
+            except (TypeError, ValueError):
+                continue
+            if new_v > ceil_v:
+                return False, f"plan expands Goal contract budget ({k})"
+
+    ceil_bounds = ceiling.get("boundaries") if isinstance(ceiling.get("boundaries"), Mapping) else {}
+    plan_bounds = plan.get("boundaries") if isinstance(plan.get("boundaries"), Mapping) else None
+    if plan_bounds is None and isinstance(nested.get("boundaries"), Mapping):
+        plan_bounds = nested.get("boundaries")
+    if isinstance(plan_bounds, Mapping):
+        ceil_must = set(_as_str_list(ceil_bounds.get("must")))
+        new_must = set(_as_str_list(plan_bounds.get("must"))) if "must" in plan_bounds else ceil_must
+        if not ceil_must.issubset(new_must):
+            return False, "plan expands Goal contract boundaries (drops must)"
+        ceil_must_not = set(_as_str_list(ceil_bounds.get("must_not")))
+        new_must_not = (
+            set(_as_str_list(plan_bounds.get("must_not"))) if "must_not" in plan_bounds else ceil_must_not
+        )
+        if not ceil_must_not.issubset(new_must_not):
+            return False, "plan expands Goal contract boundaries (drops must_not)"
+
+    ceil_allow = {k: _as_str_list(ceil_bounds.get(k)) for k in _ALLOW_KEYS}
+    for k in _ALLOW_KEYS:
+        if k in ceiling:
+            ceil_allow[k] = _as_str_list(ceiling.get(k)) or ceil_allow[k]
+    found_allow = _collect_allow_lists(plan)
+    for k, items in found_allow.items():
+        unique = []
+        seen: set[str] = set()
+        for it in items:
+            if it not in seen:
+                seen.add(it)
+                unique.append(it)
+        if not unique:
+            continue
+        ceiling_items = ceil_allow.get(k) or []
+        if not ceiling_items:
+            return False, f"plan expands Goal contract {k}"
+        for it in unique:
+            if not _allow_item_covered(it, ceiling_items):
+                return False, f"plan expands Goal contract {k}"
+    return True, REASON_READY
+
+
 def validate_plan_revision(
     plan: Any,
     *,
     goal_id: str,
     current_plan: Mapping[str, Any] | None = None,
+    goal_contract: Mapping[str, Any] | None = None,
+    enforce_contract_ceiling: bool = True,
 ) -> tuple[bool, str]:
     """Kernel legality for a Goal plan document.
 
     Ownership fields are kernel-owned. Task status changes must follow
     the public Task lifecycle. Active tasks cannot be dropped.
+    Plan revisions must not expand Goal contract auth/budget
+    (``budget``, ``allow_*``, ``boundaries``); tightening is allowed.
     """
     if not isinstance(plan, Mapping):
         return False, "plan must be an object"
@@ -180,6 +366,13 @@ def validate_plan_revision(
                 assert_transition("task", old_st, new_st)
             except LifecycleError as e:
                 return False, f"illegal task transition {tid}: {e}"
+    if enforce_contract_ceiling:
+        ceiling = extract_goal_contract(goal_contract) if isinstance(goal_contract, Mapping) else {}
+        if not ceiling:
+            ceiling = extract_goal_contract(current_plan)
+        ok_ceil, why_ceil = _check_contract_ceiling(plan, ceiling)
+        if not ok_ceil:
+            return False, why_ceil
     return True, REASON_READY
 
 
@@ -279,6 +472,7 @@ class GoalOwnershipStore:
         self.ownership = GoalOwnership(goal_id=self.goal_id)
         self.plan: dict[str, Any] = empty_plan(self.goal_id)
         self.plan_revision: int = 0
+        self.goal_contract: dict[str, Any] = {}
         self.proposals: dict[str, PlanRevisionProposal] = {}
         self.history: list[dict[str, Any]] = []
         self.notes: list[str] = []
@@ -363,7 +557,10 @@ class GoalOwnershipStore:
             now = _utc_now()
             if initial_plan is not None:
                 ok, why = validate_plan_revision(
-                    initial_plan, goal_id=self.goal_id, current_plan=self.plan
+                    initial_plan,
+                    goal_id=self.goal_id,
+                    current_plan=self.plan,
+                    enforce_contract_ceiling=False,
                 )
                 if not ok:
                     return {
@@ -375,6 +572,7 @@ class GoalOwnershipStore:
                 self.plan = dict(initial_plan)
                 if "goal_id" not in self.plan:
                     self.plan["goal_id"] = self.goal_id
+                self.goal_contract = extract_goal_contract(self.plan)
                 self.plan_revision = 1 if self.plan.get("tasks") else 0
             self.ownership = GoalOwnership(
                 goal_id=self.goal_id,
@@ -548,11 +746,19 @@ class GoalOwnershipStore:
                 self._persist_unlocked()
                 return rec
             legal, detail = validate_plan_revision(
-                rec.plan, goal_id=self.goal_id, current_plan=self.plan
+                rec.plan,
+                goal_id=self.goal_id,
+                current_plan=self.plan,
+                goal_contract=self.goal_contract,
             )
             if not legal:
+                reject = (
+                    REASON_CONTRACT_EXPANSION
+                    if "expands Goal contract" in detail
+                    else REASON_ILLEGAL_PLAN
+                )
                 rec.status = STATUS_REJECTED
-                rec.reject_reason = REASON_ILLEGAL_PLAN
+                rec.reject_reason = reject
                 rec.reason = rec.reason or detail
                 self.proposals[pid] = rec
                 self.history.append(
@@ -560,13 +766,13 @@ class GoalOwnershipStore:
                         "op": "propose_rejected",
                         "proposal_id": pid,
                         "coordinator_id": rec.coordinator_id,
-                        "reason": REASON_ILLEGAL_PLAN,
+                        "reason": reject,
                         "detail": detail,
                         "at": now,
                         "at_iso": _iso(now),
                     }
                 )
-                self.notes.append(f"propose rejected {pid} illegal_plan: {detail}")
+                self.notes.append(f"propose rejected {pid} {reject}: {detail}")
                 self._persist_unlocked()
                 return rec
             self.proposals[pid] = rec
@@ -676,24 +882,33 @@ class GoalOwnershipStore:
                     "ownership": self.ownership.to_dict(),
                 }
             legal, detail = validate_plan_revision(
-                rec.plan, goal_id=self.goal_id, current_plan=self.plan
+                rec.plan,
+                goal_id=self.goal_id,
+                current_plan=self.plan,
+                goal_contract=self.goal_contract,
             )
             if not legal:
+                reject = (
+                    REASON_CONTRACT_EXPANSION
+                    if "expands Goal contract" in detail
+                    else REASON_ILLEGAL_PLAN
+                )
                 rec.status = STATUS_REJECTED
-                rec.reject_reason = REASON_ILLEGAL_PLAN
+                rec.reject_reason = reject
                 self.history.append(
                     {
                         "op": "commit_rejected",
                         "proposal_id": pid,
-                        "reason": REASON_ILLEGAL_PLAN,
+                        "reason": reject,
                         "detail": detail,
                         "at": _utc_now(),
                     }
                 )
+                self.notes.append(f"commit rejected {pid} {reject}: {detail}")
                 self._persist_unlocked()
                 return {
                     "ok": False,
-                    "reason": REASON_ILLEGAL_PLAN,
+                    "reason": reject,
                     "error": detail,
                     "proposal_id": pid,
                     "ownership": self.ownership.to_dict(),
@@ -772,6 +987,7 @@ class GoalOwnershipStore:
                 "ownership": self.ownership.to_dict(),
                 "plan_revision": int(self.plan_revision),
                 "plan": dict(self.plan),
+                "goal_contract": dict(self.goal_contract),
                 "proposals": {k: v.to_dict() for k, v in self.proposals.items()},
                 "history": list(self.history),
                 "notes": list(self.notes),
@@ -788,6 +1004,7 @@ class GoalOwnershipStore:
                 "ownership": self.ownership.to_dict(),
                 "plan_revision": int(self.plan_revision),
                 "plan": dict(self.plan),
+                "goal_contract": dict(self.goal_contract),
                 "proposals": {k: v.to_dict() for k, v in self.proposals.items()},
                 "history": list(self.history)[-200:],
                 "notes": list(self.notes)[-50:],
@@ -813,6 +1030,8 @@ class GoalOwnershipStore:
             self.plan_revision = int(payload.get("plan_revision") or 0)
             plan = payload.get("plan") if isinstance(payload.get("plan"), Mapping) else None
             self.plan = dict(plan) if plan is not None else empty_plan(self.goal_id)
+            contract = payload.get("goal_contract") if isinstance(payload.get("goal_contract"), Mapping) else None
+            self.goal_contract = dict(contract) if contract is not None else extract_goal_contract(self.plan)
             self.proposals = {}
             raw = payload.get("proposals") if isinstance(payload.get("proposals"), Mapping) else {}
             for k, v in raw.items():

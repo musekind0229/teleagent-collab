@@ -52,6 +52,37 @@ class TestPreparePermission(unittest.TestCase):
         self.assertEqual(native["id"], "per_2")
         self.assertEqual(to_native_for_rules(public)["sessionID"], "ses_2")
 
+    def test_native_preserves_full_raw_and_missing_is_not_allow(self):
+        raw = {
+            "id": "per_full",
+            "sessionID": "ses_full",
+            "permission": "external_directory",
+            "patterns": ["/tmp/*"],
+            "metadata": {"filepath": "/tmp/x"},
+            "tool": {"name": "Read"},
+            "scope": "write",
+            "mode": "once",
+            "allowed": False,
+            "action": "bash",
+        }
+        public = to_public_permission(raw)
+        native = public["native"]
+        self.assertEqual(native["scope"], "write")
+        self.assertEqual(native["mode"], "once")
+        self.assertIs(native["allowed"], False)
+        self.assertEqual(native["action"], "bash")
+        self.assertEqual(native["id"], "per_full")
+        self.assertEqual(native["sessionID"], "ses_full")
+        _, rule_native = prepare_permission(raw)
+        self.assertEqual(rule_native.get("scope"), "write")
+        self.assertEqual(rule_native.get("action"), "bash")
+
+        missing = to_public_permission({"id": "per_empty", "sessionID": "ses_empty"})
+        self.assertEqual(missing["permission"], "")
+        self.assertNotEqual(missing["permission"].lower(), "allow")
+        self.assertNotEqual(missing["permission"].lower(), "once")
+        self.assertEqual(missing["native"]["id"], "per_empty")
+
 
 class TestPendingItemPublicIds(unittest.TestCase):
     def test_request_id_defaults_and_roundtrip(self):

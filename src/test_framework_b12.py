@@ -23,6 +23,7 @@ from framework.charter_map import map_charter_to_goal_task  # noqa: E402
 from framework.goal_ownership import (  # noqa: E402
     OWNERSHIP_DIRNAME,
     REASON_ALREADY_OWNED,
+    REASON_CONTRACT_EXPANSION,
     REASON_ILLEGAL_PLAN,
     REASON_NOT_COORDINATOR,
     REASON_STALE_OWNERSHIP,
@@ -319,6 +320,111 @@ class TestPlanLegality(unittest.TestCase):
             )
             self.assertFalse(out["ok"], out)
             self.assertEqual(out["reason"], REASON_ILLEGAL_PLAN)
+        reset_goal_ownership_cache()
+
+    def test_plan_revision_refuses_budget_and_allow_expansion(self):
+        contract = {
+            "budget": {"wall_sec": 360, "max_reworks": 1},
+            "boundaries": {
+                "must": ["stay in workspace"],
+                "must_not": ["deploy"],
+                "allow_paths": ["/tmp", "/workspace"],
+            },
+        }
+        current = {
+            "goal_id": "g1",
+            "tasks": [{"task_id": "t1", "goal_id": "g1", "status": "queued"}],
+            **contract,
+        }
+        expanded_budget = {
+            **current,
+            "budget": {"wall_sec": 1e9, "max_reworks": 1},
+        }
+        ok, why = validate_plan_revision(
+            expanded_budget, goal_id="g1", current_plan=current, goal_contract=contract
+        )
+        self.assertFalse(ok)
+        self.assertIn("budget", why)
+
+        expanded_allow = {
+            "goal_id": "g1",
+            "tasks": [
+                {
+                    "task_id": "t1",
+                    "goal_id": "g1",
+                    "status": "queued",
+                    "inputs": {"allow_paths": ["/**"]},
+                }
+            ],
+        }
+        ok, why = validate_plan_revision(
+            expanded_allow, goal_id="g1", current_plan=current, goal_contract=contract
+        )
+        self.assertFalse(ok)
+        self.assertIn("allow", why)
+
+        introduced = {
+            "goal_id": "g1",
+            "tasks": [{"task_id": "t1", "goal_id": "g1", "status": "queued"}],
+            "budget": {"wall_sec": 1e9},
+        }
+        ok, why = validate_plan_revision(introduced, goal_id="g1")
+        self.assertFalse(ok)
+        self.assertIn("budget", why)
+
+        tighter = {
+            "goal_id": "g1",
+            "tasks": [{"task_id": "t1", "goal_id": "g1", "status": "queued"}],
+            "budget": {"wall_sec": 60, "max_reworks": 1},
+            "boundaries": {
+                "must": ["stay in workspace", "write tests"],
+                "must_not": ["deploy"],
+                "allow_paths": ["/tmp"],
+            },
+        }
+        ok, why = validate_plan_revision(
+            tighter, goal_id="g1", current_plan=current, goal_contract=contract
+        )
+        self.assertTrue(ok, why)
+        self.assertEqual(why, "ready")
+
+    def test_submit_plan_revision_contract_expansion_rejected(self):
+        reset_goal_ownership_cache()
+        with tempfile.TemporaryDirectory() as td:
+            initial = {
+                "goal_id": "g1",
+                "tasks": [{"task_id": "t1", "goal_id": "g1", "status": "queued"}],
+                "budget": {"wall_sec": 360},
+                "boundaries": {"must": [], "must_not": [], "allow_paths": ["/tmp"]},
+            }
+            store = GoalOwnershipStore.open("g1", td)
+            claimed = store.claim("c1", initial_plan=initial)
+            self.assertTrue(claimed["ok"], claimed)
+            expanded = {
+                "goal_id": "g1",
+                "tasks": [{"task_id": "t1", "goal_id": "g1", "status": "queued"}],
+                "budget": {"wall_sec": 99999},
+                "boundaries": {"must": [], "must_not": [], "allow_paths": ["/tmp", "/**"]},
+            }
+            out = store.submit_plan_revision(
+                coordinator_id="c1",
+                ownership_version=1,
+                plan=expanded,
+            )
+            self.assertFalse(out["ok"], out)
+            self.assertEqual(out["reason"], REASON_CONTRACT_EXPANSION)
+            tighter = {
+                "goal_id": "g1",
+                "tasks": [{"task_id": "t1", "goal_id": "g1", "status": "queued"}],
+                "budget": {"wall_sec": 10},
+                "boundaries": {"must": [], "must_not": [], "allow_paths": ["/tmp"]},
+            }
+            ok = store.submit_plan_revision(
+                coordinator_id="c1",
+                ownership_version=1,
+                plan=tighter,
+            )
+            self.assertTrue(ok["ok"], ok)
         reset_goal_ownership_cache()
 
 
