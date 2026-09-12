@@ -1,0 +1,51 @@
+# Knife 11 — producer. Consumer depends on this job's completion + artifact.
+# Shares Goal budget with consumer via goal_id. Isolation is not required;
+# they are sequential (deps), not parallel.
+
+name: producer
+goal_id: goal_dep_demo
+task_kind: file_task
+goal: "In the assigned workspace only, create producer.txt with exactly one short line, then stop."
+
+must:
+  - Stay inside the assigned workspace
+  - Create the artifact named in done_when.artifacts
+  - Stop when the file exists
+
+must_not:
+  - Read or copy credentials, tokens, cookies, or secret files
+  - Use always-approve / yolo / global auto-approve
+  - Touch directories outside the workspace
+  - Install system packages or change services
+
+allow_secret_globs: []
+allow_paths: []
+allow_keys: []
+
+network_allow: []
+install_roots: []
+lead_review_steps:
+  - job_end
+user_gate_permissions:
+  - sudo
+  - credential_store_write
+
+allowed_surfaces:
+  - workspace_fs
+  - lead_approved_tools
+
+done_when:
+  artifacts:
+    - producer.txt
+
+acceptance: |
+  producer.txt exists under this job's workspace and contains exactly one
+  non-empty text line.
+
+rollback: |
+  Delete producer.txt from this job's workspace.
+
+timeout_sec: 60
+max_attempts: 2
+max_reworks: 0
+force_lead_review: false

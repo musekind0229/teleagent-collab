@@ -13,6 +13,11 @@ from framework.lifecycle import (
 )
 from framework.models import CONTRACT_VERSION, new_run_id, new_task_id
 from framework.project_report import attach_framework_projection
+from framework.task_deps import (
+    deps_satisfied,
+    parse_depends_on,
+    unsatisfied_deps,
+)
 
 __all__ = [
     "CONTRACT_VERSION",
@@ -23,10 +28,13 @@ __all__ = [
     "TASK_STATES",
     "assert_transition",
     "attach_framework_projection",
+    "deps_satisfied",
     "map_charter_to_goal_task",
     "map_error_class",
     "new_run_id",
     "new_task_id",
+    "parse_depends_on",
     "project_scheduler_state",
     "stable_goal_task_ids",
+    "unsatisfied_deps",
 ]

@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from framework.models import CONTRACT_VERSION, new_goal_id, new_task_id
+from framework.task_deps import depends_on_strings
 
 
 class CharterMapError(ValueError):
@@ -18,7 +19,9 @@ def _as_list(v: Any) -> list:
     raise CharterMapError(f"expected list, got {type(v).__name__}")
 
 
-def map_charter_to_goal_task(charter: dict, *, goal_id: str | None = None) -> dict[str, Any]:
+def map_charter_to_goal_task(
+    charter: dict, *, goal_id: str | None = None, task_id: str | None = None
+) -> dict[str, Any]:
     """Return {goal, task, warnings}. Does not mutate charter.
 
     Missing allow_* keys are NOT filled with wildcards or permissive defaults.
@@ -68,8 +71,38 @@ def map_charter_to_goal_task(charter: dict, *, goal_id: str | None = None) -> di
         raise CharterMapError(f"invalid timeout_sec: {timeout!r}") from e
 
     name = str(charter.get("name") or "job")
-    gid = goal_id or new_goal_id(name)
-    tid = new_task_id()
+    gid = (goal_id or str(charter.get("goal_id") or "").strip() or new_goal_id(name))
+    tid = task_id or new_task_id()
+
+    cb = charter.get("budget") if isinstance(charter.get("budget"), dict) else {}
+    try:
+        if cb.get("wall_sec") is not None:
+            wall = float(cb.get("wall_sec"))
+    except (TypeError, ValueError) as e:
+        raise CharterMapError(f"invalid budget.wall_sec: {cb.get('wall_sec')!r}") from e
+
+    budget: dict[str, Any] = {
+        "wall_sec": wall,
+        "max_reworks": int(cb.get("max_reworks") if cb.get("max_reworks") is not None else (charter.get("max_reworks") or 1)),
+    }
+    for src_key, dst_key, conv in (
+        ("max_lead_calls", "max_lead_calls", int),
+        ("max_attempts", "max_attempts", int),
+        ("max_usage", "max_usage", float),
+        ("cost_hint", "cost_hint", str),
+    ):
+        raw_v = cb.get(src_key) if src_key in cb else charter.get(src_key)
+        if raw_v is None:
+            continue
+        try:
+            budget[dst_key] = conv(raw_v)
+        except (TypeError, ValueError) as e:
+            raise CharterMapError(f"invalid {dst_key}: {raw_v!r}") from e
+
+    try:
+        dep_list = depends_on_strings(charter.get("depends_on"))
+    except Exception as e:
+        raise CharterMapError(f"invalid depends_on: {e}") from e
 
     goal = {
         "contract_version": CONTRACT_VERSION,
@@ -78,10 +111,7 @@ def map_charter_to_goal_task(charter: dict, *, goal_id: str | None = None) -> di
         "desired_outcome": goal_text,
         "boundaries": boundaries,
         "acceptance": acceptance,
-        "budget": {
-            "wall_sec": wall,
-            "max_reworks": int(charter.get("max_reworks") or 1),
-        },
+        "budget": budget,
         "capability_requirements": [],
         "platform_allowlist": ["linux"],
         "source_charter_path": str(charter.get("_source") or ""),
@@ -110,7 +140,7 @@ def map_charter_to_goal_task(charter: dict, *, goal_id: str | None = None) -> di
         "task_id": tid,
         "goal_id": gid,
         "title": f"{name} implementation",
-        "depends_on": [],
+        "depends_on": dep_list,
         "inputs": task_inputs,
         "expected_artifacts": expected,
         "done_when": charter.get("done_when") if isinstance(charter.get("done_when"), dict) else {"artifacts": expected},

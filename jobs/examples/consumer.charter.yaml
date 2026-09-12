@@ -1,0 +1,56 @@
+# Knife 11 — consumer. Stays queued until producer completes and producer.txt exists.
+# Shares Goal budget with producer via goal_id. Over-budget must not report success.
+
+name: consumer
+goal_id: goal_dep_demo
+task_kind: file_task
+goal: "In the assigned workspace only, create consumer.txt with exactly one short line after producer.txt exists, then stop."
+
+depends_on:
+  - producer
+  - artifact: producer.txt
+
+must:
+  - Stay inside the assigned workspace
+  - Create the artifact named in done_when.artifacts
+  - Wait until producer.txt exists
+  - Stop when the file exists
+
+must_not:
+  - Read or copy credentials, tokens, cookies, or secret files
+  - Use always-approve / yolo / global auto-approve
+  - Touch directories outside the workspace
+  - Install system packages or change services
+  - Start before producer has completed
+
+allow_secret_globs: []
+allow_paths: []
+allow_keys: []
+
+network_allow: []
+install_roots: []
+lead_review_steps:
+  - job_end
+user_gate_permissions:
+  - sudo
+  - credential_store_write
+
+allowed_surfaces:
+  - workspace_fs
+  - lead_approved_tools
+
+done_when:
+  artifacts:
+    - consumer.txt
+
+acceptance: |
+  consumer.txt exists under this job's workspace and contains exactly one
+  non-empty text line. producer.txt must already exist (dependency).
+
+rollback: |
+  Delete consumer.txt from this job's workspace.
+
+timeout_sec: 60
+max_attempts: 2
+max_reworks: 0
+force_lead_review: false

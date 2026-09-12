@@ -10,7 +10,8 @@ Hermes is not the task source or ledger.
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -298,18 +299,40 @@ def run_inprocess_closed_loop(
     force_lead_review: bool | None = None,
     max_reworks: int | None = None,
     exchange_dir: str | Path | None = None,
+    goal_budget: Any | None = None,
+    completed: Mapping[str, Any] | None = None,
+    skip_dep_check: bool = False,
+    skip_budget: bool = False,
 ) -> dict[str, Any]:
     """Execute a file job on inprocess.local_v1 with optional accept+rework closed loop.
 
     Each attempt: start_run / observe_run / collect_result only (via run_file_job_via_public_api).
     Same Task, new Run on acceptance_failed / implementation_failed. Wall never reset.
     decision_channel_failed stops without consuming rework.
+
+    Knife 11: GoalBudget child costs (attempt / rework / approval / wall) roll up.
+    Minting a new run_id does not reset the parent Goal account. Dispatch reserves;
+    finish reconciles. Unsatisfied depends_on stay queued.
     """
+    from execution_backend.goal_budget import (
+        BudgetCost,
+        attach_goal_budget,
+        can_enter_running,
+        estimate_dispatch_cost,
+        open_goal_budget,
+        queued_for_deps_result,
+        stable_budget_goal_id,
+    )
+
     root = Path(workdir)
     root.mkdir(parents=True, exist_ok=True)
     be = backend or InProcessExecutionBackend()
     job = name or job_name(charter)
-    mapped = map_charter_to_goal_task(charter)
+    budget_gid = (
+        (getattr(goal_budget, "goal_id", None) if goal_budget is not None else None)
+        or stable_budget_goal_id(charter, job)
+    )
+    mapped = map_charter_to_goal_task(charter, goal_id=str(budget_gid))
     goal = mapped["goal"]
     task = mapped["task"]
     goal_id = str(goal["goal_id"])
@@ -331,8 +354,35 @@ def run_inprocess_closed_loop(
     if reworks is None:
         reworks = int(charter.get("max_reworks") or goal.get("budget", {}).get("max_reworks") or 1)
 
+    if not skip_dep_check:
+        gate = can_enter_running(
+            charter=charter,
+            name=job,
+            task=task,
+            completed=completed,
+            workdir=root,
+            budget=None,
+            enforce_named_deps=completed is not None,
+        )
+        if not gate.get("ready") and gate.get("reason") == "unsatisfied_deps":
+            out = queued_for_deps_result(
+                name=job,
+                unsatisfied=list(gate.get("unsatisfied_deps") or []),
+                charter=charter,
+            )
+            out["task_id"] = task_id
+            out["goal_id"] = goal_id
+            return out
+
+    parent = goal_budget
+    if parent is None and not skip_budget:
+        parent = open_goal_budget(goal_id, root, charter=charter, goal=goal)
+    if parent is not None and parent.remaining_wall_sec() > 0:
+        wall = min(float(wall), parent.remaining_wall_sec())
+
     budget = ReworkBudget.start(float(wall), max_reworks=int(reworks))
     wall_at_start = budget.wall_deadline
+    parent_wall_at_start = parent.wall_deadline if parent is not None else None
     xdir = Path(exchange_dir) if exchange_dir is not None else (root / "_lead_exchange")
     adapter = _bind_lead(lead=lead, decision_fn=decision_fn, exchange_dir=xdir) if need_review else None
 
@@ -340,6 +390,7 @@ def run_inprocess_closed_loop(
         "backend=inprocess.local_v1 public API only (start_run/observe_run/collect_result)",
         "list_pending_actions empty; reply_permission unsupported (not called as approve)",
         "closed_loop=stage-2 artifact_review+rework" if need_review else "closed_loop=execute-only (force_lead_review false)",
+        f"goal_budget={parent.goal_id if parent is not None else 'off'} skip_budget={skip_budget}",
     ]
     attempts: list[dict[str, Any]] = []
     last_raw: dict[str, Any] = {}
@@ -351,10 +402,11 @@ def run_inprocess_closed_loop(
     grok_review = ""
 
     while True:
-        if budget.exhausted_wall():
+        if budget.exhausted_wall() or (parent is not None and parent.exhausted_wall()):
             error_class = map_error_class(kind="budget_exhausted")
             error = "wall clock exhausted before closed loop finished"
             notes.append(error)
+            ok = False
             break
 
         attempt_n = len(attempts) + 1
@@ -366,6 +418,29 @@ def run_inprocess_closed_loop(
             workspace_id=str(root),
             state="running",
         )
+        rsv = None
+        if parent is not None and not skip_budget:
+            cost = estimate_dispatch_cost(
+                charter,
+                remaining_wall=parent.remaining_wall_sec(),
+                attempt_n=attempt_n,
+                need_review=need_review,
+            )
+            rsv = parent.reserve(
+                run_rec["run_id"],
+                task_id=task_id,
+                run_id=run_rec["run_id"],
+                cost=cost,
+            )
+            if not rsv.granted:
+                error_class = map_error_class(kind="budget_exhausted")
+                error = f"goal budget refused dispatch of run {run_rec['run_id']}"
+                notes.append(error)
+                ok = False
+                # do not enter running / do not write
+                break
+
+        t_attempt = time.time()
         raw = run_file_job_via_public_api(workdir=root, charter=charter, backend=be)
         last_raw = raw
         backend_run_id = str(raw.get("run_id") or "")
@@ -389,20 +464,55 @@ def run_inprocess_closed_loop(
             f"backend_run_id={backend_run_id} collect_ok={bool(raw.get('ok'))}"
         )
 
+        def _reconcile_attempt(*, reviewed: bool) -> bool:
+            """Roll child costs up to the Goal. Returns False if parent is now over-budget."""
+            if parent is None or skip_budget or rsv is None:
+                return True
+            actual = BudgetCost(
+                wall_sec=max(0.0, time.time() - t_attempt),
+                attempts=1,
+                reworks=1 if attempt_n > 1 else 0,
+                approvals=1 if reviewed else 0,
+            )
+            recb = parent.reconcile(rsv.reservation_id, actual)
+            notes.append(
+                f"goal_budget reconcile run={run_rec['run_id']} "
+                f"attempts={actual.attempts} reworks={actual.reworks} "
+                f"approvals={actual.approvals} over={recb.get('over_budget')}"
+            )
+            return not recb.get("over_budget")
+
         if not raw.get("ok"):
             error_class = map_error_class(kind="implementation_failed")
             run_rec["error_class"] = error_class
             run_rec["state"] = "failed"
             error = str(raw.get("error") or "collect_result not ok")
+            parent_ok = _reconcile_attempt(reviewed=False)
+            if not parent_ok:
+                error_class = map_error_class(kind="budget_exhausted")
+                error = "goal budget over after reconcile; success refused"
+                notes.append(error)
+                ok = False
+                break
             if not budget.consume_rework():
                 error_class = map_error_class(kind="budget_exhausted")
                 error = f"implementation_failed; rework budget exhausted ({error})"
                 notes.append(error)
+                ok = False
                 break
             notes.append("implementation_failed → rework new Run; wall unchanged")
             continue
 
         if not need_review:
+            parent_ok = _reconcile_attempt(reviewed=False)
+            if not parent_ok:
+                run_rec["state"] = "failed"
+                ok = False
+                state = "fail"
+                error_class = map_error_class(kind="budget_exhausted")
+                error = "goal budget over after reconcile; success refused"
+                notes.append(error)
+                break
             run_rec["state"] = "succeeded"
             ok = True
             state = "ok"
@@ -434,6 +544,7 @@ def run_inprocess_closed_loop(
             f"artifact_review verdict={review.get('verdict')!r} "
             f"error_class={review.get('error_class')!r} code={review.get('lead_error_code')!r}"
         )
+        parent_ok = _reconcile_attempt(reviewed=True)
 
         if review.get("error_class") == "decision_channel_failed":
             error_class = "decision_channel_failed"
@@ -441,6 +552,16 @@ def run_inprocess_closed_loop(
             run_rec["state"] = "failed"
             error = str(review.get("reason") or "decision_channel_failed")
             notes.append("decision_channel_failed → stop; rework budget not consumed as business rework")
+            ok = False
+            break
+
+        if not parent_ok:
+            run_rec["state"] = "failed"
+            ok = False
+            state = "fail"
+            error_class = map_error_class(kind="budget_exhausted")
+            error = "goal budget over after reconcile; success refused"
+            notes.append(error)
             break
 
         if review.get("ok") and review.get("verdict") == "pass":
@@ -459,10 +580,15 @@ def run_inprocess_closed_loop(
             error_class = map_error_class(kind="budget_exhausted")
             error = f"acceptance_failed; rework budget exhausted ({error})"
             notes.append(error)
+            ok = False
             break
         notes.append("acceptance_failed → rework new Run same Task; wall unchanged")
 
     wall_unchanged = budget.wall_deadline == wall_at_start
+    if parent is not None and parent_wall_at_start is not None:
+        if parent.wall_deadline != parent_wall_at_start:
+            wall_unchanged = False
+            notes.append("BUG: Goal wall_deadline changed during closed loop")
     if not wall_unchanged:
         notes.append("BUG: wall_deadline changed during closed loop")
     used_new_run = len(attempts) > 1
@@ -538,6 +664,13 @@ def run_inprocess_closed_loop(
         report["state"] = "ok"
         report["error"] = ""
         report["error_class"] = None
+    if parent is not None:
+        report = attach_goal_budget(report, parent)
+        if parent.over_budget() and report.get("ok"):
+            report["ok"] = False
+            report["state"] = "fail"
+            report["error_class"] = map_error_class(kind="budget_exhausted")
+            report["error"] = "goal budget over; success refused"
     try:
         from framework.project_report import attach_framework_projection
 

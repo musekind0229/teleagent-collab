@@ -97,6 +97,10 @@ def run_inprocess_charter(
     holder_id: str | None = None,
     on_conflict: str = "block",
     claim_timeout_sec: float = 0.0,
+    goal_budget: Any | None = None,
+    completed: Mapping[str, Any] | None = None,
+    skip_dep_check: bool = False,
+    skip_budget: bool = False,
 ) -> dict[str, Any]:
     """Run a charter through inprocess.local_v1 public API only (no glue, no TA HTTP).
 
@@ -108,31 +112,57 @@ def run_inprocess_charter(
     job on the same resolved path is blocked/queued with occupancy metadata and
     does not write. Pass ``claim_workdir=False`` when the caller already holds
     the claim (re-entry / helpers).
+
+    Knife 11: unsatisfied depends_on stay queued (before claim). GoalBudget
+    reserve/reconcile happens inside the closed loop. Default TeleAgent path
+    is unchanged.
     """
+    from charter import job_name as charter_job_name
+    from execution_backend.goal_budget import can_enter_running, queued_for_deps_result
+
     fn = decision_fn
     if fn is None and lead is None:
         fn = decision_fn_from_env(dict(environ) if environ is not None else None)
+
+    job = name or charter_job_name(charter)
+
+    if not skip_dep_check:
+        gate = can_enter_running(
+            charter=charter,
+            name=job,
+            completed=completed,
+            workdir=workdir,
+            budget=None,
+            enforce_named_deps=completed is not None,
+        )
+        if not gate.get("ready") and gate.get("reason") == "unsatisfied_deps":
+            return queued_for_deps_result(
+                name=job,
+                unsatisfied=list(gate.get("unsatisfied_deps") or []),
+                charter=charter,
+            )
 
     def _run() -> dict[str, Any]:
         return run_inprocess_closed_loop(
             charter=charter,
             workdir=workdir,
             instruction=instruction,
-            name=name,
+            name=job,
             lead=lead,
             decision_fn=fn,
             timeout_sec=timeout_sec,
             force_lead_review=force_lead_review,
             max_reworks=max_reworks,
             exchange_dir=exchange_dir,
+            goal_budget=goal_budget,
+            completed=completed,
+            skip_dep_check=True,
+            skip_budget=skip_budget,
         )
 
     if not claim_workdir:
         return _run()
 
-    from charter import job_name as charter_job_name
-
-    job = name or charter_job_name(charter)
     hid = holder_id or ""
     reg = claim_registry if claim_registry is not None else default_registry()
     outcome = reg.claim(

@@ -11,3 +11,4 @@ Old entrypoints `bin/run-job.py` / `bin/run-scheduler.py` stay valid.
 Knife 8 adds an inprocess stage-2 closed loop: independent `artifact_review` + same-Task new-Run rework (`docs/framework-v01/knife8-inprocess-closed-loop.md`).
 Knife 9: two independent inprocess jobs isolated **by workdir** (not by process instance) — `docs/framework-v01/knife9-two-job-isolation.md`.
 Knife 10: same workdir / write path is **claimed** (queue or block) with occupancy; isolated workdirs still run in parallel — `docs/framework-v01/knife10-workdir-claim.md`.
+Knife 11: Goal-level total budget (reserve / reconcile, child costs roll up, new ids do not reset) and Task `depends_on` (unready stay queued) — `docs/framework-v01/knife11-goal-budget-deps.md`.

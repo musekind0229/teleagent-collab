@@ -107,6 +107,14 @@
           "type": "integer",
           "minimum": 0
         },
+        "max_attempts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_usage": {
+          "type": "number",
+          "minimum": 0
+        },
         "cost_hint": {
           "type": "string"
         }

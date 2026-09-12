@@ -83,7 +83,7 @@ def map_error_class(*, kind: str = "", lead_code: str = "") -> str:
 
 # Conservative edges for the skeleton — expand later without rewriting glue.
 _TASK_EDGES = {
-    "queued": {"running", "cancelled", "blocked"},
+    "queued": {"running", "cancelled", "blocked", "failed"},
     "running": {"awaiting_decision", "review", "failed", "cancel_requested", "unknown", "blocked"},
     "awaiting_decision": {"running", "blocked", "failed", "cancel_requested", "unknown"},
     "review": {"succeeded", "failed", "running", "awaiting_decision"},

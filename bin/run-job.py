@@ -76,6 +76,9 @@ def write_reports(out_dir: Path, charter: dict, result: dict, instruction: str) 
         "occupancy",
         "workdir_claim",
         "resource_status",
+        "goal_budget",
+        "unsatisfied_deps",
+        "gate_reason",
     ):
         if extra_key in result and result.get(extra_key) is not None:
             status[extra_key] = result.get(extra_key)
@@ -366,6 +369,14 @@ def main(argv: list[str] | None = None) -> int:
         summary["occupancy"] = result.get("occupancy")
     if result.get("workdir_claim") is not None:
         summary["workdir_claim"] = result.get("workdir_claim")
+    if result.get("goal_budget") is not None:
+        summary["goal_id"] = result.get("goal_id")
+        gb = result.get("goal_budget") or {}
+        if isinstance(gb, dict) and gb.get("over_budget"):
+            summary["over_budget"] = True
+    if result.get("unsatisfied_deps"):
+        summary["unsatisfied_deps"] = result.get("unsatisfied_deps")
+        summary["gate_reason"] = result.get("gate_reason")
     print(json.dumps(summary, ensure_ascii=False))
     if args.dry_run:
         return 0
