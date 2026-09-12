@@ -124,3 +124,20 @@ def to_native_for_rules(p: dict) -> dict:
             native["permission"] = p["permission"]
         return native
     return p
+
+
+def prepare_permission(p: dict) -> tuple[dict, dict]:
+    """Return (public PendingAction, native TA-shaped dict for hard_rules).
+
+    Callers that only have raw TA input get both views. Callers that already
+    hold a public view get native via to_native_for_rules.
+    """
+    if not isinstance(p, dict):
+        raise TypeError("permission must be dict")
+    if isinstance(p.get("native"), dict) and (p.get("request_id") or p.get("session_id")):
+        public = p
+        native = to_native_for_rules(p)
+    else:
+        public = to_public_permission(p)
+        native = to_native_for_rules(public)
+    return public, native

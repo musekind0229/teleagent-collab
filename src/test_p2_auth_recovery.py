@@ -373,7 +373,7 @@ class TestSchedulerRecoverySim(unittest.TestCase):
             j2.state = JobState.RUNNING
             pending = sched.scan_pending()
             self.assertEqual(len(pending), 1)
-            self.assertEqual(pending[0]["sessionID"], j2.session_id)
+            self.assertEqual(pending[0].get("session_id") or pending[0].get("sessionID"), j2.session_id)
             job = sched._job_for_permission(pending[0])
             self.assertEqual(job.job_id, j2.job_id)
 

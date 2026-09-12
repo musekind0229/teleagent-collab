@@ -61,26 +61,38 @@ class DecisionRecord:
 
 @dataclass
 class PendingItem:
+    """Open permission wait. permission_id == public request_id (stable key)."""
     permission_id: str
     job_id: str
     session_id: str = ""
+    request_id: str = ""  # public id; defaults to permission_id for old rows
     summary: str = ""
     created_at: float = field(default_factory=time.time)
     status: str = "open"  # open | decided | abandoned
+
+    def __post_init__(self) -> None:
+        if not self.request_id:
+            self.request_id = self.permission_id
+        if not self.permission_id and self.request_id:
+            self.permission_id = self.request_id
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "PendingItem":
+        pid = str(d.get("permission_id") or d.get("request_id") or "")
+        rid = str(d.get("request_id") or pid)
         return cls(
-            permission_id=str(d.get("permission_id") or ""),
+            permission_id=pid,
             job_id=str(d.get("job_id") or ""),
             session_id=str(d.get("session_id") or ""),
+            request_id=rid,
             summary=str(d.get("summary") or ""),
             created_at=float(d.get("created_at") or time.time()),
             status=str(d.get("status") or "open"),
         )
+
 
 
 @dataclass

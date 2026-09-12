@@ -958,10 +958,10 @@ class ParallelScheduler:
     def handle_one_permission(self, p: dict) -> dict:
         """Process exactly one pending (serial弹权). Hard rules first; lead only if needed."""
         self.stats.serial_one_by_one += 1
-        from teleagent_adapter.permission_view import to_native_for_rules
+        from teleagent_adapter.permission_view import prepare_permission
 
-        public = p if isinstance(p, dict) else {}
-        p = to_native_for_rules(public)  # hard_rules / fingerprints still see TA-shaped dict
+        public, p = prepare_permission(p if isinstance(p, dict) else {})
+        # hard_rules / fingerprints / authorize always see TA-shaped `p` (native)
         job = self._job_for_permission(public if public.get("session_id") else p)
         if job is None:
             job = self._job_for_permission(p)
@@ -989,12 +989,20 @@ class ParallelScheduler:
                     "prior_reply": prior.reply,
                 }
             from state_store import PendingItem
+            sid = str(public.get("session_id") or job.session_id or "")
             self.state_store.add_pending(
                 PendingItem(
                     permission_id=pid,
+                    request_id=pid,
                     job_id=job.job_id,
-                    session_id=job.session_id,
-                    summary=str(p.get("path") or p.get("tool") or "")[:200],
+                    session_id=sid,
+                    summary=str(
+                        public.get("summary")
+                        or public.get("path")
+                        or p.get("path")
+                        or p.get("tool")
+                        or ""
+                    )[:200],
                 )
             )
 

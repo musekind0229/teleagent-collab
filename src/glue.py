@@ -435,11 +435,19 @@ def expected_exists(paths: list[str]) -> list[str]:
 
 
 def session_id_of_permission(p: dict) -> str:
-    for k in ("sessionID", "session_id", "sessionId"):
-        v = p.get(k) if isinstance(p, dict) else None
+    """Accept raw TeleAgent permission or public PendingAction."""
+    if not isinstance(p, dict):
+        return ""
+    for k in ("session_id", "sessionID", "sessionId"):
+        v = p.get(k)
         if v:
             return str(v)
-    meta = p.get("metadata") if isinstance(p, dict) and isinstance(p.get("metadata"), dict) else {}
+    native = p.get("native") if isinstance(p.get("native"), dict) else {}
+    for k in ("sessionID", "session_id", "sessionId"):
+        v = native.get(k)
+        if v:
+            return str(v)
+    meta = p.get("metadata") if isinstance(p.get("metadata"), dict) else {}
     for k in ("sessionID", "session_id", "sessionId"):
         v = meta.get(k)
         if v:
@@ -506,18 +514,20 @@ def _handle_permission_for_session(
     """Process one permission strictly for *sid*. Returns (handled_ok, charter_sent_full)."""
     if not isinstance(p, dict):
         return False, charter_sent_full
-    psid = session_id_of_permission(p)
+    from teleagent_adapter.permission_view import prepare_permission
+
+    public, perm_obj = prepare_permission(p)  # hard_rules always see native shape
+    psid = session_id_of_permission(public) or session_id_of_permission(perm_obj)
     if psid and psid != sid:
         return False, charter_sent_full  # never touch other sessions
-    pid = str(p.get("id") or p.get("requestID") or "")
+    pid = str(public.get("request_id") or perm_obj.get("id") or perm_obj.get("requestID") or "")
     if not pid or pid in handled_perm_ids:
         return False, charter_sent_full
     if ping_deduper.already_handled(pid):
         return False, charter_sent_full
 
-    summary = summarize_permission(p)
+    summary = summarize_permission(perm_obj)
     report["pending_summaries"].append(summary)
-    perm_obj = p
     hr = hard_rule_decision(perm_obj, charter=job_charter)
     if hr and hr.get("reply") == "reject":
         if _reconfirm_and_reply(sid, pid, "reject", perm_obj, report, "hard_rule"):
