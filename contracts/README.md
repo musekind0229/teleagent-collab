@@ -21,3 +21,8 @@ JSON Schema 文件：
 - Python map: `src/framework/charter_map.py` → `map_charter_to_goal_task`
 - Lifecycle vocabulary: `src/framework/lifecycle.py`
 - Opaque TeleAgent handle helper: `src/teleagent_adapter/native_handle.py` (HTTP fields stay out of Goal/Task state)
+
+## Execution backends
+
+- `teleagent.linux.local_v1` — existing TeleAgent worker (unchanged entrypoints).
+- `inprocess.local_v1` — deterministic second backend under `src/execution_backend/` (public observe/start/collect; not Hermes ledger).
