@@ -39,7 +39,24 @@ from execution_backend.two_job_isolation import (
     prove_shared_workspace_collides,
     require_distinct_workdirs,
     run_one_inprocess_job,
+    run_two_jobs_claimed,
     run_two_jobs_isolated,
+)
+from execution_backend.workdir_claim import (
+    ClaimOutcome,
+    Occupancy,
+    WorkdirClaimError,
+    WorkdirClaimRegistry,
+    claim_workdir,
+    default_registry,
+    occupancy_path,
+    prove_same_workdir_no_silent_overwrite,
+    release_workdir,
+    reset_default_registry,
+    run_claimed_inprocess_job,
+    run_two_jobs_with_claims,
+    simulate_scheduler_workdir_claims,
+    start_run_with_workdir_claim,
 )
 
 __all__ = [
@@ -76,7 +93,22 @@ __all__ = [
     "prove_shared_workspace_collides",
     "require_distinct_workdirs",
     "run_one_inprocess_job",
+    "run_two_jobs_claimed",
     "run_two_jobs_isolated",
+    "ClaimOutcome",
+    "Occupancy",
+    "WorkdirClaimError",
+    "WorkdirClaimRegistry",
+    "claim_workdir",
+    "default_registry",
+    "occupancy_path",
+    "prove_same_workdir_no_silent_overwrite",
+    "release_workdir",
+    "reset_default_registry",
+    "run_claimed_inprocess_job",
+    "run_two_jobs_with_claims",
+    "simulate_scheduler_workdir_claims",
+    "start_run_with_workdir_claim",
 ]
 
 

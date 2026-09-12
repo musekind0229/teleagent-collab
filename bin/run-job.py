@@ -73,6 +73,9 @@ def write_reports(out_dir: Path, charter: dict, result: dict, instruction: str) 
         "force_lead_review",
         "used_public_api_only",
         "backend",
+        "occupancy",
+        "workdir_claim",
+        "resource_status",
     ):
         if extra_key in result and result.get(extra_key) is not None:
             status[extra_key] = result.get(extra_key)
@@ -357,6 +360,12 @@ def main(argv: list[str] | None = None) -> int:
             summary["backend_id"] = result.get("backend")
     if workspace_used:
         summary["workspace"] = workspace_used
+    if result.get("resource_status"):
+        summary["resource_status"] = result.get("resource_status")
+    if result.get("occupancy") is not None:
+        summary["occupancy"] = result.get("occupancy")
+    if result.get("workdir_claim") is not None:
+        summary["workdir_claim"] = result.get("workdir_claim")
     print(json.dumps(summary, ensure_ascii=False))
     if args.dry_run:
         return 0

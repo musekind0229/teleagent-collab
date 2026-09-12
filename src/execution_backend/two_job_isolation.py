@@ -4,6 +4,10 @@ Each job gets its own workdir. Distinct artifact filenames (iso-a.txt / iso-b.tx
 must not land in the peer workdir. Sharing a workspace path is not isolation even
 if backend instances differ.
 
+Knife 10 (workdir_claim): a second job on the same workdir is queued/blocked with
+an occupancy record instead of racing writes. Isolation here still *requires*
+distinct workdirs; claims are the conflict path, not a substitute for isolation.
+
 Public ExecutionBackend API only. No TeleAgent HTTP. No Hermes ledger.
 """
 from __future__ import annotations
@@ -332,3 +336,35 @@ def prove_shared_workdir_is_not_isolation(
 ) -> dict[str, Any]:
     """Positional alias used by convenience tests."""
     return prove_shared_workspace_collides(workdir=shared_root, relative=relative)
+
+
+def run_two_jobs_claimed(
+    *,
+    charter_a: dict | None = None,
+    charter_b: dict | None = None,
+    workdir_a: str | Path | None = None,
+    workdir_b: str | Path | None = None,
+    concurrent: bool = True,
+    on_conflict: str = "block",
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Knife 10: same workdir → second queued/blocked; distinct → parallel.
+
+    Unlike ``run_two_jobs_isolated``, a shared workdir does not raise
+    IsolationError — the claim registry refuses the second writer.
+    """
+    from execution_backend.workdir_claim import run_two_jobs_with_claims
+
+    ca = charter_a if charter_a is not None else load_charter(ISO_A_CHARTER)
+    cb = charter_b if charter_b is not None else load_charter(ISO_B_CHARTER)
+    if workdir_a is None or workdir_b is None:
+        raise ValueError("workdir_a and workdir_b are required")
+    return run_two_jobs_with_claims(
+        charter_a=ca,
+        charter_b=cb,
+        workdir_a=workdir_a,
+        workdir_b=workdir_b,
+        concurrent=concurrent,
+        on_conflict=on_conflict,
+        **kwargs,
+    )
