@@ -262,6 +262,22 @@ class LinuxLocalV1Adapter(TeleAgentAdapterABC):
             )]
         return code, status
 
+    def observe_run(
+        self,
+        session_id: str,
+        *,
+        dispatch_user_message_id: str | None = None,
+        fetch_messages: bool = True,
+    ) -> dict:
+        from teleagent_adapter.run_observe import fetch_run_observation
+
+        return fetch_run_observation(
+            self.call,
+            session_id,
+            dispatch_user_message_id=dispatch_user_message_id,
+            fetch_messages=fetch_messages,
+        )
+
     def cancel(self, session_id: str) -> tuple[int, Any]:
         return self.call("POST", f"/session/{session_id}/abort", body={})
 

@@ -74,6 +74,8 @@ class FakeTransport:
             return 200, True
         if method == "GET" and path == "/session/status":
             return 200, {sid: {"type": "idle"} for sid in self.sessions}
+        if method == "GET" and "/message" in path:
+            return 200, []
         if method == "POST" and path.endswith("/abort"):
             return 200, {"ok": True}
         if method == "GET" and path.startswith("/session/"):

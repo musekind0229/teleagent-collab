@@ -79,6 +79,15 @@ class TeleAgentAdapter(Protocol):
     def session_status(self, session_id: str | None = None) -> tuple[int, Any]:
         ...
 
+    def observe_run(
+        self,
+        session_id: str,
+        *,
+        dispatch_user_message_id: str | None = None,
+        fetch_messages: bool = True,
+    ) -> dict:
+        ...
+
     def cancel(self, session_id: str) -> tuple[int, Any]:
         ...
 
@@ -125,6 +134,16 @@ class TeleAgentAdapterABC(ABC):
 
     @abstractmethod
     def session_status(self, session_id: str | None = None) -> tuple[int, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def observe_run(
+        self,
+        session_id: str,
+        *,
+        dispatch_user_message_id: str | None = None,
+        fetch_messages: bool = True,
+    ) -> dict:
         raise NotImplementedError
 
     @abstractmethod

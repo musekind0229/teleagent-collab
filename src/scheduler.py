@@ -445,25 +445,30 @@ class ParallelScheduler:
         }
 
     def _session_stop_confirmed(self, job: JobSlot) -> bool:
-        """True only when status is HTTP 2xx and activity parses as idle.
+        """True only when public Run observation says status_ok and activity idle.
 
-        Unknown (error dict, unrecognized entry, non-dict, non-2xx) is NOT
-        confirmed — never treat not-busy as idle.
+        Unknown / missing fields are NOT confirmed — never treat not-busy as idle.
         """
         sid = (job.session_id or "").strip()
         if not sid:
             return True
+        if self.dry_run and self._teleagent_call is None:
+            return True
         try:
-            code, status = self.ta_call("GET", "/session/status")
+            from teleagent_adapter.run_observe import fetch_run_observation
+
+            obs = fetch_run_observation(
+                self.ta_call, sid, fetch_messages=False
+            )
         except Exception as e:
-            job.notes.append(f"abort confirm status raised: {e}")
+            job.notes.append(f"abort confirm observe raised: {e}")
             return False
-        if not isinstance(code, int) or not (200 <= code < 300):
+        if not obs.get("status_ok"):
             job.notes.append(
-                f"abort confirm status unusable http={code} body_type={type(status).__name__}"
+                f"abort confirm status unusable http={obs.get('status_http')}"
             )
             return False
-        activity = self.session_activity(status, sid)
+        activity = obs.get("activity") or "unknown"
         if activity != "idle":
             job.notes.append(f"abort confirm activity={activity} (need idle)")
             return False
@@ -1620,21 +1625,41 @@ class ParallelScheduler:
                 job.result["markers"] = [str(m) for m in markers]
             return
 
-        # Live: require HTTP 2xx + strict activity==idle, ALL artifacts, message read
-        # success, and this-round successful finish — BEFORE any acceptance branch
-        # (including force_lead_review). Lead pass cannot convert hard failures into success.
-        sc, status = self.ta_call("GET", "/session/status")
-        status_ok = isinstance(sc, int) and 200 <= sc < 300
-        if not status_ok:
+        # Live: public Run observation only (adapter hides TA status/message shapes).
+        # Require status_ok + activity==idle, ALL artifacts, messages_ok, finish_successful
+        # BEFORE any acceptance branch. Lead pass cannot convert hard failures into success.
+        from teleagent_adapter.run_observe import fetch_run_observation
+
+        try:
+            obs = fetch_run_observation(
+                self.ta_call,
+                job.session_id or "",
+                dispatch_user_message_id=job.dispatch_user_message_id or None,
+                fetch_messages=True,
+            )
+        except Exception as e:
+            job.busy = True
+            job.notes.append(f"run observe raised: {e}")
+            self._attach_lifecycle_projection(job)
+            return
+
+        sc = obs.get("status_http")
+        msg_http = obs.get("message_http")
+        fin = obs.get("finish")
+        err = obs.get("assistant_error") or ""
+        messages_ok = bool(obs.get("messages_ok"))
+        if obs.get("dispatch_user_message_id") and not job.dispatch_user_message_id:
+            job.dispatch_user_message_id = str(obs["dispatch_user_message_id"])
+
+        if not obs.get("status_ok"):
             job.busy = True
             job.notes.append(
-                f"session status unusable http={sc} body_type={type(status).__name__}; not idle"
+                f"session status unusable http={sc}; not idle"
             )
             self._attach_lifecycle_projection(job)
             return
 
-        activity = self.session_activity(status, job.session_id)
-        # unknown (error dict / unrecognized entry) and busy both block completion.
+        activity = obs.get("activity") or "unknown"
         if activity != "idle":
             job.busy = True
             if activity == "unknown":
@@ -1650,59 +1675,24 @@ class ParallelScheduler:
             self._attach_lifecycle_projection(job)
             return
 
-        # Fetch this-round assistant finish/error — required for ALL acceptance paths.
-        # Bound to latest user / recorded dispatch user message (never reuse older stop).
-        fin = None
-        err = ""
-        msgs = None
-        msg_http = None
-        messages_ok = False
-        if job.session_id:
-            try:
-                msg_http, msgs = self.ta_call("GET", f"/session/{job.session_id}/message")
-            except Exception as e:
-                job.notes.append(f"message fetch raised: {e}")
-                msg_http, msgs = None, None
-            try:
-                g = self._glue()
-                messages_ok = (
-                    isinstance(msg_http, int)
-                    and 200 <= int(msg_http) < 300
-                    and msgs is not None
-                )
-                asst = (
-                    g.this_round_assistant(
-                        msgs,
-                        dispatch_user_message_id=job.dispatch_user_message_id or None,
-                    )
-                    if messages_ok
-                    else None
-                )
-                # If we still lack a recorded dispatch user id, capture latest user for persist.
-                if messages_ok and not job.dispatch_user_message_id:
-                    uid = g.latest_user_message_id(msgs)
-                    if uid:
-                        job.dispatch_user_message_id = uid
-                fin = g.assistant_finish(asst) if asst is not None else None
-                err = g.assistant_error(asst) if asst is not None else ""
-                if messages_ok and asst is None:
-                    job.notes.append(
-                        "completion gate: no this-round assistant for latest user "
-                        f"(dispatch_user={job.dispatch_user_message_id or '-'})"
-                    )
-            except Exception as e:
-                job.notes.append(f"assistant parse failed: {e}")
-                messages_ok = False
+        if messages_ok and not obs.get("this_round_found"):
+            job.notes.append(
+                "completion gate: no this-round assistant for latest user "
+                f"(dispatch_user={job.dispatch_user_message_id or '-'})"
+            )
 
-        if err or fin == "error":
+        if obs.get("errored") or fin == "error":
             _fail("fail", err or "assistant finish=error", arts)
             if isinstance(job.result, dict):
                 job.result["finish"] = fin
                 job.result["status_http"] = sc
                 job.result["message_http"] = msg_http
+                job.result["run_observation"] = {k: obs.get(k) for k in (
+                    "activity", "finish_successful", "cancelled", "errored"
+                )}
             return
 
-        if fin in ("cancelled", "canceled"):
+        if obs.get("cancelled"):
             _fail("fail", f"assistant finish={fin}", arts)
             if isinstance(job.result, dict):
                 job.result["finish"] = fin
@@ -1711,8 +1701,7 @@ class ParallelScheduler:
             return
 
         # Hard completion gate — precedes force_lead_review and non-force success.
-        successful_finish = fin in ("stop", "complete", "completed")
-        if not messages_ok or not successful_finish:
+        if not messages_ok or not obs.get("finish_successful"):
             job.notes.append(
                 f"completion gate blocked: messages_ok={messages_ok} "
                 f"message_http={msg_http} finish={fin!r}; not DONE"
@@ -1728,6 +1717,7 @@ class ParallelScheduler:
             "finish": fin,
             "assistant_error": err,
             "path": "scheduler_live",
+            "activity": activity,
         }
 
         if job.force_lead_review:

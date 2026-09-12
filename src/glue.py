@@ -874,7 +874,8 @@ def run_job(
         return report
 
     while not budget.exhausted_wall():
-        sc, status = call("GET", "/session/status")
+        from teleagent_adapter.run_observe import fetch_run_observation
+
         pc, pending = call("GET", "/permission")
         if isinstance(pending, list) and pending:
             report["pending_seen"] = True
@@ -908,25 +909,30 @@ def run_job(
                     _write_status(name, report)
                     return report
 
-        busy = session_busy(status, sid)
+        # Public Run observation (adapter); glue does not parse TA status/message shapes here.
         # NOTE: no early-accept / timeout-with-partial-arts success (条2).
-        if busy:
+        obs = fetch_run_observation(call, sid, fetch_messages=False)
+        if obs.get("busy"):
             time.sleep(1.5)
             continue
-
-        mc, msgs = call("GET", f"/session/{sid}/message")
-        asst = this_round_assistant(msgs)
-        fin = assistant_finish(asst)
-        err = assistant_error(asst)
+        obs = fetch_run_observation(call, sid, fetch_messages=True)
+        fin = obs.get("finish")
+        err = obs.get("assistant_error") or ""
         report["finish"] = fin
+        report["run_observation"] = {
+            "activity": obs.get("activity"),
+            "finish_successful": obs.get("finish_successful"),
+            "cancelled": obs.get("cancelled"),
+            "errored": obs.get("errored"),
+        }
         arts_ok = _all_arts_ok()
-        if err or fin == "error":
+        if obs.get("errored") or fin == "error":
             report["state"] = "fail"
             report["error"] = err or "assistant finish=error"
             report["ok"] = False
             _write_status(name, report)
             return report
-        if fin in ("cancelled", "cancel"):
+        if obs.get("cancelled"):
             report["state"] = "cancelled"
             report["error"] = f"finish={fin}"
             report["ok"] = False
@@ -935,7 +941,7 @@ def run_job(
 
         # Require this-round successful finish before judging / force_lead_review.
         # Arts present is not enough; do not fall back to last_assistant.
-        if not assistant_finish_successful(fin):
+        if not obs.get("finish_successful"):
             time.sleep(1.5)
             continue
 
@@ -974,7 +980,6 @@ def run_job(
             )
             redo_deadline = budget.clamp_subdeadline(180)
             while time.time() < redo_deadline and not budget.exhausted_wall():
-                sc, status = call("GET", "/session/status")
                 pc, pending = call("GET", "/permission")
                 if isinstance(pending, list) and pending:
                     report["pending_seen"] = True
@@ -1000,27 +1005,29 @@ def run_job(
                 if report.get("error") == "lead deny_job":
                     _write_status(name, report)
                     return report
-                if session_busy(status, sid):
+                from teleagent_adapter.run_observe import fetch_run_observation as _fro
+
+                obs2 = _fro(call, sid, fetch_messages=False)
+                if obs2.get("busy"):
                     time.sleep(1.5)
                     continue
-                mc, msgs = call("GET", f"/session/{sid}/message")
-                asst = this_round_assistant(msgs)
-                fin2 = assistant_finish(asst)
-                err2 = assistant_error(asst)
+                obs2 = _fro(call, sid, fetch_messages=True)
+                fin2 = obs2.get("finish")
+                err2 = obs2.get("assistant_error") or ""
                 report["finish"] = fin2
-                if err2 or fin2 == "error":
+                if obs2.get("errored") or fin2 == "error":
                     report["state"] = "fail"
                     report["error"] = err2 or "assistant finish=error"
                     report["ok"] = False
                     _write_status(name, report)
                     return report
-                if fin2 in ("cancelled", "cancel"):
+                if obs2.get("cancelled"):
                     report["state"] = "cancelled"
                     report["error"] = f"finish={fin2}"
                     report["ok"] = False
                     _write_status(name, report)
                     return report
-                if assistant_finish_successful(fin2):
+                if obs2.get("finish_successful"):
                     break
                 time.sleep(1.5)
             if not assistant_finish_successful(report.get("finish")):

@@ -57,6 +57,15 @@ class WindowsBlockedAdapter(TeleAgentAdapterABC):
     def session_status(self, session_id: str | None = None) -> tuple[int, Any]:
         self._blocked()
 
+    def observe_run(
+        self,
+        session_id: str,
+        *,
+        dispatch_user_message_id: str | None = None,
+        fetch_messages: bool = True,
+    ) -> dict:
+        self._blocked()
+
     def cancel(self, session_id: str) -> tuple[int, Any]:
         self._blocked()
 
