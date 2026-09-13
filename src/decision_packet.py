@@ -486,6 +486,94 @@ def should_ping_lead(
     return bool(reason in PING_REASONS)
 
 
+def _system_install_roots(charter: dict | None) -> list[str]:
+    """Return non-empty install_roots when charter is system_install; else []."""
+    if not isinstance(charter, dict):
+        return []
+    try:
+        from task_auth import extract_auth_fields
+
+        auth = extract_auth_fields(charter)
+    except Exception:
+        kind = str(charter.get("task_kind") or "").strip().lower()
+        raw = charter.get("install_roots") or []
+        if kind not in ("system_install", "install", "system", "sys_install"):
+            return []
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list):
+            return []
+        return [str(r) for r in raw if str(r).strip()]
+    if auth.get("task_kind") != "system_install":
+        return []
+    return [str(r) for r in (auth.get("install_roots") or []) if str(r).strip()]
+
+
+def lead_permission_allow_hint(workspace: str, charter: dict | None = None) -> str:
+    """Lead permission hint for glue/scheduler.
+
+    Default (file_task): workspace-only; secret-adjacent → reject/demand_safe_path.
+    system_install with non-empty install_roots: in-root install_execute (stop
+    listen, rm/delete root, git clone into root, npm install, start server)
+    prefers **once**. Do not prefer demand_safe_path for those in-charter
+    actions. Secret-adjacent, paths outside install_roots+workspace, sudo /
+    firewall / user_gate still reject or demand_safe_path.
+    """
+    ws = str(workspace or "").strip() or "(job workdir)"
+    secret_line = (
+        "Secret-adjacent / auth workarounds: reject or demand_safe_path, never once. "
+        "Never choose always."
+    )
+    roots = _system_install_roots(charter)
+    if not roots:
+        return f"Allowed workspace only: {ws}. {secret_line}"
+    roots_s = ", ".join(roots)
+    return (
+        f"Allowed workspace: {ws}. Authorized install_roots: {roots_s}. "
+        f"{secret_line} "
+        "install_execute under declared install_roots (stop listen, rm/delete the root, "
+        "git clone into the root, npm install, start server) is in-charter: prefer once. "
+        "Do not choose demand_safe_path for those in-root install actions "
+        "(including rm -rf of an install_root). "
+        "Still reject or demand_safe_path for secret-adjacent, paths outside "
+        "install_roots and workspace, sudo, firewall, systemd, or other user_gate."
+    )
+
+
+def permission_authorized_scope(charter: dict | None, workspace: str = "") -> list:
+    """Lead authorized_scope: charter must, plus install_roots excerpt when applicable."""
+    c = charter if isinstance(charter, dict) else {}
+    must = c.get("must")
+    if isinstance(must, str):
+        scope: list = [must] if must.strip() else []
+    elif isinstance(must, list):
+        scope = [str(x) for x in must if x is not None and str(x).strip()]
+    else:
+        scope = []
+    if not scope and workspace:
+        scope = [f"stay inside workspace {workspace}"]
+    roots = _system_install_roots(c)
+    if not roots:
+        return scope
+    scope = list(scope)
+    scope.append(f"install_roots: {roots}")
+    excerpt = ""
+    for line in scope:
+        low = str(line).lower()
+        if "rm" in low or "delete" in low or "install_execute" in low:
+            excerpt = str(line).strip()
+            break
+    if excerpt:
+        if len(excerpt) > 180:
+            excerpt = excerpt[:177] + "..."
+        scope.append(f"must excerpt (in-charter install): {excerpt}")
+    scope.append(
+        "install_execute under install_roots (stop listen, rm, git clone, npm, start): "
+        "once, not demand_safe_path"
+    )
+    return scope
+
+
 def format_lead_prompt(packet: dict, allow_hint: str = "") -> str:
     """Compact lead prompt: decision packet JSON only, no CoT."""
     body = json.dumps(packet, ensure_ascii=False, indent=2)
@@ -510,6 +598,8 @@ __all__ = [
     "should_ping_lead",
     "lead_permission_schema",
     "map_lead_decision_to_api",
+    "lead_permission_allow_hint",
+    "permission_authorized_scope",
     "format_lead_prompt",
     "path_pattern",
     "target_class_for",

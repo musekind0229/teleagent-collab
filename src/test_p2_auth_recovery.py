@@ -16,6 +16,11 @@ if str(_SRC) not in sys.path:
 
 from charter import CharterError, build_instruction, load_charter, validate_charter
 from completion import ReworkBudget, is_success_allowed, missing_artifacts
+from decision_packet import (
+    format_lead_prompt,
+    lead_permission_allow_hint,
+    permission_authorized_scope,
+)
 from scheduler import JobState, ParallelScheduler
 from state_store import (
     DecisionRecord,
@@ -132,6 +137,73 @@ class TestTaskAuth(unittest.TestCase):
             self.assertIn(auth["task_kind"], ("file_task", "system_install"))
             instr = build_instruction(data)
             self.assertIn("Task kind:", instr)
+
+
+class TestSystemInstallLeadHint(unittest.TestCase):
+    """Lead allow_hint / authorized_scope: in-root install_execute prefers once."""
+
+    _INSTALL = {
+        "task_kind": "system_install",
+        "install_roots": ["/home/box/SillyTavern"],
+        "must": [
+            "Delete /home/box/SillyTavern completely (this install only). "
+            "rm -rf of install_roots is in-charter, not an unsafe workaround.",
+            "Lead must allow install_execute under install_roots. Verdict once.",
+        ],
+        "must_not": ["sudo", "secrets"],
+        "network_allow": ["github.com"],
+        "rollback": "leave last checkout",
+    }
+
+    def test_system_install_hint_once_not_demand_safe_path_for_in_root_rm(self):
+        hint = lead_permission_allow_hint("/tmp/ws-job", self._INSTALL)
+        self.assertIn("/home/box/SillyTavern", hint)
+        self.assertIn("install_roots", hint)
+        self.assertIn("prefer once", hint)
+        self.assertIn("rm", hint.lower())
+        # Must not instruct demand_safe_path as the verdict for in-root rm.
+        self.assertIn(
+            "Do not choose demand_safe_path for those in-root install actions",
+            hint,
+        )
+        self.assertIn("rm -rf of an install_root", hint)
+        # Secret-adjacent / out-of-root still demand_safe_path.
+        self.assertIn("Secret-adjacent", hint)
+        self.assertIn("reject or demand_safe_path, never once", hint)
+        self.assertIn("paths outside", hint)
+
+        prompt = format_lead_prompt(
+            {"proposed_action": {"tool": "bash", "target": "/home/box/SillyTavern"}},
+            allow_hint=hint,
+        )
+        self.assertIn(hint, prompt)
+        self.assertIn("Do not choose demand_safe_path for those in-root install actions", prompt)
+
+        scope = permission_authorized_scope(self._INSTALL, "/tmp/ws-job")
+        joined = "\n".join(str(x) for x in scope)
+        self.assertIn("/home/box/SillyTavern", joined)
+        self.assertIn("install_roots:", joined)
+        self.assertIn("once, not demand_safe_path", joined)
+        self.assertTrue(any("rm -rf of install_roots" in str(x) for x in scope))
+
+    def test_file_task_hint_still_secret_adjacent_demand_safe_path(self):
+        hint = lead_permission_allow_hint("/tmp/ws-job", {"task_kind": "file_task"})
+        self.assertIn("Allowed workspace only:", hint)
+        self.assertNotIn("install_roots", hint)
+        self.assertNotIn("prefer once", hint)
+        self.assertNotIn("in-root install", hint)
+        self.assertIn("Secret-adjacent / auth workarounds: reject or demand_safe_path, never once", hint)
+        scope = permission_authorized_scope({"task_kind": "file_task", "must": ["stay in ws"]}, "/tmp/ws-job")
+        joined = "\n".join(str(x) for x in scope)
+        self.assertNotIn("install_roots:", joined)
+        self.assertNotIn("once, not demand_safe_path", joined)
+
+    def test_system_install_empty_roots_no_once_guidance(self):
+        # Invalid charter combo, but helper must not invent once-guidance.
+        hint = lead_permission_allow_hint("/tmp/ws-job", {"task_kind": "system_install", "install_roots": []})
+        self.assertIn("Allowed workspace only:", hint)
+        self.assertNotIn("prefer once", hint)
+        self.assertIn("demand_safe_path", hint)
 
 
 class TestStateStoreRecovery(unittest.TestCase):

@@ -30,9 +30,11 @@ from hard_rules import hard_rule_decision
 from decision_packet import (
     PingDeduper,
     format_lead_prompt,
+    lead_permission_allow_hint,
     lead_permission_schema,
     map_lead_decision_to_api,
     packet_from_permission,
+    permission_authorized_scope,
     should_ping_lead,
 )
 from pathutil import canonicalize, is_path_within, permission_fingerprint
@@ -1142,11 +1144,7 @@ class ParallelScheduler:
         if not job.ping_deduper.should_emit_id(pid):
             return {"skipped": True, "reason": "dedupe_request_id", "id": pid}
         job.ping_deduper.mark_inflight_id(pid)
-        allow_hint = (
-            f"Allowed workspace only: {ws}. "
-            "Secret-adjacent / auth workarounds: reject or demand_safe_path, never once. "
-            "Never choose always."
-        )
+        allow_hint = lead_permission_allow_hint(ws, job.charter)
         from lead_adapter import (
             LeadDecisionError,
             build_lead_request,
@@ -1157,18 +1155,21 @@ class ParallelScheduler:
             from task_auth import auth_summary_for_lead
             auth_extra = {"task_authorization": auth_summary_for_lead(job.charter)}
         except Exception:
-            auth_extra = None
+            auth_extra = {}
+        extra = dict(auth_extra or {})
+        extra["allow_hint"] = allow_hint
+        extra["legacy_packet_prompt"] = format_lead_prompt(packet, allow_hint=allow_hint)
         req = build_lead_request(
             kind="permission",
             goal=(job.charter or {}).get("goal") or f"job {job.name}",
-            authorized_scope=(job.charter or {}).get("must") or [],
+            authorized_scope=permission_authorized_scope(job.charter, ws),
             prohibitions=(job.charter or {}).get("must_not") or [],
             acceptance_criteria=(job.charter or {}).get("acceptance")
             or (job.charter or {}).get("done_when")
             or {},
             current_application=packet,
             charter=job.charter,
-            extra=auth_extra,
+            extra=extra,
         )
         schema = lead_permission_response_schema()
         if self._call_lead_fn is not None or self.dry_run:

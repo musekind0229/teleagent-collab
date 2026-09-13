@@ -23,9 +23,11 @@ from hard_rules import hard_rule_decision
 from decision_packet import (
     PingDeduper,
     format_lead_prompt,
+    lead_permission_allow_hint,
     lead_permission_schema,
     map_lead_decision_to_api,
     packet_from_permission,
+    permission_authorized_scope,
     should_ping_lead,
 )
 from pathutil import canonicalize, is_path_within, permission_fingerprint
@@ -602,11 +604,7 @@ def _handle_permission_for_session(
     if not ping_deduper.should_emit_id(pid):
         return False, charter_sent_full
     ping_deduper.mark_inflight_id(pid)
-    allow_hint = (
-        f"Allowed workspace only: {ws_can}. "
-        "Secret-adjacent / auth workarounds: reject or demand_safe_path, never once. "
-        "Never choose always."
-    )
+    allow_hint = lead_permission_allow_hint(ws_can, job_charter)
     from lead_adapter import (
         LeadDecisionError,
         build_lead_request,
@@ -616,7 +614,7 @@ def _handle_permission_for_session(
     req = build_lead_request(
         kind="permission",
         goal=job_charter.get("goal") or f"job {name}",
-        authorized_scope=job_charter.get("must") or [f"stay inside workspace {ws}"],
+        authorized_scope=permission_authorized_scope(job_charter, ws_can),
         prohibitions=job_charter.get("must_not") or [],
         acceptance_criteria=job_charter.get("acceptance") or job_charter.get("done_when") or {},
         current_application=packet,
