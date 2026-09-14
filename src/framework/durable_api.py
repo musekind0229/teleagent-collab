@@ -15,8 +15,8 @@ The kernel does **not** promote identity/memory (no 晋升身份记忆).
 Persisted under ``<persist_dir>/.collab-durable/``.
 Canonical file is ``store.json``; per-goal copies are derived.
 Mutations take a persist-root exclusive lock for the whole
-read-validate-modify-save cycle (``framework.persist_lock``, Linux
-fcntl.flock). A missing file initializes; corrupt / permission /
+read-validate-modify-save cycle (``framework.persist_lock``, via
+platform file lock). A missing file initializes; corrupt / permission /
 incompatible opens raise and do not rewrite the original.
 Public kernel path only. No TeleAgent HTTP. No Hermes ledger. No glue rewrite.
 """

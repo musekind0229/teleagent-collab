@@ -10,13 +10,16 @@ This module forces a single exclusive lock around the **entire**
 read → validate → modify → save cycle for every ledger under a persist root.
 The lock is not taken only around the write.
 
-Linux: ``fcntl.flock(LOCK_EX)``. flock is per-process, so a threading.RLock
-serializes threads in the same process. Nested acquisition (durable submit
-claiming ownership under the same persist root) reuses one fd — closing a
-second fd would drop the process lock (flock(2)).
+Lock syscall is provided by ``platform_services`` (POSIX ``fcntl.flock``,
+Windows ``LockFileEx``). The backend is loaded per host; this module does
+not import ``fcntl`` at the top level.
 
-Windows lock semantics are **not** implemented here (v0.3 §5.3). Callers
-must not pretend a no-op or threading-only lock is cross-process on Windows.
+flock/LockFileEx are not a substitute for in-process thread serializing, so
+a threading.RLock still serializes threads on the same persist root. Nested
+acquisition (durable submit claiming ownership under the same persist root)
+reuses one held lock — a second independent acquire in the same process
+would block or, on POSIX, unlocking the extra descriptor could drop the
+process lock (flock(2)).
 
 Crash recovery (file storage, not a SQL transaction)
 ----------------------------------------------------
@@ -44,20 +47,22 @@ Cross-file (durable Goal + ownership claim on submit):
 * Missing file → initialize. Corrupt / permission / incompatible open
   raises and **does not rewrite** the original.
 
-Not in this module: Windows LockFileEx, single-writer network service,
-SQLite/other transactional engines.
+Not in this module: single-writer network service, SQLite/other
+transactional engines. Windows LockFileEx lives in
+``platform_services.windows`` (v0.3 §5.3).
 """
 from __future__ import annotations
 
 import errno
 import json
 import os
-import sys
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
+
+from platform_services import FileLockUnsupported, HeldFileLock, get_file_lock
 
 LOCK_FILENAME = ".collab-persist.lock"
 
@@ -130,36 +135,28 @@ def _thread_lock(key: str) -> threading.RLock:
 
 @dataclass
 class _Held:
-    fd: int
+    lock: HeldFileLock
     depth: int
 
 
-# One flock fd per persist-root per process. Nested contexts increment depth.
+# One lock descriptor per persist-root per process. Nested contexts increment depth.
 _HELD: dict[str, _Held] = {}
 
 
-def _require_linux_flock():
-    if sys.platform == "win32":
-        raise PersistLockUnsupported(
-            "Windows persist-lock semantics are deferred to v0.3 §5.3; "
-            "this knife uses Linux fcntl.flock only"
-        )
+def _file_lock_backend():
     try:
-        import fcntl
-    except ImportError as e:  # pragma: no cover — Linux always has fcntl
-        raise PersistLockUnsupported(
-            "fcntl is unavailable; Linux fcntl.flock is required for §5.1"
-        ) from e
-    return fcntl
+        return get_file_lock()
+    except FileLockUnsupported as e:
+        raise PersistLockUnsupported(str(e)) from e
 
 
 @contextmanager
 def persist_lock(persist_root: str | Path) -> Iterator[Path]:
     """Exclusive lock for the whole RMW of ledgers under ``persist_root``.
 
-    Not write-only. Nested calls from the same thread reuse the same fd.
+    Not write-only. Nested calls from the same thread reuse the same hold.
     """
-    fcntl = _require_linux_flock()
+    backend = _file_lock_backend()
     root = Path(persist_root)
     root.mkdir(parents=True, exist_ok=True)
     key = _root_key(root)
@@ -169,13 +166,11 @@ def persist_lock(persist_root: str | Path) -> Iterator[Path]:
     try:
         held = _HELD.get(key)
         if held is None:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX)
-            except OSError:
-                os.close(fd)
-                raise
-            held = _Held(fd=fd, depth=1)
+                handle = backend.acquire(lock_path, blocking=True)
+            except FileLockUnsupported as e:
+                raise PersistLockUnsupported(str(e)) from e
+            held = _Held(lock=handle, depth=1)
             _HELD[key] = held
         else:
             held.depth += 1
@@ -185,10 +180,9 @@ def persist_lock(persist_root: str | Path) -> Iterator[Path]:
             held.depth -= 1
             if held.depth <= 0:
                 try:
-                    fcntl.flock(held.fd, fcntl.LOCK_UN)
+                    held.lock.unlock_and_close()
                 except OSError:
                     pass
-                os.close(held.fd)
                 _HELD.pop(key, None)
     finally:
         mu.release()

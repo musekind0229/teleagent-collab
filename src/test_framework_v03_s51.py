@@ -183,7 +183,6 @@ class _S51Case(unittest.TestCase):
         reset_outbox_cache()
 
 
-@unittest.skipIf(sys.platform == "win32", "§5.1 Linux fcntl.flock only; Windows lock is §5.3")
 class TestCrossProcessSubmitKeepsBothGoals(_S51Case):
     def test_two_processes_interleaved_submit_keep_both_goals(self):
         """A stalls after reload while holding the RMW lock; B waits; both Goals remain."""
@@ -228,7 +227,6 @@ class TestCrossProcessSubmitKeepsBothGoals(_S51Case):
             self.assertNotEqual(ra["goal_id"], rb["goal_id"])
 
 
-@unittest.skipIf(sys.platform == "win32", "§5.1 Linux fcntl.flock only; Windows lock is §5.3")
 class TestConflictingOwnershipAndBudget(_S51Case):
     def test_conflicting_ownership_claims_at_most_one_succeeds(self):
         with tempfile.TemporaryDirectory() as td:
@@ -416,7 +414,6 @@ class TestCorruptIncompatibleKeepOriginal(_S51Case):
             self.assertEqual(path.read_bytes(), original)
 
 
-@unittest.skipIf(sys.platform == "win32", "§5.1 Linux fcntl.flock only; Windows lock is §5.3")
 class TestInterruptRecovery(_S51Case):
     def test_crash_after_ownership_claim_before_store_does_not_invent_empty_overwrite(self):
         """Crash after side-file claim, before store.json replace.

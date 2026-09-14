@@ -4,14 +4,13 @@ Two jobs targeting the same resolved workdir must not run in parallel merely
 because they use different ExecutionBackend instances. The holder is recorded
 in an occupancy record. Isolated (distinct) workdirs still run in parallel.
 
-In-process: threading occupancy (flock is per-process on Linux).
-Cross-process: fcntl flock + occupancy JSON under the workdir.
+In-process: threading occupancy (OS file locks are per-handle / per-process).
+Cross-process: platform exclusive file lock + occupancy JSON under the workdir.
 
 Public ExecutionBackend path only. No TeleAgent HTTP. No Hermes ledger.
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import threading
@@ -22,6 +21,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
+
+from platform_services import HeldFileLock, current_pid, current_thread_id, get_file_lock
 
 LOCK_FILENAME = ".collab-workdir-claim.lock"
 OCCUPANCY_FILENAME = ".collab-workdir-claim.json"
@@ -70,7 +71,7 @@ def _normalize_mode(mode: str) -> str:
 
 
 def _new_holder_id() -> str:
-    return f"inproc-{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex[:8]}"
+    return f"inproc-{current_pid()}-{current_thread_id()}-{uuid.uuid4().hex[:8]}"
 
 
 @dataclass
@@ -214,12 +215,12 @@ def _clear_occupancy_file(workdir: str | Path) -> None:
 
 
 class WorkdirClaimRegistry:
-    """Exclusive workdir claims: in-memory (threads) + flock (processes)."""
+    """Exclusive workdir claims: in-memory (threads) + OS file lock (processes)."""
 
     def __init__(self) -> None:
         self._mu = threading.RLock()
         self._held: dict[str, Occupancy] = {}
-        self._fds: dict[str, int] = {}
+        self._locks: dict[str, HeldFileLock] = {}
         self._conds: dict[str, threading.Condition] = {}
 
     def _key(self, workdir: str | Path) -> str:
@@ -276,8 +277,8 @@ class WorkdirClaimRegistry:
         waiter = {
             "holder_id": hid,
             "job_name": job_name,
-            "pid": os.getpid(),
-            "thread_id": threading.get_ident(),
+            "pid": current_pid(),
+            "thread_id": current_thread_id(),
             "requested_at": time.time(),
             "requested_at_iso": _utc_iso(),
             "mode": kind,
@@ -422,16 +423,9 @@ class WorkdirClaimRegistry:
                     waiter=waiter,
                 )
 
-        fd: int | None = None
         try:
-            fd = os.open(str(lock_path(root)), os.O_CREAT | os.O_RDWR, 0o644)
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            held_lock = get_file_lock().acquire(lock_path(root), blocking=False)
         except BlockingIOError:
-            if fd is not None:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
             occ = self._occupancy_after_block(root, key)
             return ClaimOutcome(
                 granted=False,
@@ -442,11 +436,6 @@ class WorkdirClaimRegistry:
                 waiter=waiter,
             )
         except OSError as e:
-            if fd is not None:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
             return ClaimOutcome(
                 granted=False,
                 status=STATUS_BLOCKED,
@@ -466,8 +455,8 @@ class WorkdirClaimRegistry:
             job_name=job_name,
             backend_id=backend_id,
             backend_instance_id=str(backend_instance_id or ""),
-            pid=os.getpid(),
-            thread_id=threading.get_ident(),
+            pid=current_pid(),
+            thread_id=current_thread_id(),
             claimed_at=now,
             claimed_at_iso=_utc_iso(now),
             write_paths=list(write_paths),
@@ -482,11 +471,9 @@ class WorkdirClaimRegistry:
         with self._mu:
             rec = self._held.get(key)
             if rec is not None and rec.holder_id != hid:
-                # Do not LOCK_UN — that would drop a same-process holder's flock.
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
+                # Do not unlock — that would drop a same-process holder's lock
+                # (POSIX flock is associated with the process / open file).
+                held_lock.close_without_unlock()
                 if not any(w.get("holder_id") == hid for w in rec.waiters):
                     rec.waiters.append(dict(waiter))
                 return ClaimOutcome(
@@ -499,10 +486,7 @@ class WorkdirClaimRegistry:
                 )
             if rec is not None and rec.holder_id == hid:
                 rec.refcount += 1
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
+                held_lock.close_without_unlock()
                 return ClaimOutcome(
                     granted=True,
                     status=STATUS_GRANTED,
@@ -511,7 +495,7 @@ class WorkdirClaimRegistry:
                     occupancy=rec.snapshot(),
                 )
             self._held[key] = occ
-            self._fds[key] = fd
+            self._locks[key] = held_lock
             return ClaimOutcome(
                 granted=True,
                 status=STATUS_GRANTED,
@@ -534,15 +518,11 @@ class WorkdirClaimRegistry:
             if rec.refcount > 0 and not force:
                 return True
             self._held.pop(key, None)
-            fd = self._fds.pop(key, None)
+            held_lock = self._locks.pop(key, None)
             _clear_occupancy_file(key)
-            if fd is not None:
+            if held_lock is not None:
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                except OSError:
-                    pass
-                try:
-                    os.close(fd)
+                    held_lock.unlock_and_close()
                 except OSError:
                     pass
             self._cond(key).notify_all()
