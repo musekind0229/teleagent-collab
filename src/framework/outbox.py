@@ -12,18 +12,26 @@ Public kernel path only. No TeleAgent HTTP. No Hermes ledger. No glue rewrite.
 """
 from __future__ import annotations
 
-import json
-import os
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from framework.lifecycle import GOAL_STATES, TASK_STATES, LifecycleError, assert_transition
 from framework.models import CONTRACT_VERSION
+from framework.persist_lock import (
+    StoreIncompatibleError,
+    atomic_write_json,
+    classify_ledger_path,
+    persist_lock,
+    read_json_file,
+    require_json_object,
+    rmw_lock,
+)
 
 OUTBOX_DIRNAME = ".collab-outbox"
 STATUS_PENDING = "pending"
@@ -62,28 +70,7 @@ def persist_dir(root: str | Path) -> Path:
 
 
 def _atomic_write(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    data = json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n"
-    tmp.write_text(data, encoding="utf-8")
-    try:
-        fd = os.open(str(tmp), os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except OSError:
-        pass
-    os.replace(tmp, path)
-
-
-def _read_json(path: Path) -> Any | None:
-    if not path.is_file():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
+    atomic_write_json(path, payload)
 
 
 def new_event_id() -> str:
@@ -280,6 +267,7 @@ class OutboxStore:
         self.history: list[dict[str, Any]] = []
         self.notes: list[str] = []
         self._mu = threading.RLock()
+        self._rmw_depth = 0
 
     @property
     def path(self) -> Path:
@@ -294,8 +282,13 @@ class OutboxStore:
     def outbox_path(self) -> Path:
         return self.path / "outbox.json"
 
+    @contextmanager
+    def _rmw(self, *, init_if_missing: bool = False) -> Iterator[None]:
+        with rmw_lock(self, self.persist_root, init_if_missing=init_if_missing):
+            yield
+
     def get_entity(self, kind: str, entity_id: str) -> dict[str, Any] | None:
-        with self._mu:
+        with self._rmw():
             rec = self.entities.get(entity_key(kind, entity_id))
             return dict(rec) if rec else None
 
@@ -306,7 +299,7 @@ class OutboxStore:
         return str(rec.get("state") or "") or None
 
     def list_rows(self, *, status: str | None = None) -> list[OutboxRow]:
-        with self._mu:
+        with self._rmw():
             rows = list(self.rows.values())
         if status:
             rows = [r for r in rows if r.status == status]
@@ -323,7 +316,7 @@ class OutboxStore:
         return len(self.list_rows(status=STATUS_SENT))
 
     def snapshot(self) -> dict[str, Any]:
-        with self._mu:
+        with self._rmw():
             return {
                 "persist_dir": str(self.persist_root),
                 "path": str(self.path),
@@ -358,7 +351,7 @@ class OutboxStore:
     ) -> list[OutboxRow]:
         """Claim pending (and reclaim claimed-but-not-sent) rows for delivery."""
         ts = now if now is not None else _utc_now()
-        with self._mu:
+        with self._rmw():
             claimed: list[OutboxRow] = []
             for row in sorted(self.rows.values(), key=lambda r: (r.created_at, r.outbox_id)):
                 if len(claimed) >= int(limit):
@@ -376,7 +369,7 @@ class OutboxStore:
         ts = now if now is not None else _utc_now()
         ids = [outbox_id] if isinstance(outbox_id, str) else list(outbox_id)
         marked: list[str] = []
-        with self._mu:
+        with self._rmw():
             for oid in ids:
                 row = self.rows.get(str(oid))
                 if row is None:
@@ -396,7 +389,7 @@ class OutboxStore:
         crash: str | None = None,
         history_item: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        with self._mu:
+        with self._rmw():
             return self._commit_unlocked(
                 entity_updates=entity_updates,
                 events=events,
@@ -481,30 +474,78 @@ class OutboxStore:
         except OSError as e:
             self.notes.append(f"journal unlink failed: {e}")
 
+    def _validate_journal(self, path: Path, raw: Any) -> dict[str, Any]:
+        payload = require_json_object(path, raw, what="outbox journal")
+        if not payload.get("txn_id"):
+            raise StoreIncompatibleError(path, "outbox journal missing txn_id")
+        if "entities" in payload and not isinstance(payload.get("entities"), Mapping):
+            raise StoreIncompatibleError(path, "journal entities must be a JSON object")
+        if "outbox" in payload and payload.get("outbox") is not None and not isinstance(payload.get("outbox"), list):
+            raise StoreIncompatibleError(path, "journal outbox must be a list")
+        return payload
+
+    def _validate_live_entities(self, path: Path, raw: Any) -> Mapping[str, Any]:
+        payload = require_json_object(path, raw, what="outbox entities")
+        raw_ents = payload.get("entities") if isinstance(payload.get("entities"), Mapping) else payload
+        if not isinstance(raw_ents, Mapping):
+            raise StoreIncompatibleError(path, "entities must be a JSON object")
+        return raw_ents
+
+    def _validate_live_outbox(self, path: Path, raw: Any) -> list[Any]:
+        payload = require_json_object(path, raw, what="outbox rows")
+        rows = payload.get("rows")
+        if rows is None:
+            return []
+        if not isinstance(rows, list):
+            raise StoreIncompatibleError(path, "outbox rows must be a list")
+        return rows
+
     def _replay_journal_unlocked(self) -> bool:
-        raw = _read_json(self.journal_path())
-        if not isinstance(raw, dict) or not raw.get("txn_id"):
+        path = self.journal_path()
+        kind = classify_ledger_path(path)
+        if kind == "missing":
             return False
-        self._apply_snapshot_unlocked(raw)
-        self.notes.append(f"replayed journal txn={raw.get('txn_id')}")
+        if kind == "incompatible":
+            raise StoreIncompatibleError(path, "outbox journal path exists but is not a file")
+        raw = read_json_file(path)
+        payload = self._validate_journal(path, raw)
+        self._apply_snapshot_unlocked(payload)
+        self.notes.append(f"replayed journal txn={payload.get('txn_id')}")
         self._drop_journal_unlocked()
         return True
 
     def _load_live_unlocked(self) -> None:
-        ents = _read_json(self.entities_path())
-        if isinstance(ents, dict):
-            raw_ents = ents.get("entities") if isinstance(ents.get("entities"), Mapping) else ents
-            if isinstance(raw_ents, Mapping):
-                self.entities = {
-                    str(k): dict(v) for k, v in raw_ents.items() if isinstance(v, Mapping)
-                }
-        box = _read_json(self.outbox_path())
-        if isinstance(box, dict):
+        ents_path = self.entities_path()
+        box_path = self.outbox_path()
+        ents_kind = classify_ledger_path(ents_path)
+        if ents_kind == "incompatible":
+            raise StoreIncompatibleError(ents_path, "entities path exists but is not a file")
+        if ents_kind == "file":
+            raw_ents = read_json_file(ents_path)
+            loaded = self._validate_live_entities(ents_path, raw_ents)
+            self.entities = {str(k): dict(v) for k, v in loaded.items() if isinstance(v, Mapping)}
+        else:
+            self.entities = {}
+        box_kind = classify_ledger_path(box_path)
+        if box_kind == "incompatible":
+            raise StoreIncompatibleError(box_path, "outbox path exists but is not a file")
+        if box_kind == "file":
+            raw_box = read_json_file(box_path)
             self.rows = {}
-            for raw in box.get("rows") or []:
+            for raw in self._validate_live_outbox(box_path, raw_box):
                 rec = OutboxRow.from_dict(raw if isinstance(raw, Mapping) else {})
                 if rec is not None:
                     self.rows[rec.outbox_id] = rec
+        else:
+            self.rows = {}
+
+    def _reload_unlocked(self, *, init_if_missing: bool = False) -> None:
+        self.path.mkdir(parents=True, exist_ok=True)
+        replayed = self._replay_journal_unlocked()
+        if not replayed:
+            self._load_live_unlocked()
+            if init_if_missing:
+                self.notes.append("opened outbox store")
 
     @classmethod
     def open(
@@ -514,21 +555,22 @@ class OutboxStore:
         use_cache: bool = True,
     ) -> "OutboxStore":
         root = Path(persist_dir_root)
-        key = str(root.resolve()) if root.exists() else str(root)
+        root.mkdir(parents=True, exist_ok=True)
+        key = str(root.resolve())
         if use_cache:
             with _CACHE_MU:
                 hit = _CACHE.get(key)
                 if hit is not None:
                     return hit
         store = cls(root)
-        store.path.mkdir(parents=True, exist_ok=True)
-        with store._mu:
-            replayed = store._replay_journal_unlocked()
-            if not replayed:
-                store._load_live_unlocked()
-                store.notes.append("opened outbox store")
+        with persist_lock(root):
+            with store._mu:
+                store._reload_unlocked(init_if_missing=True)
         if use_cache:
             with _CACHE_MU:
+                hit = _CACHE.get(key)
+                if hit is not None:
+                    return hit
                 _CACHE[key] = store
         return store
 
@@ -559,14 +601,20 @@ class DedupStore:
         self.event_ids: set[str] = set()
         self.events: list[dict[str, Any]] = []
         self._mu = threading.RLock()
+        self._rmw_depth = 0
 
     @property
     def path(self) -> Path:
         return persist_dir(self.persist_root) / "inbox.json"
 
+    @contextmanager
+    def _rmw(self, *, init_if_missing: bool = False) -> Iterator[None]:
+        with rmw_lock(self, self.persist_root, init_if_missing=init_if_missing):
+            yield
+
     def seen(self, key: str) -> bool:
         k = str(key or "").strip()
-        with self._mu:
+        with self._rmw():
             return k in self.keys or k in self.event_ids
 
     def receive(
@@ -584,7 +632,7 @@ class DedupStore:
                 "duplicate": False,
                 "error": "missing event_id/delivery_key",
             }
-        with self._mu:
+        with self._rmw():
             if (key and key in self.keys) or (eid and eid in self.event_ids):
                 return {
                     "accepted": False,
@@ -618,12 +666,32 @@ class DedupStore:
         )
 
     def _load_unlocked(self) -> None:
-        raw = _read_json(self.path)
-        if not isinstance(raw, dict):
+        path = self.path
+        kind = classify_ledger_path(path)
+        if kind == "missing":
+            self.keys = set()
+            self.event_ids = set()
+            self.events = []
             return
-        self.keys = {str(x) for x in (raw.get("keys") or [])}
-        self.event_ids = {str(x) for x in (raw.get("event_ids") or [])}
-        self.events = [dict(x) for x in (raw.get("events") or []) if isinstance(x, Mapping)]
+        if kind == "incompatible":
+            raise StoreIncompatibleError(path, "inbox path exists but is not a file")
+        raw = read_json_file(path)
+        payload = require_json_object(path, raw, what="outbox inbox")
+        if "keys" in payload and payload.get("keys") is not None and not isinstance(payload.get("keys"), list):
+            raise StoreIncompatibleError(path, "inbox keys must be a list")
+        if "event_ids" in payload and payload.get("event_ids") is not None and not isinstance(
+            payload.get("event_ids"), list
+        ):
+            raise StoreIncompatibleError(path, "inbox event_ids must be a list")
+        if "events" in payload and payload.get("events") is not None and not isinstance(payload.get("events"), list):
+            raise StoreIncompatibleError(path, "inbox events must be a list")
+        self.keys = {str(x) for x in (payload.get("keys") or [])}
+        self.event_ids = {str(x) for x in (payload.get("event_ids") or [])}
+        self.events = [dict(x) for x in (payload.get("events") or []) if isinstance(x, Mapping)]
+
+    def _reload_unlocked(self, *, init_if_missing: bool = False) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._load_unlocked()
 
     @classmethod
     def open(
@@ -633,18 +701,22 @@ class DedupStore:
         use_cache: bool = True,
     ) -> "DedupStore":
         root = Path(persist_dir_root)
-        key = str(root.resolve()) if root.exists() else str(root)
+        root.mkdir(parents=True, exist_ok=True)
+        key = str(root.resolve())
         if use_cache:
             with _CACHE_MU:
                 hit = _DEDUP_CACHE.get(key)
                 if hit is not None:
                     return hit
         store = cls(root)
-        store.path.parent.mkdir(parents=True, exist_ok=True)
-        with store._mu:
-            store._load_unlocked()
+        with persist_lock(root):
+            with store._mu:
+                store._reload_unlocked(init_if_missing=True)
         if use_cache:
             with _CACHE_MU:
+                hit = _DEDUP_CACHE.get(key)
+                if hit is not None:
+                    return hit
                 _DEDUP_CACHE[key] = store
         return store
 

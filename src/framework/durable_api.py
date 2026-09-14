@@ -13,18 +13,22 @@ accepting new child tasks and requests terminate of in-flight work —
 The kernel does **not** promote identity/memory (no 晋升身份记忆).
 
 Persisted under ``<persist_dir>/.collab-durable/``.
+Canonical file is ``store.json``; per-goal copies are derived.
+Mutations take a persist-root exclusive lock for the whole
+read-validate-modify-save cycle (``framework.persist_lock``, Linux
+fcntl.flock). A missing file initializes; corrupt / permission /
+incompatible opens raise and do not rewrite the original.
 Public kernel path only. No TeleAgent HTTP. No Hermes ledger. No glue rewrite.
 """
 from __future__ import annotations
 
-import json
-import os
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 from framework.delegation import (
     ESCALATE_KINDS,
@@ -50,6 +54,16 @@ from framework.lifecycle import (
     assert_transition,
 )
 from framework.models import CONTRACT_VERSION, contract_fingerprint, new_goal_id, new_task_id
+from framework.persist_lock import (
+    StoreIncompatibleError,
+    atomic_write_json,
+    check_contract_version,
+    classify_ledger_path,
+    persist_lock,
+    read_json_file,
+    require_json_object,
+    rmw_lock,
+)
 
 DURABLE_DIRNAME = ".collab-durable"
 STORE_FILENAME = "store.json"
@@ -158,28 +172,19 @@ def store_path(root: str | Path) -> Path:
 
 
 def _atomic_write(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    data = json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n"
-    tmp.write_text(data, encoding="utf-8")
-    try:
-        fd = os.open(str(tmp), os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except OSError:
-        pass
-    os.replace(tmp, path)
+    atomic_write_json(path, payload)
 
 
-def _read_json(path: Path) -> Any | None:
-    if not path.is_file():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
+def _validate_durable_store(path: Path, raw: Any) -> dict[str, Any]:
+    payload = require_json_object(path, raw, what="durable store")
+    check_contract_version(path, payload, supported={CONTRACT_VERSION})
+    if "goals" in payload and not isinstance(payload.get("goals"), Mapping):
+        raise StoreIncompatibleError(path, "durable store 'goals' must be a JSON object")
+    if "submit_keys" in payload and not isinstance(payload.get("submit_keys"), Mapping):
+        raise StoreIncompatibleError(path, "durable store 'submit_keys' must be a JSON object")
+    if "notes" in payload and payload.get("notes") is not None and not isinstance(payload.get("notes"), list):
+        raise StoreIncompatibleError(path, "durable store 'notes' must be a list")
+    return payload
 
 
 def new_decision_id() -> str:
@@ -626,6 +631,9 @@ def _delegation_fields_from(
 _CACHE: dict[str, "DurableLayer"] = {}
 _CACHE_MU = threading.Lock()
 
+# Test-only: after ownership claim, before canonical store.json replace.
+after_ownership_claim_hook = None
+
 
 def reset_durable_cache() -> None:
     with _CACHE_MU:
@@ -641,6 +649,7 @@ class DurableLayer:
         self.goals: dict[str, dict[str, Any]] = {}
         self.notes: list[str] = []
         self._mu = threading.RLock()
+        self._rmw_depth = 0
 
     @property
     def path(self) -> Path:
@@ -650,10 +659,44 @@ class DurableLayer:
         return store_path(self.persist_root)
 
     def goal_count(self) -> int:
-        with self._mu:
+        with self._rmw():
             return len(self.goals)
 
+    @contextmanager
+    def _rmw(self, *, init_if_missing: bool = False) -> Iterator[None]:
+        with rmw_lock(self, self.persist_root, init_if_missing=init_if_missing):
+            yield
+
+    def _load_into_unlocked(self, payload: Mapping[str, Any]) -> None:
+        keys = payload.get("submit_keys") if isinstance(payload.get("submit_keys"), Mapping) else {}
+        self.submit_keys = {str(k): str(v) for k, v in keys.items() if str(k) and str(v)}
+        raw_goals = payload.get("goals") if isinstance(payload.get("goals"), Mapping) else {}
+        self.goals = {}
+        for gid, snap in raw_goals.items():
+            if isinstance(snap, Mapping) and str(gid):
+                self.goals[str(gid)] = dict(snap)
+        self.notes = [str(x) for x in (payload.get("notes") or [])]
+
+    def _reload_unlocked(self, *, init_if_missing: bool = False) -> None:
+        """Refresh from disk under the persist lock. Never treat corrupt as empty."""
+        path = self.store_file()
+        kind = classify_ledger_path(path)
+        if kind == "incompatible":
+            raise StoreIncompatibleError(path, "durable store path exists but is not a file")
+        if kind == "missing":
+            self.submit_keys = {}
+            self.goals = {}
+            self.notes = ["opened empty durable store"] if init_if_missing else []
+            if init_if_missing:
+                self._persist_unlocked()
+            return
+        raw = read_json_file(path)
+        payload = _validate_durable_store(path, raw)
+        self._load_into_unlocked(payload)
+
     def _persist_unlocked(self) -> None:
+        # Canonical file first; per-goal copies are derived (crash → next open
+        # reloads store.json and rewrites copies on the next persist).
         payload = {
             "contract_version": CONTRACT_VERSION,
             "submit_keys": dict(self.submit_keys),
@@ -668,40 +711,33 @@ class DurableLayer:
             _atomic_write(goals_dir / f"{slug}.json", snap)
 
     def persist(self) -> Path:
-        with self._mu:
+        with self._rmw():
             self._persist_unlocked()
             return self.store_file()
 
     def load_into(self, payload: Mapping[str, Any]) -> None:
         with self._mu:
-            keys = payload.get("submit_keys") if isinstance(payload.get("submit_keys"), Mapping) else {}
-            self.submit_keys = {str(k): str(v) for k, v in keys.items() if str(k) and str(v)}
-            raw_goals = payload.get("goals") if isinstance(payload.get("goals"), Mapping) else {}
-            self.goals = {}
-            for gid, snap in raw_goals.items():
-                if isinstance(snap, Mapping) and str(gid):
-                    self.goals[str(gid)] = dict(snap)
-            self.notes = [str(x) for x in (payload.get("notes") or [])]
+            self._load_into_unlocked(payload)
 
     @classmethod
     def open(cls, persist_dir_root: str | Path, *, use_cache: bool = True) -> "DurableLayer":
         root = Path(persist_dir_root)
-        key = str(root.resolve()) if root.exists() else str(root)
+        root.mkdir(parents=True, exist_ok=True)
+        key = str(root.resolve())
         if use_cache:
             with _CACHE_MU:
                 hit = _CACHE.get(key)
                 if hit is not None:
                     return hit
         layer = cls(root)
-        raw = _read_json(store_path(root))
-        if isinstance(raw, dict):
-            layer.load_into(raw)
-            layer.notes.append("loaded existing durable store")
-        else:
-            layer.notes.append("opened empty durable store")
-            layer._persist_unlocked()
+        with persist_lock(root):
+            with layer._mu:
+                layer._reload_unlocked(init_if_missing=True)
         if use_cache:
             with _CACHE_MU:
+                hit = _CACHE.get(key)
+                if hit is not None:
+                    return hit
                 _CACHE[key] = layer
         return layer
 
@@ -824,7 +860,7 @@ class DurableLayer:
             autonomy=spec if autonomy_is_known(spec) else None,
             coordinator_id=fields["coordinator_id"],
         )
-        with self._mu:
+        with self._rmw():
             existing_id = self.submit_keys.get(key)
             if existing_id and existing_id in self.goals:
                 stored = self.goals[existing_id]
@@ -915,6 +951,9 @@ class DurableLayer:
                         "created": False,
                         "ownership": (claimed.get("ownership") or {}),
                     }
+            hook = after_ownership_claim_hook
+            if hook is not None:
+                hook()
             self._append_history(
                 snap,
                 "submit_goal",
@@ -954,7 +993,7 @@ class DurableLayer:
     def get_goal(self, goal_id: str) -> dict[str, Any]:
         """Read the current Goal snapshot."""
         gid = _norm_key(goal_id)
-        with self._mu:
+        with self._rmw():
             snap = self.goals.get(gid)
             if snap is None:
                 return {
@@ -1003,7 +1042,7 @@ class DurableLayer:
                 "reason": REASON_IDENTITY_MEMORY_FORBIDDEN,
                 "error": forbidden,
             }
-        with self._mu:
+        with self._rmw():
             snap = self.goals.get(gid)
             if snap is None:
                 return {
@@ -1047,7 +1086,7 @@ class DurableLayer:
         """Move a queued child Task to running (in-flight)."""
         gid = _norm_key(goal_id)
         tid = _norm_key(task_id)
-        with self._mu:
+        with self._rmw():
             snap = self.goals.get(gid)
             if snap is None:
                 return {"ok": False, "reason": REASON_UNKNOWN_GOAL, "error": f"unknown goal_id {gid!r}"}
@@ -1102,7 +1141,7 @@ class DurableLayer:
         knd = escalated or _norm_key(kind) or "action_approval"
         if knd not in DECISION_KINDS:
             return {"ok": False, "reason": "unknown_kind", "error": f"unknown decision kind {knd!r}"}
-        with self._mu:
+        with self._rmw():
             snap = self.goals.get(gid)
             if snap is None:
                 return {"ok": False, "reason": REASON_UNKNOWN_GOAL, "error": f"unknown goal_id {gid!r}"}
@@ -1225,7 +1264,7 @@ class DurableLayer:
         action_list = _as_mapping_list(actions) or []
         if not did and action_list:
             did = _target_id(action_list[0])
-        with self._mu:
+        with self._rmw():
             snap = self.goals.get(gid)
             if snap is None:
                 return {"ok": False, "reason": REASON_UNKNOWN_GOAL, "error": f"unknown goal_id {gid!r}"}
@@ -1383,7 +1422,7 @@ class DurableLayer:
         )
         if not opened.get("ok"):
             return opened
-        with self._mu:
+        with self._rmw():
             snap = self.goals.get(gid)
             if snap is not None:
                 self._append_history(
@@ -1415,7 +1454,7 @@ class DurableLayer:
     def list_events(self, goal_id: str) -> dict[str, Any]:
         """History + pending notifications. Escalations are decision_required."""
         gid = _norm_key(goal_id)
-        with self._mu:
+        with self._rmw():
             snap = self.goals.get(gid)
             if snap is None:
                 return {
@@ -1464,7 +1503,7 @@ class DurableLayer:
     ) -> dict[str, Any]:
         """Wire existing ownership handoff into the durable layer."""
         gid = _norm_key(goal_id)
-        with self._mu:
+        with self._rmw():
             snap = self.goals.get(gid)
             if snap is None:
                 return {
@@ -1515,7 +1554,7 @@ class DurableLayer:
         Lands on ``cancel_requested``. This is **not** terminal ``cancelled``.
         """
         gid = _norm_key(goal_id)
-        with self._mu:
+        with self._rmw():
             snap = self.goals.get(gid)
             if snap is None:
                 return {"ok": False, "reason": REASON_UNKNOWN_GOAL, "error": f"unknown goal_id {gid!r}"}
@@ -1586,7 +1625,7 @@ class DurableLayer:
     def effect_cancel(self, goal_id: str, *, reason: str = "") -> dict[str, Any]:
         """Terminal cancelled — only after cancel_requested. Distinct from the request."""
         gid = _norm_key(goal_id)
-        with self._mu:
+        with self._rmw():
             snap = self.goals.get(gid)
             if snap is None:
                 return {"ok": False, "reason": REASON_UNKNOWN_GOAL, "error": f"unknown goal_id {gid!r}"}
@@ -1644,7 +1683,7 @@ class DurableLayer:
     def get_report(self, goal_id: str) -> dict[str, Any]:
         """Read-only report snapshot for a Goal."""
         gid = _norm_key(goal_id)
-        with self._mu:
+        with self._rmw():
             snap = self.goals.get(gid)
             if snap is None:
                 return {

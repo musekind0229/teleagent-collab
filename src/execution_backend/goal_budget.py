@@ -12,15 +12,26 @@ Public ExecutionBackend path only. No TeleAgent HTTP. No Hermes ledger.
 """
 from __future__ import annotations
 
-import json
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Iterator, Mapping
 
 from framework.lifecycle import assert_transition, map_error_class
+from framework.models import CONTRACT_VERSION
+from framework.persist_lock import (
+    StoreIncompatibleError,
+    atomic_write_json,
+    check_contract_version,
+    classify_ledger_path,
+    persist_lock,
+    read_json_file,
+    require_json_object,
+    rmw_lock,
+)
 from framework.task_deps import (
     depends_on_strings,
     unsatisfied_deps,
@@ -313,6 +324,7 @@ class GoalBudget:
         self.ledger: list[dict[str, Any]] = []
         self._mu = threading.RLock()
         self.notes: list[str] = []
+        self._rmw_depth = 0
 
     # --- identity / persist ---
 
@@ -379,7 +391,7 @@ class GoalBudget:
         """Hold capacity before a child Task/Run starts. Does not mint a new account."""
         rid = (reservation_id or "").strip() or f"rsv_{uuid.uuid4().hex[:12]}"
         cost = cost or BudgetCost(attempts=1)
-        with self._mu:
+        with self._rmw():
             ok, reason = self.can_reserve(cost)
             rec = Reservation(
                 reservation_id=rid,
@@ -431,7 +443,7 @@ class GoalBudget:
     ) -> dict[str, Any]:
         """Commit actual child cost; release unused reservation. New ids do not reset."""
         actual = actual or BudgetCost()
-        with self._mu:
+        with self._rmw():
             rec = self.reservations.get(reservation_id)
             if rec is None or rec.status != STATUS_HELD:
                 # still charge actual against the parent (roll-up must not be lost)
@@ -487,7 +499,7 @@ class GoalBudget:
 
     def release(self, reservation_id: str) -> bool:
         """Drop a held reservation without consuming (did not start / aborted)."""
-        with self._mu:
+        with self._rmw():
             rec = self.reservations.get(reservation_id)
             if rec is None or rec.status != STATUS_HELD:
                 return False
@@ -505,8 +517,13 @@ class GoalBudget:
             self._persist_unlocked()
             return True
 
+    @contextmanager
+    def _rmw(self, *, init_if_missing: bool = False) -> Iterator[None]:
+        with rmw_lock(self, self.persist_dir, init_if_missing=init_if_missing):
+            yield
+
     def to_dict(self) -> dict[str, Any]:
-        with self._mu:
+        with self._rmw():
             return {
                 "goal_id": self.goal_id,
                 "contract_version": "contract.v0.1-draft",
@@ -527,53 +544,79 @@ class GoalBudget:
             }
 
     def _persist_unlocked(self) -> None:
-        path = self.path
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {
-                "goal_id": self.goal_id,
-                "limits": self.limits.to_dict(),
-                "consumed": self.consumed.to_dict(),
-                "reserved": self.reserved.to_dict(),
-                "started_at": self.started_at,
-                "wall_deadline": self.wall_deadline,
-                "reservations": {k: v.to_dict() for k, v in self.reservations.items()},
-                "ledger": list(self.ledger),
-                "notes": list(self.notes)[-50:],
-            }
-            tmp = path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            tmp.replace(path)
-        except OSError as e:
-            self.notes.append(f"persist failed: {e}")
+        payload = {
+            "goal_id": self.goal_id,
+            "contract_version": CONTRACT_VERSION,
+            "limits": self.limits.to_dict(),
+            "consumed": self.consumed.to_dict(),
+            "reserved": self.reserved.to_dict(),
+            "started_at": self.started_at,
+            "wall_deadline": self.wall_deadline,
+            "reservations": {k: v.to_dict() for k, v in self.reservations.items()},
+            "ledger": list(self.ledger),
+            "notes": list(self.notes)[-50:],
+        }
+        atomic_write_json(self.path, payload)
 
     def persist(self) -> Path:
-        with self._mu:
+        with self._rmw():
             self._persist_unlocked()
             return self.path
+
+    def _load_into_unlocked(self, payload: Mapping[str, Any]) -> None:
+        if payload.get("started_at") is not None:
+            self.started_at = float(payload["started_at"])
+        if payload.get("wall_deadline") is not None:
+            self.wall_deadline = float(payload["wall_deadline"])
+        self.consumed = BudgetCost.from_dict(payload.get("consumed") if isinstance(payload.get("consumed"), Mapping) else {})
+        self.reserved = BudgetCost.from_dict(payload.get("reserved") if isinstance(payload.get("reserved"), Mapping) else {})
+        self.reservations = {}
+        raw_rs = payload.get("reservations") if isinstance(payload.get("reservations"), Mapping) else {}
+        for k, v in raw_rs.items():
+            rec = Reservation.from_dict(v if isinstance(v, Mapping) else {})
+            if rec is not None:
+                self.reservations[str(k)] = rec
+        self.ledger = [dict(x) for x in (payload.get("ledger") or []) if isinstance(x, Mapping)]
+        self.notes = [str(x) for x in (payload.get("notes") or [])]
+        if isinstance(payload.get("limits"), Mapping):
+            loaded = BudgetLimits.from_dict(payload["limits"])
+            self.limits = loaded
 
     def load_into(self, payload: Mapping[str, Any]) -> None:
         """Restore consumed/reserved/deadline. Never resets because a new id was minted."""
         with self._mu:
-            if payload.get("started_at") is not None:
-                self.started_at = float(payload["started_at"])
-            if payload.get("wall_deadline") is not None:
-                self.wall_deadline = float(payload["wall_deadline"])
-            self.consumed = BudgetCost.from_dict(payload.get("consumed") if isinstance(payload.get("consumed"), Mapping) else {})
-            self.reserved = BudgetCost.from_dict(payload.get("reserved") if isinstance(payload.get("reserved"), Mapping) else {})
+            self._load_into_unlocked(payload)
+
+    def _validate_payload(self, path: Path, raw: Any) -> dict[str, Any]:
+        payload = require_json_object(path, raw, what="goal budget store")
+        check_contract_version(path, payload, supported={CONTRACT_VERSION})
+        for key in ("consumed", "reserved", "limits"):
+            if key in payload and payload.get(key) is not None and not isinstance(payload.get(key), Mapping):
+                raise StoreIncompatibleError(path, f"{key} must be a JSON object")
+        if "reservations" in payload and payload.get("reservations") is not None and not isinstance(
+            payload.get("reservations"), Mapping
+        ):
+            raise StoreIncompatibleError(path, "reservations must be a JSON object")
+        if "ledger" in payload and payload.get("ledger") is not None and not isinstance(payload.get("ledger"), list):
+            raise StoreIncompatibleError(path, "ledger must be a list")
+        return payload
+
+    def _reload_unlocked(self, *, init_if_missing: bool = False) -> None:
+        path = self.path
+        kind = classify_ledger_path(path)
+        if kind == "incompatible":
+            raise StoreIncompatibleError(path, "goal budget path exists but is not a file")
+        if kind == "missing":
+            self.consumed = BudgetCost()
+            self.reserved = BudgetCost()
             self.reservations = {}
-            raw_rs = payload.get("reservations") if isinstance(payload.get("reservations"), Mapping) else {}
-            for k, v in raw_rs.items():
-                rec = Reservation.from_dict(v if isinstance(v, Mapping) else {})
-                if rec is not None:
-                    self.reservations[str(k)] = rec
-            self.ledger = [dict(x) for x in (payload.get("ledger") or []) if isinstance(x, Mapping)]
-            self.notes = [str(x) for x in (payload.get("notes") or [])]
-            # limits stay as constructed unless payload has them AND we haven't been given explicit ones
-            if isinstance(payload.get("limits"), Mapping):
-                # Keep original wall_deadline; do not extend limits.wall_sec on reload
-                loaded = BudgetLimits.from_dict(payload["limits"])
-                self.limits = loaded
+            self.ledger = []
+            self.notes = ["opened new Goal budget account"] if init_if_missing else []
+            if init_if_missing:
+                self._persist_unlocked()
+            return
+        raw = read_json_file(path)
+        self._load_into_unlocked(self._validate_payload(path, raw))
 
     @classmethod
     def open(
@@ -587,29 +630,22 @@ class GoalBudget:
         """Load existing Goal account or create. New task/run ids are not a new account."""
         gid = str(goal_id or "").strip() or "goal"
         root = Path(persist_dir)
-        key = (str(root.resolve()) if root.exists() else str(root), gid)
+        root.mkdir(parents=True, exist_ok=True)
+        key = (str(root.resolve()), gid)
         if use_cache:
             with _CACHE_MU:
                 hit = _CACHE.get(key)
                 if hit is not None:
                     return hit
         acc = cls(goal_id=gid, persist_dir=root, limits=limits)
-        path = persist_path(root, gid)
-        if path.is_file():
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                payload = None
-            if isinstance(payload, dict):
-                acc.load_into(payload)
-                acc.notes.append("loaded existing Goal budget; minting a new id does not reset")
-        else:
-            if limits is not None:
-                acc.limits = limits
-            acc.notes.append("opened new Goal budget account")
-            acc._persist_unlocked()
+        with persist_lock(root):
+            with acc._mu:
+                acc._reload_unlocked(init_if_missing=True)
         if use_cache:
             with _CACHE_MU:
+                hit = _CACHE.get(key)
+                if hit is not None:
+                    return hit
                 _CACHE[key] = acc
         return acc
 

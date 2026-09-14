@@ -12,14 +12,14 @@ Public kernel path only. No TeleAgent HTTP. No Hermes ledger. No glue rewrite.
 from __future__ import annotations
 
 import fnmatch
-import json
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 from framework.delegation import (
     REASON_AUTONOMY_DENIED as DELEGATION_AUTONOMY_DENIED,
@@ -28,6 +28,17 @@ from framework.delegation import (
     undeclared_autonomy,
 )
 from framework.lifecycle import TASK_STATES, LifecycleError, assert_transition
+from framework.models import CONTRACT_VERSION
+from framework.persist_lock import (
+    StoreIncompatibleError,
+    atomic_write_json,
+    check_contract_version,
+    classify_ledger_path,
+    persist_lock,
+    read_json_file,
+    require_json_object,
+    rmw_lock,
+)
 
 OWNERSHIP_DIRNAME = ".collab-goal-ownership"
 
@@ -490,13 +501,19 @@ class GoalOwnershipStore:
         self.history: list[dict[str, Any]] = []
         self.notes: list[str] = []
         self._mu = threading.RLock()
+        self._rmw_depth = 0
 
     @property
     def path(self) -> Path:
         return persist_path(self.persist_dir, self.goal_id)
 
+    @contextmanager
+    def _rmw(self, *, init_if_missing: bool = False) -> Iterator[None]:
+        with rmw_lock(self, self.persist_dir, init_if_missing=init_if_missing):
+            yield
+
     def current(self) -> GoalOwnership:
-        with self._mu:
+        with self._rmw():
             return GoalOwnership(
                 goal_id=self.ownership.goal_id,
                 coordinator_id=self.ownership.coordinator_id,
@@ -520,7 +537,7 @@ class GoalOwnershipStore:
             ver = int(ownership_version)
         except (TypeError, ValueError):
             return False, REASON_STALE_OWNERSHIP
-        with self._mu:
+        with self._rmw():
             own = self.ownership
             if not own.coordinator_id or int(own.version) <= 0:
                 return False, REASON_NO_OWNER
@@ -535,7 +552,7 @@ class GoalOwnershipStore:
     def set_autonomy(self, autonomy: Any) -> dict[str, Any]:
         """Store declared autonomy scope. Does not bump ownership version."""
         spec = normalize_autonomy(autonomy)
-        with self._mu:
+        with self._rmw():
             self.autonomy = spec
             self._persist_unlocked()
             return {"ok": True, "autonomy": dict(self.autonomy)}
@@ -557,7 +574,7 @@ class GoalOwnershipStore:
                 "error": "coordinator_id required",
                 "ownership": self.current().to_dict(),
             }
-        with self._mu:
+        with self._rmw():
             own = self.ownership
             if own.coordinator_id and own.version > 0:
                 if own.coordinator_id == cid:
@@ -648,7 +665,7 @@ class GoalOwnershipStore:
                 "ownership": self.current().to_dict(),
                 "bumped": False,
             }
-        with self._mu:
+        with self._rmw():
             own = self.ownership
             if not own.coordinator_id or own.version <= 0:
                 return {
@@ -752,7 +769,7 @@ class GoalOwnershipStore:
             created_at=now,
             status=STATUS_PROPOSED,
         )
-        with self._mu:
+        with self._rmw():
             ok, why = self.check_submitter(rec.coordinator_id, rec.ownership_version)
             if not ok:
                 rec.status = STATUS_REJECTED
@@ -833,7 +850,7 @@ class GoalOwnershipStore:
     ) -> dict[str, Any]:
         """Validate legality against live ownership, then commit the plan."""
         pid = str(proposal_id or "").strip()
-        with self._mu:
+        with self._rmw():
             rec = self.proposals.get(pid)
             if rec is None:
                 return {
@@ -1014,10 +1031,10 @@ class GoalOwnershipStore:
         return committed
 
     def to_dict(self) -> dict[str, Any]:
-        with self._mu:
+        with self._rmw():
             return {
                 "goal_id": self.goal_id,
-                "contract_version": "contract.v0.1-draft",
+                "contract_version": CONTRACT_VERSION,
                 "ownership": self.ownership.to_dict(),
                 "plan_revision": int(self.plan_revision),
                 "plan": dict(self.plan),
@@ -1032,51 +1049,82 @@ class GoalOwnershipStore:
 
     def _persist_unlocked(self) -> None:
         path = self.path
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {
-                "goal_id": self.goal_id,
-                "ownership": self.ownership.to_dict(),
-                "plan_revision": int(self.plan_revision),
-                "plan": dict(self.plan),
-                "goal_contract": dict(self.goal_contract),
-                "autonomy": dict(self.autonomy),
-                "proposals": {k: v.to_dict() for k, v in self.proposals.items()},
-                "history": list(self.history)[-200:],
-                "notes": list(self.notes)[-50:],
-            }
-            tmp = path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            tmp.replace(path)
-        except OSError as e:
-            self.notes.append(f"persist failed: {e}")
+        payload = {
+            "goal_id": self.goal_id,
+            "contract_version": CONTRACT_VERSION,
+            "ownership": self.ownership.to_dict(),
+            "plan_revision": int(self.plan_revision),
+            "plan": dict(self.plan),
+            "goal_contract": dict(self.goal_contract),
+            "autonomy": dict(self.autonomy),
+            "proposals": {k: v.to_dict() for k, v in self.proposals.items()},
+            "history": list(self.history)[-200:],
+            "notes": list(self.notes)[-50:],
+        }
+        atomic_write_json(path, payload)
 
     def persist(self) -> Path:
-        with self._mu:
+        with self._rmw():
             self._persist_unlocked()
             return self.path
 
+    def _load_into_unlocked(self, payload: Mapping[str, Any]) -> None:
+        own_raw = payload.get("ownership") if isinstance(payload.get("ownership"), Mapping) else payload
+        loaded = GoalOwnership.from_dict(own_raw if isinstance(own_raw, Mapping) else {})
+        if loaded.goal_id:
+            self.ownership = loaded
+            self.ownership.goal_id = self.goal_id
+        self.plan_revision = int(payload.get("plan_revision") or 0)
+        plan = payload.get("plan") if isinstance(payload.get("plan"), Mapping) else None
+        self.plan = dict(plan) if plan is not None else empty_plan(self.goal_id)
+        contract = payload.get("goal_contract") if isinstance(payload.get("goal_contract"), Mapping) else None
+        self.goal_contract = dict(contract) if contract is not None else extract_goal_contract(self.plan)
+        self.autonomy = normalize_autonomy(payload.get("autonomy"))
+        self.proposals = {}
+        raw = payload.get("proposals") if isinstance(payload.get("proposals"), Mapping) else {}
+        for k, v in raw.items():
+            rec = PlanRevisionProposal.from_dict(v if isinstance(v, Mapping) else {})
+            if rec is not None:
+                self.proposals[str(k)] = rec
+        self.history = [dict(x) for x in (payload.get("history") or []) if isinstance(x, Mapping)]
+        self.notes = [str(x) for x in (payload.get("notes") or [])]
+
     def load_into(self, payload: Mapping[str, Any]) -> None:
         with self._mu:
-            own_raw = payload.get("ownership") if isinstance(payload.get("ownership"), Mapping) else payload
-            loaded = GoalOwnership.from_dict(own_raw if isinstance(own_raw, Mapping) else {})
-            if loaded.goal_id:
-                self.ownership = loaded
-                self.ownership.goal_id = self.goal_id
-            self.plan_revision = int(payload.get("plan_revision") or 0)
-            plan = payload.get("plan") if isinstance(payload.get("plan"), Mapping) else None
-            self.plan = dict(plan) if plan is not None else empty_plan(self.goal_id)
-            contract = payload.get("goal_contract") if isinstance(payload.get("goal_contract"), Mapping) else None
-            self.goal_contract = dict(contract) if contract is not None else extract_goal_contract(self.plan)
-            self.autonomy = normalize_autonomy(payload.get("autonomy"))
+            self._load_into_unlocked(payload)
+
+    def _validate_payload(self, path: Path, raw: Any) -> dict[str, Any]:
+        payload = require_json_object(path, raw, what="goal ownership store")
+        check_contract_version(path, payload, supported={CONTRACT_VERSION})
+        if "ownership" in payload and not isinstance(payload.get("ownership"), Mapping):
+            raise StoreIncompatibleError(path, "ownership must be a JSON object")
+        if "plan" in payload and payload.get("plan") is not None and not isinstance(payload.get("plan"), Mapping):
+            raise StoreIncompatibleError(path, "plan must be a JSON object")
+        if "proposals" in payload and payload.get("proposals") is not None and not isinstance(
+            payload.get("proposals"), Mapping
+        ):
+            raise StoreIncompatibleError(path, "proposals must be a JSON object")
+        return payload
+
+    def _reload_unlocked(self, *, init_if_missing: bool = False) -> None:
+        path = self.path
+        kind = classify_ledger_path(path)
+        if kind == "incompatible":
+            raise StoreIncompatibleError(path, "goal ownership path exists but is not a file")
+        if kind == "missing":
+            self.ownership = GoalOwnership(goal_id=self.goal_id)
+            self.plan = empty_plan(self.goal_id)
+            self.plan_revision = 0
+            self.goal_contract = {}
+            self.autonomy = undeclared_autonomy()
             self.proposals = {}
-            raw = payload.get("proposals") if isinstance(payload.get("proposals"), Mapping) else {}
-            for k, v in raw.items():
-                rec = PlanRevisionProposal.from_dict(v if isinstance(v, Mapping) else {})
-                if rec is not None:
-                    self.proposals[str(k)] = rec
-            self.history = [dict(x) for x in (payload.get("history") or []) if isinstance(x, Mapping)]
-            self.notes = [str(x) for x in (payload.get("notes") or [])]
+            self.history = []
+            self.notes = ["opened empty Goal ownership"] if init_if_missing else []
+            if init_if_missing:
+                self._persist_unlocked()
+            return
+        raw = read_json_file(path)
+        self._load_into_unlocked(self._validate_payload(path, raw))
 
     @classmethod
     def open(
@@ -1088,27 +1136,22 @@ class GoalOwnershipStore:
     ) -> "GoalOwnershipStore":
         gid = str(goal_id or "").strip() or "goal"
         root = Path(persist_dir)
-        key = (str(root.resolve()) if root.exists() else str(root), gid)
+        root.mkdir(parents=True, exist_ok=True)
+        key = (str(root.resolve()), gid)
         if use_cache:
             with _CACHE_MU:
                 hit = _CACHE.get(key)
                 if hit is not None:
                     return hit
         store = cls(goal_id=gid, persist_dir=root)
-        path = persist_path(root, gid)
-        if path.is_file():
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                payload = None
-            if isinstance(payload, dict):
-                store.load_into(payload)
-                store.notes.append("loaded existing Goal ownership")
-        else:
-            store.notes.append("opened empty Goal ownership")
-            store._persist_unlocked()
+        with persist_lock(root):
+            with store._mu:
+                store._reload_unlocked(init_if_missing=True)
         if use_cache:
             with _CACHE_MU:
+                hit = _CACHE.get(key)
+                if hit is not None:
+                    return hit
                 _CACHE[key] = store
         return store
 
