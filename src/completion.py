@@ -163,6 +163,95 @@ class ReworkBudget:
 
 
 TERMINAL_FAIL_STATES = frozenset({"fail", "timeout", "cancelled", "cancel", "error"})
+SUCCESSFUL_FINISH = frozenset({"stop", "complete", "completed"})
+
+
+def finish_is_successful(finish: str | None) -> bool:
+    """Worker this-round finish is a successful stop (job_end physical gate)."""
+    return (finish or "").lower().strip() in SUCCESSFUL_FINISH
+
+
+def job_end_contract_close(
+    *,
+    artifacts_ok: bool,
+    missing: list[str] | None = None,
+    finish: str | None = None,
+    lead_verdict: str | None = None,
+    fingerprint_ok: bool = True,
+    lead_binding_ok: bool = True,
+    session_id: str = "",
+    run_id: str = "",
+    artifact_records: list | None = None,
+) -> dict:
+    """v0.3 stage2-k1: job_end must not fail when arts_ok and finish is successful.
+
+    Physical gate (all required artifacts present, missing=[], this-round
+    successful finish, stable fingerprints) is the contract. A lead model
+    verdict of fail is recorded as advisory and must not override the close.
+    Channel/binding failures and unstable fingerprints still fail.
+    """
+    missing_l = [str(m) for m in (missing or [])]
+    arts_ok = bool(artifacts_ok) and len(missing_l) == 0
+    fin_ok = finish_is_successful(finish)
+    lead = (lead_verdict or "").lower().strip()
+    lead_fail = lead not in ("", "pass")
+    recs = list(artifact_records or [])
+    evidence = {
+        "artifacts_ok": arts_ok,
+        "missing": missing_l,
+        "finish": finish,
+        "lead_verdict": lead_verdict or "",
+        "fingerprint_ok": bool(fingerprint_ok),
+        "lead_binding_ok": bool(lead_binding_ok),
+        "session_id": session_id or "",
+        "run_id": run_id or session_id or "",
+        "artifact_records": recs,
+    }
+    if not arts_ok:
+        return {
+            "ok": False,
+            "state": "fail",
+            "reason": "artifacts_incomplete",
+            "error": "artifacts_incomplete",
+            "lead_advisory": False,
+            **evidence,
+        }
+    if not fin_ok:
+        return {
+            "ok": False,
+            "state": "fail",
+            "reason": f"finish_not_successful:{finish}",
+            "error": f"finish_not_successful:{finish}",
+            "lead_advisory": False,
+            **evidence,
+        }
+    if not fingerprint_ok:
+        return {
+            "ok": False,
+            "state": "fail",
+            "reason": "artifact_fingerprint_changed",
+            "error": "artifact_fingerprint_changed",
+            "lead_advisory": False,
+            **evidence,
+        }
+    if not lead_binding_ok:
+        return {
+            "ok": False,
+            "state": "fail",
+            "reason": "lead_review_invalid",
+            "error": "lead_review_invalid",
+            "lead_advisory": False,
+            **evidence,
+        }
+    # Physical gate holds — contract success. Lead fail is advisory only.
+    return {
+        "ok": True,
+        "state": "ok",
+        "reason": "ok_lead_advisory" if lead_fail else "ok",
+        "error": "",
+        "lead_advisory": lead_fail,
+        **evidence,
+    }
 
 
 def is_success_allowed(
@@ -176,7 +265,9 @@ def is_success_allowed(
 ) -> tuple[bool, str]:
     """Strict success gate. Missing/error/timeout/cancel never succeed.
 
-    When force_lead_review, lead_verdict must be 'pass' and artifacts_ok.
+    When force_lead_review, lead_verdict must be 'pass' and artifacts_ok
+    unless job_end physical gate holds (arts_ok + successful finish): then
+    lead fail is advisory and must not block contract success (v0.3 s2-k1).
     Partial artifacts (any-of) are rejected by artifacts_ok=False.
     """
     st = (state or "").lower().strip()
@@ -190,6 +281,8 @@ def is_success_allowed(
         return False, "artifacts_incomplete"
     if force_lead_review:
         if (lead_verdict or "").lower() != "pass":
+            if finish_is_successful(finish):
+                return True, "ok_lead_advisory"
             return False, f"lead_verdict_required_pass got={lead_verdict!r}"
     return True, "ok"
 
@@ -282,6 +375,9 @@ __all__ = [
     "artifacts_unchanged",
     "expected_exists",
     "missing_artifacts",
+    "SUCCESSFUL_FINISH",
+    "finish_is_successful",
+    "job_end_contract_close",
     "is_success_allowed",
     "build_acceptance_packet",
     "confirm_artifacts_for_lead_approve",

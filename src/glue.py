@@ -751,6 +751,7 @@ def run_job(
         confirm_artifacts_for_lead_approve,
         format_acceptance_prompt,
         is_success_allowed,
+        job_end_contract_close,
         missing_artifacts,
         snapshot_artifacts,
     )
@@ -827,7 +828,9 @@ def run_job(
         except LeadDecisionError as e:
             report["notes"].append(f"lead review invalid ({e.code}): {e} → fail/safe-stop")
             report["grok_review_decision"] = "fail"
+            report["lead_review_invalid"] = True
             return "fail"
+        report["lead_review_invalid"] = False
         verdict = decision.get("verdict") or "fail"
         report["grok_review_decision"] = verdict
         # Reconfirm artifacts unchanged after lead returns (approve gate)
@@ -837,6 +840,53 @@ def run_job(
             report["notes"].append(f"artifacts changed during lead review: {gate2.get('diffs')}")
             return "fail"
         return verdict
+
+    def _fingerprint_ok() -> bool:
+        gate = report.get("artifact_gate")
+        if isinstance(gate, dict) and "unchanged" in gate and not gate.get("unchanged"):
+            return False
+        post = report.get("artifact_gate_post")
+        if isinstance(post, dict) and "unchanged" in post and not post.get("unchanged"):
+            return False
+        return True
+
+    def _apply_job_end_close(verdict: str | None) -> dict | None:
+        """If arts_ok + successful finish, close as contract success.
+
+        Lead fail is kept as grok_review_decision / lead_advisory, not ok=false.
+        Returns the report on close, or None if the physical gate does not hold.
+        """
+        arts_ok = _all_arts_ok()
+        missing = missing_artifacts(expected_artifacts)
+        fin = report.get("finish")
+        close = job_end_contract_close(
+            artifacts_ok=arts_ok,
+            missing=missing,
+            finish=fin,
+            lead_verdict=verdict,
+            fingerprint_ok=_fingerprint_ok(),
+            lead_binding_ok=not bool(report.get("lead_review_invalid")),
+            session_id=sid,
+            run_id=str(report.get("run_id") or sid),
+            artifact_records=report.get("artifact_records") or [],
+        )
+        report["job_end_contract"] = close
+        report["run_id"] = close.get("run_id") or sid
+        if not close.get("ok"):
+            return None
+        if close.get("lead_advisory"):
+            note = (
+                f"job_end: lead verdict={verdict} kept as advisory; "
+                f"contract success arts_ok=True missing={missing} finish={fin}"
+            )
+            report["notes"].append(note)
+            report["lead_advisory"] = {
+                "verdict": verdict,
+                "reason": (report.get("grok_review_raw") or "")[:1500],
+            }
+            # Physical close must not carry a leftover error string.
+            report["error"] = ""
+        return _mark_success(verdict)
 
     def _mark_success(verdict: str | None = None) -> dict:
         arts_ok = _all_arts_ok()
@@ -851,18 +901,46 @@ def run_job(
             report["rework_budget"] = budget.to_dict()
             _write_status(name, report)
             return report
+        # v0.3 s2-k1: arts_ok + successful finish must not fail solely on lead fail.
+        lead_for_gate = verdict if force_lead_review else (verdict or "pass")
+        leftover_error = report.get("error") or ""
+        # Do not let a prior "lead verdict=fail ..." string block the physical close.
+        if leftover_error.startswith("lead verdict=") and assistant_finish_successful(fin) and arts_ok:
+            leftover_error = ""
         ok, why = is_success_allowed(
             state="ok",
             artifacts_ok=arts_ok,
-            lead_verdict=verdict if force_lead_review else (verdict or "pass"),
+            lead_verdict=lead_for_gate,
             force_lead_review=force_lead_review,
             finish=fin,
-            error=report.get("error"),
+            error=leftover_error,
         )
         if ok:
             report["ok"] = True
             report["state"] = "ok"
             report["error"] = ""
+            report.setdefault("run_id", sid)
+            if why == "ok_lead_advisory" and not report.get("lead_advisory"):
+                report["notes"].append(
+                    f"job_end: lead verdict={verdict} kept as advisory; "
+                    f"contract success arts_ok=True finish={fin}"
+                )
+                report["lead_advisory"] = {
+                    "verdict": verdict,
+                    "reason": (report.get("grok_review_raw") or "")[:1500],
+                }
+            if "job_end_contract" not in report:
+                report["job_end_contract"] = job_end_contract_close(
+                    artifacts_ok=arts_ok,
+                    missing=missing_artifacts(expected_artifacts),
+                    finish=fin,
+                    lead_verdict=verdict,
+                    fingerprint_ok=_fingerprint_ok(),
+                    lead_binding_ok=not bool(report.get("lead_review_invalid")),
+                    session_id=sid,
+                    run_id=str(report.get("run_id") or sid),
+                    artifact_records=report.get("artifact_records") or [],
+                )
         else:
             report["ok"] = False
             report["state"] = "fail"
@@ -955,6 +1033,9 @@ def run_job(
         if need_review:
             report["path"] = "lead_review" if force_lead_review else report.get("path") or "lead_review"
             verdict = _do_lead_review(phase="review1")
+            closed = _apply_job_end_close(verdict)
+            if closed is not None:
+                return closed
             if verdict == "pass" and _all_arts_ok():
                 return _mark_success("pass")
             # rework under budget — wall deadline NEVER extended
@@ -1040,6 +1121,9 @@ def run_job(
                 _write_status(name, report)
                 return report
             verdict2 = _do_lead_review(phase="review2")
+            closed2 = _apply_job_end_close(verdict2)
+            if closed2 is not None:
+                return closed2
             if verdict2 == "pass" and _all_arts_ok():
                 return _mark_success("pass")
             report["ok"] = False
@@ -1082,14 +1166,19 @@ def _write_status(name: str, report: dict):
         "ok": report.get("ok", False),
         "state": report.get("state"),
         "session_id": report.get("session_id"),
+        "run_id": report.get("run_id") or report.get("session_id"),
+        "finish": report.get("finish"),
         "exit_code": None,
         "artifacts": report.get("artifacts", []),
+        "artifact_records": report.get("artifact_records") or [],
         "log_path": "",
         "pending_permissions": report.get("pending_summaries", []),
         "error": report.get("error", ""),
         "grok_permission_decision": report.get("grok_permission_decision"),
         "grok_review_decision": report.get("grok_review_decision"),
         "path": report.get("path"),
+        "job_end_contract": report.get("job_end_contract"),
+        "lead_advisory": report.get("lead_advisory"),
     }
     (COLLAB / f"status-{name}.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
 
