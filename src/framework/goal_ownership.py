@@ -11,7 +11,6 @@ Public kernel path only. No TeleAgent HTTP. No Hermes ledger. No glue rewrite.
 """
 from __future__ import annotations
 
-import fnmatch
 import threading
 import time
 import uuid
@@ -28,7 +27,12 @@ from framework.delegation import (
     undeclared_autonomy,
 )
 from framework.lifecycle import TASK_STATES, LifecycleError, assert_transition
-from framework.models import CONTRACT_VERSION
+from framework.models import CONTRACT_VERSION, contract_fingerprint
+from framework.path_scope import (
+    REASON_PATH_ESCAPE as PATH_SCOPE_ESCAPE,
+    allow_item_covered,
+    normalize_platform,
+)
 from framework.persist_lock import (
     StoreIncompatibleError,
     atomic_write_json,
@@ -56,6 +60,8 @@ REASON_STALE_PROPOSAL = "stale_proposal"
 REASON_UNKNOWN_PROPOSAL = "unknown_proposal"
 REASON_EMPTY_COORDINATOR = "empty_coordinator"
 REASON_CONTRACT_EXPANSION = "contract_expansion"
+REASON_PATH_ESCAPE = "path_escape"
+REASON_GATE_REMOVED = "required_gate_removed"
 REASON_AUTONOMY_DENIED = DELEGATION_AUTONOMY_DENIED
 
 # Plan documents must not rewrite kernel-owned identity.
@@ -63,14 +69,17 @@ _FORBIDDEN_PLAN_KEYS = frozenset(
     {"coordinator_id", "ownership_version", "ownership", "version"}
 )
 
-# Goal-contract auth/budget ceiling. Plan may tighten; expansion is refused.
-_ALLOW_KEYS = (
+# Range keys may shrink (exact / proven glob subset). Gate keys cannot shrink.
+# Plans inherit the Goal contract; they must not rewrite authorization to expand.
+_RANGE_KEYS = (
     "allow_secret_globs",
     "allow_paths",
     "allow_keys",
     "allowed_surfaces",
-    "user_gate_permissions",
 )
+_GATE_KEYS = ("user_gate_permissions",)
+_PATH_RANGE_KEYS = frozenset({"allow_paths", "allow_secret_globs"})
+_ALLOW_KEYS = _RANGE_KEYS + _GATE_KEYS
 _BUDGET_LIMIT_KEYS = (
     "wall_sec",
     "max_reworks",
@@ -179,64 +188,82 @@ def extract_goal_contract(src: Mapping[str, Any] | None) -> dict[str, Any]:
         elif k in nested and k not in b:
             b[k] = list(nested[k]) if isinstance(nested[k], list) else nested[k]
     if b:
+        plat = (
+            src.get("path_platform")
+            or nested.get("path_platform")
+            or b.get("path_platform")
+        )
+        if plat:
+            b["path_platform"] = normalize_platform(plat)
         contract["boundaries"] = b
+    elif src.get("path_platform") or nested.get("path_platform"):
+        contract["boundaries"] = {
+            "path_platform": normalize_platform(src.get("path_platform") or nested.get("path_platform"))
+        }
     return contract
 
 
-def _allow_item_covered(item: str, ceiling: list[str]) -> bool:
-    item_n = str(item or "").replace("\\", "/").strip()
-    if not item_n:
-        return True
-    for raw in ceiling:
-        c_n = str(raw or "").replace("\\", "/").strip()
-        if not c_n:
-            continue
-        if item_n == c_n:
-            return True
-        if c_n in ("/**", "**", "*"):
-            return True
-        if c_n.endswith("/**"):
-            prefix = c_n[:-3].rstrip("/")
-            if not prefix or item_n == prefix or item_n.startswith(prefix + "/"):
-                return True
-        try:
-            if fnmatch.fnmatch(item_n, c_n):
-                return True
-        except Exception:
-            pass
-        if c_n.endswith("/") and item_n.startswith(c_n):
-            return True
-        if item_n.startswith(c_n.rstrip("/") + "/"):
-            return True
-    return False
+PLATFORM_DEFAULT = "posix"
+
+
+def goal_contract_fingerprint(contract: Mapping[str, Any] | None) -> str:
+    extracted = extract_goal_contract(contract) if isinstance(contract, Mapping) else {}
+    return contract_fingerprint({"goal_contract": extracted})
+
+
+def contract_path_platform(contract: Mapping[str, Any] | None) -> str:
+    src = contract if isinstance(contract, Mapping) else {}
+    nested = src.get("boundaries") if isinstance(src.get("boundaries"), Mapping) else {}
+    raw = src.get("path_platform") or nested.get("path_platform") or PLATFORM_DEFAULT
+    return normalize_platform(raw)
+
+
+def _auth_sources(plan: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    out: list[Mapping[str, Any]] = []
+    if isinstance(plan, Mapping):
+        out.append(plan)
+        nested_goal = plan.get("goal") if isinstance(plan.get("goal"), Mapping) else None
+        if nested_goal is not None:
+            out.append(nested_goal)
+        for src in (plan, nested_goal):
+            if not isinstance(src, Mapping):
+                continue
+            bounds = src.get("boundaries") if isinstance(src.get("boundaries"), Mapping) else None
+            if bounds is not None:
+                out.append(bounds)
+            inputs = src.get("inputs") if isinstance(src.get("inputs"), Mapping) else None
+            if inputs is not None:
+                out.append(inputs)
+        tasks = plan.get("tasks") if isinstance(plan.get("tasks"), list) else []
+        for item in tasks:
+            if not isinstance(item, Mapping):
+                continue
+            out.append(item)
+            bounds = item.get("boundaries") if isinstance(item.get("boundaries"), Mapping) else None
+            if bounds is not None:
+                out.append(bounds)
+            inputs = item.get("inputs") if isinstance(item.get("inputs"), Mapping) else None
+            if inputs is not None:
+                out.append(inputs)
+    return out
 
 
 def _collect_allow_lists(plan: Mapping[str, Any]) -> dict[str, list[str]]:
-    found: dict[str, list[str]] = {k: [] for k in _ALLOW_KEYS}
-
-    def _extend(src: Mapping[str, Any] | None) -> None:
-        if not isinstance(src, Mapping):
-            return
-        for k in _ALLOW_KEYS:
+    found: dict[str, list[str]] = {k: [] for k in _RANGE_KEYS}
+    for src in _auth_sources(plan):
+        for k in _RANGE_KEYS:
             if k in src:
                 found[k].extend(_as_str_list(src.get(k)))
-        nested = src.get("boundaries") if isinstance(src.get("boundaries"), Mapping) else {}
-        for k in _ALLOW_KEYS:
-            if k in nested:
-                found[k].extend(_as_str_list(nested.get(k)))
-        inputs = src.get("inputs") if isinstance(src.get("inputs"), Mapping) else {}
-        for k in _ALLOW_KEYS:
-            if k in inputs:
-                found[k].extend(_as_str_list(inputs.get(k)))
-
-    _extend(plan)
-    nested_goal = plan.get("goal") if isinstance(plan.get("goal"), Mapping) else {}
-    _extend(nested_goal)
-    tasks = plan.get("tasks") if isinstance(plan.get("tasks"), list) else []
-    for item in tasks:
-        if isinstance(item, Mapping):
-            _extend(item)
     return found
+
+
+def _explicit_str_sets(plan: Mapping[str, Any], key: str) -> list[set[str]]:
+    """Each explicit mention of ``key`` (omission is inherit, not an empty set)."""
+    out: list[set[str]] = []
+    for src in _auth_sources(plan):
+        if key in src:
+            out.append(set(_as_str_list(src.get(key))))
+    return out
 
 
 def _check_contract_ceiling(
@@ -245,9 +272,11 @@ def _check_contract_ceiling(
 ) -> tuple[bool, str]:
     """Refuse plan revisions that expand Goal contract auth/budget.
 
-    Tightening (lower numeric caps, fewer/narrower allow_*, extra must/must_not)
-    is allowed. Introducing or widening budget / allow_* / boundaries is not.
-    Contract expansion stays a separate, currently unsupported path.
+    Plans inherit contract authorization. Omitted auth fields inherit.
+    Allow ranges may only shrink (proven subset; no string-prefix glob cheat).
+    Required gates (user_gate_permissions, must, must_not) cannot be reduced.
+    Path patterns are interpreted for the execution target platform; ``..``
+    escape is refused. Further per-field narrowing can open later once proven.
     """
     ceiling = ceiling if isinstance(ceiling, Mapping) else {}
     ceil_budget = ceiling.get("budget") if isinstance(ceiling.get("budget"), Mapping) else {}
@@ -278,20 +307,32 @@ def _check_contract_ceiling(
     plan_bounds = plan.get("boundaries") if isinstance(plan.get("boundaries"), Mapping) else None
     if plan_bounds is None and isinstance(nested.get("boundaries"), Mapping):
         plan_bounds = nested.get("boundaries")
-    if isinstance(plan_bounds, Mapping):
-        ceil_must = set(_as_str_list(ceil_bounds.get("must")))
-        new_must = set(_as_str_list(plan_bounds.get("must"))) if "must" in plan_bounds else ceil_must
-        if not ceil_must.issubset(new_must):
-            return False, "plan expands Goal contract boundaries (drops must)"
-        ceil_must_not = set(_as_str_list(ceil_bounds.get("must_not")))
-        new_must_not = (
-            set(_as_str_list(plan_bounds.get("must_not"))) if "must_not" in plan_bounds else ceil_must_not
-        )
-        if not ceil_must_not.issubset(new_must_not):
-            return False, "plan expands Goal contract boundaries (drops must_not)"
+    ceil_must = set(_as_str_list(ceil_bounds.get("must")))
+    ceil_must_not = set(_as_str_list(ceil_bounds.get("must_not")))
+    for src in _auth_sources(plan):
+        if "must" in src:
+            new_must = set(_as_str_list(src.get("must")))
+            if not ceil_must.issubset(new_must):
+                return False, f"{REASON_GATE_REMOVED}: plan drops must"
+        if "must_not" in src:
+            new_must_not = set(_as_str_list(src.get("must_not")))
+            if not ceil_must_not.issubset(new_must_not):
+                return False, f"{REASON_GATE_REMOVED}: plan drops must_not"
 
-    ceil_allow = {k: _as_str_list(ceil_bounds.get(k)) for k in _ALLOW_KEYS}
-    for k in _ALLOW_KEYS:
+    ceil_gates = {k: set(_as_str_list(ceil_bounds.get(k))) for k in _GATE_KEYS}
+    for k in _GATE_KEYS:
+        if k in ceiling:
+            extra = set(_as_str_list(ceiling.get(k)))
+            if extra:
+                ceil_gates[k] = extra
+        for mentioned in _explicit_str_sets(plan, k):
+            required = ceil_gates.get(k) or set()
+            if not required.issubset(mentioned):
+                return False, f"{REASON_GATE_REMOVED}: plan drops {k}"
+
+    plat = contract_path_platform(ceiling)
+    ceil_allow = {k: _as_str_list(ceil_bounds.get(k)) for k in _RANGE_KEYS}
+    for k in _RANGE_KEYS:
         if k in ceiling:
             ceil_allow[k] = _as_str_list(ceiling.get(k)) or ceil_allow[k]
     found_allow = _collect_allow_lists(plan)
@@ -307,9 +348,16 @@ def _check_contract_ceiling(
         ceiling_items = ceil_allow.get(k) or []
         if not ceiling_items:
             return False, f"plan expands Goal contract {k}"
+        path_like = k in _PATH_RANGE_KEYS
         for it in unique:
-            if not _allow_item_covered(it, ceiling_items):
-                return False, f"plan expands Goal contract {k}"
+            ok_item, why_item = allow_item_covered(
+                it, ceiling_items, platform=plat, path_like=path_like
+            )
+            if ok_item:
+                continue
+            if why_item == PATH_SCOPE_ESCAPE:
+                return False, f"{REASON_PATH_ESCAPE}: plan {k} escapes contract via .."
+            return False, f"plan expands Goal contract {k}"
     return True, REASON_READY
 
 
@@ -326,8 +374,10 @@ def validate_plan_revision(
 
     Ownership fields are kernel-owned. Task status changes must follow
     the public Task lifecycle. Active tasks cannot be dropped.
-    Plan revisions must not expand Goal contract auth/budget
-    (``budget``, ``allow_*``, ``boundaries``); tightening is allowed.
+    Plan revisions inherit Goal contract auth. They must not expand
+    ``budget`` / ``allow_*`` / ``boundaries``, drop required gates, or
+    smuggle path escape (``/safe/../outside/**``). Proven tightening of
+    numeric caps and extra must/must_not remains allowed.
     Declared autonomy (explicit plan vs bounded) is respected when set.
     """
     if not isinstance(plan, Mapping):
@@ -397,6 +447,81 @@ def validate_plan_revision(
     if not ok_auto:
         return False, why_auto
     return True, REASON_READY
+
+
+def check_contract_ceiling(
+    plan: Mapping[str, Any],
+    ceiling: Mapping[str, Any] | None,
+) -> tuple[bool, str]:
+    """Public wrapper: is ``plan`` within ``ceiling`` auth/budget?"""
+    return _check_contract_ceiling(plan, ceiling)
+
+
+def _reject_reason_for_plan_detail(detail: str) -> str:
+    text = str(detail or "")
+    if text == REASON_PATH_ESCAPE or text.startswith(f"{REASON_PATH_ESCAPE}:"):
+        return REASON_PATH_ESCAPE
+    if text == REASON_GATE_REMOVED or text.startswith(f"{REASON_GATE_REMOVED}:"):
+        return REASON_GATE_REMOVED
+    if "expands Goal contract" in text:
+        return REASON_CONTRACT_EXPANSION
+    if text == REASON_AUTONOMY_DENIED or "forbids" in text or "autonomy" in text:
+        return REASON_AUTONOMY_DENIED
+    return REASON_ILLEGAL_PLAN
+
+
+def merge_authorized_grant(
+    contract: Mapping[str, Any] | None,
+    grant: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Union grant ranges into a contract. Gates cannot be dropped."""
+    base = extract_goal_contract(contract) if isinstance(contract, Mapping) else {}
+    payload = grant if isinstance(grant, Mapping) else {}
+    extra = extract_goal_contract(payload)
+    if not extra and payload:
+        extra = extract_goal_contract({"boundaries": payload, "budget": payload.get("budget")})
+    out: dict[str, Any] = dict(base)
+    base_budget = dict(out.get("budget") or {}) if isinstance(out.get("budget"), Mapping) else {}
+    extra_budget = extra.get("budget") if isinstance(extra.get("budget"), Mapping) else {}
+    if extra_budget:
+        merged_budget = dict(base_budget)
+        for k, v in extra_budget.items():
+            merged_budget[k] = v
+        out["budget"] = merged_budget
+    base_bounds = dict(out.get("boundaries") or {}) if isinstance(out.get("boundaries"), Mapping) else {}
+    extra_bounds = extra.get("boundaries") if isinstance(extra.get("boundaries"), Mapping) else {}
+    if not extra_bounds and payload:
+        extra_bounds = {k: payload[k] for k in (*_RANGE_KEYS, *_GATE_KEYS, "must", "must_not") if k in payload}
+    merged_bounds = dict(base_bounds)
+    for k in _RANGE_KEYS:
+        existing = _as_str_list(merged_bounds.get(k))
+        added = _as_str_list(extra_bounds.get(k) if isinstance(extra_bounds, Mapping) else None)
+        for item in added:
+            if item not in existing:
+                existing.append(item)
+        if existing:
+            merged_bounds[k] = existing
+    for k in _GATE_KEYS:
+        existing = _as_str_list(merged_bounds.get(k))
+        added = _as_str_list(extra_bounds.get(k) if isinstance(extra_bounds, Mapping) else None)
+        for item in added:
+            if item not in existing:
+                existing.append(item)
+        if existing:
+            merged_bounds[k] = existing
+    if isinstance(extra_bounds, Mapping):
+        for k in ("must", "must_not"):
+            if k in extra_bounds:
+                existing = _as_str_list(merged_bounds.get(k))
+                for item in _as_str_list(extra_bounds.get(k)):
+                    if item not in existing:
+                        existing.append(item)
+                merged_bounds[k] = existing
+        if extra_bounds.get("path_platform"):
+            merged_bounds["path_platform"] = normalize_platform(extra_bounds.get("path_platform"))
+    if merged_bounds:
+        out["boundaries"] = merged_bounds
+    return out
 
 
 @dataclass
@@ -747,6 +872,29 @@ class GoalOwnershipStore:
             expected_version=expected_version,
         )
 
+    def apply_authorized_grant(self, grant: Mapping[str, Any] | None) -> dict[str, Any]:
+        """Apply an upper-authorized contract expansion. Not a plan revision."""
+        with self._rmw():
+            merged = merge_authorized_grant(self.goal_contract, grant)
+            self.goal_contract = merged
+            now = _utc_now()
+            self.history.append(
+                {
+                    "op": "authorized_grant",
+                    "at": now,
+                    "at_iso": _iso(now),
+                    "grant": dict(grant) if isinstance(grant, Mapping) else {},
+                }
+            )
+            self.notes.append("authorized_grant applied to goal_contract")
+            self._persist_unlocked()
+            return {
+                "ok": True,
+                "reason": REASON_READY,
+                "goal_contract": dict(self.goal_contract),
+                "contract_fingerprint": goal_contract_fingerprint(self.goal_contract),
+            }
+
     def propose_plan_revision(
         self,
         *,
@@ -800,12 +948,7 @@ class GoalOwnershipStore:
                 autonomy=self.autonomy,
             )
             if not legal:
-                if "expands Goal contract" in detail:
-                    reject = REASON_CONTRACT_EXPANSION
-                elif detail == REASON_AUTONOMY_DENIED or "forbids" in detail or "autonomy" in detail:
-                    reject = REASON_AUTONOMY_DENIED
-                else:
-                    reject = REASON_ILLEGAL_PLAN
+                reject = _reject_reason_for_plan_detail(detail)
                 rec.status = STATUS_REJECTED
                 rec.reject_reason = reject
                 rec.reason = rec.reason or detail
@@ -938,12 +1081,7 @@ class GoalOwnershipStore:
                 autonomy=self.autonomy,
             )
             if not legal:
-                if "expands Goal contract" in detail:
-                    reject = REASON_CONTRACT_EXPANSION
-                elif detail == REASON_AUTONOMY_DENIED or "forbids" in detail or "autonomy" in detail:
-                    reject = REASON_AUTONOMY_DENIED
-                else:
-                    reject = REASON_ILLEGAL_PLAN
+                reject = _reject_reason_for_plan_detail(detail)
                 rec.status = STATUS_REJECTED
                 rec.reject_reason = reject
                 self.history.append(

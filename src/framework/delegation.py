@@ -37,6 +37,49 @@ ESCALATE_KINDS = frozenset(
 EVENT_CLASS_STATUS = "status"
 EVENT_CLASS_DECISION = "decision_required"
 
+# Decision verdict classes. A non-empty string is not a legal decision.
+VERDICT_CLASS_ACK = "ack"
+VERDICT_CLASS_EVIDENCE = "need_evidence"
+VERDICT_CLASS_WITHDRAW = "withdraw"
+VERDICT_CLASS_DENY = "deny"
+VERDICT_CLASS_GRANT = "grant"
+VERDICT_CLASS_ALLOW = "allow"
+
+REASON_ILLEGAL_VERDICT = "illegal_verdict"
+REASON_SELF_GRANT_FORBIDDEN = "self_grant_forbidden"
+REASON_STALE_CONTRACT = "stale_contract"
+REASON_GRANT_EXCEEDS_AUTHORITY = "grant_exceeds_authority"
+REASON_EMPTY_GRANT = "empty_grant"
+REASON_STALE_DECISION_BINDING = "stale_decision_binding"
+
+_ACTION_VERDICTS = {
+    "allow": VERDICT_CLASS_ALLOW,
+    "once": VERDICT_CLASS_ALLOW,
+    "pass": VERDICT_CLASS_ALLOW,
+    "approve": VERDICT_CLASS_ALLOW,
+    "deny": VERDICT_CLASS_DENY,
+    "reject": VERDICT_CLASS_DENY,
+    "fail": VERDICT_CLASS_DENY,
+}
+
+_ESCALATE_VERDICTS = {
+    "ack": VERDICT_CLASS_ACK,
+    "acknowledge": VERDICT_CLASS_ACK,
+    "confirm_receipt": VERDICT_CLASS_ACK,
+    "confirmed": VERDICT_CLASS_ACK,
+    "ack_raise_budget": VERDICT_CLASS_ACK,
+    "need_evidence": VERDICT_CLASS_EVIDENCE,
+    "supplement_evidence": VERDICT_CLASS_EVIDENCE,
+    "more_evidence": VERDICT_CLASS_EVIDENCE,
+    "withdraw": VERDICT_CLASS_WITHDRAW,
+    "deny": VERDICT_CLASS_DENY,
+    "reject": VERDICT_CLASS_DENY,
+    "approve": VERDICT_CLASS_GRANT,
+    "grant": VERDICT_CLASS_GRANT,
+    "expand_auth": VERDICT_CLASS_GRANT,
+    "expand": VERDICT_CLASS_GRANT,
+}
+
 _AUTONOMY_ALIASES = {
     "explicit_plan": AUTONOMY_EXPLICIT_PLAN,
     "explicit": AUTONOMY_EXPLICIT_PLAN,
@@ -258,3 +301,17 @@ def event_class_for(*, kind: str = "", op: str = "", return_to_upper: bool = Fal
     if op == "open_decision" and is_escalate_kind(kind):
         return EVENT_CLASS_DECISION
     return EVENT_CLASS_STATUS
+
+
+def classify_verdict(verdict: Any, *, kind: str = "", return_to_upper: bool = False) -> str:
+    """Map a verdict string onto a class. Unknown → empty (illegal)."""
+    raw = _norm(verdict).lower().replace("-", "_").replace(" ", "_")
+    if not raw:
+        return ""
+    if is_escalate_kind(kind, return_to_upper=return_to_upper):
+        return _ESCALATE_VERDICTS.get(raw, "")
+    return _ACTION_VERDICTS.get(raw, "")
+
+
+def is_grant_verdict(verdict: Any, *, kind: str = "", return_to_upper: bool = False) -> bool:
+    return classify_verdict(verdict, kind=kind, return_to_upper=return_to_upper) == VERDICT_CLASS_GRANT

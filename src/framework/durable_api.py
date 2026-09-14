@@ -38,9 +38,17 @@ from framework.delegation import (
     KIND_ESCALATE_OUT_OF_SCOPE,
     KIND_ESCALATE_OVER_BUDGET,
     REASON_AUTONOMY_DENIED,
+    REASON_EMPTY_GRANT,
+    REASON_GRANT_EXCEEDS_AUTHORITY,
+    REASON_ILLEGAL_VERDICT,
+    REASON_SELF_GRANT_FORBIDDEN,
+    REASON_STALE_CONTRACT,
+    REASON_STALE_DECISION_BINDING,
     REASON_UNKNOWN_AUTONOMY,
     REASON_UNKNOWN_ESCALATE,
+    VERDICT_CLASS_GRANT,
     autonomy_is_known,
+    classify_verdict,
     event_class_for,
     is_escalate_kind,
     normalize_autonomy,
@@ -93,6 +101,12 @@ REASON_NOT_COORDINATOR = "not_coordinator"
 REASON_STALE_OWNERSHIP = "stale_ownership"
 REASON_ACTOR_NOT_AUTHORIZED = "actor_not_authorized"
 REASON_NO_OWNER = "no_owner"
+REASON_ILLEGAL_VERDICT = REASON_ILLEGAL_VERDICT
+REASON_SELF_GRANT_FORBIDDEN = REASON_SELF_GRANT_FORBIDDEN
+REASON_STALE_CONTRACT = REASON_STALE_CONTRACT
+REASON_GRANT_EXCEEDS_AUTHORITY = REASON_GRANT_EXCEEDS_AUTHORITY
+REASON_EMPTY_GRANT = REASON_EMPTY_GRANT
+REASON_STALE_DECISION_BINDING = REASON_STALE_DECISION_BINDING
 
 DECISION_KINDS = frozenset(
     {
@@ -414,6 +428,17 @@ def _ownership_projection(persist_root: str | Path, goal_id: str) -> dict[str, A
     }
 
 
+def _live_ownership(persist_root: str | Path, goal_id: str):
+    store = _ownership_store_if_present(persist_root, goal_id)
+    own = store.current() if store is not None else None
+    coordinator = ""
+    version = 0
+    if own is not None and own.coordinator_id and int(own.version) > 0:
+        coordinator = own.coordinator_id
+        version = int(own.version)
+    return store, own, coordinator, version
+
+
 def _authorize_resolve_actor(
     persist_root: str | Path,
     goal_id: str,
@@ -423,20 +448,26 @@ def _authorize_resolve_actor(
     decision_kind: str = "",
     return_to_upper: bool = False,
     submitter_id: str = "",
+    verdict_class: str = "",
 ) -> tuple[bool, str]:
-    """Bind resolve to a caller identity.
+    """Bind resolve to a caller identity and verdict class.
 
-    P0: if the Goal has a coordinator, actor must be that live instance.
-    P1 return-to-upper / escalate: the recorded submitter (upper) may resolve,
-    as may the live coordinator. Silent retry is not an authorization path.
+    Ordinary decisions: live coordinator (when the Goal has one).
+    Escalation ack / evidence / withdraw: recorded submitter or live coordinator.
+    Grant (approve expansion): submitter only; the local coordinator cannot
+    self-approve insufficient_auth or any other escalate grant.
     """
-    store = _ownership_store_if_present(persist_root, goal_id)
-    own = store.current() if store is not None else None
-    coordinator = ""
-    if own is not None and own.coordinator_id and int(own.version) > 0:
-        coordinator = own.coordinator_id
-
+    _store, own, coordinator, live_ver = _live_ownership(persist_root, goal_id)
     escalate = is_escalate_kind(decision_kind, return_to_upper=return_to_upper)
+    grant = verdict_class == VERDICT_CLASS_GRANT
+
+    if grant and escalate:
+        if coordinator and actor_id == coordinator:
+            return False, REASON_SELF_GRANT_FORBIDDEN
+        if not _norm_key(submitter_id) or actor_id != _norm_key(submitter_id):
+            return False, REASON_ACTOR_NOT_AUTHORIZED
+        return True, REASON_READY
+
     if escalate:
         allowed = {x for x in (_norm_key(submitter_id), _norm_key(coordinator)) if x}
         if not allowed:
@@ -452,7 +483,7 @@ def _authorize_resolve_actor(
                 return False, REASON_STALE_OWNERSHIP
         return True, REASON_READY
 
-    if store is None or not coordinator:
+    if _store is None or not coordinator:
         return True, REASON_READY
     if actor_id != coordinator:
         return False, REASON_NOT_COORDINATOR
@@ -462,9 +493,137 @@ def _authorize_resolve_actor(
         ver = int(ownership_version)
     except (TypeError, ValueError):
         return False, REASON_STALE_OWNERSHIP
-    if own is not None and ver != int(own.version):
+    if live_ver and ver != live_ver:
         return False, REASON_STALE_OWNERSHIP
     return True, REASON_READY
+
+
+def _snap_contract_payload(snap: Mapping[str, Any] | None) -> dict[str, Any]:
+    from framework.goal_ownership import extract_goal_contract
+
+    snap = snap if isinstance(snap, Mapping) else {}
+    body = snap.get("goal") if isinstance(snap.get("goal"), Mapping) else snap
+    extracted = extract_goal_contract(body)
+    return extracted
+
+
+def _snap_contract_fingerprint(snap: Mapping[str, Any] | None) -> str:
+    from framework.goal_ownership import goal_contract_fingerprint
+
+    return goal_contract_fingerprint(_snap_contract_payload(snap))
+
+
+def _grant_scope_from(
+    extra_map: Mapping[str, Any],
+    target: Mapping[str, Any],
+) -> dict[str, Any]:
+    extra_map = extra_map if isinstance(extra_map, Mapping) else {}
+    grant = extra_map.get("grant") if extra_map.get("grant") is not None else extra_map.get("granted")
+    if isinstance(grant, Mapping):
+        return dict(grant)
+    details = target.get("details") if isinstance(target.get("details"), Mapping) else {}
+    for key in ("requested", "grant", "granted", "requested_auth"):
+        raw = details.get(key) if isinstance(details, Mapping) else None
+        if isinstance(raw, Mapping) and raw:
+            return dict(raw)
+    # Bare details that already look like an auth payload.
+    if isinstance(details, Mapping) and any(
+        k in details
+        for k in (
+            "allow_paths",
+            "allow_secret_globs",
+            "allow_keys",
+            "allowed_surfaces",
+            "user_gate_permissions",
+            "budget",
+            "boundaries",
+        )
+    ):
+        return dict(details)
+    return {}
+
+
+def _grant_as_plan(grant: Mapping[str, Any]) -> dict[str, Any]:
+    src = dict(grant) if isinstance(grant, Mapping) else {}
+    plan: dict[str, Any] = {"tasks": []}
+    if isinstance(src.get("budget"), Mapping):
+        plan["budget"] = dict(src["budget"])
+    elif any(k in src for k in ("wall_sec", "max_reworks", "max_lead_calls", "max_attempts", "max_usage")):
+        plan["budget"] = {
+            k: src[k]
+            for k in ("wall_sec", "max_reworks", "max_lead_calls", "max_attempts", "max_usage")
+            if k in src
+        }
+    bounds: dict[str, Any] = {}
+    nested = src.get("boundaries") if isinstance(src.get("boundaries"), Mapping) else {}
+    if nested:
+        bounds.update(dict(nested))
+    for k in (
+        "allow_paths",
+        "allow_secret_globs",
+        "allow_keys",
+        "allowed_surfaces",
+        "user_gate_permissions",
+        "must",
+        "must_not",
+        "path_platform",
+    ):
+        if k in src:
+            bounds[k] = src[k]
+    if bounds:
+        plan["boundaries"] = bounds
+    return plan
+
+
+def _pause_task_for_decision(snap: dict[str, Any], task_id: str, decision_id: str) -> None:
+    tid = _norm_key(task_id)
+    if not tid:
+        return
+    tasks = [dict(t) for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
+    changed = False
+    for t in tasks:
+        if t.get("task_id") != tid:
+            continue
+        st = _norm_key(t.get("status") or "queued") or "queued"
+        if st == "running":
+            try:
+                assert_transition("task", st, "awaiting_decision")
+            except LifecycleError:
+                return
+            t["status"] = "awaiting_decision"
+            t["blocked_on_decision"] = decision_id
+            changed = True
+        elif st == "awaiting_decision":
+            t["blocked_on_decision"] = t.get("blocked_on_decision") or decision_id
+            changed = True
+        break
+    if changed:
+        snap["tasks"] = tasks
+
+
+def _resume_task_after_grant(snap: dict[str, Any], task_id: str, decision_id: str) -> bool:
+    tid = _norm_key(task_id)
+    if not tid:
+        return False
+    tasks = [dict(t) for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
+    resumed = False
+    for t in tasks:
+        if t.get("task_id") != tid:
+            continue
+        st = _norm_key(t.get("status") or "") or ""
+        blocked = _norm_key(t.get("blocked_on_decision"))
+        if st == "awaiting_decision" and (not blocked or blocked == _norm_key(decision_id)):
+            try:
+                assert_transition("task", st, "running")
+            except LifecycleError:
+                return False
+            t["status"] = "running"
+            t.pop("blocked_on_decision", None)
+            resumed = True
+        break
+    if resumed:
+        snap["tasks"] = tasks
+    return resumed
 
 
 def _default_goal_body(
@@ -566,6 +725,7 @@ def _empty_snapshot(*, goal_id: str, submit_key: str, goal: Mapping[str, Any]) -
         "notes": [],
         "submitter_id": "",
         "external_goal_ref": "",
+        "submitter_authority": {},
         "autonomy": undeclared_autonomy(),
         "created_at": now,
         "created_at_iso": _iso(now),
@@ -586,6 +746,7 @@ def _delegation_fields_from(
     external_goal_ref: str = "",
     autonomy: Any = None,
     coordinator_id: str = "",
+    submitter_authority: Any = None,
 ) -> dict[str, Any]:
     extra = extra if isinstance(extra, Mapping) else {}
     src = goal if isinstance(goal, Mapping) else {}
@@ -620,11 +781,21 @@ def _delegation_fields_from(
         or src.get("coordinator_id")
         or hints.get("coordinator")
     )
+    raw_auth = submitter_authority
+    if raw_auth is None:
+        raw_auth = extra.get("submitter_authority")
+    if raw_auth is None:
+        raw_auth = extra.get("upper_authority")
+    if raw_auth is None:
+        raw_auth = src.get("submitter_authority")
+    if raw_auth is None:
+        raw_auth = src.get("upper_authority")
     return {
         "submitter_id": sid,
         "external_goal_ref": xref,
         "autonomy": raw_auto,
         "coordinator_id": cid,
+        "submitter_authority": raw_auth,
     }
 
 
@@ -755,6 +926,8 @@ class DurableLayer:
         out["notes"] = list(snap.get("notes") or [])
         if isinstance(snap.get("autonomy"), Mapping):
             out["autonomy"] = dict(snap.get("autonomy") or {})
+        if isinstance(snap.get("submitter_authority"), Mapping):
+            out["submitter_authority"] = dict(snap.get("submitter_authority") or {})
         return out
 
     def _touch(self, snap: dict[str, Any], *, now: float | None = None) -> None:
@@ -799,6 +972,7 @@ class DurableLayer:
         external_goal_ref: str = "",
         autonomy: Any = None,
         coordinator_id: str = "",
+        submitter_authority: Any = None,
     ) -> dict[str, Any]:
         """Open a Goal, or return the existing one for this submit key.
 
@@ -841,6 +1015,7 @@ class DurableLayer:
             external_goal_ref=external_goal_ref,
             autonomy=autonomy,
             coordinator_id=coordinator_id,
+            submitter_authority=submitter_authority,
         )
         spec = normalize_autonomy(fields["autonomy"])
         if spec.get("unknown"):
@@ -916,6 +1091,18 @@ class DurableLayer:
             snap["submitter_id"] = fields["submitter_id"]
             snap["external_goal_ref"] = fields["external_goal_ref"]
             snap["autonomy"] = spec
+            from framework.goal_ownership import extract_goal_contract
+
+            raw_auth = fields.get("submitter_authority")
+            if isinstance(raw_auth, Mapping) and raw_auth:
+                extracted_auth = extract_goal_contract(raw_auth)
+                if not extracted_auth:
+                    extracted_auth = extract_goal_contract(
+                        {"boundaries": raw_auth, "budget": raw_auth.get("budget") if isinstance(raw_auth.get("budget"), Mapping) else {}}
+                    )
+                snap["submitter_authority"] = extracted_auth or dict(raw_auth)
+            else:
+                snap["submitter_authority"] = extract_goal_contract(body) or {}
             child_tasks: list[dict[str, Any]] = []
             for item in tasks or []:
                 if isinstance(item, Mapping):
@@ -1155,6 +1342,7 @@ class DurableLayer:
                     row.setdefault("request_id", rid)
                     related.append(row)
             to_upper = bool(return_to_upper) or is_escalate_kind(knd)
+            _store, _own, coordinator, own_ver = _live_ownership(self.persist_root, gid)
             rec = {
                 "contract_version": CONTRACT_VERSION,
                 "decision_id": did,
@@ -1174,7 +1362,21 @@ class DurableLayer:
                 "silent_retry": False if to_upper else None,
                 "event_class": EVENT_CLASS_DECISION if to_upper else EVENT_CLASS_STATUS,
                 "details": dict(details) if isinstance(details, Mapping) else {},
+                "grant_applied": False,
+                "task_resumed": False,
+                "binding": {
+                    "decision_id": did,
+                    "goal_id": gid,
+                    "kind": knd,
+                    "contract_version": CONTRACT_VERSION,
+                    "contract_fingerprint": _snap_contract_fingerprint(snap),
+                    "ownership_version": own_ver,
+                    "coordinator_id": coordinator,
+                    "submitter_id": _norm_key(snap.get("submitter_id")),
+                },
             }
+            if to_upper:
+                _pause_task_for_decision(snap, task_id, did)
             pending = [dict(d) for d in (snap.get("pending_decisions") or []) if isinstance(d, Mapping)]
             pending.append(rec)
             snap["pending_decisions"] = pending
@@ -1204,10 +1406,11 @@ class DurableLayer:
     ) -> dict[str, Any]:
         """Resolve exactly one pending decision. Unrelated batches are refused.
 
-        ``actor_id`` is required. If the Goal has a coordinator, the actor
-        must be that coordinator (optional ``ownership_version`` must match
-        when supplied). The actor is recorded on the resolution; this is not
-        identity/memory promotion.
+        ``actor_id`` is required. Verdicts are classified: ack / evidence /
+        withdraw vs grant (approve expansion). A non-empty string is not an
+        arbitrary legal decision. Local coordinators cannot grant their own
+        ``insufficient_auth``. Grants bind contract version and decision
+        object; stale contract / stale owner / duplicates do not resume tasks.
         """
         gid = _norm_key(goal_id)
         extra_map: dict[str, Any] = dict(extra) if isinstance(extra, Mapping) else {}
@@ -1230,6 +1433,10 @@ class DurableLayer:
         extra_map.pop("actor", None)
         extra_map.pop("ownership_version", None)
         extra_map.pop("ownership_ver", None)
+        caller_cv = extra_map.pop("contract_version", None)
+        if caller_cv is None:
+            caller_cv = extra_map.pop("contract_ver", None)
+        caller_fp = extra_map.pop("contract_fingerprint", None)
         if not actor:
             return {
                 "ok": False,
@@ -1284,12 +1491,15 @@ class DurableLayer:
                         if (did and d.get("decision_id") == did) or (
                             rid and (d.get("request_id") == rid or d.get("decision_id") == rid)
                         ):
+                            # Duplicate decide: do not re-apply grant or resume.
                             return {
                                 "ok": True,
                                 "reason": REASON_ALREADY_RESOLVED,
                                 "idempotent": True,
                                 "goal_id": gid,
                                 "decision": dict(d),
+                                "task_resumed": False,
+                                "grant_applied": False,
                             }
                     return {
                         "ok": False,
@@ -1314,27 +1524,120 @@ class DurableLayer:
                         "pending_count": len(pending),
                     }
                 target = pending[0]
+            kind = str(target.get("kind") or "")
+            to_upper = bool(target.get("return_to_upper"))
+            vclass = classify_verdict(vdict, kind=kind, return_to_upper=to_upper)
+            if not vclass:
+                return {
+                    "ok": False,
+                    "reason": REASON_ILLEGAL_VERDICT,
+                    "error": f"verdict {vdict!r} is not a legal decision for kind {kind!r}",
+                    "goal_id": gid,
+                    "actor_id": actor,
+                    "pending_count": len(pending),
+                }
+            grant = vclass == VERDICT_CLASS_GRANT
+            binding = target.get("binding") if isinstance(target.get("binding"), Mapping) else {}
+            live_fp = _snap_contract_fingerprint(snap)
+            bound_fp = _norm_key(binding.get("contract_fingerprint"))
+            bound_cv = _norm_key(binding.get("contract_version")) or CONTRACT_VERSION
+            bound_did = _norm_key(binding.get("decision_id")) or _norm_key(target.get("decision_id"))
+            if did and bound_did and did != bound_did:
+                return {
+                    "ok": False,
+                    "reason": REASON_STALE_DECISION_BINDING,
+                    "error": "decision object mismatch",
+                    "goal_id": gid,
+                    "actor_id": actor,
+                    "pending_count": len(pending),
+                }
+            if grant:
+                caller_cv_n = _norm_key(caller_cv)
+                caller_fp_n = _norm_key(caller_fp)
+                if caller_cv_n and caller_cv_n != bound_cv:
+                    return {
+                        "ok": False,
+                        "reason": REASON_STALE_CONTRACT,
+                        "error": "grant bound to a different contract_version",
+                        "goal_id": gid,
+                        "actor_id": actor,
+                        "pending_count": len(pending),
+                    }
+                if bound_fp and live_fp and bound_fp != live_fp:
+                    return {
+                        "ok": False,
+                        "reason": REASON_STALE_CONTRACT,
+                        "error": "goal contract changed since this decision was opened",
+                        "goal_id": gid,
+                        "actor_id": actor,
+                        "pending_count": len(pending),
+                    }
+                if caller_fp_n and bound_fp and caller_fp_n != bound_fp:
+                    return {
+                        "ok": False,
+                        "reason": REASON_STALE_CONTRACT,
+                        "error": "grant contract_fingerprint mismatch",
+                        "goal_id": gid,
+                        "actor_id": actor,
+                        "pending_count": len(pending),
+                    }
+                # Ownership binding applies to the coordinator identity. Upper
+                # (submitter) may still grant after a local handoff. An expired
+                # coordinator is refused later by _authorize_resolve_actor.
             authed, auth_why = _authorize_resolve_actor(
                 self.persist_root,
                 gid,
                 actor_id=actor,
                 ownership_version=own_ver,
-                decision_kind=str(target.get("kind") or ""),
-                return_to_upper=bool(target.get("return_to_upper")),
+                decision_kind=kind,
+                return_to_upper=to_upper,
                 submitter_id=_norm_key(snap.get("submitter_id")),
+                verdict_class=vclass,
             )
             if not authed:
+                err = "stale ownership instance; resolve refused"
+                if auth_why == REASON_SELF_GRANT_FORBIDDEN:
+                    err = "local coordinator cannot grant authority expansion"
+                elif auth_why == REASON_STALE_OWNERSHIP:
+                    err = "stale ownership instance; resolve refused"
+                else:
+                    err = f"actor {actor!r} is not authorized to resolve"
                 return {
                     "ok": False,
                     "reason": auth_why,
-                    "error": (
-                        "stale ownership instance; resolve refused"
-                        if auth_why == REASON_STALE_OWNERSHIP
-                        else f"actor {actor!r} is not authorized to resolve"
-                    ),
+                    "error": err,
                     "goal_id": gid,
                     "actor_id": actor,
+                    "pending_count": len(pending),
                 }
+            grant_payload: dict[str, Any] = {}
+            if grant:
+                from framework.goal_ownership import check_contract_ceiling, extract_goal_contract
+
+                grant_payload = _grant_scope_from(extra_map, target)
+                if kind == KIND_ESCALATE_INSUFFICIENT_AUTH and not grant_payload:
+                    return {
+                        "ok": False,
+                        "reason": REASON_EMPTY_GRANT,
+                        "error": "approve expansion requires an explicit grant scope",
+                        "goal_id": gid,
+                        "actor_id": actor,
+                        "pending_count": len(pending),
+                    }
+                if grant_payload:
+                    authority = snap.get("submitter_authority") if isinstance(snap.get("submitter_authority"), Mapping) else {}
+                    if not authority:
+                        authority = extract_goal_contract(snap.get("goal") if isinstance(snap.get("goal"), Mapping) else {})
+                    ok_grant, why_grant = check_contract_ceiling(_grant_as_plan(grant_payload), authority)
+                    if not ok_grant:
+                        return {
+                            "ok": False,
+                            "reason": REASON_GRANT_EXCEEDS_AUTHORITY,
+                            "error": why_grant,
+                            "goal_id": gid,
+                            "actor_id": actor,
+                            "pending_count": len(pending),
+                        }
             # Related actions must share this decision's id.
             target_ids = {_norm_key(target.get("decision_id")), _norm_key(target.get("request_id"))} - {""}
             for item in action_list:
@@ -1346,10 +1649,38 @@ class DurableLayer:
                         "error": "resolve_decision accepts exactly one pending decision; unrelated batch refused",
                         "goal_id": gid,
                     }
+            resumed = False
+            grant_applied = False
+            if grant and grant_payload:
+                from framework.goal_ownership import merge_authorized_grant
+
+                body = dict(snap.get("goal") or {})
+                merged = merge_authorized_grant(body, grant_payload)
+                if isinstance(merged.get("boundaries"), Mapping):
+                    bounds = dict(body.get("boundaries") or {})
+                    bounds.update(merged["boundaries"])
+                    body["boundaries"] = bounds
+                if isinstance(merged.get("budget"), Mapping):
+                    budget = dict(body.get("budget") or {})
+                    budget.update(merged["budget"])
+                    body["budget"] = budget
+                snap["goal"] = body
+                store = _ownership_store_if_present(self.persist_root, gid)
+                if store is not None:
+                    store.apply_authorized_grant(grant_payload)
+                grant_applied = True
+                resumed = _resume_task_after_grant(
+                    snap, str(target.get("task_id") or ""), str(target.get("decision_id") or "")
+                )
             target["status"] = STATUS_RESOLVED
             target["verdict"] = vdict
+            target["verdict_class"] = vclass
             target["reason"] = rsn or "resolved"
             target["actor_id"] = actor
+            target["grant_applied"] = grant_applied
+            target["task_resumed"] = resumed
+            if grant_payload:
+                target["granted"] = dict(grant_payload)
             if own_ver is not None and own_ver != "":
                 try:
                     target["ownership_version"] = int(own_ver)
@@ -1368,7 +1699,10 @@ class DurableLayer:
                 "resolve_decision",
                 decision_id=target.get("decision_id"),
                 verdict=vdict,
+                verdict_class=vclass,
                 actor_id=actor,
+                grant_applied=grant_applied,
+                task_resumed=resumed,
             )
             self._touch(snap)
             self._persist_unlocked()
@@ -1379,6 +1713,8 @@ class DurableLayer:
                 "goal_id": gid,
                 "decision": dict(target),
                 "pending_count": len(remaining),
+                "grant_applied": grant_applied,
+                "task_resumed": resumed,
             }
 
     def escalate_to_upper(
