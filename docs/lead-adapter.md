@@ -12,10 +12,10 @@
 | `src/lead_adapter/inprocess.py` | 当前 Codex/对话当组长：目录协议 `pending/` + `decisions/`，或 `decision_fn` 进程内回调 |
 | `src/lead_adapter/claude_code.py` | **待办 stub**：`call_failed`，禁止假 PASS |
 | `src/lead_adapter/codex_cli.py` | **待办 stub**：独立 Codex CLI 进程；`codex` 别名仍→inprocess |
-| `src/lead_adapter/deepseek_harness.py` | DeepSeek harness：**JSON-in/JSON-out 包装**；**真 harness 未接线验收** |
+| `src/lead_adapter/deepseek_harness.py` | DeepSeek harness：**JSON-in/JSON-out 包装**；包装内调 `dsh --profile headless` |
 | 工厂 | `get_lead_adapter(kind=...)`；`COLLAB_LEAD_ADAPTER=grok_cli\|inprocess\|claude_code\|codex_cli\|deepseek_harness`（`deepseek` 为别名） |
 | `bin/run-live-grok-lead.py` | 真机：创建→权限→GrokCLI→继续→验收 |
-| `bin/run-deepseek-lead.py` | DeepSeek 示例包装（stdin / `--request-file`）；无真 harness 时 fail-closed |
+| `bin/run-deepseek-lead.py` | DeepSeek 包装（stdin / `--request-file`）→ `dsh --profile headless`；无 bin/key 时 fail-closed |
 
 ## 请求（每次决策自包含）
 
@@ -63,7 +63,7 @@ export COLLAB_LEAD_EXCHANGE=/path/to/exchange
 
 `src/test_p1_completion_lead.py`（simulated）：绑定校验、inprocess 文件协议、无 disallowed-tools 降级、并行 `force_lead_review`。
 
-`src/test_deepseek_harness_lead.py`（simulated）：`deepseek_harness` 工厂别名、合法 once/pass、非法 JSON / 超时 / spawn 失败 / `application_id` 不匹配 fail-closed；示例包装未接线验收。
+`src/test_deepseek_harness_lead.py`（simulated）：`deepseek_harness` 工厂别名、合法 once/pass、非法 JSON / 超时 / spawn 失败 / `application_id` 不匹配 fail-closed；包装 mock `dsh --profile headless` 成功/失败路径。真 dsh+key 的 smoke 默认 skip。
 
 
 ## Live Grok echo reliability
@@ -78,20 +78,25 @@ Do not loosen `validate_lead_decision`: empty `application_id` is `application_i
 - 对话当组长继续用 `inprocess`（`COLLAB_LEAD_ADAPTER=inprocess` 或历史别名 `codex`）。
 - 真机回归集：Grok 见 `bin/run-live-grok-lead.py`；Claude/Codex CLI 接线后替换 stub。
 
-## DeepSeek harness（**真 harness 未接线验收**）
+## DeepSeek harness（`dsh --profile headless`）
 
-适配器 `deepseek_harness`（别名 `deepseek`）与 `grok_cli` 同构：一次 spawn、走 `build_lead_request` / `pin_lead_response_schema` / `validate_lead_decision`，非法 JSON / 超时 / spawn 失败 → `call_failed` 或保持待决。**禁止**假 `once`/`pass`，**禁止**「去掉工具限制再重试」。
+适配器 `deepseek_harness`（别名 `deepseek`）与 `grok_cli` 同构：一次 spawn、走 `build_lead_request` / `pin_lead_response_schema` / `validate_lead_decision`，非法 JSON / 超时 / spawn 失败 → `call_failed` 或保持待决。**禁止**假 `once`/`pass`，**禁止**「去掉工具限制再重试」。**不要把 `dsh` 当 TeleAgent 工人。**
 
-DeepSeek harness 的真实 CLI argv / 线上 API **未接线**。调用面是 `COLLAB_LEAD_BIN` 指向的可执行包装：stdin（默认）或 `--request-file` 换 JSON 信封（含完整 request + 钉死的 schema + prompt），stdout 必须是回绑 `application_id`（建议同时回绑 `context_summary`）的决策对象。
+调用面仍是 `COLLAB_LEAD_BIN` 指向的可执行包装：stdin（默认）或 `--request-file` 换 JSON 信封（含完整 request + 钉死的 schema + prompt）。包装在有 harness bin 与 key 时调用公网 `dsh` headless，stdout 必须是回绑 `application_id`（建议同时回绑 `context_summary`）的 **collab-lead-v1 决策 JSON**。
+
+`dsh` 默认 stdout = 终答文本（exit 0/1）。`--json` 是事件流，**不是** lead schema；包装不传 `--json`。从 stdout 取**最后一个**合法 JSON 对象，再按 schema / `validate_lead_decision` 检查（至少 `application_id` 字节级回绑、`decision`/`verdict` 合法集）。validate 失败或 dsh 非 0 → 包装 **exit 2**，stdout **禁止**假 `once`/`pass`。
+
+Lead 提示禁止 bash / 写文件 / 任何改仓库的工具，只出 JSON。包装把 dsh 的 cwd 放到临时目录，避免工具落到本仓或 job workdir。
 
 ```bash
-export COLLAB_LEAD_ADAPTER=deepseek_harness   # 或 deepseek
-export COLLAB_LEAD_BIN=/workspace/teleagent-collab/bin/run-deepseek-lead.py
-# 若环境里已有 grok 的 COLLAB_LEAD_BIN，请改成此包装，或：
-# export COLLAB_DEEPSEEK_LEAD_BIN=/path/to/wrapper   # 优先于 COLLAB_LEAD_BIN
-# export COLLAB_DEEPSEEK_IO=stdin    # 或 file
+export COLLAB_LEAD_ADAPTER=deepseek_harness
+export COLLAB_LEAD_BIN=.../bin/run-deepseek-lead.py
+export COLLAB_DEEPSEEK_HARNESS_BIN=dsh   # 或 npx 包装
+export DEEPSEEK_API_KEY=...
 ```
 
-`bin/run-deepseek-lead.py` 是示例包装：读信封、拒绝猜测 DeepSeek CLI 参数或 POST 线上 API；即便设置了 `COLLAB_DEEPSEEK_HARNESS_BIN` 也 **fail-closed**（exit 2，stdout 不写 `once`/`pass`）。接线真 harness 时替换该包装，保持 JSON-in/JSON-out 与 `application_id` 回绑，不要改 glue 主路径。
+安装：`npx @deepseek-ai/dsh` 或全局/源码。headless：`dsh --profile headless "task"`（省略任务或任务为 `-` 时从 stdin 读；包装走 stdin `-`）。
 
-测例：`src/test_deepseek_harness_lead.py`（模拟合法 once/pass、非法 JSON、超时/spawn 失败、application_id 不匹配）。不把 mock 当真实 DeepSeek 验收。
+无 `COLLAB_DEEPSEEK_HARNESS_BIN` 且 PATH 无 `dsh`、或无 `DEEPSEEK_API_KEY` 时 **fail-closed**（exit 2），stderr 写清缺的是 bin 还是 key。不要 POST `api.deepseek.com`。若环境里已有 grok 的 `COLLAB_LEAD_BIN`，改成此包装，或设 `COLLAB_DEEPSEEK_LEAD_BIN`（优先于 `COLLAB_LEAD_BIN`）。`COLLAB_DEEPSEEK_IO=stdin|file` 仍可用。
+
+测例：`src/test_deepseek_harness_lead.py`（mock subprocess：合法 once/pass、dsh 非 0、非法 JSON、`application_id` 不匹配）。不把 mock 当真实 DeepSeek 验收。本机同时有 `dsh` 与 `DEEPSEEK_API_KEY` 时才会跑 optional live smoke（默认 skip）。

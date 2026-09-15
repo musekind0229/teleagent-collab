@@ -1,13 +1,16 @@
-"""DeepSeek harness LeadAdapter — JSON-in/JSON-out wrapper; 真 harness 未接线验收.
+"""DeepSeek harness LeadAdapter — JSON-in/JSON-out wrapper over dsh headless.
 
 Call surface matches grok_cli's fail-closed spawn (one shot, no tool-restriction
 retry): COLLAB_LEAD_BIN (or COLLAB_DEEPSEEK_LEAD_BIN) is an executable wrapper
 that reads a lead envelope on stdin or --request-file and writes a decision
 JSON object on stdout.
 
-The real DeepSeek harness CLI argv / HTTP API is not wired. The in-tree
-example wrapper (bin/run-deepseek-lead.py) exits non-zero rather than invent
-once/pass. Do not treat this adapter as a live DeepSeek API client.
+The in-tree wrapper (bin/run-deepseek-lead.py) invokes
+`dsh --profile headless` (or stdin `-`) when COLLAB_DEEPSEEK_HARNESS_BIN or
+PATH dsh is present and DEEPSEEK_API_KEY is set. Missing bin/key, illegal
+JSON, timeout, or spawn failure stay failed — never invent once/pass.
+Do not treat dsh as a TeleAgent worker; do not POST to a DeepSeek HTTP API
+from this adapter. `--json` is dsh's event stream, not collab-lead-v1.
 """
 from __future__ import annotations
 
@@ -30,14 +33,17 @@ _DEFAULT_DISALLOWED = "bash,shell,edit,write,web_search,web_fetch"
 
 
 class DeepSeekHarnessLeadAdapter(LeadAdapterABC):
-    """Spawn a JSON wrapper once. Failures stay failed. Status: 真 harness 未接线验收."""
+    """Spawn the JSON wrapper once. Failures stay failed. dsh is lead, not worker."""
 
     name = "deepseek_harness"
-    STATUS = "unwired"
+    STATUS = "dsh_headless"
     REASON = (
-        "DeepSeek harness lead adapter is landed as JSON-in/JSON-out. "
-        "真 harness 未接线验收 — no live DeepSeek CLI/API. "
-        "Illegal/timeout/spawn failure → call_failed; never invent once/pass."
+        "DeepSeek harness lead adapter spawns bin/run-deepseek-lead.py "
+        "(JSON-in/JSON-out). The wrapper calls `dsh --profile headless` when "
+        "COLLAB_DEEPSEEK_HARNESS_BIN or PATH dsh is present and "
+        "DEEPSEEK_API_KEY is set. Missing bin/key, illegal JSON, timeout, "
+        "or spawn failure → call_failed; never invent once/pass. "
+        "Live dsh is not claimed verified."
     )
 
     def __init__(

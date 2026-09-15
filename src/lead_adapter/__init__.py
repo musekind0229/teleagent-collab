@@ -46,7 +46,8 @@ def get_lead_adapter(kind: str | None = None, **kwargs: Any) -> LeadAdapter:
     """Factory. COLLAB_LEAD_ADAPTER=grok_cli|inprocess|claude_code|codex_cli|deepseek_harness.
 
     Default grok_cli. Claude/Codex kinds return stubs that fail closed (call_failed).
-    deepseek / deepseek_harness is JSON-in/JSON-out; 真 harness 未接线验收 — never fake PASS.
+    deepseek / deepseek_harness is JSON-in/JSON-out over dsh --profile headless;
+    missing bin/key or illegal JSON → call_failed, never fake PASS.
     """
     name = (kind or os.environ.get("COLLAB_LEAD_ADAPTER") or "grok_cli").strip().lower()
     if name in ("inprocess", "in_process", "codex", "file", "stdin"):
