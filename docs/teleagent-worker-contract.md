@@ -1,7 +1,7 @@
 # TeleAgent Worker Contract v0.1
 
-> 范围：**仅 Linux 验证**（Debian 13 容器）。Windows 未测。  
-> 密钥：报告不写 token/密码全文；运行时从 GUI 子进程环境读取本地口令与 sessionKey。
+> 范围：**Linux 已验证**（Debian 13 容器）。**Windows 适配器已实现（契约/模拟测），真机未验收。**  
+> 密钥：报告不写 token/密码全文；Linux 从 GUI 子进程 `/proc/*/environ` 读本地口令与 sessionKey；Windows 读进程环境变量（未刮 Credential Manager / 其它进程）。
 
 ## 投递
 
@@ -94,12 +94,12 @@ x-opencode-directory: /workspace/teleagent/probe-sandbox
 4. 收集 artifacts（工作区 diff / 约定文件列表）
 5. 端口发现：优先探测 4399；勿死写 4397
 
-详见 `teleagent-min-wrapper.md`。
+详见 `teleagent-min-wrapper.md`。Windows 端口发现与凭据来源见 `docs/windows-teleagent-adapter.md`（**真机未验收**）。
 
 ## 不保证
 
 - 无 GUI 时独立冷启动完整登录云厂商链路（本刀假定 GUI 已登录并已拉起 SAC）
-- Windows 行为
+- **Windows 真机行为**（适配器按本契约同构实现；live Win HTTP 面未测，见 `docs/windows-teleagent-adapter.md`）
 - 「必须点窗才能批」的所有工具类别
 - 上游 `opencode` CLI 子命令（run/serve/attach/acp）在本发行版可用
 - 全局 auto-approve

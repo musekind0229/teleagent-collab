@@ -18,7 +18,8 @@ TeleAgent SAC 人机问答面，与 `/permission` 并列。工人工具可抛出
 | --- | --- |
 | `src/question_api.py` | probe / list / reply / reject + session 绑定 + `need_human` |
 | `src/teleagent_adapter/linux_local_v1.py` | `list_questions` / `reply_question` / `reject_question` |
-| `src/teleagent_adapter/windows_blocked.py` | 全部 blocked |
+| `src/teleagent_adapter/windows_local_v1.py` | 同构 list/reply/reject（**Windows 真机未验收**） |
+| `src/teleagent_adapter/windows_blocked.py` | 显式降级：全部 blocked |
 | `src/teleagent_adapter/doctor.py` | 附加 question probe（缺口写入 extras，不单独把 doctor 打红） |
 | `bin/run-live-grok-lead.py` | 真机轮询 question → need_human |
 

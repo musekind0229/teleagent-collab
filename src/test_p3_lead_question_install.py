@@ -37,7 +37,14 @@ from question_api import (
     reject_question,
     list_questions_for_session,
 )
-from teleagent_adapter import WindowsBlockedAdapter, AdapterError, AdapterStatus, get_adapter, doctor
+from teleagent_adapter import (
+    WindowsBlockedAdapter,
+    WindowsLocalV1Adapter,
+    AdapterError,
+    AdapterStatus,
+    get_adapter,
+    doctor,
+)
 from teleagent_adapter.linux_local_v1 import LinuxLocalV1Adapter
 
 
@@ -220,9 +227,20 @@ class TestControlledInstall(unittest.TestCase):
         self.assertFalse(d.allowed)
 
 
-class TestWindowsStillBlocked(unittest.TestCase):
-    def test_win_blocked(self):
-        w = get_adapter(platform="win32")
+class TestWindowsAdapterQuestionSurface(unittest.TestCase):
+    """win32 factory is local-v1 (not blocked). Explicit blocked stub still blocks.
+
+    Windows 真机未验收 — question methods on the live adapter are mock-tested
+    in teleagent_adapter.test_adapter_contract.
+    """
+
+    def test_factory_win32_is_local_v1_not_blocked(self):
+        w = get_adapter(platform="win32", discover=False)
+        self.assertIsInstance(w, WindowsLocalV1Adapter)
+        self.assertNotIsInstance(w, WindowsBlockedAdapter)
+
+    def test_explicit_blocked_still_blocks_questions(self):
+        w = get_adapter(platform="win32", blocked=True)
         self.assertIsInstance(w, WindowsBlockedAdapter)
         with self.assertRaises(AdapterError) as cm:
             w.list_questions()

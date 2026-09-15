@@ -7,18 +7,19 @@
 | 文件 | 作用 |
 | --- | --- |
 | `src/teleagent_adapter/base.py` | Protocol / ABC：`create_session` / `prompt` / `list_permissions` / `list_questions` / `reply_question` / `reject_question` / `reply_permission` / `session_status` / `cancel`；以及 creds refresh / reconnect / resume 规则 |
-| `src/teleagent_adapter/linux_local_v1.py` | Linux：HTTP Basic + `local-v1` HMAC → `http://127.0.0.1:4399`（可从 glue 抽） |
-| `src/teleagent_adapter/windows_blocked.py` | Windows TeleAgent **2.4.1**：无受支持认证入口 → `AdapterStatus.blocked` |
-| `src/teleagent_adapter/doctor.py` | 诊断：`not_running` / `version_incompatible` / `missing_creds` / `auth_failed` / `api_incompatible`（Win → blocked） |
+| `src/teleagent_adapter/linux_local_v1.py` | Linux：HTTP Basic + `local-v1` HMAC → `http://127.0.0.1:4399`；共享 `LocalV1HttpAdapter` |
+| `src/teleagent_adapter/windows_local_v1.py` | Windows：同构 HTTP；端口发现 4399→4397；凭据来自进程 env。**Windows 真机未验收** |
+| `src/teleagent_adapter/windows_blocked.py` | 显式 blocked/降级路径（`get_adapter(..., blocked=True)`），**不是** win32 工厂默认 |
+| `src/teleagent_adapter/doctor.py` | 诊断：`not_running` / `version_incompatible` / `missing_creds` / `auth_failed` / `api_incompatible` / `ok`（Win 与 Linux 同一套；仅显式 blocked stub → `blocked`） |
 | `src/teleagent_adapter/test_adapter_contract.py` | **模拟 (simulated)** 契约单测，不连真机 |
 
-工厂：`get_adapter(platform=...)` — `win*` → `WindowsBlockedAdapter`；否则 `LinuxLocalV1Adapter`。
+工厂：`get_adapter(platform=...)` — `win*` → `WindowsLocalV1Adapter`；`blocked=True` → `WindowsBlockedAdapter`；否则 `LinuxLocalV1Adapter`。详见 [`windows-teleagent-adapter.md`](windows-teleagent-adapter.md)。
 
-## 鉴权（Linux only）
+## 鉴权（Linux 已验证；Windows 同算法、真机未验收）
 
 - Basic：`OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD`
 - HMAC：`X-SA-Sign-Version: local-v1` + Timestamp/Nonce/Signature；密钥 `SUPER_AGENT_LOCAL_SESSION_KEY`
-- 凭据来源：GUI/SAC 子进程 `/proc/*/environ`（仅内存；禁止写入 git/报告）
+- 凭据来源：Linux 为 GUI/SAC 子进程 `/proc/*/environ`；Windows 为进程环境变量（仅内存；禁止写入 git/报告；**不**刮 Credential Manager）
 - **禁止**：关鉴权、改安装包、开公网诊断端口、IPv6 部署当 workaround
 
 ## 规则摘要
@@ -27,7 +28,7 @@
 `AUTH_FAILED` / 401/403 / `local_auth_missing` 或显式 `refresh_creds()` 时重读 environ；禁止每次请求轮询刷新。
 
 ### reconnect
-连接失败时：固定回 `127.0.0.1:4399`、refresh 一次、原调用最多重试一次。
+连接失败时：Linux 固定回 `127.0.0.1:4399`；Windows 可再发现 4399/4397。refresh 一次、原调用最多重试一次。
 
 ### resume
 已有 `session_id` → `resume` 校验存在后继续 `prompt` / 审批；**禁止**另建重复 session。权限 / 提问 / status / message **严格按 sessionID 过滤**。
@@ -35,9 +36,11 @@
 ### 回复边界
 默认 `once`；适配层将 `always` 降为 `once`。工人侧另有 hard-rule / lead 决策。
 
-## Windows 阻塞说明
+## Windows 说明（真机未验收）
 
-Win TeleAgent **2.4.1** 没有文档化的工人自动化认证入口（无可用的 Basic + local-v1 等价物）。`WindowsBlockedAdapter` 对所有工人操作抛 `AdapterError(BLOCKED)`。请使用 Linux local-v1。不要用关鉴权 / 刮 GUI token / 开公网端口等方式绕过。
+`get_adapter(platform="win32"|"windows")` 返回 `WindowsLocalV1Adapter`：假定与 Linux 相同的 Basic + local-v1 HTTP 工人面，带端口发现与 env 凭据。单测全部 simulated。
+
+`WindowsBlockedAdapter` 仍可用作显式降级（`blocked=True`），不再是工厂默认。不要用关鉴权 / 刮 GUI token / 开公网端口等方式绕过。
 
 ## 测例
 
@@ -59,7 +62,7 @@ python3 test_hard_rules.py
 
 ## Question API（P3）
 
-见 [`question-api.md`](question-api.md)。Linux 已接 list/reply/reject；Win blocked；doctor extras 记录探测。
+见 [`question-api.md`](question-api.md)。Linux 已接 list/reply/reject；Win 适配器实现同一路由（**真机未验收**）；显式 blocked stub 仍全部 blocked；doctor extras 记录探测。
 
 ## Loopback / proxy (Astra P1)
 

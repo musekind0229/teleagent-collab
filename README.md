@@ -39,7 +39,7 @@ jobs/examples/        # 样例章程（*.charter.yaml）
 jobs/runs/            # 收件目录（status/report；gitignore）
 docs/                 # 工人契约、适配层、backlog、发现笔记、永续骨架
 src/                  # glue / scheduler / completion / hard_rules / decision_packet
-src/teleagent_adapter/# Linux local-v1 / Windows blocked / doctor（条4）
+src/teleagent_adapter/# Linux local-v1 / Windows local-v1（真机未验收） / doctor（条4）
 src/lead_adapter/     # 组长协议：grok_cli / inprocess（条3）
 src/task_auth.py      # 任务授权范围（条5）
 src/state_store.py    # 任务/决定持久化与恢复（条6）

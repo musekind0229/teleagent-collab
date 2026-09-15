@@ -6,13 +6,13 @@
 - [x] Claude/Codex 骨架 stub + docs 待办（不假 PASS）
 - [x] Question API：探测 TeleAgent；接入 list/reply/reject + session 绑定；doctor extras；缺则标缺口
 - [x] 受控安装单：`task_kind=system_install`；workdir 内假包/可回滚；授权字段门控；危险真装 blocked
-- [x] Win：确认仍 blocked（含 question 方法）
+- [x] Win：local-v1 适配器（工厂默认非 blocked；显式 `blocked=True` 仍降级）。**真机未验收**
 - [x] `docs/p3-test-results.md` + 本 backlog
 
 ## P1 / P2 剩余
 
 - [ ] Question API 完整 lead/人编排与 scheduler 对称扫描（基础 list/reply 已在 P3）
-- [ ] 真机 Windows：若未来版本出现受支持 local auth，再新增 `windows_local_vN`
+- [ ] 真机 Windows：对 `WindowsLocalV1Adapter` 做 live 端口/鉴权/permission 验收（当前仅模拟契约）
 - [ ] 调度器 live A/B：多 job 并行 + 真 pending 串行弹权长稳跑
 - [ ] 审批 reconfirm 失败时的自动重拉 + 告警指标
 - [ ] Claude Code / Codex CLI **真机** lead（替换 stub）

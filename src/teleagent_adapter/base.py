@@ -29,7 +29,9 @@ def creds_refresh_policy() -> dict[str, str]:
         "from GUI/SAC child process environ only (memory). Never write secrets to git/reports.",
         "when": "On AdapterStatus.AUTH_FAILED / HTTP 401/403 / local_auth_missing; "
         "or explicit refresh_creds(). Do not poll-refresh on every call.",
-        "scope": "Linux local-v1 only. Windows has no supported auth entry → blocked.",
+        "scope": "Linux: /proc/*/environ. Windows: process env "
+        "(OPENCODE_SERVER_* / SUPER_AGENT_LOCAL_SESSION_KEY); Windows 真机未验收. "
+        "WindowsBlockedAdapter remains an explicit blocked/degraded path.",
     }
 
 

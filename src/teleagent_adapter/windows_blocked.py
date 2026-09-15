@@ -1,4 +1,9 @@
-"""Windows TeleAgent adapter stub — 2.4.1 has no supported auth entry → blocked."""
+"""Explicit Windows blocked/degraded adapter — not the win32 factory default.
+
+Factory ``get_adapter(platform="win32")`` returns ``WindowsLocalV1Adapter``.
+Use this class (or ``get_adapter(platform="win32", blocked=True)``) only as an
+explicit degrade path (known-bad version, policy block). Windows 真机未验收.
+"""
 from __future__ import annotations
 
 from typing import Any
@@ -7,10 +12,10 @@ from teleagent_adapter.base import AdapterError, AdapterStatus, TeleAgentAdapter
 
 
 class WindowsBlockedAdapter(TeleAgentAdapterABC):
-    """Win TeleAgent 2.4.1: no supported Basic/local-v1 auth entry for workers.
+    """Explicit blocked stub. All worker operations raise AdapterError(BLOCKED).
 
-    All worker operations raise AdapterError(BLOCKED). Do not invent workarounds
-    (disable auth, open public ports, scrape GUI tokens).
+    Not the default Win adapter. Do not invent workarounds (disable auth, open
+    public ports, scrape GUI tokens).
     """
 
     PLATFORM = "windows"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import unittest
 from pathlib import Path
 
 # Allow `python3 -m test_hard_rules` from src/ and direct script run.
@@ -200,6 +201,43 @@ def test_ssh_eternal_reject() -> None:
         assert_true(d is not None and d["reply"] == "reject", f"eternal {path} got {d}")
 
 
+def test_windows_secret_paths() -> None:
+    """Win common credential locations — eternal reject / secret (path fragments)."""
+    win_eternal = [
+        r"C:\Users\alice\.ssh\id_ed25519",
+        r"C:\Users\alice\.ssh\id_rsa",
+        r"%USERPROFILE%\.ssh\id_rsa",
+        r"%USERPROFILE%\.ssh\config",
+        r"C:\ProgramData\ssh\administrators_authorized_keys",
+        r"C:\Users\alice\AppData\Local\Google\Chrome\User Data\Default\Login Data",
+        r"C:\Users\alice\AppData\Local\Google\Chrome\User Data\Default\Cookies",
+        r"C:\Users\alice\AppData\Local\Microsoft\Edge\User Data\Default\Login Data",
+        r"C:\Users\alice\AppData\Roaming\Mozilla\Firefox\Profiles\abc.default\cookies.sqlite",
+        r"C:\Users\alice\AppData\Roaming\Mozilla\Firefox\Profiles\abc.default\logins.json",
+        r"C:\Users\alice\AppData\Local\Microsoft\Credentials\ABCD1234",
+        r"C:\Users\alice\AppData\Roaming\Microsoft\Credentials\ABCD1234",
+        r"C:\Users\alice\AppData\Local\Microsoft\Vault\4BF4C442-9B8A-41E2-BCA3-000000000000",
+        r"C:\Users\alice\AppData\Roaming\Microsoft\Protect\S-1-5-21-1\preferred",
+        r"C:\Users\alice\AppData\Local\Microsoft\Windows\INetCookies\index.dat",
+    ]
+    for p in win_eternal:
+        assert_true(is_secret_path(p), f"expected win secret: {p!r}")
+        assert_true(is_eternal_reject_path(p), f"expected win eternal: {p!r}")
+        d = hard_rule_decision({"path": p, "tool": "read"}, charter={"allow_secret_globs": ["**/*"]})
+        assert_true(d is not None and d["reply"] == "reject", f"win eternal must reject {p!r} got {d}")
+
+    # ordinary Win workspace path is not a credential store
+    safe = r"C:\Users\alice\Documents\hello.txt"
+    assert_true(not is_secret_path(safe), f"expected non-secret: {safe!r}")
+    assert_true(not is_eternal_reject_path(safe), f"expected non-eternal: {safe!r}")
+    d = hard_rule_decision({"path": safe, "tool": "edit"})
+    assert_true(d is None, f"ordinary win edit should pass-through, got {d}")
+
+    # message-embedded Win ssh path
+    d = hard_rule_decision({"message": r"please read C:\Users\alice\.ssh\id_ed25519", "tool": "read"})
+    assert_true(d is not None and d["reply"] == "reject", f"embedded win ssh got {d}")
+
+
 def test_always_plus_secret_rejects_even_with_whitelist() -> None:
     """always + 秘密类：即使白名单仍拒。"""
     perm = {
@@ -221,8 +259,34 @@ def main() -> int:
     test_whitelist_does_not_reject()
     test_ssh_eternal_reject()
     test_always_plus_secret_rejects_even_with_whitelist()
+    test_windows_secret_paths()
     print("test_hard_rules: OK")
     return 0
+
+
+class TestHardRulesUnittest(unittest.TestCase):
+    """Wrap function tests so `python3 -m unittest test_hard_rules` discovers them."""
+
+    def test_is_secret_path(self) -> None:
+        test_is_secret_path()
+
+    def test_hard_rule_decision(self) -> None:
+        test_hard_rule_decision()
+
+    def test_no_whitelist_rejects(self) -> None:
+        test_no_whitelist_rejects()
+
+    def test_whitelist_does_not_reject(self) -> None:
+        test_whitelist_does_not_reject()
+
+    def test_ssh_eternal_reject(self) -> None:
+        test_ssh_eternal_reject()
+
+    def test_always_plus_secret_rejects_even_with_whitelist(self) -> None:
+        test_always_plus_secret_rejects_even_with_whitelist()
+
+    def test_windows_secret_paths(self) -> None:
+        test_windows_secret_paths()
 
 
 if __name__ == "__main__":

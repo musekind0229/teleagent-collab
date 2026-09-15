@@ -61,8 +61,12 @@ def prompt_body(text: str, model: dict | None = None, agent: str | None = None) 
     }
 
 
-class LinuxLocalV1Adapter(TeleAgentAdapterABC):
-    """Basic + X-SA-* local-v1 HMAC against TeleAgent SAC HTTP (default :4399)."""
+class LocalV1HttpAdapter(TeleAgentAdapterABC):
+    """Basic + X-SA-* local-v1 HMAC against TeleAgent SAC HTTP (default :4399).
+
+    Shared by LinuxLocalV1Adapter and WindowsLocalV1Adapter. Platform-specific
+    creds / port discovery live in the subclasses.
+    """
 
     def __init__(
         self,
@@ -297,4 +301,10 @@ class LinuxLocalV1Adapter(TeleAgentAdapterABC):
         raise AdapterError(AdapterStatus.API_INCOMPATIBLE, f"session {session_id} not found")
 
 
-__all__ = ["LinuxLocalV1Adapter", "default_find_creds", "prompt_body"]
+class LinuxLocalV1Adapter(LocalV1HttpAdapter):
+    """Linux TeleAgent adapter: HTTP Basic + local-v1 HMAC on :4399 (/proc creds)."""
+
+    PLATFORM = "linux"
+
+
+__all__ = ["LinuxLocalV1Adapter", "LocalV1HttpAdapter", "default_find_creds", "prompt_body"]

@@ -1,4 +1,9 @@
-"""TeleAgent adapter doctor: not_running / version_incompatible / missing_creds / auth_failed / api_incompatible."""
+"""TeleAgent adapter doctor: not_running / version_incompatible / missing_creds / auth_failed / api_incompatible / ok.
+
+Windows uses the same classification as Linux (no automatic ``blocked``).
+``blocked`` is only reported for an explicit ``WindowsBlockedAdapter`` (or
+``simulate_status``). Windows 真机未验收.
+"""
 from __future__ import annotations
 
 import json
@@ -7,14 +12,15 @@ import sys
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 from teleagent_adapter.base import AdapterStatus
 
 
-# Known-compatible Linux SAC HTTP API surface (from discovery notes).
-_MIN_LINUX_APP = (2, 5, 0)
+# Known-compatible SAC HTTP API surface (Linux verified 2.5.0; Win unverified).
+_MIN_APP = (2, 5, 0)
+_MIN_LINUX_APP = _MIN_APP  # alias — do not break callers that imported the old name
 _KNOWN_API_ROUTES = ("/session", "/permission", "/version")
 
 
@@ -58,8 +64,17 @@ def doctor(
     adapter: Any = None,
     simulated: bool = False,
     simulate_status: str | None = None,
+    port_open_fn: Callable[[str, int], bool] | None = None,
 ) -> DoctorReport:
-    """Probe TeleAgent readiness. Pass simulated=True + simulate_status for unit tests."""
+    """Probe TeleAgent readiness. Pass simulated=True + simulate_status for unit tests.
+
+    Classification (Linux and Windows): not_running / version_incompatible /
+    missing_creds / auth_failed / api_incompatible / ok. ``blocked`` only when
+    the adapter itself is an explicit blocked stub (or simulated).
+
+    ``port_open_fn(host, port)`` injects the TCP probe for tests.
+    Windows 真机未验收.
+    """
     plat = (platform or sys.platform).lower()
     report = DoctorReport(
         status=AdapterStatus.OK.value,
@@ -67,19 +82,28 @@ def doctor(
         base_url=base_url,
         simulated=simulated,
     )
+    if plat.startswith("win"):
+        report.extras["windows_live_verified"] = False
+        report.extras["note"] = "Windows 真机未验收"
 
     if simulated and simulate_status:
         report.status = simulate_status
         report.details.append(f"simulated status={simulate_status}")
         return report
 
-    if plat.startswith("win"):
-        report.status = AdapterStatus.BLOCKED.value
-        report.details.append(
-            "Windows TeleAgent 2.4.1 has no supported auth entry for workers → blocked"
-        )
-        report.extras["teleagent_version"] = teleagent_version or "2.4.1"
-        return report
+    # Explicit blocked/degraded adapter only — not the win32 factory default.
+    if adapter is not None:
+        hint_fn = getattr(adapter, "doctor_hint", None)
+        if callable(hint_fn):
+            try:
+                hint = hint_fn()
+            except Exception:
+                hint = None
+            if isinstance(hint, dict) and str(hint.get("status", "")).lower() == AdapterStatus.BLOCKED.value:
+                report.status = AdapterStatus.BLOCKED.value
+                report.details.append(str(hint.get("reason") or "adapter blocked"))
+                report.extras["teleagent_version"] = hint.get("teleagent_version") or teleagent_version or ""
+                return report
 
     parsed = urlparse(base_url)
     host = parsed.hostname or "127.0.0.1"
@@ -88,17 +112,18 @@ def doctor(
     if parsed.port is None and "4399" in base_url:
         port = 4399
 
-    if not _port_open(host, port):
+    check_port = port_open_fn or _port_open
+    if not check_port(host, port):
         report.status = AdapterStatus.NOT_RUNNING.value
         report.details.append(f"{host}:{port} not accepting TCP connections")
         return report
 
     if teleagent_version:
         ver = _parse_version(teleagent_version)
-        if ver < _MIN_LINUX_APP:
+        if ver < _MIN_APP:
             report.status = AdapterStatus.VERSION_INCOMPATIBLE.value
             report.details.append(
-                f"teleagent_version={teleagent_version} < minimum {'.'.join(map(str, _MIN_LINUX_APP))}"
+                f"teleagent_version={teleagent_version} < minimum {'.'.join(map(str, _MIN_APP))}"
             )
             return report
 
@@ -107,14 +132,30 @@ def doctor(
         try:
             adapter.refresh_creds()
         except Exception as e:
-            report.status = AdapterStatus.MISSING_CREDS.value
+            from teleagent_adapter.base import AdapterError as _AE
+
+            if isinstance(e, _AE) and e.status == AdapterStatus.AUTH_FAILED:
+                report.status = AdapterStatus.AUTH_FAILED.value
+            elif isinstance(e, _AE) and e.status == AdapterStatus.NOT_RUNNING:
+                report.status = AdapterStatus.NOT_RUNNING.value
+            else:
+                report.status = AdapterStatus.MISSING_CREDS.value
             report.details.append(f"refresh_creds failed: {e}")
             return report
         try:
             code, body = adapter.call("GET", "/version")
         except Exception as e:
+            from teleagent_adapter.base import AdapterError as _AE
+
             err = str(e).lower()
-            if "auth" in err or "401" in err or "403" in err:
+            if isinstance(e, _AE) and e.status in (
+                AdapterStatus.AUTH_FAILED,
+                AdapterStatus.MISSING_CREDS,
+                AdapterStatus.NOT_RUNNING,
+                AdapterStatus.API_INCOMPATIBLE,
+            ):
+                report.status = e.status.value
+            elif "auth" in err or "401" in err or "403" in err:
                 report.status = AdapterStatus.AUTH_FAILED.value
             elif "cred" in err or "missing" in err:
                 report.status = AdapterStatus.MISSING_CREDS.value

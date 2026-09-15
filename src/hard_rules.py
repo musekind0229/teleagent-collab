@@ -46,6 +46,10 @@ _SECRET_BASENAMES = frozenset(
         "cookies.sqlite",
         "cookies.db",
         "cookie",
+        "login data",
+        "logins.json",
+        "key4.db",
+        "cert9.db",
     }
 )
 
@@ -77,6 +81,22 @@ _SECRET_PATH_MARKERS = (
     "/logindata",
     "/keychain",
     "/keyring",
+    # Windows common credential locations (normalized to '/'; 真机路径表扩展)
+    "%userprofile%/.ssh",
+    "/programdata/ssh",
+    "appdata/local/microsoft/credentials",
+    "appdata/roaming/microsoft/credentials",
+    "appdata/local/microsoft/vault",
+    "appdata/roaming/microsoft/protect",
+    "appdata/local/microsoft/windows/inetcookies",
+    "appdata/roaming/microsoft/windows/cookies",
+    "appdata/local/google/chrome/user data",
+    "appdata/local/microsoft/edge/user data",
+    "appdata/roaming/mozilla/firefox",
+    "appdata/roaming/opera software",
+    "appdata/local/bravesoftware",
+    "/credential manager",
+    "credential manager",
 )
 
 # Eternal-reject markers: never allowlisted, even via charter.
@@ -100,6 +120,20 @@ _ETERNAL_PATH_MARKERS = (
     "/.mozilla/",
     "/login data",
     "/logindata",
+    # Windows eternal (ssh / browser / Credential Manager folders)
+    "%userprofile%/.ssh",
+    "/programdata/ssh",
+    "appdata/local/microsoft/credentials",
+    "appdata/roaming/microsoft/credentials",
+    "appdata/local/microsoft/vault",
+    "appdata/roaming/microsoft/protect",
+    "appdata/local/microsoft/windows/inetcookies",
+    "appdata/roaming/microsoft/windows/cookies",
+    "appdata/local/google/chrome/user data",
+    "appdata/local/microsoft/edge/user data",
+    "appdata/roaming/mozilla/firefox",
+    "appdata/roaming/opera software",
+    "appdata/local/bravesoftware",
 )
 
 _ETERNAL_BASENAMES = frozenset(
@@ -117,6 +151,10 @@ _ETERNAL_BASENAMES = frozenset(
         "cookies.sqlite",
         "cookies.db",
         "cookie",
+        "login data",
+        "logins.json",
+        "key4.db",
+        "cert9.db",
     }
 )
 
@@ -209,6 +247,10 @@ def _one_is_secret(raw: str) -> bool:
             return True
         if "cookie" in pl or "auth.json" in pl:
             return True
+        if "login data" in pl or "microsoft/credentials" in pl or "microsoft/vault" in pl:
+            return True
+        if "microsoft/protect" in pl or "%userprofile%" in pl and ".ssh" in pl:
+            return True
 
     return False
 
@@ -271,6 +313,12 @@ def _one_is_eternal(raw: str) -> bool:
         if "cookie" in pl or "browser/profile" in pl or "chrome/profile" in pl:
             return True
         if "chromium/profile" in pl or ".mozilla" in pl:
+            return True
+        if "login data" in pl or "microsoft/credentials" in pl or "microsoft/vault" in pl:
+            return True
+        if "microsoft/protect" in pl or "chrome/user data" in pl or "edge/user data" in pl:
+            return True
+        if "mozilla/firefox" in pl or "%userprofile%" in pl and ".ssh" in pl:
             return True
 
     return False
@@ -492,7 +540,14 @@ def _collect_paths(permission_dict: dict) -> tuple[list[str], list[str]]:
         t = permission_dict.get(text_key)
         if isinstance(t, str) and t:
             # pull path-looking tokens
-            for m in re.finditer(r"(~/[^\s\"']+|/[^\s\"']*\.(?:env|json|yml|yaml|netrc)[^\s\"']*|/[^\s\"']*/\.(?:ssh|netrc)[^\s\"']*)", t):
+            for m in re.finditer(
+                r"(~/[^\s\"']+"
+                r"|/[^\s\"']*\.(?:env|json|yml|yaml|netrc)[^\s\"']*"
+                r"|/[^\s\"']*/\.(?:ssh|netrc)[^\s\"']*"
+                r"|%[A-Za-z][A-Za-z0-9_]*%(?:\\[^\s\"']+)+"
+                r"|[A-Za-z]:\\[^\s\"']+)",
+                t,
+            ):
                 paths.append(m.group(1))
 
     return paths, patterns
