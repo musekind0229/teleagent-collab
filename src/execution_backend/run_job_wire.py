@@ -1,9 +1,10 @@
 """Wire old bin/run-job.py to a selectable ExecutionBackend.
 
-Default remains TeleAgent (glue). inprocess.local_v1 uses only the public
-ExecutionBackend surface: start_run / observe_run / collect_result plus
-empty list_pending_actions. reply_permission stays unsupported — never
-invent once/approve. Hermes is not offered.
+Default remains TeleAgent (glue). inprocess.local_v1 and antigravity.cli_v1
+use only the public ExecutionBackend surface: start_run / observe_run /
+collect_result plus empty list_pending_actions. reply_permission stays
+unsupported — never invent once/approve. Hermes is not offered.
+antigravity.cli_v1 does not default --dangerously-skip-permissions.
 
 Knife 8: inprocess path runs a stage-2 closed loop (independent artifact_review
 + same-Task new-Run rework) when force_lead_review is set. Wall budget is
@@ -32,6 +33,7 @@ from execution_backend.workdir_claim import (
 ENV_NAME = "COLLAB_EXECUTION_BACKEND"
 KIND_TELEAGENT = "teleagent"
 KIND_INPROCESS = "inprocess"
+KIND_ANTIGRAVITY = "antigravity"
 
 _TELEAGENT_ALIASES = frozenset(
     {
@@ -48,13 +50,21 @@ _INPROCESS_ALIASES = frozenset(
         "in_process",
     }
 )
+_ANTIGRAVITY_ALIASES = frozenset(
+    {
+        "antigravity",
+        "antigravity.cli_v1",
+        "agy",
+        "agy.cli_v1",
+    }
+)
 
 
 def resolve_run_job_backend(
     cli_value: str | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> str:
-    """Return KIND_TELEAGENT or KIND_INPROCESS.
+    """Return KIND_TELEAGENT, KIND_INPROCESS, or KIND_ANTIGRAVITY.
 
     Priority: CLI ``--backend`` > env COLLAB_EXECUTION_BACKEND > teleagent.
     Unknown names (including hermes) raise BackendError UNSUPPORTED.
@@ -70,10 +80,13 @@ def resolve_run_job_backend(
         return KIND_TELEAGENT
     if key in _INPROCESS_ALIASES:
         return KIND_INPROCESS
+    if key in _ANTIGRAVITY_ALIASES:
+        return KIND_ANTIGRAVITY
     raise BackendError(
         BackendStatus.UNSUPPORTED,
         f"unsupported execution backend {raw!r}; "
-        "supported: teleagent, inprocess (inprocess.local_v1). "
+        "supported: teleagent, inprocess (inprocess.local_v1), "
+        "antigravity (antigravity.cli_v1 / agy). "
         "Hermes is not a collab execution backend.",
         capability="select_backend",
     )
@@ -238,3 +251,45 @@ def _wire_outbox_task(
         return attach_outbox(result, open_outbox(workdir))
     except Exception:  # noqa: BLE001 — outbox must not fail the job
         return result
+
+
+def run_antigravity_charter(
+    *,
+    charter: dict,
+    workdir: str | Path,
+    instruction: str = "",
+    name: str = "",
+    timeout_sec: float | None = None,
+    environ: Mapping[str, str] | None = None,
+    backend: Any | None = None,
+) -> dict[str, Any]:
+    """Run a charter through antigravity.cli_v1 public API only (no glue, no TA HTTP).
+
+    Permissions stay fail-closed (empty pending list; reply_permission unsupported).
+    --dangerously-skip-permissions stays off unless charter/env agy_auto_approve=true.
+    Does not go through the inprocess closed-loop / workdir-claim knives.
+    """
+    from execution_backend.antigravity_cli_v1 import (
+        AntigravityCliExecutionBackend,
+        run_antigravity_job_via_public_api,
+    )
+
+    be = backend or AntigravityCliExecutionBackend(
+        timeout_sec=timeout_sec,
+        environ=environ,
+    )
+    result = run_antigravity_job_via_public_api(
+        workdir=workdir,
+        charter=charter,
+        instruction=instruction,
+        name=name,
+        timeout_sec=timeout_sec,
+        backend=be,
+    )
+    result.setdefault("notes", [])
+    if isinstance(result.get("notes"), list):
+        result["notes"].append(
+            "backend=antigravity.cli_v1 public API only; "
+            f"skip_permissions={bool(result.get('skip_permissions'))}"
+        )
+    return result

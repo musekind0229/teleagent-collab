@@ -5,10 +5,12 @@ Usage:
   python3 bin/run-job.py jobs/examples/hello.charter.yaml
   python3 bin/run-job.py --dry-run jobs/examples/hello.charter.yaml
   python3 bin/run-job.py --backend inprocess jobs/examples/hello.charter.yaml
+  python3 bin/run-job.py --backend antigravity jobs/examples/hello.charter.yaml
   COLLAB_EXECUTION_BACKEND=inprocess.local_v1 python3 bin/run-job.py jobs/examples/hello.charter.yaml
+  COLLAB_EXECUTION_BACKEND=antigravity.cli_v1 python3 bin/run-job.py jobs/examples/hello.charter.yaml
 
-Default backend is TeleAgent (glue). inprocess uses ExecutionBackend public API only
-(no TeleAgent HTTP). Reports land under jobs/runs/<name>-<utc>/.
+Default backend is TeleAgent (glue). inprocess and antigravity use ExecutionBackend
+public API only (no TeleAgent HTTP). Reports land under jobs/runs/<name>-<utc>/.
 """
 from __future__ import annotations
 
@@ -77,6 +79,7 @@ def write_reports(out_dir: Path, charter: dict, result: dict, instruction: str) 
         "force_lead_review",
         "used_public_api_only",
         "backend",
+        "skip_permissions",
         "occupancy",
         "workdir_claim",
         "resource_status",
@@ -239,7 +242,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         metavar="NAME",
         help=(
-            "Execution backend: teleagent (default) or inprocess. "
+            "Execution backend: teleagent (default), inprocess, or antigravity (agy). "
             "Overrides env COLLAB_EXECUTION_BACKEND. "
             "Dry-run ignores this and never calls a backend."
         ),
@@ -258,7 +261,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--workspace",
         default=None,
-        help="Per-job workdir (default: glue.COLLAB for teleagent; jobs/workspaces/<name>-inproc-<utc> for inprocess).",
+        help=(
+            "Per-job workdir (default: glue.COLLAB for teleagent; "
+            "jobs/workspaces/<name>-inproc-<utc> for inprocess; "
+            "jobs/workspaces/<name>-agy-<utc> for antigravity)."
+        ),
     )
     args = ap.parse_args(argv)
 
@@ -284,8 +291,10 @@ def main(argv: list[str] | None = None) -> int:
     else:
         from execution_backend.base import BackendError
         from execution_backend.run_job_wire import (
+            KIND_ANTIGRAVITY,
             KIND_INPROCESS,
             resolve_run_job_backend,
+            run_antigravity_charter,
             run_inprocess_charter,
         )
 
@@ -313,6 +322,32 @@ def main(argv: list[str] | None = None) -> int:
                 timeout = int(charter.get("timeout_sec") or 300)
             t0 = time.time()
             result = run_inprocess_charter(
+                charter=charter,
+                workdir=ws,
+                instruction=instruction,
+                name=name,
+                timeout_sec=timeout,
+            )
+            result.setdefault("notes", []).append(f"wall_sec={time.time() - t0:.1f}")
+            result["dry_run"] = False
+        elif backend_kind == KIND_ANTIGRAVITY:
+            ws = (
+                Path(args.workspace)
+                if args.workspace
+                else REPO / "jobs" / "workspaces" / f"{name}-agy-{_utc_stamp()}"
+            )
+            ws.mkdir(parents=True, exist_ok=True)
+            workspace_used = str(ws)
+            arts = expected_artifacts(charter, workspace=ws)
+            for apath in arts:
+                p = Path(apath)
+                if p.exists() and p.is_file():
+                    p.unlink()
+            timeout = args.timeout_sec
+            if timeout is None:
+                timeout = int(charter.get("timeout_sec") or 300)
+            t0 = time.time()
+            result = run_antigravity_charter(
                 charter=charter,
                 workdir=ws,
                 instruction=instruction,
@@ -372,6 +407,8 @@ def main(argv: list[str] | None = None) -> int:
             summary["used_public_api_only"] = bool(result.get("used_public_api_only"))
         if result.get("backend"):
             summary["backend_id"] = result.get("backend")
+        if result.get("skip_permissions") is not None:
+            summary["skip_permissions"] = bool(result.get("skip_permissions"))
     if workspace_used:
         summary["workspace"] = workspace_used
     if result.get("resource_status"):

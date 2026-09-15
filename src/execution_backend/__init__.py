@@ -18,12 +18,18 @@ from execution_backend.closed_loop import (
     make_fail_once_then_pass,
     run_inprocess_closed_loop,
 )
+from execution_backend.antigravity_cli_v1 import (
+    AntigravityCliExecutionBackend,
+    run_antigravity_job_via_public_api,
+)
 from execution_backend.inprocess_v1 import InProcessExecutionBackend, run_file_job_via_public_api
 from execution_backend.run_job_wire import (
     ENV_NAME as COLLAB_EXECUTION_BACKEND_ENV,
+    KIND_ANTIGRAVITY,
     KIND_INPROCESS,
     KIND_TELEAGENT,
     resolve_run_job_backend,
+    run_antigravity_charter,
     run_inprocess_charter,
 )
 from execution_backend.two_job_isolation import (
@@ -85,13 +91,17 @@ __all__ = [
     "ExecutionBackend",
     "ExecutionBackendABC",
     "InProcessExecutionBackend",
+    "AntigravityCliExecutionBackend",
     "unsupported",
     "run_file_job_via_public_api",
+    "run_antigravity_job_via_public_api",
     "get_execution_backend",
     "COLLAB_EXECUTION_BACKEND_ENV",
+    "KIND_ANTIGRAVITY",
     "KIND_INPROCESS",
     "KIND_TELEAGENT",
     "resolve_run_job_backend",
+    "run_antigravity_charter",
     "run_inprocess_charter",
     "REVIEW_STUB_ENV",
     "artifact_review",
@@ -153,4 +163,6 @@ def get_execution_backend(name: str | None = None, **kwargs):
     key = (name or "inprocess").strip().lower()
     if key in ("inprocess", "inprocess.local_v1", "in_process", "local"):
         return InProcessExecutionBackend(**kwargs)
+    if key in ("antigravity", "antigravity.cli_v1", "agy", "agy.cli_v1"):
+        return AntigravityCliExecutionBackend(**kwargs)
     raise BackendError(BackendStatus.UNSUPPORTED, f"unknown execution backend={name!r}", capability="get_execution_backend")
