@@ -8,6 +8,7 @@
 - [x] 受控安装单：`task_kind=system_install`；workdir 内假包/可回滚；授权字段门控；危险真装 blocked
 - [x] Win：local-v1 适配器（工厂默认非 blocked；显式 `blocked=True` 仍降级）。**真机未验收**
 - [x] `docs/p3-test-results.md` + 本 backlog
+- [x] DeepSeek harness LeadAdapter（`deepseek_harness` / `deepseek`；JSON-in/JSON-out 包装；**真 harness 未接线验收**）
 
 ## P1 / P2 剩余
 

@@ -7,6 +7,7 @@ from typing import Any
 from lead_adapter.base import LeadAdapter, LeadAdapterABC, safe_failure
 from lead_adapter.claude_code import ClaudeCodeLeadAdapter
 from lead_adapter.codex_cli import CodexCliLeadAdapter
+from lead_adapter.deepseek_harness import DeepSeekHarnessLeadAdapter
 from lead_adapter.grok_cli import GrokCliLeadAdapter
 from lead_adapter.inprocess import InProcessLeadAdapter
 from lead_adapter.schema import (
@@ -27,6 +28,7 @@ __all__ = [
     "InProcessLeadAdapter",
     "ClaudeCodeLeadAdapter",
     "CodexCliLeadAdapter",
+    "DeepSeekHarnessLeadAdapter",
     "LeadDecisionError",
     "safe_failure",
     "build_lead_request",
@@ -41,9 +43,10 @@ __all__ = [
 
 
 def get_lead_adapter(kind: str | None = None, **kwargs: Any) -> LeadAdapter:
-    """Factory. COLLAB_LEAD_ADAPTER=grok_cli|inprocess|claude_code|codex_cli (default grok_cli).
+    """Factory. COLLAB_LEAD_ADAPTER=grok_cli|inprocess|claude_code|codex_cli|deepseek_harness.
 
-    Claude/Codex kinds return stubs that fail closed (call_failed) — never fake PASS.
+    Default grok_cli. Claude/Codex kinds return stubs that fail closed (call_failed).
+    deepseek / deepseek_harness is JSON-in/JSON-out; 真 harness 未接线验收 — never fake PASS.
     """
     name = (kind or os.environ.get("COLLAB_LEAD_ADAPTER") or "grok_cli").strip().lower()
     if name in ("inprocess", "in_process", "codex", "file", "stdin"):
@@ -61,4 +64,9 @@ def get_lead_adapter(kind: str | None = None, **kwargs: Any) -> LeadAdapter:
         return ClaudeCodeLeadAdapter()
     if name in ("codex_cli", "codex-cli"):
         return CodexCliLeadAdapter()
+    if name in ("deepseek", "deepseek_harness", "deepseek-harness"):
+        return DeepSeekHarnessLeadAdapter(**{
+            k: v for k, v in kwargs.items()
+            if k in ("bin_path", "io_mode", "disallowed_tools", "max_turns")
+        })
     raise ValueError(f"unknown lead adapter kind: {name!r}")
