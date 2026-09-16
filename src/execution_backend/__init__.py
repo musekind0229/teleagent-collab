@@ -18,6 +18,20 @@ from execution_backend.closed_loop import (
     make_fail_once_then_pass,
     run_inprocess_closed_loop,
 )
+from execution_backend.agy_account_pool import (
+    Account,
+    AccountPool,
+    AccountPoolError,
+    ENV_POOL as COLLAB_AGY_ACCOUNT_POOL_ENV,
+    account_environ,
+    inject_agy_pool_into_backend_kwargs,
+    load_pool,
+    mark_account,
+    prepare_antigravity_environ_from_pool,
+    save_pool,
+    select_account,
+)
+from execution_backend.agy_error_classify import classify as classify_agy_error
 from execution_backend.antigravity_cli_v1 import (
     AntigravityCliExecutionBackend,
     run_antigravity_job_via_public_api,
@@ -96,6 +110,18 @@ __all__ = [
     "run_file_job_via_public_api",
     "run_antigravity_job_via_public_api",
     "get_execution_backend",
+    "Account",
+    "AccountPool",
+    "AccountPoolError",
+    "COLLAB_AGY_ACCOUNT_POOL_ENV",
+    "account_environ",
+    "classify_agy_error",
+    "inject_agy_pool_into_backend_kwargs",
+    "load_pool",
+    "mark_account",
+    "prepare_antigravity_environ_from_pool",
+    "save_pool",
+    "select_account",
     "COLLAB_EXECUTION_BACKEND_ENV",
     "KIND_ANTIGRAVITY",
     "KIND_INPROCESS",
@@ -164,5 +190,6 @@ def get_execution_backend(name: str | None = None, **kwargs):
     if key in ("inprocess", "inprocess.local_v1", "in_process", "local"):
         return InProcessExecutionBackend(**kwargs)
     if key in ("antigravity", "antigravity.cli_v1", "agy", "agy.cli_v1"):
-        return AntigravityCliExecutionBackend(**kwargs)
+        kw = inject_agy_pool_into_backend_kwargs(kwargs)
+        return AntigravityCliExecutionBackend(**kw)
     raise BackendError(BackendStatus.UNSUPPORTED, f"unknown execution backend={name!r}", capability="get_execution_backend")

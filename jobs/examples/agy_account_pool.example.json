@@ -1,0 +1,31 @@
+{
+  "notes": [
+    "Example only. Fake HOME paths — do not point this file at a real oauth store.",
+    "Copy to a gitignored path (e.g. jobs/agy-account-pool.json) and fill in real profile HOMEs locally.",
+    "Never put access/id/refresh tokens, oauth JSON, or GEMINI_API_KEY in the pool file.",
+    "GEMINI_API_KEY mode is not Google AI Pro quota. Serial dispatch only; one HOME per spawn."
+  ],
+  "accounts": [
+    {
+      "id": "A",
+      "home": "/path/to/profiles/homeA",
+      "state": "available",
+      "email_mask": "a***@example.com",
+      "notes": "example primary; fake path, not a live HOME"
+    },
+    {
+      "id": "B",
+      "home": "/path/to/profiles/homeB",
+      "state": "unavailable",
+      "email_mask": "b***@example.com",
+      "notes": "example: eligibility_blocked (location). Never dispatch."
+    },
+    {
+      "id": "C",
+      "home": "/path/to/profiles/homeC",
+      "state": "available",
+      "email_mask": "c***@example.com",
+      "notes": "example standby; selected after A is exhausted"
+    }
+  ]
+}

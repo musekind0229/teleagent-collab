@@ -80,6 +80,7 @@ def write_reports(out_dir: Path, charter: dict, result: dict, instruction: str) 
         "used_public_api_only",
         "backend",
         "skip_permissions",
+        "agy_profile",
         "occupancy",
         "workdir_claim",
         "resource_status",
@@ -267,6 +268,15 @@ def main(argv: list[str] | None = None) -> int:
             "jobs/workspaces/<name>-agy-<utc> for antigravity)."
         ),
     )
+    ap.add_argument(
+        "--agy-account-pool",
+        default=None,
+        metavar="PATH",
+        help=(
+            "agy account-pool JSON (overrides env COLLAB_AGY_ACCOUNT_POOL). "
+            "Selects one available HOME per spawn; does not enable skip-permissions."
+        ),
+    )
     args = ap.parse_args(argv)
 
     try:
@@ -353,6 +363,7 @@ def main(argv: list[str] | None = None) -> int:
                 instruction=instruction,
                 name=name,
                 timeout_sec=timeout,
+                account_pool_path=args.agy_account_pool,
             )
             result.setdefault("notes", []).append(f"wall_sec={time.time() - t0:.1f}")
             result["dry_run"] = False
@@ -409,6 +420,8 @@ def main(argv: list[str] | None = None) -> int:
             summary["backend_id"] = result.get("backend")
         if result.get("skip_permissions") is not None:
             summary["skip_permissions"] = bool(result.get("skip_permissions"))
+        if result.get("agy_profile"):
+            summary["agy_profile"] = result.get("agy_profile")
     if workspace_used:
         summary["workspace"] = workspace_used
     if result.get("resource_status"):

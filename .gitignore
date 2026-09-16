@@ -33,3 +33,15 @@ jobs/runs/
 jobs/workspaces/
 # persisted scheduler/job state (条6)
 jobs/state/
+# agy HOME profiles (oauth / gemini file creds — never commit)
+**/profiles/**/oauth*
+**/profiles/**/.gemini/**
+**/.gemini/**
+**/antigravity-oauth-token
+**/*oauth-token*
+**/*oauth_creds*
+**/oauth*
+# live agy account-pool state may list real HOME paths
+jobs/agy-account-pool.json
+jobs/agy_account_pool.json
+!jobs/examples/agy_account_pool.example.json

@@ -257,6 +257,9 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
     def _env(self) -> Mapping[str, str]:
         return self._environ if self._environ is not None else os.environ
 
+    def _agy_profile(self) -> str:
+        return str(self._env().get("AGY_PROFILE") or "").strip()
+
     def start_run(
         self,
         *,
@@ -362,7 +365,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         return self._start_payload(rec, ok=True)
 
     def _start_payload(self, rec: dict[str, Any], *, ok: bool) -> dict[str, Any]:
-        return {
+        payload = {
             "ok": ok,
             "backend": self.backend_id,
             "run_id": rec["run_id"],
@@ -374,6 +377,10 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             "argv_flags": list(rec.get("argv_flags") or []),
             "contract_version": "contract.v0.1-draft",
         }
+        profile = self._agy_profile()
+        if profile:
+            payload["agy_profile"] = profile
+        return payload
 
     def _get(self, run_id: str) -> dict[str, Any]:
         rec = self._runs.get(run_id)
@@ -511,7 +518,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             )
             errored = (not busy) and (fin == "error" or bool(rec.get("assistant_error")))
             cancelled = False
-        return {
+        out = {
             "session_id": rec.get("conversation_id") or rec["run_id"],
             "native_handle": rec["native_handle"],
             "activity": activity,
@@ -533,6 +540,10 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             "skip_permissions": bool(rec.get("skip_permissions")),
             "usage": rec.get("usage"),
         }
+        profile = self._agy_profile()
+        if profile:
+            out["agy_profile"] = profile
+        return out
 
     def collect_result(self, run_id: str) -> dict[str, Any]:
         rec = self._get(run_id)
@@ -562,7 +573,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             ok = False
         state = "ok" if ok else ("cancelled" if rec.get("cancelled") else "fail")
         parsed = rec.get("agy_json") if isinstance(rec.get("agy_json"), dict) else {}
-        return {
+        out = {
             "ok": ok,
             "backend": self.backend_id,
             "run_id": rec["run_id"],
@@ -581,6 +592,10 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
                 for k in ("activity", "finish_successful", "cancelled", "errored", "busy")
             },
         }
+        profile = self._agy_profile()
+        if profile:
+            out["agy_profile"] = profile
+        return out
 
     def list_pending_actions(self, *, session_id: str | None = None) -> tuple[int, list]:
         # agy print is one-shot. No permission channel — same as inprocess.

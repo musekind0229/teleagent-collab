@@ -74,6 +74,7 @@ agy --output-format=json --model=gemini-3.8-flash-low --dangerously-skip-permiss
 | `AGY_MODEL` | 模型，默认 `gemini-3.8-flash-low` |
 | `AGY_AUTO_APPROVE` / `COLLAB_AGY_AUTO_APPROVE` | 仅 `true` 时才加 `--dangerously-skip-permissions` |
 | `COLLAB_AGY_LIVE=1` | 打开可选 live smoke（单测默认 skip） |
+| `COLLAB_AGY_ACCOUNT_POOL` | 外围账号池 JSON；见 [agy-account-pool.md](./agy-account-pool.md) |
 
 ## 测例
 
@@ -84,3 +85,5 @@ PYTHONPATH=src python3 -m unittest src.test_antigravity_cli_v1 -q
 ```
 
 可选 live：PATH 有 agy 且已登录时，`COLLAB_AGY_LIVE=1` 跑一条无工具短问（仍**默认不** skip-permissions）。
+
+多账号串行调度（HOME 隔离、一次 spawn 钉死一个 HOME）是外围账号池，见 [agy-account-pool.md](./agy-account-pool.md)。

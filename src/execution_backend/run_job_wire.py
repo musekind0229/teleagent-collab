@@ -262,22 +262,57 @@ def run_antigravity_charter(
     timeout_sec: float | None = None,
     environ: Mapping[str, str] | None = None,
     backend: Any | None = None,
+    account_pool_path: str | Path | None = None,
+    precheck: Any | None = None,
 ) -> dict[str, Any]:
     """Run a charter through antigravity.cli_v1 public API only (no glue, no TA HTTP).
 
     Permissions stay fail-closed (empty pending list; reply_permission unsupported).
     --dangerously-skip-permissions stays off unless charter/env agy_auto_approve=true.
     Does not go through the inprocess closed-loop / workdir-claim knives.
+
+    Optional peripheral account pool (COLLAB_AGY_ACCOUNT_POOL / account_pool_path):
+    select one available HOME, inject environ, never swap HOME mid-run.
     """
+    from execution_backend.agy_account_pool import (
+        AccountPoolError,
+        apply_job_result_to_pool,
+        inject_agy_pool_into_backend_kwargs,
+        load_pool,
+        selected_profile_from_environ,
+    )
     from execution_backend.antigravity_cli_v1 import (
         AntigravityCliExecutionBackend,
         run_antigravity_job_via_public_api,
     )
 
-    be = backend or AntigravityCliExecutionBackend(
-        timeout_sec=timeout_sec,
-        environ=environ,
-    )
+    selected_env: Mapping[str, str] | None = None
+    if backend is None:
+        kw: dict[str, Any] = {"timeout_sec": timeout_sec, "environ": environ}
+        if account_pool_path:
+            kw["account_pool_path"] = account_pool_path
+        if precheck is not None:
+            kw["precheck"] = precheck
+        try:
+            kw = inject_agy_pool_into_backend_kwargs(kw)
+        except AccountPoolError as e:
+            return {
+                "ok": False,
+                "backend": "antigravity.cli_v1",
+                "state": "fail",
+                "error": str(e),
+                "skip_permissions": False,
+                "used_public_api_only": True,
+                "path": "antigravity.cli_v1",
+                "artifacts": [],
+                "notes": [f"agy account pool: {e}"],
+            }
+        selected_env = kw.get("environ")
+        be = AntigravityCliExecutionBackend(**kw)
+    else:
+        be = backend
+        selected_env = getattr(be, "_environ", None)
+
     result = run_antigravity_job_via_public_api(
         workdir=workdir,
         charter=charter,
@@ -286,10 +321,27 @@ def run_antigravity_charter(
         timeout_sec=timeout_sec,
         backend=be,
     )
+    env_map = selected_env if isinstance(selected_env, Mapping) else None
+    profile = selected_profile_from_environ(env_map) or str(result.get("agy_profile") or "").strip()
+    if profile:
+        result["agy_profile"] = profile
+    pool_path = None
+    if env_map is not None:
+        pool_path = env_map.get("COLLAB_AGY_ACCOUNT_POOL")
+    if not pool_path and account_pool_path:
+        pool_path = str(account_pool_path)
+    if profile and pool_path:
+        try:
+            pool_obj = load_pool(pool_path)
+            apply_job_result_to_pool(pool_obj, pool_obj.by_id(profile), result)
+        except Exception:  # noqa: BLE001 — pool update must not flip job ok
+            pass
     result.setdefault("notes", [])
     if isinstance(result.get("notes"), list):
         result["notes"].append(
             "backend=antigravity.cli_v1 public API only; "
             f"skip_permissions={bool(result.get('skip_permissions'))}"
         )
+        if profile:
+            result["notes"].append(f"agy_profile={profile}")
     return result
