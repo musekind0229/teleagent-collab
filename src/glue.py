@@ -43,7 +43,17 @@ def get_ta_adapter():
         _ADAPTER = get_adapter(platform="linux")
     return _ADAPTER
 
-COLLAB = Path("/workspace/teleagent/probe-sandbox/collab")
+def _default_collab_dir() -> Path:
+    import os
+
+    env = (os.environ.get("COLLAB_DIR") or os.environ.get("COLLAB") or "").strip()
+    if env:
+        return Path(env)
+    # Repo-local fallback (works on Windows checkout and Linux box).
+    return Path(__file__).resolve().parents[1] / "jobs" / "runs"
+
+
+COLLAB = _default_collab_dir()
 def _default_base() -> str:
     import os
     import sys
