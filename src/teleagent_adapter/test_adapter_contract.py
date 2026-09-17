@@ -527,3 +527,21 @@ class TestSignHeadersSimulated(unittest.TestCase):
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())
+
+
+class TestDoctorWinPortFallback(unittest.TestCase):
+    def test_doctor_win_falls_back_to_4397(self):
+        from teleagent_adapter.doctor import doctor
+
+        def probe(_host, port):
+            return port == 4397
+
+        r = doctor(
+            platform="win32",
+            base_url="http://127.0.0.1:4399",
+            port_open_fn=probe,
+            adapter=None,
+        )
+        self.assertEqual(r.base_url, "http://127.0.0.1:4397")
+        self.assertNotEqual(r.status, "not_running")
+

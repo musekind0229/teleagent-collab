@@ -272,3 +272,13 @@ class TestDoctorExtrasWin(unittest.TestCase):
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())
+
+
+class TestPbiClassNotShadowed(unittest.TestCase):
+    def test_process_basic_information_class_is_int_zero(self):
+        from teleagent_adapter import windows_process_environ as m
+
+        self.assertIsInstance(m._PROCESS_BASIC_INFORMATION_CLASS, int)
+        self.assertEqual(m._PROCESS_BASIC_INFORMATION_CLASS, 0)
+        self.assertTrue(issubclass(m._PROCESS_BASIC_INFORMATION_STRUCT, object))
+

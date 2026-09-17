@@ -97,6 +97,13 @@ def doctor(
         report.details.append(f"simulated status={simulate_status}")
         return report
 
+    # Prefer adapter-discovered base_url when present (Win live often lands on :4397).
+    if adapter is not None:
+        ad_url = getattr(adapter, "base_url", None)
+        if isinstance(ad_url, str) and ad_url.strip():
+            base_url = ad_url.rstrip("/")
+            report.base_url = base_url
+
     parsed = urlparse(base_url)
     host = parsed.hostname or "127.0.0.1"
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
@@ -145,9 +152,23 @@ def doctor(
                 return report
 
     if not _checked(host, port):
-        report.status = AdapterStatus.NOT_RUNNING.value
-        report.details.append(f"{host}:{port} not accepting TCP connections")
-        return report
+        # Windows workers frequently bind :4397 only; do not fail solely on closed :4399.
+        if plat.startswith("win") and port != 4397 and _checked(host, 4397):
+            port = 4397
+            base_url = f"http://{host}:4397"
+            report.base_url = base_url
+            report.details.append(
+                f"preferred port closed; using discovered http://{host}:4397"
+            )
+            if adapter is not None and hasattr(adapter, "base_url"):
+                try:
+                    adapter.base_url = base_url
+                except Exception:
+                    pass
+        else:
+            report.status = AdapterStatus.NOT_RUNNING.value
+            report.details.append(f"{host}:{port} not accepting TCP connections")
+            return report
 
     if teleagent_version:
         ver = _parse_version(teleagent_version)

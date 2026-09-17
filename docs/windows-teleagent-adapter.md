@@ -91,3 +91,9 @@ PYTHONPATH=src python3 -m unittest teleagent_adapter.test_adapter_contract test_
 | `src/teleagent_adapter/linux_local_v1.py` | 共享 `LocalV1HttpAdapter` HTTP 实现 |
 | `src/teleagent_adapter/doctor.py` | 跨平台分类 + Win extras |
 | `src/hard_rules.py` | Win 密钥路径片段 |
+
+### DESKTOP-TBB531F notes (2026-09-17)
+- Worker HTTP observed on **:4397** (4399 closed).
+- Cred discovery: this-process env, then Win32 PEB environ of TeleAgent/SAC candidates (fixed NtQuery ProcessInformationClass shadowing).
+- `windows_live_verified` stays false until workshop live doctor/hello succeeds.
+

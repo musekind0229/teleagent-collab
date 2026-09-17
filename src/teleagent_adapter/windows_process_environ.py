@@ -59,7 +59,7 @@ _PROCESS_VM_READ = 0x0010
 _PROCESS_QUERY_INFORMATION = 0x0400
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _TH32CS_SNAPPROCESS = 0x00000002
-_PROCESS_BASIC_INFORMATION = 0
+_PROCESS_BASIC_INFORMATION_CLASS = 0  # NtQuery ProcessInformationClass
 _PROCESS_WOW64_INFORMATION = 26
 _MAX_ENV_BYTES = 128 * 1024
 _ENV_CHUNK = 4096
@@ -212,7 +212,7 @@ def _win_dll(name: str) -> Any:
         raise WindowsEnvironUnavailable(f"{name} is unavailable: {e}") from e
 
 
-class _PROCESS_BASIC_INFORMATION(ctypes.Structure):
+class _PROCESS_BASIC_INFORMATION_STRUCT(ctypes.Structure):
     _fields_ = [
         ("Reserved1", ctypes.c_void_p),
         ("PebBaseAddress", ctypes.c_void_p),
@@ -357,10 +357,10 @@ def _peb_base(ntdll: Any, handle: Any, *, wow64: bool, ptr_size: int) -> int | N
             if _valid_user_ptr(addr, 4):
                 return addr
         return None
-    pbi = _PROCESS_BASIC_INFORMATION()
+    pbi = _PROCESS_BASIC_INFORMATION_STRUCT()
     status = ntdll.NtQueryInformationProcess(
         handle,
-        _PROCESS_BASIC_INFORMATION,
+        _PROCESS_BASIC_INFORMATION_CLASS,
         ctypes.byref(pbi),
         ctypes.sizeof(pbi),
         ctypes.byref(retlen),
