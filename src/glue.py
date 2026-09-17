@@ -44,7 +44,24 @@ def get_ta_adapter():
     return _ADAPTER
 
 COLLAB = Path("/workspace/teleagent/probe-sandbox/collab")
-BASE = "http://127.0.0.1:4399"
+def _default_base() -> str:
+    import os
+    import sys
+
+    env = (os.environ.get("TELEAGENT_BASE_URL") or "").strip().rstrip("/")
+    if env:
+        return env
+    if sys.platform.startswith("win"):
+        try:
+            from teleagent_adapter.windows_local_v1 import discover_windows_base_url
+
+            return discover_windows_base_url()
+        except Exception:
+            return "http://127.0.0.1:4397"
+    return "http://127.0.0.1:4399"
+
+
+BASE = _default_base()
 # Lead is swappable: default Grok Build; override with COLLAB_LEAD_BIN (Claude Code/Codex later).
 LEAD_BIN = os.environ.get("COLLAB_LEAD_BIN", "/workspace/run-grok.sh")
 LEAD_NAME = os.environ.get("COLLAB_LEAD_NAME", "grok")
@@ -67,6 +84,13 @@ def prompt_body(text: str, model=None) -> dict:
 
 
 def find_creds():
+    """Linux: /proc/*/environ. Windows: this-process env then TeleAgent PEB environ."""
+    import sys
+
+    if sys.platform.startswith("win"):
+        from teleagent_adapter.windows_local_v1 import default_find_creds_windows
+
+        return default_find_creds_windows()
     keys = (b"OPENCODE_SERVER_PASSWORD", b"SUPER_AGENT_LOCAL_SESSION_KEY", b"OPENCODE_SERVER_USERNAME")
     for path in glob.glob("/proc/[0-9]*/environ"):
         try:
