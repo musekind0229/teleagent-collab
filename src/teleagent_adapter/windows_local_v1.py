@@ -2,13 +2,15 @@
 
 **Windows 真机未验收** — this module is a contract-level port. Tests inject
 mock transport / HTTP responses. Do not treat a green unittest run as proof
-that a live Windows TeleAgent install speaks this surface.
+that a live Windows TeleAgent install speaks this surface. Live doctor/hello
+on DESKTOP-TBB531F is workshop-owned (``windows_live_verified=false``).
 
 Differences vs Linux (`linux_local_v1.py`):
-- Creds: process environment (`OPENCODE_SERVER_*`, `SUPER_AGENT_LOCAL_SESSION_KEY`),
-  not `/proc/*/environ`.
+- Creds: this-process env first, then other TeleAgent/SAC process environ
+  (Win32 PEB / ``ReadProcessMemory``), analog of Linux ``/proc/*/environ``.
+  Never Credential Manager. Never disable auth.
 - Port discovery: probe loopback 4399 then 4397 (env `TELEAGENT_BASE_URL` /
-  `TELEAGENT_PORT` override). Linux glue historically hard-codes :4399.
+  `TELEAGENT_PORT` override). Live Win worker HTTP may be **:4397**.
 - Paths: session `directory` / `x-opencode-directory` are passed through
   (Windows drive-letter paths). Do not POSIX-rewrite.
 
@@ -19,15 +21,17 @@ from __future__ import annotations
 
 import os
 import socket
-from collections.abc import Mapping
-from typing import Callable
+from collections.abc import Callable, Mapping
 from urllib.parse import urlparse
 
 from teleagent_adapter.base import AdapterError, AdapterStatus
 from teleagent_adapter.linux_local_v1 import FindCredsFn, LocalV1HttpAdapter
+from teleagent_adapter.windows_process_environ import (
+    MISSING_CREDS_MESSAGE,
+    resolve_windows_local_v1_creds,
+)
 
-# Same worker HTTP candidates as Linux discovery notes (4397 was a stale env;
-# 4399 is the verified Linux listen port). Win live bind is unconfirmed.
+# Probe 4399 first (Linux verified listen), then 4397 (DESKTOP-TBB531F worker HTTP).
 DEFAULT_WIN_PORTS: tuple[int, ...] = (4399, 4397)
 DEFAULT_WIN_HOST = "127.0.0.1"
 
@@ -51,27 +55,24 @@ def _first_env(env: Mapping[str, str], *names: str) -> str:
 def default_find_creds_windows(
     *,
     environ: Mapping[str, str] | None = None,
+    foreign_finder: Callable[[], tuple[str, str, str] | None] | None = None,
 ) -> tuple[str, str, str]:
-    """Read local-v1 creds from process env (no /proc on Windows).
+    """Read local-v1 creds: this-process env, then TeleAgent/SAC process environ.
 
     Username defaults to ``super-agent`` when password + session key are set
-    (Linux documented Basic user). Missing password or HMAC key → MISSING_CREDS.
+    (Linux documented Basic user). Missing password or HMAC key → MISSING_CREDS
+    after scanning other processes' environ (not this-process env). Does not
+    suggest disabling auth. Inject ``foreign_finder`` in tests.
 
-    Windows 真机未验收: GUI/SAC child-process environ scrape is not implemented
-    here (would need Win32 process APIs). Inject ``find_creds_fn`` in tests.
+    Windows 真机未验收 — live doctor/hello is workshop-owned.
     """
-    env = environ if environ is not None else os.environ
-    user = _first_env(env, "OPENCODE_SERVER_USERNAME", "SUPER_AGENT_OPENCODE_USERNAME") or "super-agent"
-    pw = _first_env(env, "OPENCODE_SERVER_PASSWORD", "SUPER_AGENT_OPENCODE_PASSWORD")
-    key = _first_env(env, "SUPER_AGENT_LOCAL_SESSION_KEY")
-    if not pw or not key:
-        raise AdapterError(
-            AdapterStatus.MISSING_CREDS,
-            "Windows TeleAgent local API creds not found in process environment "
-            "(need OPENCODE_SERVER_PASSWORD + SUPER_AGENT_LOCAL_SESSION_KEY). "
-            "Windows 真机未验收.",
-        )
-    return user, pw, key
+    creds, _presence = resolve_windows_local_v1_creds(
+        environ=environ,
+        foreign_finder=foreign_finder,
+    )
+    if creds is None:
+        raise AdapterError(AdapterStatus.MISSING_CREDS, MISSING_CREDS_MESSAGE)
+    return creds
 
 
 def discover_windows_base_url(
@@ -88,7 +89,7 @@ def discover_windows_base_url(
     then TCP probe of 4399 then 4397. If nothing accepts TCP, return the
     first candidate (4399) so doctor can classify ``not_running``.
 
-    Windows 真机未验收 — live bind address/port may differ.
+    Live Win worker HTTP may be **:4397** (DESKTOP-TBB531F). Windows 真机未验收.
     """
     environ = env if env is not None else os.environ
     explicit = _first_env(environ, "TELEAGENT_BASE_URL").rstrip("/")

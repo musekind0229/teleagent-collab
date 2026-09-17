@@ -384,8 +384,27 @@ class TestWindowsLocalV1Simulated(unittest.TestCase):
         )
         self.assertEqual((u, p, k), ("super-agent", "sim-pass", "sim-key"))
         with self.assertRaises(AdapterError) as cm:
-            default_find_creds_windows(environ={})
+            default_find_creds_windows(environ={}, foreign_finder=lambda: None)
         self.assertEqual(cm.exception.status, AdapterStatus.MISSING_CREDS)
+        self.assertIn("other", str(cm.exception).lower())
+        self.assertIn("Do not disable authentication", str(cm.exception))
+
+    def test_creds_process_env_preferred_over_foreign(self):
+        u, p, k = default_find_creds_windows(
+            environ={
+                "OPENCODE_SERVER_PASSWORD": "sim-pass",
+                "SUPER_AGENT_LOCAL_SESSION_KEY": "sim-key",
+            },
+            foreign_finder=lambda: ("super-agent", "sim-foreign-pass", "sim-foreign-key"),
+        )
+        self.assertEqual((u, p, k), ("super-agent", "sim-pass", "sim-key"))
+
+    def test_creds_foreign_fallback_when_process_env_empty(self):
+        u, p, k = default_find_creds_windows(
+            environ={},
+            foreign_finder=lambda: ("super-agent", "sim-pass", "sim-key"),
+        )
+        self.assertEqual((u, p, k), ("super-agent", "sim-pass", "sim-key"))
 
     def test_adapter_discover_uses_probe(self):
         ad = WindowsLocalV1Adapter(
@@ -470,9 +489,16 @@ class TestDoctorClassificationWinAndLinux(unittest.TestCase):
         for plat in ("win32", "linux"):
             r = doctor(platform=plat, adapter=ad, port_open_fn=_open, teleagent_version="2.5.0")
             self.assertEqual(r.status, AdapterStatus.OK.value, plat)
-        self.assertFalse(
-            doctor(platform="win32", adapter=ad, port_open_fn=_open).extras.get("windows_live_verified", True)
-        )
+        win = doctor(platform="win32", adapter=ad, port_open_fn=_open)
+        self.assertFalse(win.extras.get("windows_live_verified", True))
+        self.assertIn(win.extras.get("creds_source"), (
+            "process_env",
+            "foreign_process_environ",
+            "missing",
+        ))
+        self.assertIn("4397", win.extras.get("ports") or {})
+        self.assertIn("4399", win.extras.get("ports") or {})
+        self.assertNotIn("sim-pass", json.dumps(win.to_dict()))
 
     def test_permission_401_is_auth_failed(self):
         ad = _ProbeAdapter(permission=(401, {"code": "unauthorized"}))

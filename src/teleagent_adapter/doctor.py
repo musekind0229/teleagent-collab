@@ -2,7 +2,11 @@
 
 Windows uses the same classification as Linux (no automatic ``blocked``).
 ``blocked`` is only reported for an explicit ``WindowsBlockedAdapter`` (or
-``simulate_status``). Windows 真机未验收.
+``simulate_status``). Windows 真机未验收 — extras keep
+``windows_live_verified=false`` until workshop live doctor/hello on
+DESKTOP-TBB531F. Extra keys may include ``creds_source``
+(process_env|foreign_process_environ|missing) and loopback ports 4399/4397;
+never secret values.
 """
 from __future__ import annotations
 
@@ -84,12 +88,47 @@ def doctor(
     )
     if plat.startswith("win"):
         report.extras["windows_live_verified"] = False
-        report.extras["note"] = "Windows 真机未验收"
+        report.extras["note"] = (
+            "Windows 真机未验收; live doctor/hello on DESKTOP-TBB531F is workshop-owned"
+        )
 
     if simulated and simulate_status:
         report.status = simulate_status
         report.details.append(f"simulated status={simulate_status}")
         return report
+
+    parsed = urlparse(base_url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    # Prefer explicit 4399 default
+    if parsed.port is None and "4399" in base_url:
+        port = 4399
+
+    check_port = port_open_fn or _port_open
+    port_cache: dict[tuple[str, int], bool] = {}
+
+    def _checked(h: str, p: int) -> bool:
+        key = (h, p)
+        if key not in port_cache:
+            port_cache[key] = bool(check_port(h, p))
+        return port_cache[key]
+
+    if plat.startswith("win"):
+        report.extras["ports"] = {
+            "4399": _checked(host, 4399),
+            "4397": _checked(host, 4397),
+        }
+        try:
+            from teleagent_adapter.windows_process_environ import probe_windows_creds_presence
+
+            presence = probe_windows_creds_presence()
+            report.extras["creds_source"] = presence.source
+            report.extras["password_present"] = bool(presence.password_present)
+            report.extras["session_key_present"] = bool(presence.session_key_present)
+        except Exception:
+            report.extras["creds_source"] = "missing"
+            report.extras["password_present"] = False
+            report.extras["session_key_present"] = False
 
     # Explicit blocked/degraded adapter only — not the win32 factory default.
     if adapter is not None:
@@ -105,15 +144,7 @@ def doctor(
                 report.extras["teleagent_version"] = hint.get("teleagent_version") or teleagent_version or ""
                 return report
 
-    parsed = urlparse(base_url)
-    host = parsed.hostname or "127.0.0.1"
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    # Prefer explicit 4399 default
-    if parsed.port is None and "4399" in base_url:
-        port = 4399
-
-    check_port = port_open_fn or _port_open
-    if not check_port(host, port):
+    if not _checked(host, port):
         report.status = AdapterStatus.NOT_RUNNING.value
         report.details.append(f"{host}:{port} not accepting TCP connections")
         return report
