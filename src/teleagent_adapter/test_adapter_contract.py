@@ -24,6 +24,7 @@ from teleagent_adapter import (  # noqa: E402
     get_adapter,
 )
 from teleagent_adapter.windows_local_v1 import (  # noqa: E402
+    DEFAULT_WIN_PORTS,
     default_find_creds_windows,
     discover_windows_base_url,
 )
@@ -358,6 +359,18 @@ class TestWindowsLocalV1Simulated(unittest.TestCase):
         url = discover_windows_base_url(probe_fn=only_4397, env={})
         self.assertEqual(url, "http://127.0.0.1:4397")
 
+    def test_discover_only_4398(self):
+        self.assertEqual(DEFAULT_WIN_PORTS, (4399, 4397, 4398))
+        seen: list[int] = []
+
+        def only_4398(host: str, port: int) -> bool:
+            seen.append(port)
+            return port == 4398
+
+        url = discover_windows_base_url(probe_fn=only_4398, env={})
+        self.assertEqual(url, "http://127.0.0.1:4398")
+        self.assertEqual(seen, [4399, 4397, 4398])
+
     def test_discover_nothing_listening_defaults_4399(self):
         url = discover_windows_base_url(probe_fn=lambda h, p: False, env={})
         self.assertEqual(url, "http://127.0.0.1:4399")
@@ -498,6 +511,7 @@ class TestDoctorClassificationWinAndLinux(unittest.TestCase):
         ))
         self.assertIn("4397", win.extras.get("ports") or {})
         self.assertIn("4399", win.extras.get("ports") or {})
+        self.assertIn("4398", win.extras.get("ports") or {})
         self.assertNotIn("sim-pass", json.dumps(win.to_dict()))
 
     def test_permission_401_is_auth_failed(self):
@@ -544,4 +558,24 @@ class TestDoctorWinPortFallback(unittest.TestCase):
         )
         self.assertEqual(r.base_url, "http://127.0.0.1:4397")
         self.assertNotEqual(r.status, "not_running")
+
+    def test_doctor_win_falls_back_to_4398(self):
+        from teleagent_adapter.doctor import doctor
+
+        def probe(_host, port):
+            return port == 4398
+
+        r = doctor(
+            platform="win32",
+            base_url="http://127.0.0.1:4399",
+            port_open_fn=probe,
+            adapter=None,
+        )
+        self.assertEqual(r.base_url, "http://127.0.0.1:4398")
+        self.assertNotEqual(r.status, "not_running")
+        ports = r.extras.get("ports") or {}
+        self.assertIn("4398", ports)
+        self.assertTrue(ports["4398"])
+        self.assertFalse(ports["4399"])
+        self.assertFalse(ports["4397"])
 

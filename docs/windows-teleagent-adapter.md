@@ -23,7 +23,7 @@ ad = get_adapter(platform="win32", blocked=True)  # 显式降级 → WindowsBloc
 | 项 | 约定 |
 | --- | --- |
 | 默认 URL | `http://127.0.0.1:4399`（发现失败时的回退） |
-| 端口发现 | **先 4399，再 4397**；`TELEAGENT_BASE_URL` / `TELEAGENT_PORT` 可覆盖。真机工人 HTTP 可能是 **:4397**（DESKTOP-TBB531F 面在、需鉴权） |
+| 端口发现 | **4399→4397→4398**；`TELEAGENT_BASE_URL` / `TELEAGENT_PORT` 可覆盖，**以发现为准**。不要把默认 URL 写死成 4398。DESKTOP-TBB531F 曾见 **:4397**，重启后曾见 **:4398**（面在、需鉴权） |
 | 鉴权 | HTTP Basic（用户 `super-agent`）+ `X-SA-*` `local-v1` HMAC |
 | Session | `POST /session`，`directory` + 头 `x-opencode-directory`（**原样传 Win 路径**） |
 | 投递 | `POST /session/:id/prompt_async` |
@@ -36,10 +36,10 @@ ad = get_adapter(platform="win32", blocked=True)  # 显式降级 → WindowsBloc
 | 项 | Linux | Windows（本实现） |
 | --- | --- | --- |
 | 凭据来源 | GUI/SAC 子进程 `/proc/*/environ` | **本进程 env** → 失败则读 TeleAgent/SAC/**其它进程** environ（Win32 PEB：`OpenProcess` + `NtQueryInformationProcess` + `ReadProcessMemory`，对标 Linux `/proc`）。用户名缺省 `super-agent`。**禁止** Credential Manager 刮取 |
-| 端口 | glue 常用死写 `:4399` | 发现 4399→4397；真机可能是 **4397**；未监听时仍回 4399，由 doctor 报 `not_running` |
+| 端口 | glue 常用死写 `:4399` | 发现 **4399→4397→4398**；真机曾见 **4397** / **4398**；未监听时仍回 4399，由 doctor 报 `not_running` |
 | 路径 | POSIX | 驱动器号 / 反斜杠原样进 session；硬规则把 `\` 归一成 `/` 再匹配 |
 | 硬规则 | `~/.ssh`、浏览器 profile、gh hosts、`.netrc` | 另含 `%USERPROFILE%\.ssh`、`AppData\...\Login Data` / Cookies、`Microsoft\Credentials` / Vault / Protect、Firefox `logins.json` 等（eternal reject） |
-| doctor | 分类见下 | **同一套分类**；仅显式 blocked stub 才报 `blocked`。extras：`windows_live_verified=false`、`creds_source=process_env\|foreign_process_environ\|missing`、端口 4397/4399 是否在听、password/session_key **是否存在**（bool）。**不写 secret 值** |
+| doctor | 分类见下 | **同一套分类**；仅显式 blocked stub 才报 `blocked`。extras：`windows_live_verified=false`、`creds_source=process_env\|foreign_process_environ\|missing`、端口 4399/4397/4398 是否在听、password/session_key **是否存在**（bool）。**不写 secret 值** |
 | 真机 | Debian 上 :4399 已验证 | **未验收**（见下节 `windows_live_verified`） |
 
 禁止：关鉴权、刮 GUI token、开公网诊断端口、把 Credential Manager 当凭据采集面。
@@ -56,12 +56,12 @@ HMAC session key 在进程内存，重启即换。官方数据根可能在 `%APP
 
 ## windows_live_verified
 
-本刀代码已具备发现路径（本进程 env → 其它进程 environ；端口 4399→4397）。
+本刀代码已具备发现路径（本进程 env → 其它进程 environ；端口 **4399→4397→4398**）。
 
 | 项 | 状态 |
 | --- | --- |
 | 适配器 / doctor 代码 | 已合入；单测为 mock |
-| DESKTOP-TBB531F 背景 | TeleAgent 在跑；工人 HTTP **:4397** 返回 **401**（面在，需鉴权）；当前 shell 无 `OPENCODE_SERVER_PASSWORD` / `SUPER_AGENT_LOCAL_SESSION_KEY` |
+| DESKTOP-TBB531F 背景 | TeleAgent 在跑；工人 HTTP 曾见 **:4397** 返回 **401**（面在，需鉴权）；重启后曾见 **:4398**（:4397 / :4399 关闭）。当前 shell 无 `OPENCODE_SERVER_PASSWORD` / `SUPER_AGENT_LOCAL_SESSION_KEY` |
 | live doctor / hello | **由工坊在 DESKTOP-TBB531F 另验** |
 | `windows_live_verified` | **false**（doctor extras 如实；未 live 前不得改 true） |
 
@@ -85,7 +85,7 @@ PYTHONPATH=src python3 -m unittest teleagent_adapter.test_adapter_contract test_
 
 | 文件 | 作用 |
 | --- | --- |
-| `src/teleagent_adapter/windows_local_v1.py` | Win 适配器 + 端口发现 4399→4397 + 凭据编排 |
+| `src/teleagent_adapter/windows_local_v1.py` | Win 适配器 + 端口发现 4399→4397→4398 + 凭据编排 |
 | `src/teleagent_adapter/windows_process_environ.py` | Win32 PEB 读其它进程 environ（可注入 enumerator / block） |
 | `src/teleagent_adapter/windows_blocked.py` | 显式 blocked 降级 |
 | `src/teleagent_adapter/linux_local_v1.py` | 共享 `LocalV1HttpAdapter` HTTP 实现 |
@@ -94,7 +94,7 @@ PYTHONPATH=src python3 -m unittest teleagent_adapter.test_adapter_contract test_
 
 ## Windows 控制层（本机 Grok CLI）
 
-工人层（本适配器）在 DESKTOP-TBB531F 已通：HTTP **:4397** + PEB 凭据。控制层（Grok lead）默认接本机 Grok CLI，不要再用 Linux 的 `/workspace/run-grok.sh` 或 `:4399` 当 Win 默认。
+工人层 HTTP 在 DESKTOP-TBB531F 曾见 **:4397**，重启 TeleAgent 后曾见 **:4398**（:4397 / :4399 关闭）。**以端口发现为准**，不要把默认 `TELEAGENT_BASE_URL` 写死成 4398。控制层（Grok lead）默认接本机 Grok CLI，不要再用 Linux 的 `/workspace/run-grok.sh` 或 `:4399` 当 Win 默认。文档示例仍可用 `:4397`。
 
 ```
 set COLLAB_LEAD_ADAPTER=grok_cli
@@ -103,10 +103,14 @@ set TELEAGENT_BASE_URL=http://127.0.0.1:4397
 python bin/run-live-grok-lead.py
 ```
 
-`COLLAB_LEAD_BIN` 未设或路径不存在时：PATH 上的 `grok` / `grok.exe`，再 `%USERPROFILE%\.grok\bin\grok.exe`，最后仅当文件存在才回退 `/workspace/run-grok.sh`。`TELEAGENT_BASE_URL` 未设时 Win 默认 `http://127.0.0.1:4397`。详见 `docs/lead-adapter.md`。不把本段当成 `windows_live_verified=true`。
+`COLLAB_LEAD_BIN` 未设或路径不存在时：PATH 上的 `grok` / `grok.exe`，再 `%USERPROFILE%\.grok\bin\grok.exe`，最后仅当文件存在才回退 `/workspace/run-grok.sh`。`TELEAGENT_BASE_URL` 未设时走发现（**4399→4397→4398**）；lead 脚本示例仍可用 `:4397`。详见 `docs/lead-adapter.md`。不把本段当成 `windows_live_verified=true`。
 
 ### DESKTOP-TBB531F notes (2026-09-17)
 - Worker HTTP observed on **:4397** (4399 closed).
 - Cred discovery: this-process env, then Win32 PEB environ of TeleAgent/SAC candidates (fixed NtQuery ProcessInformationClass shadowing).
 - `windows_live_verified` stays false until workshop live doctor/hello succeeds.
+
+### DESKTOP-TBB531F notes (2026-09-18)
+- After TeleAgent restart, worker HTTP observed on **:4398** (401 face present; **:4397** and **:4399** closed).
+- Discovery order is **4399 → 4397 → 4398**. Do not pin default `TELEAGENT_BASE_URL` to 4398.
 

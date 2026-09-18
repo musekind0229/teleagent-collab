@@ -68,7 +68,7 @@ export COLLAB_LEAD_EXCHANGE=/path/to/exchange
 
 ## Windows 控制层（本机 Grok CLI）
 
-工人层 TeleAgent 在 DESKTOP-TBB531F 走 HTTP **:4397** + PEB 凭据。控制层默认接本机 Grok CLI（`%USERPROFILE%\.grok\bin\grok.exe`），**不要**再把 Linux 的 `/workspace/run-grok.sh` 或 `:4399` 写死成 Win 默认。
+工人层 TeleAgent 在 DESKTOP-TBB531F 的 HTTP 端口以发现为准（**4399→4397→4398**；曾见 **:4397**，重启后曾见 **:4398**），凭据仍走 PEB。控制层默认接本机 Grok CLI（`%USERPROFILE%\.grok\bin\grok.exe`），**不要**再把 Linux 的 `/workspace/run-grok.sh` 或 `:4399` 写死成 Win 默认，也不要把默认 `TELEAGENT_BASE_URL` 写死成 4398。
 
 ```
 set COLLAB_LEAD_ADAPTER=grok_cli
@@ -77,7 +77,7 @@ set TELEAGENT_BASE_URL=http://127.0.0.1:4397
 python bin/run-live-grok-lead.py
 ```
 
-未设 `COLLAB_LEAD_BIN` 时，`resolve_lead_bin()`（`src/lead_adapter/grok_cli.py`）按上面的顺序找 `grok.exe`。未设 `TELEAGENT_BASE_URL` 时，Win 默认 `:4397`，其它平台 `:4399`。失败后**禁止**去掉 `--disallowed-tools` 再试。
+未设 `COLLAB_LEAD_BIN` 时，`resolve_lead_bin()`（`src/lead_adapter/grok_cli.py`）按上面的顺序找 `grok.exe`。未设 `TELEAGENT_BASE_URL` 时，工人适配器按 **4399→4397→4398** 发现；lead 脚本示例仍可用 `:4397`。其它平台默认 `:4399`。失败后**禁止**去掉 `--disallowed-tools` 再试。
 
 ## Live Grok echo reliability
 

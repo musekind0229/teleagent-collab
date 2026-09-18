@@ -9,8 +9,9 @@ Differences vs Linux (`linux_local_v1.py`):
 - Creds: this-process env first, then other TeleAgent/SAC process environ
   (Win32 PEB / ``ReadProcessMemory``), analog of Linux ``/proc/*/environ``.
   Never Credential Manager. Never disable auth.
-- Port discovery: probe loopback 4399 then 4397 (env `TELEAGENT_BASE_URL` /
-  `TELEAGENT_PORT` override). Live Win worker HTTP may be **:4397**.
+- Port discovery: probe loopback 4399 then 4397 then 4398 (env
+  `TELEAGENT_BASE_URL` / `TELEAGENT_PORT` override). Live Win worker HTTP
+  has been observed on **:4397** and **:4398**.
 - Paths: session `directory` / `x-opencode-directory` are passed through
   (Windows drive-letter paths). Do not POSIX-rewrite.
 
@@ -31,8 +32,9 @@ from teleagent_adapter.windows_process_environ import (
     resolve_windows_local_v1_creds,
 )
 
-# Probe 4399 first (Linux verified listen), then 4397 (DESKTOP-TBB531F worker HTTP).
-DEFAULT_WIN_PORTS: tuple[int, ...] = (4399, 4397)
+# Probe 4399 first (Linux verified listen), then 4397 (historical Win),
+# then 4398 (DESKTOP-TBB531F after TeleAgent restart).
+DEFAULT_WIN_PORTS: tuple[int, ...] = (4399, 4397, 4398)
 DEFAULT_WIN_HOST = "127.0.0.1"
 
 
@@ -86,10 +88,11 @@ def discover_windows_base_url(
     """Resolve TeleAgent worker HTTP base URL for Windows.
 
     Order: ``TELEAGENT_BASE_URL``, then ``TELEAGENT_PORT`` among candidates,
-    then TCP probe of 4399 then 4397. If nothing accepts TCP, return the
-    first candidate (4399) so doctor can classify ``not_running``.
+    then TCP probe of 4399 then 4397 then 4398. If nothing accepts TCP,
+    return the first candidate (4399) so doctor can classify ``not_running``.
 
-    Live Win worker HTTP may be **:4397** (DESKTOP-TBB531F). Windows 真机未验收.
+    Live Win worker HTTP has been observed on **:4397** and **:4398**
+    (DESKTOP-TBB531F). Windows 真机未验收.
     """
     environ = env if env is not None else os.environ
     explicit = _first_env(environ, "TELEAGENT_BASE_URL").rstrip("/")

@@ -8,7 +8,7 @@
 | --- | --- |
 | `src/teleagent_adapter/base.py` | Protocol / ABC：`create_session` / `prompt` / `list_permissions` / `list_questions` / `reply_question` / `reject_question` / `reply_permission` / `session_status` / `cancel`；以及 creds refresh / reconnect / resume 规则 |
 | `src/teleagent_adapter/linux_local_v1.py` | Linux：HTTP Basic + `local-v1` HMAC → `http://127.0.0.1:4399`；共享 `LocalV1HttpAdapter` |
-| `src/teleagent_adapter/windows_local_v1.py` | Windows：同构 HTTP；端口发现 4399→4397（真机可能是 **4397**）；凭据：本进程 env → 其它 TeleAgent/SAC 进程 environ。**Windows 真机未验收** |
+| `src/teleagent_adapter/windows_local_v1.py` | Windows：同构 HTTP；端口发现 4399→4397→4398（真机曾见 **4397** / **4398**）；凭据：本进程 env → 其它 TeleAgent/SAC 进程 environ。**Windows 真机未验收** |
 | `src/teleagent_adapter/windows_process_environ.py` | Win32 PEB 读其它进程 environ（对标 Linux `/proc/*/environ`）；禁止 CM / 关鉴权 |
 | `src/teleagent_adapter/windows_blocked.py` | 显式 blocked/降级路径（`get_adapter(..., blocked=True)`），**不是** win32 工厂默认 |
 | `src/teleagent_adapter/doctor.py` | 诊断：`not_running` / `version_incompatible` / `missing_creds` / `auth_failed` / `api_incompatible` / `ok`（Win 与 Linux 同一套；仅显式 blocked stub → `blocked`） |
@@ -29,7 +29,7 @@
 `AUTH_FAILED` / 401/403 / `local_auth_missing` 或显式 `refresh_creds()` 时重读 environ；禁止每次请求轮询刷新。
 
 ### reconnect
-连接失败时：Linux 固定回 `127.0.0.1:4399`；Windows 可再发现 4399/4397。refresh 一次、原调用最多重试一次。
+连接失败时：Linux 固定回 `127.0.0.1:4399`；Windows 可再发现 4399/4397/4398。refresh 一次、原调用最多重试一次。
 
 ### resume
 已有 `session_id` → `resume` 校验存在后继续 `prompt` / 审批；**禁止**另建重复 session。权限 / 提问 / status / message **严格按 sessionID 过滤**。
@@ -39,7 +39,7 @@
 
 ## Windows 说明（真机未验收）
 
-`get_adapter(platform="win32"|"windows")` 返回 `WindowsLocalV1Adapter`：假定与 Linux 相同的 Basic + local-v1 HTTP 工人面，带端口发现（4399→4397）与凭据发现（本进程 env → 其它进程 environ）。单测全部 simulated。`windows_live_verified=false` 直至工坊在 DESKTOP-TBB531F 另验 live doctor/hello。
+`get_adapter(platform="win32"|"windows")` 返回 `WindowsLocalV1Adapter`：假定与 Linux 相同的 Basic + local-v1 HTTP 工人面，带端口发现（**4399→4397→4398**；DESKTOP-TBB531F 曾见 **:4398**）与凭据发现（本进程 env → 其它进程 environ）。单测全部 simulated。`windows_live_verified=false` 直至工坊在 DESKTOP-TBB531F 另验 live doctor/hello。
 
 `WindowsBlockedAdapter` 仍可用作显式降级（`blocked=True`），不再是工厂默认。不要用关鉴权 / 刮 GUI token / 开公网端口等方式绕过。
 

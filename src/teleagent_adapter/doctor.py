@@ -5,8 +5,8 @@ Windows uses the same classification as Linux (no automatic ``blocked``).
 ``simulate_status``). Windows 真机未验收 — extras keep
 ``windows_live_verified=false`` until workshop live doctor/hello on
 DESKTOP-TBB531F. Extra keys may include ``creds_source``
-(process_env|foreign_process_environ|missing) and loopback ports 4399/4397;
-never secret values.
+(process_env|foreign_process_environ|missing) and loopback ports
+4399/4397/4398; never secret values.
 """
 from __future__ import annotations
 
@@ -97,7 +97,8 @@ def doctor(
         report.details.append(f"simulated status={simulate_status}")
         return report
 
-    # Prefer adapter-discovered base_url when present (Win live often lands on :4397).
+    # Prefer adapter-discovered base_url when present (Win live may land on
+    # :4397 or :4398).
     if adapter is not None:
         ad_url = getattr(adapter, "base_url", None)
         if isinstance(ad_url, str) and ad_url.strip():
@@ -120,11 +121,15 @@ def doctor(
             port_cache[key] = bool(check_port(h, p))
         return port_cache[key]
 
+    win_probe_ports: tuple[int, ...] = (4399, 4397, 4398)
     if plat.startswith("win"):
-        report.extras["ports"] = {
-            "4399": _checked(host, 4399),
-            "4397": _checked(host, 4397),
-        }
+        try:
+            from teleagent_adapter.windows_local_v1 import DEFAULT_WIN_PORTS
+
+            win_probe_ports = tuple(DEFAULT_WIN_PORTS)
+        except Exception:
+            pass
+        report.extras["ports"] = {str(p): _checked(host, p) for p in win_probe_ports}
         try:
             from teleagent_adapter.windows_process_environ import probe_windows_creds_presence
 
@@ -152,13 +157,20 @@ def doctor(
                 return report
 
     if not _checked(host, port):
-        # Windows workers frequently bind :4397 only; do not fail solely on closed :4399.
-        if plat.startswith("win") and port != 4397 and _checked(host, 4397):
-            port = 4397
-            base_url = f"http://{host}:4397"
+        # Windows workers may bind :4397 or :4398 only; do not fail solely on closed :4399.
+        # Preferred closed → try remaining DEFAULT_WIN_PORTS (4397 then 4398).
+        alt_hit: int | None = None
+        if plat.startswith("win"):
+            for alt in win_probe_ports:
+                if alt != port and _checked(host, alt):
+                    alt_hit = alt
+                    break
+        if alt_hit is not None:
+            port = alt_hit
+            base_url = f"http://{host}:{alt_hit}"
             report.base_url = base_url
             report.details.append(
-                f"preferred port closed; using discovered http://{host}:4397"
+                f"preferred port closed; using discovered {base_url}"
             )
             if adapter is not None and hasattr(adapter, "base_url"):
                 try:

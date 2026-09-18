@@ -259,8 +259,10 @@ class TestDoctorExtrasWin(unittest.TestCase):
         ports = r.extras.get("ports") or {}
         self.assertIn("4397", ports)
         self.assertIn("4399", ports)
+        self.assertIn("4398", ports)
         self.assertTrue(ports["4397"])
         self.assertFalse(ports["4399"])
+        self.assertFalse(ports["4398"])
         self.assertIsInstance(r.extras.get("password_present"), bool)
         self.assertIsInstance(r.extras.get("session_key_present"), bool)
         blob = json.dumps(r.to_dict())
