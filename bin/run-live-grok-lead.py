@@ -3,19 +3,29 @@
 
 Honest failures: login/quota/TeleAgent/auth gaps are written clearly — never fake PASS.
 
-Usage:
+Usage (Linux, TeleAgent :4399):
   cd /workspace/teleagent-collab
   python3 bin/run-live-grok-lead.py
   python3 bin/run-live-grok-lead.py --timeout 180 --workdir /tmp/p3-live
+
+Usage (Windows control layer — local Grok CLI + TeleAgent :4397):
+  set COLLAB_LEAD_ADAPTER=grok_cli
+  set COLLAB_LEAD_BIN=%USERPROFILE%\\.grok\\bin\\grok.exe
+  set TELEAGENT_BASE_URL=http://127.0.0.1:4397
+  python bin/run-live-grok-lead.py
+
 Env:
-  COLLAB_LEAD_BIN=/workspace/run-grok.sh   (default)
+  COLLAB_LEAD_BIN     Grok CLI. Default: env path if it exists, else PATH grok/grok.exe,
+                      else %USERPROFILE%\\.grok\\bin\\grok.exe (Windows) or ~/.grok/bin/grok,
+                      else /workspace/run-grok.sh if that file exists.
+  TELEAGENT_BASE_URL  Worker HTTP. Default: http://127.0.0.1:4397 on Windows,
+                      http://127.0.0.1:4399 elsewhere.
   TELEAGENT_MODEL_ID / TELEAGENT_PROVIDER_ID
 """
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 import traceback
@@ -36,11 +46,30 @@ def _fail(report: dict, reason: str, **extra) -> int:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Live Grok lead loop against TeleAgent :4399")
+    ap = argparse.ArgumentParser(
+        description="Live Grok lead loop against TeleAgent worker HTTP (:4397 Windows / :4399 posix)"
+    )
     ap.add_argument("--timeout", type=float, default=180.0)
     ap.add_argument("--workdir", type=str, default="")
-    ap.add_argument("--lead-bin", type=str, default=os.environ.get("COLLAB_LEAD_BIN", "/workspace/run-grok.sh"))
-    ap.add_argument("--base-url", type=str, default="http://127.0.0.1:4399")
+    ap.add_argument(
+        "--lead-bin",
+        type=str,
+        default=None,
+        help=(
+            "Grok CLI binary. Default: COLLAB_LEAD_BIN if that path exists, "
+            "else PATH grok/grok.exe, else ~/.grok/bin/grok.exe (Windows) or "
+            "~/.grok/bin/grok, else /workspace/run-grok.sh if present."
+        ),
+    )
+    ap.add_argument(
+        "--base-url",
+        type=str,
+        default=None,
+        help=(
+            "TeleAgent worker HTTP. Default: TELEAGENT_BASE_URL, else "
+            "http://127.0.0.1:4397 on Windows, http://127.0.0.1:4399 elsewhere."
+        ),
+    )
     args = ap.parse_args()
 
     report: dict = {
@@ -48,8 +77,8 @@ def main() -> int:
         "status": "starting",
         "simulated": False,
         "lead": "grok_cli",
-        "lead_bin": args.lead_bin,
-        "base_url": args.base_url,
+        "lead_bin": args.lead_bin or "",
+        "base_url": args.base_url or "",
         "steps": [],
         "reason": "",
     }
@@ -68,9 +97,12 @@ def main() -> int:
         from teleagent_adapter.doctor import doctor
         from lead_adapter import (
             GrokCliLeadAdapter,
+            LeadBinNotFound,
             build_lead_request,
+            default_live_base_url,
             lead_permission_response_schema,
             lead_review_response_schema,
+            resolve_lead_bin,
             validate_lead_decision,
             LeadDecisionError,
         )
@@ -80,11 +112,14 @@ def main() -> int:
     except Exception as e:
         return _fail(report, f"import error: {e}", traceback=traceback.format_exc())
 
+    base_url = (args.base_url or default_live_base_url()).rstrip("/")
+    report["base_url"] = base_url
+
     # --- doctor ---
     try:
-        ad = get_adapter(base_url=args.base_url)
+        ad = get_adapter(base_url=base_url)
         ad.refresh_creds()
-        rep = doctor(adapter=ad, base_url=args.base_url)
+        rep = doctor(adapter=ad, base_url=base_url)
         report["doctor"] = rep.to_dict()
         report["steps"].append({"step": "doctor", "status": rep.status})
         if rep.status != "ok":
@@ -101,14 +136,16 @@ def main() -> int:
         report["question_api"] = {"available": False, "error": str(e)}
 
     # --- lead binary exists ---
-    lead_bin = Path(args.lead_bin)
-    if not lead_bin.exists():
-        alt = Path.home() / ".grok" / "bin" / "grok"
-        if alt.exists():
-            lead_bin = alt
-            report["lead_bin"] = str(lead_bin)
-        else:
+    if args.lead_bin:
+        lead_bin = Path(args.lead_bin)
+        if not lead_bin.is_file():
             return _fail(report, f"lead binary missing: {args.lead_bin}")
+    else:
+        try:
+            lead_bin = Path(resolve_lead_bin())
+        except LeadBinNotFound as e:
+            return _fail(report, str(e))
+    report["lead_bin"] = str(lead_bin)
 
     lead = GrokCliLeadAdapter(bin_path=str(lead_bin))
     report["steps"].append({"step": "lead_adapter", "name": lead.name, "bin": str(lead_bin)})

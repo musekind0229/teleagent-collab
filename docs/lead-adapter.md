@@ -14,7 +14,7 @@
 | `src/lead_adapter/codex_cli.py` | **待办 stub**：独立 Codex CLI 进程；`codex` 别名仍→inprocess |
 | `src/lead_adapter/deepseek_harness.py` | DeepSeek harness：**JSON-in/JSON-out 包装**；包装内调 `dsh --profile headless` |
 | 工厂 | `get_lead_adapter(kind=...)`；`COLLAB_LEAD_ADAPTER=grok_cli\|inprocess\|claude_code\|codex_cli\|deepseek_harness`（`deepseek` 为别名） |
-| `bin/run-live-grok-lead.py` | 真机：创建→权限→GrokCLI→继续→验收 |
+| `bin/run-live-grok-lead.py` | 真机：创建→权限→GrokCLI→继续→验收。默认 lead bin：`COLLAB_LEAD_BIN`（存在时）→ PATH `grok`/`grok.exe` → `~/.grok/bin/grok.exe`（Win）或 `grok`（posix）→ `/workspace/run-grok.sh`（仅当文件存在）。Win 默认 worker `http://127.0.0.1:4397`，非 Win `:4399` |
 | `bin/run-deepseek-lead.py` | DeepSeek 包装（stdin / `--request-file`）→ `dsh --profile headless`；无 bin/key 时 fail-closed |
 
 ## 请求（每次决策自包含）
@@ -65,6 +65,19 @@ export COLLAB_LEAD_EXCHANGE=/path/to/exchange
 
 `src/test_deepseek_harness_lead.py`（simulated）：`deepseek_harness` 工厂别名、合法 once/pass、非法 JSON / 超时 / spawn 失败 / `application_id` 不匹配 fail-closed；包装 mock `dsh --profile headless` 成功/失败路径。真 dsh+key 的 smoke 默认 skip。
 
+
+## Windows 控制层（本机 Grok CLI）
+
+工人层 TeleAgent 在 DESKTOP-TBB531F 走 HTTP **:4397** + PEB 凭据。控制层默认接本机 Grok CLI（`%USERPROFILE%\.grok\bin\grok.exe`），**不要**再把 Linux 的 `/workspace/run-grok.sh` 或 `:4399` 写死成 Win 默认。
+
+```
+set COLLAB_LEAD_ADAPTER=grok_cli
+set COLLAB_LEAD_BIN=%USERPROFILE%\.grok\bin\grok.exe
+set TELEAGENT_BASE_URL=http://127.0.0.1:4397
+python bin/run-live-grok-lead.py
+```
+
+未设 `COLLAB_LEAD_BIN` 时，`resolve_lead_bin()`（`src/lead_adapter/grok_cli.py`）按上面的顺序找 `grok.exe`。未设 `TELEAGENT_BASE_URL` 时，Win 默认 `:4397`，其它平台 `:4399`。失败后**禁止**去掉 `--disallowed-tools` 再试。
 
 ## Live Grok echo reliability
 

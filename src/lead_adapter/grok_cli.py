@@ -4,11 +4,98 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
-from typing import Any
+import sys
+from collections.abc import Callable, Mapping
+from pathlib import Path
 
 from lead_adapter.base import LeadAdapterABC, safe_failure
 from lead_adapter.schema import format_lead_request_prompt, pin_lead_response_schema
+
+LEGACY_LINUX_LEAD_BIN = "/workspace/run-grok.sh"
+WIN_DEFAULT_BASE_URL = "http://127.0.0.1:4397"
+POSIX_DEFAULT_BASE_URL = "http://127.0.0.1:4399"
+
+
+class LeadBinNotFound(FileNotFoundError):
+    """No Grok lead binary in env, PATH, ~/.grok/bin, or the legacy Linux path."""
+
+
+def default_live_base_url(
+    *,
+    env: Mapping[str, str] | None = None,
+    platform: str | None = None,
+) -> str:
+    """TeleAgent worker HTTP for live Grok lead.
+
+    ``TELEAGENT_BASE_URL`` wins when set. Windows defaults to :4397
+    (DESKTOP-TBB531F worker HTTP); posix defaults to :4399.
+    """
+    environ = env if env is not None else os.environ
+    plat = platform if platform is not None else sys.platform
+    explicit = (environ.get("TELEAGENT_BASE_URL") or "").strip().rstrip("/")
+    if explicit:
+        return explicit
+    if plat.startswith("win"):
+        return WIN_DEFAULT_BASE_URL
+    return POSIX_DEFAULT_BASE_URL
+
+
+def resolve_lead_bin(
+    *,
+    env: Mapping[str, str] | None = None,
+    which: Callable[[str], str | None] | None = None,
+    home: Path | None = None,
+    platform: str | None = None,
+    is_file: Callable[[str], bool] | None = None,
+) -> str:
+    """Resolve the Grok CLI binary used as lead.
+
+    Order:
+    1. ``COLLAB_LEAD_BIN`` if set and the path is a file
+    2. PATH ``grok``, then ``grok.exe``
+    3. ``~/.grok/bin/grok.exe`` on Windows, ``~/.grok/bin/grok`` on posix
+    4. ``/workspace/run-grok.sh`` on posix only, and only if that file exists
+       (legacy Linux). Never the Windows default.
+
+    Raises ``LeadBinNotFound`` when nothing matches.
+    """
+    environ = env if env is not None else os.environ
+    plat = platform if platform is not None else sys.platform
+    which_fn = which if which is not None else shutil.which
+    file_ok = is_file if is_file is not None else (lambda p: Path(p).is_file())
+    home_path = Path(home) if home is not None else Path.home()
+    tried: list[str] = []
+
+    explicit = (environ.get("COLLAB_LEAD_BIN") or "").strip()
+    if explicit:
+        tried.append(f"COLLAB_LEAD_BIN={explicit}")
+        if file_ok(explicit):
+            return explicit
+
+    for name in ("grok", "grok.exe"):
+        tried.append(f"PATH {name}")
+        found = which_fn(name)
+        if found and file_ok(found):
+            return found
+
+    local_name = "grok.exe" if plat.startswith("win") else "grok"
+    local = str(home_path / ".grok" / "bin" / local_name)
+    tried.append(local)
+    if file_ok(local):
+        return local
+
+    if not plat.startswith("win"):
+        tried.append(LEGACY_LINUX_LEAD_BIN)
+        if file_ok(LEGACY_LINUX_LEAD_BIN):
+            return LEGACY_LINUX_LEAD_BIN
+
+    raise LeadBinNotFound(
+        "Grok lead binary not found. Set COLLAB_LEAD_BIN to an existing grok "
+        "or grok.exe, put grok on PATH, or install under ~/.grok/bin "
+        f"(Windows: grok.exe). Tried: {', '.join(tried)}"
+    )
 
 
 class GrokCliLeadAdapter(LeadAdapterABC):
@@ -23,7 +110,8 @@ class GrokCliLeadAdapter(LeadAdapterABC):
         disallowed_tools: str = "bash,shell,edit,write,web_search,web_fetch",
         max_turns: int = 1,
     ) -> None:
-        self.bin_path = bin_path or os.environ.get("COLLAB_LEAD_BIN", "/workspace/run-grok.sh")
+        explicit = (bin_path or "").strip()
+        self.bin_path = explicit or resolve_lead_bin()
         self.disallowed_tools = disallowed_tools
         self.max_turns = max_turns
 
@@ -99,4 +187,12 @@ class GrokCliLeadAdapter(LeadAdapterABC):
                 return None
 
 
-__all__ = ["GrokCliLeadAdapter"]
+__all__ = [
+    "GrokCliLeadAdapter",
+    "LeadBinNotFound",
+    "resolve_lead_bin",
+    "default_live_base_url",
+    "LEGACY_LINUX_LEAD_BIN",
+    "WIN_DEFAULT_BASE_URL",
+    "POSIX_DEFAULT_BASE_URL",
+]

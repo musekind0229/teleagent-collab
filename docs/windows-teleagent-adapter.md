@@ -92,6 +92,19 @@ PYTHONPATH=src python3 -m unittest teleagent_adapter.test_adapter_contract test_
 | `src/teleagent_adapter/doctor.py` | 跨平台分类 + Win extras |
 | `src/hard_rules.py` | Win 密钥路径片段 |
 
+## Windows 控制层（本机 Grok CLI）
+
+工人层（本适配器）在 DESKTOP-TBB531F 已通：HTTP **:4397** + PEB 凭据。控制层（Grok lead）默认接本机 Grok CLI，不要再用 Linux 的 `/workspace/run-grok.sh` 或 `:4399` 当 Win 默认。
+
+```
+set COLLAB_LEAD_ADAPTER=grok_cli
+set COLLAB_LEAD_BIN=%USERPROFILE%\.grok\bin\grok.exe
+set TELEAGENT_BASE_URL=http://127.0.0.1:4397
+python bin/run-live-grok-lead.py
+```
+
+`COLLAB_LEAD_BIN` 未设或路径不存在时：PATH 上的 `grok` / `grok.exe`，再 `%USERPROFILE%\.grok\bin\grok.exe`，最后仅当文件存在才回退 `/workspace/run-grok.sh`。`TELEAGENT_BASE_URL` 未设时 Win 默认 `http://127.0.0.1:4397`。详见 `docs/lead-adapter.md`。不把本段当成 `windows_live_verified=true`。
+
 ### DESKTOP-TBB531F notes (2026-09-17)
 - Worker HTTP observed on **:4397** (4399 closed).
 - Cred discovery: this-process env, then Win32 PEB environ of TeleAgent/SAC candidates (fixed NtQuery ProcessInformationClass shadowing).

@@ -8,7 +8,12 @@ from lead_adapter.base import LeadAdapter, LeadAdapterABC, safe_failure
 from lead_adapter.claude_code import ClaudeCodeLeadAdapter
 from lead_adapter.codex_cli import CodexCliLeadAdapter
 from lead_adapter.deepseek_harness import DeepSeekHarnessLeadAdapter
-from lead_adapter.grok_cli import GrokCliLeadAdapter
+from lead_adapter.grok_cli import (
+    GrokCliLeadAdapter,
+    LeadBinNotFound,
+    default_live_base_url,
+    resolve_lead_bin,
+)
 from lead_adapter.inprocess import InProcessLeadAdapter
 from lead_adapter.schema import (
     LeadDecisionError,
@@ -25,6 +30,9 @@ __all__ = [
     "LeadAdapter",
     "LeadAdapterABC",
     "GrokCliLeadAdapter",
+    "LeadBinNotFound",
+    "resolve_lead_bin",
+    "default_live_base_url",
     "InProcessLeadAdapter",
     "ClaudeCodeLeadAdapter",
     "CodexCliLeadAdapter",

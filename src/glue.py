@@ -73,7 +73,16 @@ def _default_base() -> str:
 
 BASE = _default_base()
 # Lead is swappable: default Grok Build; override with COLLAB_LEAD_BIN (Claude Code/Codex later).
-LEAD_BIN = os.environ.get("COLLAB_LEAD_BIN", "/workspace/run-grok.sh")
+def _default_lead_bin() -> str:
+    try:
+        from lead_adapter.grok_cli import resolve_lead_bin
+
+        return resolve_lead_bin()
+    except Exception:
+        return os.environ.get("COLLAB_LEAD_BIN", "/workspace/run-grok.sh")
+
+
+LEAD_BIN = _default_lead_bin()
 LEAD_NAME = os.environ.get("COLLAB_LEAD_NAME", "grok")
 MODEL = {
     "providerID": os.environ.get("TELEAGENT_PROVIDER_ID", "NewApi"),
