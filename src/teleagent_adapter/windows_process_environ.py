@@ -11,11 +11,15 @@ Current TeleAgent (app.asar) injects ``SECRET_ENV_KEYS`` (including
 them to the OS environ (so ``ps -E`` / ``/proc/*/environ`` / PEB cannot leak
 them). PEB/environ discovery is therefore ineffective on current Win builds.
 This-process env → foreign environ remains a historical / injection fallback,
-not a reliable source for GUI-launched TeleAgent.
+not a reliable source for GUI-launched TeleAgent. When those fail, a
+controlled parent-process **stdin_wrap** (see ``windows_stdin_wrap``) may
+spawn a parallel kernel on :4401 with the same stdin payload.
 
-Doctor extras may set ``creds_blocker`` to ``openprocess_vm_read_denied`` or
-``environ_secrets_stripped`` when this process has no creds and the foreign
-scan fails. Never logs secret values.
+Doctor extras may set ``creds_blocker`` to ``openprocess_vm_read_denied``,
+``environ_secrets_stripped``, or stdin_wrap codes
+(``stdin_wrap_bin_missing`` / ``stdin_wrap_ready_timeout`` /
+``stdin_wrap_spawn_failed``) when this process has no creds and discovery
+fails. Never logs secret values.
 
 Non-Windows: high-level finders no-op (return None / empty). The PEB reader
 raises ``WindowsEnvironUnavailable`` so Linux callers are not silently broken.
@@ -76,10 +80,18 @@ _ENV_CHUNK = 4096
 
 CREDS_SOURCE_PROCESS_ENV = "process_env"
 CREDS_SOURCE_FOREIGN = "foreign_process_environ"
+CREDS_SOURCE_STDIN_WRAP = "stdin_wrap"
 CREDS_SOURCE_MISSING = "missing"
 
 CREDS_BLOCKER_OPENPROCESS_VM_READ_DENIED = "openprocess_vm_read_denied"
 CREDS_BLOCKER_ENVIRON_SECRETS_STRIPPED = "environ_secrets_stripped"
+CREDS_BLOCKER_STDIN_WRAP_BIN_MISSING = "stdin_wrap_bin_missing"
+CREDS_BLOCKER_STDIN_WRAP_READY_TIMEOUT = "stdin_wrap_ready_timeout"
+CREDS_BLOCKER_STDIN_WRAP_SPAWN_FAILED = "stdin_wrap_spawn_failed"
+
+WIN_CREDS_CHANNEL_ENV = "TELEAGENT_WIN_CREDS_CHANNEL"
+WIN_SKIP_PEB_ENV = "TELEAGENT_WIN_SKIP_PEB"
+CREDS_SOURCE_MARKER_ENV = "TELEAGENT_CREDS_SOURCE"
 
 # Fail-closed copy for doctor details / AdapterError — names of keys only, never values.
 CREDS_FAIL_CLOSED_HINT = (
@@ -680,6 +692,34 @@ def count_foreign_candidates(
     return n
 
 
+def _creds_channel(env: Mapping[str, str]) -> str:
+    raw = (env.get(WIN_CREDS_CHANNEL_ENV) or "auto").strip().lower()
+    if raw in ("auto", "stdin_wrap", "env", "off"):
+        return raw
+    return "auto"
+
+
+def _truthy_env(val: str | None) -> bool:
+    return (val or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _should_try_stdin_wrap(
+    channel: str,
+    *,
+    wrap_fn: Callable[..., Any] | None,
+    platform: str | None = None,
+) -> bool:
+    if channel in ("off", "env"):
+        return False
+    if channel == "stdin_wrap":
+        return True
+    # auto: on Windows always; on other hosts only when tests inject wrap_fn
+    # so existing Linux mock suites stay fail-closed without spawning.
+    if wrap_fn is not None:
+        return True
+    return _is_windows(platform)
+
+
 def resolve_windows_local_v1_creds(
     *,
     environ: Mapping[str, str] | None = None,
@@ -688,41 +728,51 @@ def resolve_windows_local_v1_creds(
     environ_reader: Callable[[int], bytes | None] | None = None,
     environ_blocks: Iterable[bytes | str] | None = None,
     skip_pid: int | None = None,
+    wrap_fn: Callable[..., Any] | None = None,
+    skip_peb: bool = False,
 ) -> tuple[tuple[str, str, str] | None, WindowsCredsPresence]:
-    """This-process env first, then foreign TeleAgent/SAC process environ."""
+    """This-process env, then foreign PEB/environ, then stdin_wrap (channel-gated)."""
     env = environ if environ is not None else os.environ
+    channel = _creds_channel(env)
     pw_here = bool(_first_env(env, PASSWORD_KEYS))
     key_here = bool(_first_env(env, SESSION_KEY_KEYS))
     user_here = bool(_first_env(env, USERNAME_KEYS))
     here = extract_local_v1_creds(env)
-    if here is not None:
+    wrap_marker = (env.get(CREDS_SOURCE_MARKER_ENV) or "").strip() == CREDS_SOURCE_STDIN_WRAP
+    if here is not None and not (channel == "stdin_wrap" and not wrap_marker):
+        source = CREDS_SOURCE_STDIN_WRAP if wrap_marker else CREDS_SOURCE_PROCESS_ENV
         return here, WindowsCredsPresence(
-            source=CREDS_SOURCE_PROCESS_ENV,
+            source=source,
             password_present=True,
             session_key_present=True,
             username_present=True,
         )
 
+    skip_peb = bool(skip_peb) or channel in ("stdin_wrap", "env") or _truthy_env(
+        env.get(WIN_SKIP_PEB_ENV)
+    )
+
     scan = _ForeignEnvironScan()
-    try:
-        scan = _scan_foreign_process_environ(
-            enumerator=enumerator,
-            environ_reader=environ_reader,
-            environ_blocks=environ_blocks,
-            skip_pid=skip_pid,
-        )
-    except Exception:
-        scan = _ForeignEnvironScan()
+    if not skip_peb:
+        try:
+            scan = _scan_foreign_process_environ(
+                enumerator=enumerator,
+                environ_reader=environ_reader,
+                environ_blocks=environ_blocks,
+                skip_pid=skip_pid,
+            )
+        except Exception:
+            scan = _ForeignEnvironScan()
 
     n_cand = scan.candidates
-    if n_cand == 0:
+    if n_cand == 0 and not skip_peb:
         try:
             n_cand = count_foreign_candidates(enumerator=enumerator, skip_pid=skip_pid)
         except Exception:
             n_cand = 0
 
     foreign: tuple[str, str, str] | None = scan.creds
-    if foreign_finder is not None:
+    if foreign_finder is not None and not skip_peb:
         try:
             foreign = foreign_finder()
         except AdapterError:
@@ -743,17 +793,53 @@ def resolve_windows_local_v1_creds(
                 environ_readable_without_secrets=scan.environ_readable_without_secrets,
             )
 
+    wrap_blocker: str | None = None
+    if _should_try_stdin_wrap(channel, wrap_fn=wrap_fn):
+        try:
+            from teleagent_adapter.windows_stdin_wrap import (
+                ensure_stdin_wrap,
+                inject_wrap_creds_into_environ,
+            )
+
+            handle = wrap_fn() if wrap_fn is not None else ensure_stdin_wrap(environ=env)
+            pw = getattr(handle, "password", "") or ""
+            key = getattr(handle, "session_key", "") or ""
+            if pw and key:
+                try:
+                    inject_wrap_creds_into_environ(handle)
+                except Exception:
+                    pass
+                user = getattr(handle, "username", "") or DEFAULT_BASIC_USER
+                return (user, pw, key), WindowsCredsPresence(
+                    source=CREDS_SOURCE_STDIN_WRAP,
+                    password_present=True,
+                    session_key_present=True,
+                    username_present=True,
+                    foreign_candidates=n_cand,
+                    openprocess_denied_count=scan.openprocess_denied_count,
+                    environ_readable_without_secrets=scan.environ_readable_without_secrets,
+                )
+        except Exception as e:
+            wrap_blocker = getattr(e, "blocker", None)
+            if wrap_blocker not in (
+                CREDS_BLOCKER_STDIN_WRAP_BIN_MISSING,
+                CREDS_BLOCKER_STDIN_WRAP_READY_TIMEOUT,
+                CREDS_BLOCKER_STDIN_WRAP_SPAWN_FAILED,
+            ):
+                wrap_blocker = CREDS_BLOCKER_STDIN_WRAP_SPAWN_FAILED
+
+    peb_blocker = _choose_missing_blocker(
+        candidates=n_cand,
+        openprocess_denied_count=scan.openprocess_denied_count,
+        environ_readable_without_secrets=scan.environ_readable_without_secrets,
+    )
     return None, WindowsCredsPresence(
         source=CREDS_SOURCE_MISSING,
         password_present=pw_here,
         session_key_present=key_here,
         username_present=user_here,
         foreign_candidates=n_cand,
-        blocker=_choose_missing_blocker(
-            candidates=n_cand,
-            openprocess_denied_count=scan.openprocess_denied_count,
-            environ_readable_without_secrets=scan.environ_readable_without_secrets,
-        ),
+        blocker=wrap_blocker or peb_blocker,
         openprocess_denied_count=scan.openprocess_denied_count,
         environ_readable_without_secrets=scan.environ_readable_without_secrets,
     )
@@ -767,6 +853,8 @@ def probe_windows_creds_presence(
     environ_reader: Callable[[int], bytes | None] | None = None,
     environ_blocks: Iterable[bytes | str] | None = None,
     skip_pid: int | None = None,
+    wrap_fn: Callable[..., Any] | None = None,
+    skip_peb: bool = False,
 ) -> WindowsCredsPresence:
     """Doctor-facing probe: source + bool presence, never secret values."""
     _creds, presence = resolve_windows_local_v1_creds(
@@ -776,6 +864,8 @@ def probe_windows_creds_presence(
         environ_reader=environ_reader,
         environ_blocks=environ_blocks,
         skip_pid=skip_pid,
+        wrap_fn=wrap_fn,
+        skip_peb=skip_peb,
     )
     return presence
 
@@ -783,10 +873,14 @@ def probe_windows_creds_presence(
 __all__ = [
     "CREDS_BLOCKER_ENVIRON_SECRETS_STRIPPED",
     "CREDS_BLOCKER_OPENPROCESS_VM_READ_DENIED",
+    "CREDS_BLOCKER_STDIN_WRAP_BIN_MISSING",
+    "CREDS_BLOCKER_STDIN_WRAP_READY_TIMEOUT",
+    "CREDS_BLOCKER_STDIN_WRAP_SPAWN_FAILED",
     "CREDS_FAIL_CLOSED_HINT",
     "CREDS_SOURCE_FOREIGN",
     "CREDS_SOURCE_MISSING",
     "CREDS_SOURCE_PROCESS_ENV",
+    "CREDS_SOURCE_STDIN_WRAP",
     "DEFAULT_BASIC_USER",
     "MISSING_CREDS_MESSAGE",
     "PASSWORD_KEYS",

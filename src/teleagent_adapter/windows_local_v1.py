@@ -7,8 +7,10 @@ on DESKTOP-TBB531F is workshop-owned (``windows_live_verified=false``).
 
 Differences vs Linux (`linux_local_v1.py`):
 - Creds: this-process env first, then other TeleAgent/SAC process environ
-  (Win32 PEB / ``ReadProcessMemory``), analog of Linux ``/proc/*/environ``.
-  Never Credential Manager. Never disable auth.
+  (Win32 PEB / ``ReadProcessMemory``, historical / unreliable on current GUI),
+  then a controlled **stdin_wrap** parent spawn (loopback :4401) using the
+  same stdin env payload as the GUI. Never Credential Manager. Never disable
+  auth. Never SeDebug / token.json scrape.
 - Port discovery: probe loopback 4399 then 4397 then 4398 (env
   `TELEAGENT_BASE_URL` / `TELEAGENT_PORT` override). Live Win worker HTTP
   has been observed on **:4397** and **:4398**.
@@ -58,22 +60,29 @@ def default_find_creds_windows(
     *,
     environ: Mapping[str, str] | None = None,
     foreign_finder: Callable[[], tuple[str, str, str] | None] | None = None,
+    wrap_fn: Callable | None = None,
 ) -> tuple[str, str, str]:
-    """Read local-v1 creds: this-process env, then TeleAgent/SAC process environ.
+    """Read local-v1 creds: this-process env, then PEB/environ, then stdin_wrap.
 
     Username defaults to ``super-agent`` when password + session key are set
     (Linux documented Basic user). Missing password or HMAC key → MISSING_CREDS
-    after scanning other processes' environ (not this-process env). Does not
-    suggest disabling auth. Inject ``foreign_finder`` in tests.
+    after scanning other processes' environ (not this-process env) and, when
+    the creds channel allows it, a controlled stdin_wrap spawn. Does not
+    suggest disabling auth. Inject ``foreign_finder`` / ``wrap_fn`` in tests.
 
     Windows 真机未验收 — live doctor/hello is workshop-owned.
     """
-    creds, _presence = resolve_windows_local_v1_creds(
+    creds, presence = resolve_windows_local_v1_creds(
         environ=environ,
         foreign_finder=foreign_finder,
+        wrap_fn=wrap_fn,
     )
     if creds is None:
-        raise AdapterError(AdapterStatus.MISSING_CREDS, MISSING_CREDS_MESSAGE)
+        msg = MISSING_CREDS_MESSAGE
+        blocker = getattr(presence, "blocker", None)
+        if isinstance(blocker, str) and blocker.startswith("stdin_wrap"):
+            msg = msg + f" stdin_wrap blocker={blocker}."
+        raise AdapterError(AdapterStatus.MISSING_CREDS, msg)
     return creds
 
 
@@ -159,7 +168,17 @@ class WindowsLocalV1Adapter(LocalV1HttpAdapter):
                 base_url = f"http://{self._discover_host}:{DEFAULT_WIN_PORTS[0]}"
 
         def _creds() -> tuple[str, str, str]:
-            return default_find_creds_windows(environ=env)
+            result = default_find_creds_windows(environ=env)
+            if self._auto_discover:
+                try:
+                    from teleagent_adapter.windows_stdin_wrap import current_wrap_handle
+
+                    handle = current_wrap_handle()
+                except Exception:
+                    handle = None
+                if handle is not None and getattr(handle, "owns_base_url", False):
+                    self.base_url = handle.base_url.rstrip("/")
+            return result
 
         super().__init__(
             base_url=base_url,

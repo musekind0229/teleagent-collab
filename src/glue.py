@@ -103,7 +103,7 @@ def prompt_body(text: str, model=None) -> dict:
 
 
 def find_creds():
-    """Linux: /proc/*/environ. Windows: this-process env then TeleAgent PEB environ."""
+    """Linux: /proc/*/environ. Windows: this-process env, PEB, then stdin_wrap."""
     import sys
 
     if sys.platform.startswith("win"):

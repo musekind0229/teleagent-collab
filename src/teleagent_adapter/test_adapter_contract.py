@@ -507,6 +507,7 @@ class TestDoctorClassificationWinAndLinux(unittest.TestCase):
         self.assertIn(win.extras.get("creds_source"), (
             "process_env",
             "foreign_process_environ",
+            "stdin_wrap",
             "missing",
         ))
         self.assertIn("4397", win.extras.get("ports") or {})

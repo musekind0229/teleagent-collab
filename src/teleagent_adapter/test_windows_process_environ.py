@@ -266,6 +266,7 @@ class TestDoctorExtrasWin(unittest.TestCase):
             CREDS_SOURCE_PROCESS_ENV,
             CREDS_SOURCE_FOREIGN,
             CREDS_SOURCE_MISSING,
+            "stdin_wrap",
         ))
         ports = r.extras.get("ports") or {}
         self.assertIn("4397", ports)
@@ -285,6 +286,9 @@ class TestDoctorExtrasWin(unittest.TestCase):
             None,
             CREDS_BLOCKER_OPENPROCESS_VM_READ_DENIED,
             CREDS_BLOCKER_ENVIRON_SECRETS_STRIPPED,
+            "stdin_wrap_bin_missing",
+            "stdin_wrap_ready_timeout",
+            "stdin_wrap_spawn_failed",
         ))
 
 
