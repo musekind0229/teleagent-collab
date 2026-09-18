@@ -19,6 +19,7 @@ if str(_SRC) not in sys.path:
 
 from teleagent_adapter.doctor import doctor  # noqa: E402
 from teleagent_adapter.windows_process_environ import (  # noqa: E402
+    CREDS_BLOCKER_GUI_MODEL_AUTH_MISSING,
     CREDS_BLOCKER_STDIN_WRAP_BIN_MISSING,
     CREDS_BLOCKER_STDIN_WRAP_READY_TIMEOUT,
     CREDS_BLOCKER_STDIN_WRAP_SPAWN_FAILED,
@@ -52,6 +53,9 @@ _INJECT_KEYS = (
     "TELEAGENT_WIN_SKIP_PEB",
     "TELEAGENT_KERNEL_BIN",
     "TELEAGENT_WRAP_PORT",
+    "TELEAGENT_WIN_REUSE_GUI_MODEL",
+    "TELEAGENT_GUI_LEVELDB_DIR",
+    "TELEAGENT_GUI_DEVICE_META",
 )
 
 
@@ -75,6 +79,8 @@ class _WrapTestCase(unittest.TestCase):
         self._saved = {k: os.environ.get(k) for k in _INJECT_KEYS}
         for k in _INJECT_KEYS:
             os.environ.pop(k, None)
+        # Do not pick up the live GUI token on the workshop machine.
+        os.environ["TELEAGENT_WIN_REUSE_GUI_MODEL"] = "0"
         reset_wrap_for_tests()
 
     def tearDown(self) -> None:
@@ -118,9 +124,16 @@ class TestBuildEnvPayload(_WrapTestCase):
         child = build_child_os_env(
             parent=parent,
             xdg_data_home=r"C:\Temp\teleagent-collab-wrap\xdg",
+            extra_nonsecret={
+                "OPENCODE_CONFIG_DIR": r"C:\Users\x\.config\TeleAgent",
+                "SUPER_AGENT_AUTH_STATE": "sim-auth-state",
+            },
         )
         for key in SECRET_STDIN_KEYS:
             self.assertNotIn(key, child)
+        self.assertEqual(child["OPENCODE_CONFIG_DIR"], r"C:\Users\x\.config\TeleAgent")
+        self.assertIn("SUPER_AGENT_AUTH_STATE", SECRET_STDIN_KEYS)
+        self.assertIn("OPENCODE_CONFIG_CONTENT", SECRET_STDIN_KEYS)
         self.assertEqual(child["PATH"], parent["PATH"])
         self.assertEqual(child["SystemRoot"], parent["SystemRoot"])
         self.assertEqual(child["TEMP"], parent["TEMP"])
@@ -233,6 +246,8 @@ class TestEnsureStdinWrap(_WrapTestCase):
         self.assertEqual(parsed["OPENCODE_SERVER_PASSWORD"], handle.password)
         self.assertEqual(parsed["SUPER_AGENT_LOCAL_SESSION_KEY"], handle.session_key)
         self.assertEqual(parsed["SUPER_AGENT_SERVER_URL"], "http://127.0.0.1:4401")
+        self.assertNotIn("SUPER_AGENT_AUTH_STATE", parsed)
+        self.assertNotIn("OPENCODE_CONFIG_CONTENT", parsed)
 
         creds, presence = resolve_windows_local_v1_creds(
             environ={},
@@ -327,6 +342,7 @@ class TestEnsureStdinWrap(_WrapTestCase):
         creds, presence = resolve_windows_local_v1_creds(
             environ={"TELEAGENT_WIN_CREDS_CHANNEL": "off"},
             foreign_finder=lambda: None,
+            enumerator=lambda: [],
             wrap_fn=nope,
         )
         self.assertIsNone(creds)
@@ -456,6 +472,27 @@ class TestEnsureStdinWrap(_WrapTestCase):
         )
         self.assertEqual(presence.source, CREDS_SOURCE_STDIN_WRAP)
         self.assertEqual(creds, ("super-agent", "sim-pass", "sim-key"))
+
+    def test_gui_model_auth_missing_surfaces_in_presence_and_doctor(self):
+        _creds, presence = resolve_windows_local_v1_creds(
+            environ={"TELEAGENT_WIN_CREDS_CHANNEL": "stdin_wrap"},
+            foreign_finder=lambda: (_ for _ in ()).throw(AssertionError("peb skipped")),
+            wrap_fn=lambda: (_ for _ in ()).throw(
+                StdinWrapError(CREDS_BLOCKER_GUI_MODEL_AUTH_MISSING, "GUI model auth missing")
+            ),
+        )
+        self.assertIsNone(_creds)
+        self.assertEqual(presence.source, "missing")
+        self.assertEqual(presence.blocker, CREDS_BLOCKER_GUI_MODEL_AUTH_MISSING)
+        r = doctor(
+            platform="win32",
+            port_open_fn=lambda h, p: p == 4401,
+            creds_presence_fn=lambda: presence,
+        )
+        self.assertEqual(r.extras.get("creds_blocker"), CREDS_BLOCKER_GUI_MODEL_AUTH_MISSING)
+        blob = json.dumps(r.to_dict())
+        self.assertNotIn("sim-pass", blob)
+        self.assertNotIn("fake-gui-token", blob)
 
     def test_auto_without_wrap_fn_on_non_windows_skips_wrap(self):
         if sys.platform.lower().startswith("win"):

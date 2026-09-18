@@ -10,7 +10,9 @@ memory (default: not written to disk) and are injected into *this* process
 
 Never logs secret values. Never Credential Manager, never disable auth, never
 SeDebugPrivilege, never scrape OAuth token.json. Do not guess Program Files
-GUI ``TeleAgent.exe``.
+GUI ``TeleAgent.exe``. Optional GUI model reuse injects ``SUPER_AGENT_AUTH_STATE``
+and ``OPENCODE_CONFIG_CONTENT`` via the same stdin channel (see
+``windows_gui_model_reuse``).
 """
 from __future__ import annotations
 
@@ -26,11 +28,17 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Iterable, Mapping, MutableMapping
+from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from teleagent_adapter.windows_gui_model_reuse import (
+    GuiModelAuthError,
+    OPENCODE_CONFIG_DIR_ENV,
+    TELEAGENT_CONFIG_DIR_ENV,
+    prepare_gui_model_reuse,
+)
 from teleagent_adapter.windows_process_environ import (
     CREDS_BLOCKER_GUI_MODEL_AUTH_MISSING,
     CREDS_BLOCKER_STDIN_WRAP_BIN_MISSING,
@@ -427,8 +435,6 @@ def _resolve_port(port: int | None, env: Mapping[str, str]) -> int:
 
 
 def _port_listening(port: int, host: str = "127.0.0.1") -> bool:
-    import socket
-
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.settimeout(0.25)
         try:
@@ -437,21 +443,137 @@ def _port_listening(port: int, host: str = "127.0.0.1") -> bool:
             return False
 
 
+def _listener_pids_on_port(port: int) -> list[int]:
+    """PIDs in TCP LISTEN on ``port`` (IPv4/IPv6). Empty on non-Windows or error."""
+    if not sys.platform.lower().startswith("win"):
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return []
+
+    af_inet, af_inet6 = 2, 23
+    table_listener = 3
+    iphlpapi = ctypes.WinDLL("iphlpapi", use_last_error=True)
+    get_table = iphlpapi.GetExtendedTcpTable
+    get_table.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.BOOL,
+        wintypes.ULONG,
+        ctypes.c_int,
+        wintypes.ULONG,
+    ]
+    get_table.restype = wintypes.DWORD
+
+    class _Row4(ctypes.Structure):
+        _fields_ = [
+            ("dwState", wintypes.DWORD),
+            ("dwLocalAddr", wintypes.DWORD),
+            ("dwLocalPort", wintypes.DWORD),
+            ("dwRemoteAddr", wintypes.DWORD),
+            ("dwRemotePort", wintypes.DWORD),
+            ("dwOwningPid", wintypes.DWORD),
+        ]
+
+    class _Row6(ctypes.Structure):
+        _fields_ = [
+            ("ucLocalAddr", ctypes.c_ubyte * 16),
+            ("dwLocalScopeId", wintypes.DWORD),
+            ("dwLocalPort", wintypes.DWORD),
+            ("ucRemoteAddr", ctypes.c_ubyte * 16),
+            ("dwRemoteScopeId", wintypes.DWORD),
+            ("dwRemotePort", wintypes.DWORD),
+            ("dwState", wintypes.DWORD),
+            ("dwOwningPid", wintypes.DWORD),
+        ]
+
+    def _rows(family: int, row_cls: type) -> list[int]:
+        size = wintypes.DWORD(0)
+        get_table(None, ctypes.byref(size), False, family, table_listener, 0)
+        if size.value <= 4:
+            return []
+        buf = ctypes.create_string_buffer(size.value)
+        rc = get_table(buf, ctypes.byref(size), False, family, table_listener, 0)
+        if rc != 0:
+            return []
+        n = struct.unpack_from("<I", buf, 0)[0]
+        off = 4
+        row_size = ctypes.sizeof(row_cls)
+        found: list[int] = []
+        for _ in range(int(n)):
+            if off + row_size > size.value:
+                break
+            row = row_cls.from_buffer_copy(buf, off)
+            off += row_size
+            local_port = socket.ntohs(int(row.dwLocalPort) & 0xFFFF)
+            if local_port != int(port):
+                continue
+            pid = int(row.dwOwningPid or 0)
+            if pid > 0:
+                found.append(pid)
+        return found
+
+    pids: list[int] = []
+    try:
+        pids.extend(_rows(af_inet, _Row4))
+    except Exception:
+        pass
+    try:
+        pids.extend(_rows(af_inet6, _Row6))
+    except Exception:
+        pass
+    # unique, skip self
+    me = os.getpid()
+    out: list[int] = []
+    seen: set[int] = set()
+    for pid in pids:
+        if pid == me or pid in seen or pid <= 4:
+            continue
+        seen.add(pid)
+        out.append(pid)
+    return out
+
+
+def _kill_listeners_on_port(port: int) -> None:
+    """Best-effort terminate of processes LISTENING on wrap port. Never logs."""
+    for pid in _listener_pids_on_port(port):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            continue
+
+
 def _wait_port_free(
     port: int,
     *,
-    timeout: float = 10.0,
+    timeout: float | None = None,
     sleep_fn: Callable[[float], None] | None = None,
     listening_fn: Callable[[int], bool] | None = None,
 ) -> None:
-    """After killing an orphan, wait until wrap port stops accepting TCP."""
+    """Wait until wrap port is not LISTENING. Fail-closed on timeout.
+
+    ``listening_fn is None`` skips the wait (tests that inject spawn_fn).
+    """
+    if listening_fn is None:
+        return
     sleeper = sleep_fn or time.sleep
-    check = listening_fn or _port_listening
-    deadline = time.time() + float(timeout)
-    while time.time() < deadline:
-        if not check(int(port)):
+    limit = DEFAULT_PORT_FREE_TIMEOUT_S if timeout is None else float(timeout)
+    deadline = time.monotonic() + max(0.0, limit)
+    while True:
+        try:
+            busy = bool(listening_fn(int(port)))
+        except Exception:
+            busy = False
+        if not busy:
             return
-        sleeper(0.2)
+        if time.monotonic() >= deadline:
+            raise StdinWrapError(
+                CREDS_BLOCKER_STDIN_WRAP_SPAWN_FAILED,
+                f"stdin_wrap port {port} still LISTENING after kill wait",
+            )
+        sleeper(0.05)
 
 
 def inject_wrap_creds_into_environ(
@@ -478,11 +600,16 @@ def ensure_stdin_wrap(
     kernel_bin: str | Path | None = None,
     ready_timeout: float | None = None,
     is_file: Callable[[Path], bool] | None = None,
+    listening_fn: Callable[[int], bool] | None = None,
+    kill_listeners_fn: Callable[[int], None] | None = None,
+    wait_port_free_timeout: float | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
 ) -> WrapHandle:
     """Reuse a live wrap (pid file + /ready + in-memory secrets) or spawn one.
 
     Secrets are generated with ``secrets`` and kept in parent memory. Child OS
-    environ is a non-secret whitelist. Tests may inject ``spawn_fn`` / ``ready_fn``.
+    environ is a non-secret whitelist. Tests may inject ``spawn_fn`` / ``ready_fn``
+    and port-reclaim hooks (``listening_fn`` / ``kill_listeners_fn``).
     """
     global _LIVE, _LIVE_PROC
     env = environ if environ is not None else os.environ
@@ -502,6 +629,7 @@ def ensure_stdin_wrap(
             except Exception:
                 pass
 
+    extra_pids: list[int] = []
     recorded = _read_pid_file(environ=env)
     if recorded is not None:
         rec_pid, rec_port = recorded
@@ -512,13 +640,34 @@ def ensure_stdin_wrap(
                         return _LIVE
                 except Exception:
                     pass
-            # Orphan wrap we cannot authenticate to — stop and respawn.
+            extra_pids.append(rec_pid)
+        _remove_pid_file(environ=env)
+
+    reclaim_os = spawn_fn is None or listening_fn is not None or kill_listeners_fn is not None
+    if extra_pids or reclaim_os:
+        for pid in extra_pids:
             try:
-                os.kill(rec_pid, signal.SIGTERM)
+                os.kill(pid, signal.SIGTERM)
             except OSError:
                 pass
-            _wait_port_free(wrap_port)
-        _remove_pid_file(environ=env)
+        if reclaim_os:
+            killer = kill_listeners_fn
+            if killer is None and spawn_fn is None:
+                killer = _kill_listeners_on_port
+            if killer is not None:
+                try:
+                    killer(wrap_port)
+                except Exception:
+                    pass
+            wait_listen = listening_fn
+            if wait_listen is None and spawn_fn is None:
+                wait_listen = _port_listening
+            _wait_port_free(
+                wrap_port,
+                timeout=wait_port_free_timeout,
+                sleep_fn=sleep_fn,
+                listening_fn=wait_listen,
+            )
 
     if kernel_bin is not None:
         bin_path = Path(kernel_bin)
@@ -551,22 +700,31 @@ def ensure_stdin_wrap(
         "SUPER_AGENT_SERVER_URL": base_url,
         "XDG_DATA_HOME": str(xdg),
     }
+    child_extra: dict[str, str] = {}
     try:
-        from teleagent_adapter.windows_gui_model_reuse import (
-            GuiModelAuthError,
-            prepare_gui_model_reuse,
-        )
-
         extras = prepare_gui_model_reuse(session_key, environ=env)
         if extras:
             payload_env.update(extras)
+            for key in (OPENCODE_CONFIG_DIR_ENV, TELEAGENT_CONFIG_DIR_ENV):
+                val = extras.get(key)
+                if isinstance(val, str) and val:
+                    child_extra[key] = val
     except GuiModelAuthError as e:
         raise StdinWrapError(
-            getattr(e, "blocker", None) or "gui_model_auth_missing",
-            str(e),
+            CREDS_BLOCKER_GUI_MODEL_AUTH_MISSING,
+            "GUI TeleAgent model auth missing or unreadable; stdin_wrap not spawned",
+        ) from e
+    except Exception as e:
+        raise StdinWrapError(
+            CREDS_BLOCKER_GUI_MODEL_AUTH_MISSING,
+            "GUI TeleAgent model auth missing or unreadable; stdin_wrap not spawned",
         ) from e
     payload = build_env_payload(payload_env)
-    child_env = build_child_os_env(parent=env, xdg_data_home=str(xdg))
+    child_env = build_child_os_env(
+        parent=env,
+        xdg_data_home=str(xdg),
+        extra_nonsecret=child_extra or None,
+    )
 
     spawn = spawn_fn or _default_spawn
     try:

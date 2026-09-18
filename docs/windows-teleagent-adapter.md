@@ -105,9 +105,10 @@ Win doctor 在 extras 中写入（**永不写 secret 值**）：
 | `environ_secrets_stripped` | 至少一个候选进程 **成功** 读到 environ 块，但块内 **没有** password+session_key（现行 stdin 化典型：renderer 可读但无密钥；或工人 environ 被掏空） |
 | `stdin_wrap_bin_missing` | stdin_wrap 通道已尝试，但运行时内核 `TeleAgent.exe` 不在 `TELEAGENT_KERNEL_BIN` / `{USERPROFILE}/.local/share/TeleAgent/runtimes/super-agent-code/bin/`（及 LOCALAPPDATA/HOME 变体） |
 | `stdin_wrap_ready_timeout` | wrap 已 spawn，等待 `http://127.0.0.1:{port}/ready` 超时（fail-closed） |
-| `stdin_wrap_spawn_failed` | wrap spawn / 写 stdin payload 失败，或内核在 `/ready` 前退出 |
+| `stdin_wrap_spawn_failed` | wrap spawn / 写 stdin payload 失败，或内核在 `/ready` 前退出，或杀旧 wrap 后端口仍 LISTENING |
+| `gui_model_auth_missing` | `TELEAGENT_WIN_REUSE_GUI_MODEL=1` 或 auto 已发现 GUI 鉴权文件但读/加密失败；**fail-closed，不 spawn 半配置 wrap** |
 
-PEB 两码都有时优先 `environ_secrets_stripped`（证明 environ 路径已空）。wrap 已尝试且失败时优先 wrap 三码。都无则 `creds_blocker` 为空，`creds_source` 仍为 `missing`。`missing_creds` 时 `details` 带 fail-closed 说明（stdin / 禁止关鉴权、刮 CM、SeDebug）。
+PEB 两码都有时优先 `environ_secrets_stripped`（证明 environ 路径已空）。wrap 已尝试且失败时优先 wrap 三码 / `gui_model_auth_missing`。都无则 `creds_blocker` 为空，`creds_source` 仍为 `missing`。`missing_creds` 时 `details` 带 fail-closed 说明（stdin / 禁止关鉴权、刮 CM、SeDebug）。
 
 ## windows_live_verified
 
@@ -132,10 +133,11 @@ PEB 两码都有时优先 `environ_secrets_stripped`（证明 environ 路径已�
 PYTHONPATH=src python3 -m unittest teleagent_adapter.test_adapter_contract -v
 PYTHONPATH=src python3 -m unittest teleagent_adapter.test_windows_process_environ -v
 PYTHONPATH=src python3 -m unittest teleagent_adapter.test_windows_stdin_wrap -v
+PYTHONPATH=src python3 -m unittest teleagent_adapter.test_windows_gui_model_reuse -v
 PYTHONPATH=src python3 -m unittest teleagent_adapter.test_adapter_contract test_hard_rules test_p3_lead_question_install
 ```
 
-测例字符串只用 `sim-pass` / `sim-key` 一类假值。
+测例字符串只用 `sim-pass` / `sim-key` / `fake-gui-token` 一类假值。永不提交真实 token。
 
 ## 代码
 
@@ -144,6 +146,7 @@ PYTHONPATH=src python3 -m unittest teleagent_adapter.test_adapter_contract test_
 | `src/teleagent_adapter/windows_local_v1.py` | Win 适配器 + 端口发现 4399→4397→4398 + 凭据编排 |
 | `src/teleagent_adapter/windows_process_environ.py` | Win32 PEB 读其它进程 environ（可注入 enumerator / block）+ 凭据通道编排 |
 | `src/teleagent_adapter/windows_stdin_wrap.py` | 合法凭据通道：受控父进程 stdin wrap（默认 :4401，与 GUI 并行） |
+| `src/teleagent_adapter/windows_gui_model_reuse.py` | 把已登录 GUI 的 model token / device-meta 经 stdin 注入 wrap（AES-GCM；永不 log token） |
 | `src/teleagent_adapter/windows_blocked.py` | 显式 blocked 降级 |
 | `src/teleagent_adapter/linux_local_v1.py` | 共享 `LocalV1HttpAdapter` HTTP 实现 |
 | `src/teleagent_adapter/doctor.py` | 跨平台分类 + Win extras |
@@ -179,29 +182,42 @@ python bin/run-live-grok-lead.py
 - `windows_live_verified` stays **false**.
 
 - Fix (same day): `resolve_windows_local_v1_creds` no longer trusts process env when `TELEAGENT_WIN_CREDS_CHANNEL=stdin_wrap` or `TELEAGENT_CREDS_SOURCE=stdin_wrap` — fall through to `ensure_stdin_wrap` so doctor `/version` matches the live handle (avoids auth_failed from stale env after hard reset).
+- GUI model reuse: stdin_wrap injects `SUPER_AGENT_AUTH_STATE` + `OPENCODE_CONFIG_CONTENT` from GUI Local Storage `opencowork-auth` + `device-meta.json` (AES-256-GCM). After inject, live children should use `TELEAGENT_WIN_CREDS_CHANNEL=env`. Orphan wrap port waits until not LISTENING before respawn.
 
 ## GUI model reuse (stdin_wrap)
 
-On Windows, `ensure_stdin_wrap` can inject the logged-in GUI TeleAgent model
-auth into the wrap kernel stdin payload (authorized reuse):
+wrap 的 XDG 与 GUI 隔离，未注入 model 鉴权时 live `create_session` / `prompt` 会成功但 **lead_calls=0**（内核没有 NewApi 登录态）。本通道经 **同一 uint32-BE JSON stdin** 注入 GUI 已登录态，**不是** Credential Manager / PEB / SeDebug。
 
-- `SUPER_AGENT_AUTH_STATE` — AES-GCM blob of `{token, deviceId, installId}`
-- `OPENCODE_CONFIG_CONTENT` — minimal NewApi provider config
-- Optional `OPENCODE_CONFIG_DIR` / `TELEAGENT_CONFIG_DIR` when
-  `%USERPROFILE%\.config\TeleAgent` exists
+注入键（均走 stdin payload；SECRET 键禁止进子进程 OS environ）：
 
-Sources (never Credential Manager / PEB / SeDebug):
+| 键 | 内容 |
+| --- | --- |
+| `SUPER_AGENT_AUTH_STATE` | `encryptAuthState({token, deviceId, installId}, sessionKey)` 的 JSON 字符串 |
+| `SUPER_AGENT_LOCAL_SESSION_KEY` | wrap 已生成的 sessionKey（解密用） |
+| `OPENCODE_CONFIG_CONTENT` | 最小 OpenCode JSON：`provider.NewApi.options.baseURL`、`small_model=NewApi/chat-lite`、`enabled_providers` 含 `NewApi`；`agent` / `mcp` 为空对象 |
+| `OPENCODE_CONFIG_DIR` / `TELEAGENT_CONFIG_DIR` | 仅当 `%USERPROFILE%\.config\TeleAgent` **目录存在** 时写入（路径，非密） |
 
-- Local Storage LevelDB: `%USERPROFILE%\.local\share\TeleAgent\Local Storage\leveldb`
-  key `opencowork-auth`
-- Device meta: `%APPDATA%\TeleAgent\app-auth\device-meta.json`
+`encryptAuthState` 对齐 GUI：AES-256-GCM；key=`SHA256(utf8 sessionKey)`；iv=12 随机字节；输出 `{version:v1, iv, tag, ciphertext}`，各字段 base64url **不带** `=`。
 
-Env: `TELEAGENT_WIN_REUSE_GUI_MODEL` = `auto` (default) / `1` / `0`.
-Fail-closed blocker: `gui_model_auth_missing`.
+鉴权来源（可用环境变量覆盖，供测例）：
 
-After inject, child live processes should set `TELEAGENT_WIN_CREDS_CHANNEL=env`
-so they do **not** re-`ensure` and kill the wrap. Never commit tokens.
+| 材料 | 默认路径 | 覆盖 |
+| --- | --- | --- |
+| token | `%USERPROFILE%\.local\share\TeleAgent\Local Storage\leveldb\*.ldb`（也扫 `*.log`），key 字节 `opencowork-auth`，JSON `{state:{token:...},...}`；**优先最新 mtime**；brace-match 完整 JSON | `TELEAGENT_GUI_LEVELDB_DIR` |
+| deviceId + installId | `%APPDATA%\TeleAgent\app-auth\device-meta.json` | `TELEAGENT_GUI_DEVICE_META` |
+| NewApi `baseURL` | `https://agent.teleai.com.cn/superCowork/sapi/api/v1` | （写死，与 GUI log 一致） |
 
-Orphan fix: after killing a prior wrap on the wrap port, wait until the port
-stops accepting TCP before respawn (avoids `local_auth_signature_invalid`).
+`TELEAGENT_WIN_REUSE_GUI_MODEL`：
+
+| 值 | 行为 |
+| --- | --- |
+| `auto`（默认） | GUI 两份鉴权文件都在则注入；**在但读/加密失败 → fail-closed**，不 spawn 半配置 wrap |
+| `1` / `true` / `on` | 必须注入；缺文件或损坏 → `creds_blocker=gui_model_auth_missing` |
+| `0` / `false` / `off` | 不复用 GUI model（仅 local-v1 Basic + HMAC wrap） |
+
+**孤儿端口：** 杀掉先前 wrap / wrap 端口上的外国 LISTEN 之后，**等到端口不再 LISTENING**（默认约 10s，测例可 hook）再 spawn。否则新密钥打到旧内核 → `local_auth_signature_invalid`。超时仍占用 → `stdin_wrap_spawn_failed`。
+
+**注入成功后：** 后续 live 子进程应设 `TELEAGENT_WIN_CREDS_CHANNEL=env`，走本进程已注入的 env，**不要再 `ensure_stdin_wrap`**（会杀 wrap）。永不 log / extras / git 写入 token 或 ciphertext。永不提交真实密钥。
+
+禁止：Credential Manager、关鉴权、SeDebug、PEB scrape、打印真实 token、动 Linux `/proc`、agy、海景房。
 

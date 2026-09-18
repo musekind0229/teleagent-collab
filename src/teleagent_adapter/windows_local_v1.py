@@ -30,6 +30,7 @@ from urllib.parse import urlparse
 from teleagent_adapter.base import AdapterError, AdapterStatus
 from teleagent_adapter.linux_local_v1 import FindCredsFn, LocalV1HttpAdapter
 from teleagent_adapter.windows_process_environ import (
+    CREDS_BLOCKER_GUI_MODEL_AUTH_MISSING,
     MISSING_CREDS_MESSAGE,
     resolve_windows_local_v1_creds,
 )
@@ -80,8 +81,10 @@ def default_find_creds_windows(
     if creds is None:
         msg = MISSING_CREDS_MESSAGE
         blocker = getattr(presence, "blocker", None)
-        if isinstance(blocker, str) and blocker.startswith("stdin_wrap"):
-            msg = msg + f" stdin_wrap blocker={blocker}."
+        if isinstance(blocker, str) and (
+            blocker.startswith("stdin_wrap") or blocker == CREDS_BLOCKER_GUI_MODEL_AUTH_MISSING
+        ):
+            msg = msg + f" blocker={blocker}."
         raise AdapterError(AdapterStatus.MISSING_CREDS, msg)
     return creds
 

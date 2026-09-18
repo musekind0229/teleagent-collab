@@ -7,7 +7,8 @@ Windows uses the same classification as Linux (no automatic ``blocked``).
 DESKTOP-TBB531F. Extra keys may include ``creds_source``
 (process_env|foreign_process_environ|stdin_wrap|missing), ``creds_blocker``
 (openprocess_vm_read_denied|environ_secrets_stripped|stdin_wrap_bin_missing|
-stdin_wrap_ready_timeout|stdin_wrap_spawn_failed|null), and loopback
+stdin_wrap_ready_timeout|stdin_wrap_spawn_failed|gui_model_auth_missing|null),
+and loopback
 ports 4399/4397/4398; never secret values.
 """
 from __future__ import annotations

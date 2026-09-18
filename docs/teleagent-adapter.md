@@ -10,7 +10,8 @@
 | `src/teleagent_adapter/linux_local_v1.py` | Linux：HTTP Basic + `local-v1` HMAC → `http://127.0.0.1:4399`；共享 `LocalV1HttpAdapter` |
 | `src/teleagent_adapter/windows_local_v1.py` | Windows：同构 HTTP；端口发现 4399→4397→4398（真机曾见 **4397** / **4398**）；凭据：本进程 env → 其它进程 PEB/environ（历史）→ stdin_wrap 并行内核 :4401。**Windows 真机未验收** |
 | `src/teleagent_adapter/windows_process_environ.py` | Win32 PEB 读其它进程 environ（对标 Linux `/proc/*/environ`）；禁止 CM / 关鉴权 |
-| `src/teleagent_adapter/windows_stdin_wrap.py` | 合法凭据通道：受控父进程用 GUI 同款 stdin payload 拉起内核（不刮 GUI 密钥） |
+| `src/teleagent_adapter/windows_stdin_wrap.py` | 合法凭据通道：受控父进程用 GUI 同款 stdin payload 拉起内核（不刮 GUI 密钥）；可选注入 GUI model auth |
+| `src/teleagent_adapter/windows_gui_model_reuse.py` | Windows：从 GUI Local Storage + device-meta 注入 NewApi 登录态（AES-GCM stdin；fail-closed） |
 | `src/teleagent_adapter/windows_blocked.py` | 显式 blocked/降级路径（`get_adapter(..., blocked=True)`），**不是** win32 工厂默认 |
 | `src/teleagent_adapter/doctor.py` | 诊断：`not_running` / `version_incompatible` / `missing_creds` / `auth_failed` / `api_incompatible` / `ok`（Win 与 Linux 同一套；仅显式 blocked stub → `blocked`） |
 | `src/teleagent_adapter/test_adapter_contract.py` | **模拟 (simulated)** 契约单测，不连真机 |

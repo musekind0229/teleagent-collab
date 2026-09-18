@@ -397,7 +397,9 @@ class TestWindowsLocalV1Simulated(unittest.TestCase):
         )
         self.assertEqual((u, p, k), ("super-agent", "sim-pass", "sim-key"))
         with self.assertRaises(AdapterError) as cm:
-            default_find_creds_windows(environ={}, foreign_finder=lambda: None)
+            default_find_creds_windows(
+                environ={}, foreign_finder=lambda: None, wrap_fn=lambda: None
+            )
         self.assertEqual(cm.exception.status, AdapterStatus.MISSING_CREDS)
         self.assertIn("other", str(cm.exception).lower())
         self.assertIn("Do not disable authentication", str(cm.exception))

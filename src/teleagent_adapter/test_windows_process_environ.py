@@ -215,7 +215,9 @@ class TestDefaultFindCredsOrder(unittest.TestCase):
 
     def test_missing_both_sources(self):
         with self.assertRaises(AdapterError) as cm:
-            default_find_creds_windows(environ={}, foreign_finder=lambda: None)
+            default_find_creds_windows(
+                environ={}, foreign_finder=lambda: None, wrap_fn=lambda: None
+            )
         self.assertEqual(cm.exception.status, AdapterStatus.MISSING_CREDS)
         msg = str(cm.exception)
         self.assertIn("other", msg.lower())
@@ -251,7 +253,12 @@ class TestDefaultFindCredsOrder(unittest.TestCase):
         self.assertTrue(presence.password_present)
         self.assertTrue(presence.session_key_present)
 
-        missing = probe_windows_creds_presence(environ={}, foreign_finder=lambda: None)
+        missing = probe_windows_creds_presence(
+            environ={},
+            foreign_finder=lambda: None,
+            wrap_fn=lambda: None,
+            enumerator=lambda: [],
+        )
         self.assertEqual(missing.source, CREDS_SOURCE_MISSING)
         self.assertFalse(missing.password_present)
         self.assertFalse(missing.session_key_present)
@@ -289,6 +296,7 @@ class TestDoctorExtrasWin(unittest.TestCase):
             "stdin_wrap_bin_missing",
             "stdin_wrap_ready_timeout",
             "stdin_wrap_spawn_failed",
+            "gui_model_auth_missing",
         ))
 
 
@@ -322,6 +330,7 @@ class TestCredsBlockerDiagnosis(unittest.TestCase):
             enumerator=lambda: [self._TA, self._WORKER],
             environ_reader=reader,
             skip_pid=1,
+            wrap_fn=lambda: None,
         )
         self.assertEqual(presence.source, CREDS_SOURCE_MISSING)
         self.assertEqual(presence.blocker, CREDS_BLOCKER_OPENPROCESS_VM_READ_DENIED)
@@ -344,6 +353,7 @@ class TestCredsBlockerDiagnosis(unittest.TestCase):
             enumerator=lambda: [self._RENDERER],
             environ_reader=reader,
             skip_pid=1,
+            wrap_fn=lambda: None,
         )
         self.assertEqual(presence.source, CREDS_SOURCE_MISSING)
         self.assertEqual(presence.blocker, CREDS_BLOCKER_ENVIRON_SECRETS_STRIPPED)
@@ -365,6 +375,7 @@ class TestCredsBlockerDiagnosis(unittest.TestCase):
             enumerator=lambda: [self._WORKER, self._RENDERER],
             environ_reader=reader,
             skip_pid=1,
+            wrap_fn=lambda: None,
         )
         self.assertEqual(presence.blocker, CREDS_BLOCKER_ENVIRON_SECRETS_STRIPPED)
         self.assertGreaterEqual(presence.openprocess_denied_count, 1)
