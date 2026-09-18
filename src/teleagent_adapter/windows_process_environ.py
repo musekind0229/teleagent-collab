@@ -739,7 +739,16 @@ def resolve_windows_local_v1_creds(
     user_here = bool(_first_env(env, USERNAME_KEYS))
     here = extract_local_v1_creds(env)
     wrap_marker = (env.get(CREDS_SOURCE_MARKER_ENV) or "").strip() == CREDS_SOURCE_STDIN_WRAP
-    if here is not None and not (channel == "stdin_wrap" and not wrap_marker):
+    # Trust process env only when channel is not forcing stdin_wrap and env was
+    # not previously filled from wrap. With channel=stdin_wrap (or wrap marker
+    # under auto), fall through to ensure_stdin_wrap so secrets match the live
+    # kernel — stale OPENCODE_* after a hard reset otherwise yields doctor
+    # auth_failed on /version while handle-signed /session still works.
+    trust_process_env = here is not None and (
+        channel in ("env", "off")
+        or (channel != "stdin_wrap" and not wrap_marker)
+    )
+    if trust_process_env:
         source = CREDS_SOURCE_STDIN_WRAP if wrap_marker else CREDS_SOURCE_PROCESS_ENV
         return here, WindowsCredsPresence(
             source=source,

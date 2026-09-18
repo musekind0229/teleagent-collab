@@ -178,3 +178,4 @@ python bin/run-live-grok-lead.py
 - Legal creds channel: **stdin_wrap** — controlled parent spawn of `runtimes/super-agent-code/bin/TeleAgent.exe` on **:4401** (parallel to GUI, not scraping GUI secrets). Workshop live doctor/hello after this push.
 - `windows_live_verified` stays **false**.
 
+- Fix (same day): `resolve_windows_local_v1_creds` no longer trusts process env when `TELEAGENT_WIN_CREDS_CHANNEL=stdin_wrap` or `TELEAGENT_CREDS_SOURCE=stdin_wrap` — fall through to `ensure_stdin_wrap` so doctor `/version` matches the live handle (avoids auth_failed from stale env after hard reset).

@@ -405,6 +405,58 @@ class TestEnsureStdinWrap(_WrapTestCase):
         self.assertNotIn("sim-pass", blob)
         self.assertNotIn("sim-key", blob)
 
+    def test_stdin_wrap_channel_ignores_stale_env_marker(self):
+        """Stale env + wrap marker must not skip ensure (doctor auth_failed root cause)."""
+        self.assertTrue(SIMULATED)
+        stale = {
+            "TELEAGENT_WIN_CREDS_CHANNEL": "stdin_wrap",
+            "TELEAGENT_CREDS_SOURCE": CREDS_SOURCE_STDIN_WRAP,
+            "OPENCODE_SERVER_USERNAME": "super-agent",
+            "OPENCODE_SERVER_PASSWORD": "stale-pass",
+            "SUPER_AGENT_LOCAL_SESSION_KEY": "stale-key",
+        }
+        handle = WrapHandle(
+            base_url="http://127.0.0.1:4401",
+            username="super-agent",
+            password="sim-pass",
+            session_key="sim-key",
+            pid=42,
+        )
+        creds, presence = resolve_windows_local_v1_creds(
+            environ=stale,
+            foreign_finder=lambda: (_ for _ in ()).throw(AssertionError("peb skipped")),
+            wrap_fn=lambda: handle,
+        )
+        self.assertEqual(presence.source, CREDS_SOURCE_STDIN_WRAP)
+        self.assertEqual(creds, ("super-agent", "sim-pass", "sim-key"))
+        self.assertNotEqual(creds[1], "stale-pass")
+        self.assertNotEqual(creds[2], "stale-key")
+
+    def test_auto_with_wrap_marker_prefers_live_handle(self):
+        """auto + TELEAGENT_CREDS_SOURCE=stdin_wrap must re-ensure, not trust env."""
+        self.assertTrue(SIMULATED)
+        marked = {
+            "TELEAGENT_WIN_CREDS_CHANNEL": "auto",
+            "TELEAGENT_CREDS_SOURCE": CREDS_SOURCE_STDIN_WRAP,
+            "OPENCODE_SERVER_USERNAME": "super-agent",
+            "OPENCODE_SERVER_PASSWORD": "stale-pass",
+            "SUPER_AGENT_LOCAL_SESSION_KEY": "stale-key",
+        }
+        handle = WrapHandle(
+            base_url="http://127.0.0.1:4401",
+            username="super-agent",
+            password="sim-pass",
+            session_key="sim-key",
+            pid=43,
+        )
+        creds, presence = resolve_windows_local_v1_creds(
+            environ=marked,
+            foreign_finder=lambda: (_ for _ in ()).throw(AssertionError("peb skipped")),
+            wrap_fn=lambda: handle,
+        )
+        self.assertEqual(presence.source, CREDS_SOURCE_STDIN_WRAP)
+        self.assertEqual(creds, ("super-agent", "sim-pass", "sim-key"))
+
     def test_auto_without_wrap_fn_on_non_windows_skips_wrap(self):
         if sys.platform.lower().startswith("win"):
             self.skipTest("host is Windows; skip-wrap default is for non-Win CI")
