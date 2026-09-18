@@ -18,8 +18,8 @@ spawn a parallel kernel on :4401 with the same stdin payload.
 Doctor extras may set ``creds_blocker`` to ``openprocess_vm_read_denied``,
 ``environ_secrets_stripped``, or stdin_wrap codes
 (``stdin_wrap_bin_missing`` / ``stdin_wrap_ready_timeout`` /
-``stdin_wrap_spawn_failed``) when this process has no creds and discovery
-fails. Never logs secret values.
+``stdin_wrap_spawn_failed`` / ``gui_model_auth_missing``) when this process
+has no creds and discovery fails. Never logs secret values.
 
 Non-Windows: high-level finders no-op (return None / empty). The PEB reader
 raises ``WindowsEnvironUnavailable`` so Linux callers are not silently broken.
@@ -88,6 +88,7 @@ CREDS_BLOCKER_ENVIRON_SECRETS_STRIPPED = "environ_secrets_stripped"
 CREDS_BLOCKER_STDIN_WRAP_BIN_MISSING = "stdin_wrap_bin_missing"
 CREDS_BLOCKER_STDIN_WRAP_READY_TIMEOUT = "stdin_wrap_ready_timeout"
 CREDS_BLOCKER_STDIN_WRAP_SPAWN_FAILED = "stdin_wrap_spawn_failed"
+CREDS_BLOCKER_GUI_MODEL_AUTH_MISSING = "gui_model_auth_missing"
 
 WIN_CREDS_CHANNEL_ENV = "TELEAGENT_WIN_CREDS_CHANNEL"
 WIN_SKIP_PEB_ENV = "TELEAGENT_WIN_SKIP_PEB"
@@ -834,6 +835,7 @@ def resolve_windows_local_v1_creds(
                 CREDS_BLOCKER_STDIN_WRAP_BIN_MISSING,
                 CREDS_BLOCKER_STDIN_WRAP_READY_TIMEOUT,
                 CREDS_BLOCKER_STDIN_WRAP_SPAWN_FAILED,
+                CREDS_BLOCKER_GUI_MODEL_AUTH_MISSING,
             ):
                 wrap_blocker = CREDS_BLOCKER_STDIN_WRAP_SPAWN_FAILED
 
@@ -881,6 +883,7 @@ def probe_windows_creds_presence(
 
 __all__ = [
     "CREDS_BLOCKER_ENVIRON_SECRETS_STRIPPED",
+    "CREDS_BLOCKER_GUI_MODEL_AUTH_MISSING",
     "CREDS_BLOCKER_OPENPROCESS_VM_READ_DENIED",
     "CREDS_BLOCKER_STDIN_WRAP_BIN_MISSING",
     "CREDS_BLOCKER_STDIN_WRAP_READY_TIMEOUT",

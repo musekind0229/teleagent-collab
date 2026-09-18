@@ -179,3 +179,29 @@ python bin/run-live-grok-lead.py
 - `windows_live_verified` stays **false**.
 
 - Fix (same day): `resolve_windows_local_v1_creds` no longer trusts process env when `TELEAGENT_WIN_CREDS_CHANNEL=stdin_wrap` or `TELEAGENT_CREDS_SOURCE=stdin_wrap` — fall through to `ensure_stdin_wrap` so doctor `/version` matches the live handle (avoids auth_failed from stale env after hard reset).
+
+## GUI model reuse (stdin_wrap)
+
+On Windows, `ensure_stdin_wrap` can inject the logged-in GUI TeleAgent model
+auth into the wrap kernel stdin payload (authorized reuse):
+
+- `SUPER_AGENT_AUTH_STATE` — AES-GCM blob of `{token, deviceId, installId}`
+- `OPENCODE_CONFIG_CONTENT` — minimal NewApi provider config
+- Optional `OPENCODE_CONFIG_DIR` / `TELEAGENT_CONFIG_DIR` when
+  `%USERPROFILE%\.config\TeleAgent` exists
+
+Sources (never Credential Manager / PEB / SeDebug):
+
+- Local Storage LevelDB: `%USERPROFILE%\.local\share\TeleAgent\Local Storage\leveldb`
+  key `opencowork-auth`
+- Device meta: `%APPDATA%\TeleAgent\app-auth\device-meta.json`
+
+Env: `TELEAGENT_WIN_REUSE_GUI_MODEL` = `auto` (default) / `1` / `0`.
+Fail-closed blocker: `gui_model_auth_missing`.
+
+After inject, child live processes should set `TELEAGENT_WIN_CREDS_CHANNEL=env`
+so they do **not** re-`ensure` and kill the wrap. Never commit tokens.
+
+Orphan fix: after killing a prior wrap on the wrap port, wait until the port
+stops accepting TCP before respawn (avoids `local_auth_signature_invalid`).
+

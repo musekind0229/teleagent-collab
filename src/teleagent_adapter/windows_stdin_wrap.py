@@ -18,6 +18,7 @@ import json
 import os
 import secrets
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -25,12 +26,13 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Mapping, MutableMapping
+from collections.abc import Callable, Iterable, Mapping, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from teleagent_adapter.windows_process_environ import (
+    CREDS_BLOCKER_GUI_MODEL_AUTH_MISSING,
     CREDS_BLOCKER_STDIN_WRAP_BIN_MISSING,
     CREDS_BLOCKER_STDIN_WRAP_READY_TIMEOUT,
     CREDS_BLOCKER_STDIN_WRAP_SPAWN_FAILED,
@@ -40,6 +42,7 @@ from teleagent_adapter.windows_process_environ import (
 
 DEFAULT_WRAP_PORT = 4401
 DEFAULT_READY_TIMEOUT_S = 15.0
+DEFAULT_PORT_FREE_TIMEOUT_S = 10.0
 CREDS_SOURCE_ENV = "TELEAGENT_CREDS_SOURCE"
 KERNEL_BIN_ENV = "TELEAGENT_KERNEL_BIN"
 WRAP_PORT_ENV = "TELEAGENT_WRAP_PORT"
@@ -56,6 +59,8 @@ SECRET_STDIN_KEYS: frozenset[str] = frozenset(
         "SUPER_AGENT_OPENCODE_PASSWORD",
         "SUPER_AGENT_OPENCODE_USERNAME",
         "SUPER_AGENT_SERVER_PASSWORD",
+        "SUPER_AGENT_AUTH_STATE",
+        "OPENCODE_CONFIG_CONTENT",
     }
 )
 
@@ -167,6 +172,7 @@ def build_child_os_env(
     *,
     parent: Mapping[str, str] | None = None,
     xdg_data_home: str | None = None,
+    extra_nonsecret: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """OS environ for the kernel child: non-secret whitelist only."""
     src = parent if parent is not None else os.environ
@@ -177,6 +183,12 @@ def build_child_os_env(
             out[key] = val
     if xdg_data_home:
         out["XDG_DATA_HOME"] = xdg_data_home
+    if extra_nonsecret:
+        for key, val in extra_nonsecret.items():
+            if key in SECRET_STDIN_KEYS:
+                continue
+            if isinstance(val, str) and val:
+                out[key] = val
     for secret in SECRET_STDIN_KEYS:
         out.pop(secret, None)
     return out
@@ -413,6 +425,35 @@ def _resolve_port(port: int | None, env: Mapping[str, str]) -> int:
     return DEFAULT_WRAP_PORT
 
 
+
+def _port_listening(port: int, host: str = "127.0.0.1") -> bool:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.25)
+        try:
+            return sock.connect_ex((host, int(port))) == 0
+        except OSError:
+            return False
+
+
+def _wait_port_free(
+    port: int,
+    *,
+    timeout: float = 10.0,
+    sleep_fn: Callable[[float], None] | None = None,
+    listening_fn: Callable[[int], bool] | None = None,
+) -> None:
+    """After killing an orphan, wait until wrap port stops accepting TCP."""
+    sleeper = sleep_fn or time.sleep
+    check = listening_fn or _port_listening
+    deadline = time.time() + float(timeout)
+    while time.time() < deadline:
+        if not check(int(port)):
+            return
+        sleeper(0.2)
+
+
 def inject_wrap_creds_into_environ(
     handle: WrapHandle,
     environ: MutableMapping[str, str] | None = None,
@@ -476,6 +517,7 @@ def ensure_stdin_wrap(
                 os.kill(rec_pid, signal.SIGTERM)
             except OSError:
                 pass
+            _wait_port_free(wrap_port)
         _remove_pid_file(environ=env)
 
     if kernel_bin is not None:
@@ -509,6 +551,20 @@ def ensure_stdin_wrap(
         "SUPER_AGENT_SERVER_URL": base_url,
         "XDG_DATA_HOME": str(xdg),
     }
+    try:
+        from teleagent_adapter.windows_gui_model_reuse import (
+            GuiModelAuthError,
+            prepare_gui_model_reuse,
+        )
+
+        extras = prepare_gui_model_reuse(session_key, environ=env)
+        if extras:
+            payload_env.update(extras)
+    except GuiModelAuthError as e:
+        raise StdinWrapError(
+            getattr(e, "blocker", None) or "gui_model_auth_missing",
+            str(e),
+        ) from e
     payload = build_env_payload(payload_env)
     child_env = build_child_os_env(parent=env, xdg_data_home=str(xdg))
 
