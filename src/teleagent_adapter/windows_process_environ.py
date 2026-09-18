@@ -5,13 +5,23 @@ Windows has no /proc; this module uses Win32 (ctypes) ``OpenProcess`` +
 ``NtQueryInformationProcess`` (PEB → ``RTL_USER_PROCESS_PARAMETERS.Environment``)
 + ``ReadProcessMemory``.
 
+Current TeleAgent (app.asar) injects ``SECRET_ENV_KEYS`` (including
+``OPENCODE_SERVER_PASSWORD`` and ``SUPER_AGENT_LOCAL_SESSION_KEY``) via a
+**stdin env payload** into the Go backend and deliberately does **not** write
+them to the OS environ (so ``ps -E`` / ``/proc/*/environ`` / PEB cannot leak
+them). PEB/environ discovery is therefore ineffective on current Win builds.
+This-process env → foreign environ remains a historical / injection fallback,
+not a reliable source for GUI-launched TeleAgent.
+
+Doctor extras may set ``creds_blocker`` to ``openprocess_vm_read_denied`` or
+``environ_secrets_stripped`` when this process has no creds and the foreign
+scan fails. Never logs secret values.
+
 Non-Windows: high-level finders no-op (return None / empty). The PEB reader
 raises ``WindowsEnvironUnavailable`` so Linux callers are not silently broken.
 
-Never scrapes Credential Manager, never disables auth, never logs secret values.
-Session key lives in process memory (restart rotates it). No disk fallback for
-password/HMAC — official layouts may hold OAuth ``token.json`` under
-``%APPDATA%\\TeleAgent`` / ``%LOCALAPPDATA%\\TeleAgent`` (do not read).
+Never scrapes Credential Manager, never disables auth, never raises
+SeDebugPrivilege, never reads OAuth ``token.json``.
 """
 from __future__ import annotations
 
@@ -68,12 +78,23 @@ CREDS_SOURCE_PROCESS_ENV = "process_env"
 CREDS_SOURCE_FOREIGN = "foreign_process_environ"
 CREDS_SOURCE_MISSING = "missing"
 
+CREDS_BLOCKER_OPENPROCESS_VM_READ_DENIED = "openprocess_vm_read_denied"
+CREDS_BLOCKER_ENVIRON_SECRETS_STRIPPED = "environ_secrets_stripped"
+
+# Fail-closed copy for doctor details / AdapterError — names of keys only, never values.
+CREDS_FAIL_CLOSED_HINT = (
+    "Current TeleAgent may inject SECRET_ENV_KEYS via a stdin env payload "
+    "and deliberately omit them from the OS environ; PEB/environ discovery "
+    "may be ineffective. Do not disable authentication. "
+    "Do not scrape Credential Manager, OAuth token.json, or raise SeDebugPrivilege."
+)
+
 MISSING_CREDS_MESSAGE = (
     "Windows TeleAgent local API creds not found in this process environment "
     "or in other TeleAgent/SAC process environ blocks (Win32 PEB read; "
     "not this-process env). "
     "Need OPENCODE_SERVER_PASSWORD + SUPER_AGENT_LOCAL_SESSION_KEY. "
-    "Do not disable authentication."
+    + CREDS_FAIL_CLOSED_HINT
 )
 
 
@@ -97,6 +118,9 @@ class WindowsCredsPresence:
     session_key_present: bool
     username_present: bool = False
     foreign_candidates: int = 0
+    blocker: str | None = None
+    openprocess_denied_count: int = 0
+    environ_readable_without_secrets: int = 0
 
 
 def _is_windows(platform: str | None = None) -> bool:
@@ -410,25 +434,41 @@ def read_process_environ_via_peb(pid: int) -> bytes:
     handle = k32.OpenProcess(access, False, int(pid))
     hid = int(handle) if handle is not None else 0
     if handle is None or hid in (0, -1):
-        raise WindowsEnvironUnavailable(f"OpenProcess failed for pid {pid}")
+        err = 0
+        try:
+            err = int(ctypes.get_last_error())
+        except Exception:
+            err = 0
+        suffix = f" win32_error={err}" if err else ""
+        if err == 5:
+            suffix += " ACCESS_DENIED"
+        raise WindowsEnvironUnavailable(f"OpenProcess failed for pid {pid}{suffix}")
     try:
         wow64 = _is_wow64(k32, handle)
         native_ptr = ctypes.sizeof(ctypes.c_void_p)
         target_ptr = 4 if wow64 else native_ptr
         peb = _peb_base(ntdll, handle, wow64=wow64, ptr_size=native_ptr)
         if peb is None:
-            raise WindowsEnvironUnavailable(f"PEB not readable for pid {pid}")
+            raise WindowsEnvironUnavailable(
+                f"PEB not readable for pid {pid} (ReadProcessMemory/NtQuery)"
+            )
         peb_off = _PEB_PROCESS_PARAMETERS_X86 if target_ptr == 4 else _PEB_PROCESS_PARAMETERS_X64
         params = _read_ptr(k32, handle, peb + peb_off, target_ptr)
         if params is None:
-            raise WindowsEnvironUnavailable(f"ProcessParameters not readable for pid {pid}")
+            raise WindowsEnvironUnavailable(
+                f"ProcessParameters not readable for pid {pid} (ReadProcessMemory)"
+            )
         env_off = _PARAMS_ENVIRONMENT_X86 if target_ptr == 4 else _PARAMS_ENVIRONMENT_X64
         env_ptr = _read_ptr(k32, handle, params + env_off, target_ptr)
         if env_ptr is None:
-            raise WindowsEnvironUnavailable(f"Environment pointer not readable for pid {pid}")
+            raise WindowsEnvironUnavailable(
+                f"Environment pointer not readable for pid {pid} (ReadProcessMemory)"
+            )
         block = _read_environ_block(k32, handle, env_ptr)
         if not block:
-            raise WindowsEnvironUnavailable(f"empty environment block for pid {pid}")
+            raise WindowsEnvironUnavailable(
+                f"empty environment block for pid {pid} (ReadProcessMemory)"
+            )
         return block
     finally:
         try:
@@ -504,6 +544,106 @@ def _default_environ_reader(pid: int) -> bytes | None:
         return None
 
 
+def _is_openprocess_vm_read_denied(exc: BaseException) -> bool:
+    """True when PEB read failed due to OpenProcess / ReadProcessMemory / ACCESS_DENIED.
+
+    Mock-friendly: injected environ_reader may raise WindowsEnvironUnavailable
+    with those tokens. Never inspects secret values.
+    """
+    msg = str(exc).lower()
+    needles = (
+        "openprocess",
+        "readprocessmemory",
+        "access_denied",
+        "access denied",
+        "win32_error=5",
+        "error 5",
+        "winerror 5",
+    )
+    return any(n in msg for n in needles)
+
+
+def _choose_missing_blocker(
+    *,
+    candidates: int,
+    openprocess_denied_count: int,
+    environ_readable_without_secrets: int,
+) -> str | None:
+    """Prefer stripped (environ path proven empty) over OpenProcess denied."""
+    if environ_readable_without_secrets > 0:
+        return CREDS_BLOCKER_ENVIRON_SECRETS_STRIPPED
+    if candidates > 0 and openprocess_denied_count > 0:
+        return CREDS_BLOCKER_OPENPROCESS_VM_READ_DENIED
+    return None
+
+
+@dataclass
+class _ForeignEnvironScan:
+    creds: tuple[str, str, str] | None = None
+    candidates: int = 0
+    openprocess_denied_count: int = 0
+    environ_readable_without_secrets: int = 0
+
+
+def _scan_foreign_process_environ(
+    *,
+    enumerator: Callable[[], Iterable[ProcessSnapshot]] | None = None,
+    environ_reader: Callable[[int], bytes | None] | None = None,
+    environ_blocks: Iterable[bytes | str] | None = None,
+    skip_pid: int | None = None,
+) -> _ForeignEnvironScan:
+    """Scan TeleAgent/SAC candidates; collect creds and doctor blocker stats."""
+    scan = _ForeignEnvironScan()
+    if environ_blocks is not None:
+        for raw in environ_blocks:
+            try:
+                env = parse_environ_block(raw)
+            except Exception:
+                continue
+            creds = extract_local_v1_creds(env)
+            if creds is not None:
+                scan.creds = creds
+                return scan
+            scan.environ_readable_without_secrets += 1
+        return scan
+
+    if enumerator is None and not _is_windows():
+        return scan
+
+    try:
+        snaps = list((enumerator or enumerate_windows_processes)())
+    except Exception:
+        return scan
+
+    skip = os.getpid() if skip_pid is None else skip_pid
+    # Raising default so OpenProcess/ReadProcessMemory failures are classifiable.
+    reader = environ_reader or read_process_environ_via_peb
+    for snap in snaps:
+        if snap.pid == skip or snap.pid <= 4:
+            continue
+        if not is_teleagent_candidate(snap.name, snap.image_path):
+            continue
+        scan.candidates += 1
+        try:
+            raw = reader(snap.pid)
+        except Exception as e:
+            if _is_openprocess_vm_read_denied(e):
+                scan.openprocess_denied_count += 1
+            continue
+        if not raw:
+            continue
+        try:
+            env = parse_environ_block(raw)
+        except Exception:
+            continue
+        creds = extract_local_v1_creds(env)
+        if creds is not None:
+            scan.creds = creds
+            return scan
+        scan.environ_readable_without_secrets += 1
+    return scan
+
+
 def find_creds_in_foreign_processes(
     *,
     enumerator: Callable[[], Iterable[ProcessSnapshot]] | None = None,
@@ -515,30 +655,12 @@ def find_creds_in_foreign_processes(
 
     On non-Windows with no injected enumerator/blocks: no-op (None).
     """
-    if environ_blocks is not None:
-        return find_creds_in_environ_blocks(environ_blocks)
-
-    if enumerator is None and not _is_windows():
-        return None
-
-    snaps = list((enumerator or enumerate_windows_processes)())
-    skip = os.getpid() if skip_pid is None else skip_pid
-    reader = environ_reader or _default_environ_reader
-    for snap in snaps:
-        if snap.pid == skip or snap.pid <= 4:
-            continue
-        if not is_teleagent_candidate(snap.name, snap.image_path):
-            continue
-        try:
-            raw = reader(snap.pid)
-        except Exception:
-            continue
-        if not raw:
-            continue
-        creds = extract_local_v1_creds(parse_environ_block(raw))
-        if creds is not None:
-            return creds
-    return None
+    return _scan_foreign_process_environ(
+        enumerator=enumerator,
+        environ_reader=environ_reader,
+        environ_blocks=environ_blocks,
+        skip_pid=skip_pid,
+    ).creds
 
 
 def count_foreign_candidates(
@@ -581,27 +703,32 @@ def resolve_windows_local_v1_creds(
             username_present=True,
         )
 
-    n_cand = 0
+    scan = _ForeignEnvironScan()
     try:
-        n_cand = count_foreign_candidates(enumerator=enumerator, skip_pid=skip_pid)
+        scan = _scan_foreign_process_environ(
+            enumerator=enumerator,
+            environ_reader=environ_reader,
+            environ_blocks=environ_blocks,
+            skip_pid=skip_pid,
+        )
     except Exception:
-        n_cand = 0
+        scan = _ForeignEnvironScan()
 
-    foreign: tuple[str, str, str] | None = None
-    try:
-        if foreign_finder is not None:
+    n_cand = scan.candidates
+    if n_cand == 0:
+        try:
+            n_cand = count_foreign_candidates(enumerator=enumerator, skip_pid=skip_pid)
+        except Exception:
+            n_cand = 0
+
+    foreign: tuple[str, str, str] | None = scan.creds
+    if foreign_finder is not None:
+        try:
             foreign = foreign_finder()
-        else:
-            foreign = find_creds_in_foreign_processes(
-                enumerator=enumerator,
-                environ_reader=environ_reader,
-                environ_blocks=environ_blocks,
-                skip_pid=skip_pid,
-            )
-    except AdapterError:
-        foreign = None
-    except Exception:
-        foreign = None
+        except AdapterError:
+            foreign = None
+        except Exception:
+            foreign = None
 
     if foreign is not None:
         user, pw, key = foreign
@@ -612,6 +739,8 @@ def resolve_windows_local_v1_creds(
                 session_key_present=True,
                 username_present=True,
                 foreign_candidates=n_cand,
+                openprocess_denied_count=scan.openprocess_denied_count,
+                environ_readable_without_secrets=scan.environ_readable_without_secrets,
             )
 
     return None, WindowsCredsPresence(
@@ -620,6 +749,13 @@ def resolve_windows_local_v1_creds(
         session_key_present=key_here,
         username_present=user_here,
         foreign_candidates=n_cand,
+        blocker=_choose_missing_blocker(
+            candidates=n_cand,
+            openprocess_denied_count=scan.openprocess_denied_count,
+            environ_readable_without_secrets=scan.environ_readable_without_secrets,
+        ),
+        openprocess_denied_count=scan.openprocess_denied_count,
+        environ_readable_without_secrets=scan.environ_readable_without_secrets,
     )
 
 
@@ -645,6 +781,9 @@ def probe_windows_creds_presence(
 
 
 __all__ = [
+    "CREDS_BLOCKER_ENVIRON_SECRETS_STRIPPED",
+    "CREDS_BLOCKER_OPENPROCESS_VM_READ_DENIED",
+    "CREDS_FAIL_CLOSED_HINT",
     "CREDS_SOURCE_FOREIGN",
     "CREDS_SOURCE_MISSING",
     "CREDS_SOURCE_PROCESS_ENV",

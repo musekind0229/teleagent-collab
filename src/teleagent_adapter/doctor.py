@@ -5,8 +5,9 @@ Windows uses the same classification as Linux (no automatic ``blocked``).
 ``simulate_status``). Windows 真机未验收 — extras keep
 ``windows_live_verified=false`` until workshop live doctor/hello on
 DESKTOP-TBB531F. Extra keys may include ``creds_source``
-(process_env|foreign_process_environ|missing) and loopback ports
-4399/4397/4398; never secret values.
+(process_env|foreign_process_environ|missing), ``creds_blocker``
+(openprocess_vm_read_denied|environ_secrets_stripped|null), and loopback
+ports 4399/4397/4398; never secret values.
 """
 from __future__ import annotations
 
@@ -69,6 +70,7 @@ def doctor(
     simulated: bool = False,
     simulate_status: str | None = None,
     port_open_fn: Callable[[str, int], bool] | None = None,
+    creds_presence_fn: Callable[[], Any] | None = None,
 ) -> DoctorReport:
     """Probe TeleAgent readiness. Pass simulated=True + simulate_status for unit tests.
 
@@ -77,6 +79,7 @@ def doctor(
     the adapter itself is an explicit blocked stub (or simulated).
 
     ``port_open_fn(host, port)`` injects the TCP probe for tests.
+    ``creds_presence_fn()`` injects the Windows creds presence probe for tests.
     Windows 真机未验收.
     """
     plat = (platform or sys.platform).lower()
@@ -131,16 +134,40 @@ def doctor(
             pass
         report.extras["ports"] = {str(p): _checked(host, p) for p in win_probe_ports}
         try:
-            from teleagent_adapter.windows_process_environ import probe_windows_creds_presence
+            from teleagent_adapter.windows_process_environ import (
+                probe_windows_creds_presence,
+            )
 
-            presence = probe_windows_creds_presence()
+            presence = (creds_presence_fn or probe_windows_creds_presence)()
             report.extras["creds_source"] = presence.source
             report.extras["password_present"] = bool(presence.password_present)
             report.extras["session_key_present"] = bool(presence.session_key_present)
+            report.extras["creds_blocker"] = getattr(presence, "blocker", None)
+            report.extras["openprocess_denied_count"] = int(
+                getattr(presence, "openprocess_denied_count", 0) or 0
+            )
+            report.extras["environ_readable_without_secrets"] = int(
+                getattr(presence, "environ_readable_without_secrets", 0) or 0
+            )
         except Exception:
             report.extras["creds_source"] = "missing"
             report.extras["password_present"] = False
             report.extras["session_key_present"] = False
+            report.extras["creds_blocker"] = None
+
+    def _note_win_missing_creds() -> None:
+        if not plat.startswith("win"):
+            return
+        try:
+            from teleagent_adapter.windows_process_environ import CREDS_FAIL_CLOSED_HINT as _hint
+        except Exception:
+            _hint = (
+                "Current TeleAgent may inject SECRET_ENV_KEYS via a stdin env payload; "
+                "PEB/environ discovery may be ineffective. Do not disable authentication. "
+                "Do not scrape Credential Manager or raise SeDebugPrivilege."
+            )
+        if _hint not in report.details:
+            report.details.append(_hint)
 
     # Explicit blocked/degraded adapter only — not the win32 factory default.
     if adapter is not None:
@@ -205,6 +232,8 @@ def doctor(
             else:
                 report.status = AdapterStatus.MISSING_CREDS.value
             report.details.append(f"refresh_creds failed: {e}")
+            if report.status == AdapterStatus.MISSING_CREDS.value:
+                _note_win_missing_creds()
             return report
         try:
             code, body = adapter.call("GET", "/version")
@@ -226,6 +255,8 @@ def doctor(
             else:
                 report.status = AdapterStatus.NOT_RUNNING.value
             report.details.append(str(e))
+            if report.status == AdapterStatus.MISSING_CREDS.value:
+                _note_win_missing_creds()
             return report
         if code in (401, 403):
             report.status = AdapterStatus.AUTH_FAILED.value

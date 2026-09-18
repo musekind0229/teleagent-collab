@@ -18,11 +18,15 @@ from teleagent_adapter.base import AdapterError, AdapterStatus  # noqa: E402
 from teleagent_adapter.doctor import doctor  # noqa: E402
 from teleagent_adapter.windows_local_v1 import default_find_creds_windows  # noqa: E402
 from teleagent_adapter.windows_process_environ import (  # noqa: E402
+    CREDS_BLOCKER_ENVIRON_SECRETS_STRIPPED,
+    CREDS_BLOCKER_OPENPROCESS_VM_READ_DENIED,
+    CREDS_FAIL_CLOSED_HINT,
     CREDS_SOURCE_FOREIGN,
     CREDS_SOURCE_MISSING,
     CREDS_SOURCE_PROCESS_ENV,
     MISSING_CREDS_MESSAGE,
     ProcessSnapshot,
+    WindowsCredsPresence,
     WindowsEnvironUnavailable,
     encode_environ_block,
     extract_local_v1_creds,
@@ -218,8 +222,14 @@ class TestDefaultFindCredsOrder(unittest.TestCase):
         self.assertIn("process environ", msg.lower())
         self.assertIn("not this-process env", msg)
         self.assertIn("Do not disable authentication", msg)
-        self.assertNotIn("Credential Manager", msg)
+        self.assertIn("stdin", msg.lower())
+        self.assertIn("SECRET_ENV_KEYS", msg)
+        self.assertIn("Do not scrape Credential Manager", msg)
+        self.assertIn("SeDebugPrivilege", msg)
+        self.assertIn(CREDS_FAIL_CLOSED_HINT, msg)
         self.assertEqual(MISSING_CREDS_MESSAGE, msg)
+        self.assertNotIn("sim-pass", msg)
+        self.assertNotIn("sim-key", msg)
 
     def test_missing_only_session_key(self):
         with self.assertRaises(AdapterError) as cm:
@@ -245,6 +255,7 @@ class TestDefaultFindCredsOrder(unittest.TestCase):
         self.assertEqual(missing.source, CREDS_SOURCE_MISSING)
         self.assertFalse(missing.password_present)
         self.assertFalse(missing.session_key_present)
+        self.assertIsNone(missing.blocker)
 
 
 class TestDoctorExtrasWin(unittest.TestCase):
@@ -270,6 +281,164 @@ class TestDoctorExtrasWin(unittest.TestCase):
         self.assertNotIn("sim-key", blob)
         self.assertNotIn("OPENCODE_SERVER_PASSWORD", blob)
         self.assertNotIn("SUPER_AGENT_LOCAL_SESSION_KEY", blob)
+        self.assertIn(r.extras.get("creds_blocker"), (
+            None,
+            CREDS_BLOCKER_OPENPROCESS_VM_READ_DENIED,
+            CREDS_BLOCKER_ENVIRON_SECRETS_STRIPPED,
+        ))
+
+
+class TestCredsBlockerDiagnosis(unittest.TestCase):
+    """Mock-only: distinguish OpenProcess denied vs stdin-stripped environ."""
+
+    _TA = ProcessSnapshot(
+        pid=4242,
+        name="TeleAgent.exe",
+        image_path=r"C:\Program Files\TeleAgent\TeleAgent.exe",
+    )
+    _WORKER = ProcessSnapshot(
+        pid=4243,
+        name="node.exe",
+        image_path=r"C:\Users\x\AppData\Roaming\TeleAgent\runtimes\super-agent-code\bin\node.exe",
+    )
+    _RENDERER = ProcessSnapshot(
+        pid=4244,
+        name="TeleAgent.exe",
+        image_path=r"C:\Program Files\TeleAgent\TeleAgent.exe",
+    )
+
+    def test_openprocess_vm_read_denied(self):
+        def reader(pid: int) -> bytes | None:
+            raise WindowsEnvironUnavailable(
+                f"OpenProcess failed for pid {pid} ACCESS_DENIED"
+            )
+
+        presence = probe_windows_creds_presence(
+            environ={},
+            enumerator=lambda: [self._TA, self._WORKER],
+            environ_reader=reader,
+            skip_pid=1,
+        )
+        self.assertEqual(presence.source, CREDS_SOURCE_MISSING)
+        self.assertEqual(presence.blocker, CREDS_BLOCKER_OPENPROCESS_VM_READ_DENIED)
+        self.assertGreaterEqual(presence.openprocess_denied_count, 1)
+        self.assertGreaterEqual(presence.foreign_candidates, 1)
+        self.assertEqual(presence.environ_readable_without_secrets, 0)
+        blob = json.dumps(presence.__dict__)
+        self.assertNotIn("sim-pass", blob)
+        self.assertNotIn("sim-key", blob)
+
+    def test_environ_secrets_stripped(self):
+        def reader(pid: int) -> bytes | None:
+            return encode_environ_block(
+                {"PATH": r"C:\Windows", "TEMP": r"C:\Temp"},
+                wide=True,
+            )
+
+        presence = probe_windows_creds_presence(
+            environ={},
+            enumerator=lambda: [self._RENDERER],
+            environ_reader=reader,
+            skip_pid=1,
+        )
+        self.assertEqual(presence.source, CREDS_SOURCE_MISSING)
+        self.assertEqual(presence.blocker, CREDS_BLOCKER_ENVIRON_SECRETS_STRIPPED)
+        self.assertGreaterEqual(presence.environ_readable_without_secrets, 1)
+        blob = json.dumps(presence.__dict__)
+        self.assertNotIn("sim-pass", blob)
+        self.assertNotIn("sim-key", blob)
+
+    def test_stripped_preferred_when_both_signs(self):
+        def reader(pid: int) -> bytes | None:
+            if pid == self._WORKER.pid:
+                raise WindowsEnvironUnavailable(
+                    f"OpenProcess failed for pid {pid} ACCESS_DENIED"
+                )
+            return encode_environ_block({"PATH": r"C:\Windows"}, wide=True)
+
+        presence = probe_windows_creds_presence(
+            environ={},
+            enumerator=lambda: [self._WORKER, self._RENDERER],
+            environ_reader=reader,
+            skip_pid=1,
+        )
+        self.assertEqual(presence.blocker, CREDS_BLOCKER_ENVIRON_SECRETS_STRIPPED)
+        self.assertGreaterEqual(presence.openprocess_denied_count, 1)
+        self.assertGreaterEqual(presence.environ_readable_without_secrets, 1)
+
+    def test_process_env_complete_blocker_empty(self):
+        def reader(pid: int) -> bytes | None:
+            raise AssertionError("must not scan foreign when process env is complete")
+
+        presence = probe_windows_creds_presence(
+            environ=dict(_SIM_ENV),
+            enumerator=lambda: [self._TA],
+            environ_reader=reader,
+            skip_pid=1,
+        )
+        self.assertEqual(presence.source, CREDS_SOURCE_PROCESS_ENV)
+        self.assertIsNone(presence.blocker)
+        self.assertTrue(presence.password_present)
+        self.assertTrue(presence.session_key_present)
+        blob = json.dumps(presence.__dict__)
+        self.assertNotIn("sim-pass", blob)
+        self.assertNotIn("sim-key", blob)
+
+    def test_doctor_extras_blocker_and_fail_closed_details(self):
+        presence = WindowsCredsPresence(
+            source=CREDS_SOURCE_MISSING,
+            password_present=False,
+            session_key_present=False,
+            foreign_candidates=2,
+            blocker=CREDS_BLOCKER_OPENPROCESS_VM_READ_DENIED,
+            openprocess_denied_count=2,
+            environ_readable_without_secrets=0,
+        )
+
+        class _MissingAdapter:
+            base_url = "http://127.0.0.1:4398"
+
+            def refresh_creds(self):
+                raise AdapterError(AdapterStatus.MISSING_CREDS, MISSING_CREDS_MESSAGE)
+
+        r = doctor(
+            platform="win32",
+            adapter=_MissingAdapter(),
+            port_open_fn=lambda h, p: p == 4398,
+            creds_presence_fn=lambda: presence,
+        )
+        self.assertEqual(r.status, AdapterStatus.MISSING_CREDS.value)
+        self.assertEqual(r.extras.get("creds_blocker"), CREDS_BLOCKER_OPENPROCESS_VM_READ_DENIED)
+        self.assertEqual(r.extras.get("creds_source"), CREDS_SOURCE_MISSING)
+        self.assertFalse(r.extras.get("password_present"))
+        self.assertFalse(r.extras.get("session_key_present"))
+        self.assertIn("4398", r.extras.get("ports") or {})
+        details = " ".join(r.details)
+        self.assertIn("stdin", details.lower())
+        self.assertIn("Do not disable authentication", details)
+        self.assertIn("Credential Manager", details)
+        self.assertIn("SeDebugPrivilege", details)
+        blob = json.dumps(r.to_dict())
+        self.assertNotIn("sim-pass", blob)
+        self.assertNotIn("sim-key", blob)
+
+    def test_doctor_extras_stripped_blocker(self):
+        presence = WindowsCredsPresence(
+            source=CREDS_SOURCE_MISSING,
+            password_present=False,
+            session_key_present=False,
+            foreign_candidates=1,
+            blocker=CREDS_BLOCKER_ENVIRON_SECRETS_STRIPPED,
+            openprocess_denied_count=0,
+            environ_readable_without_secrets=1,
+        )
+        r = doctor(
+            platform="win32",
+            port_open_fn=lambda h, p: p == 4398,
+            creds_presence_fn=lambda: presence,
+        )
+        self.assertEqual(r.extras.get("creds_blocker"), CREDS_BLOCKER_ENVIRON_SECRETS_STRIPPED)
+        self.assertFalse(r.extras.get("windows_live_verified", True))
 
 
 if __name__ == "__main__":
