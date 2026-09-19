@@ -68,7 +68,9 @@ DESKTOP-TBB531F 已核实：GUI 工人 **:4398**；`SECRET_ENV_KEYS` 经 **stdin
 | 2 | （历史）其它进程 PEB/environ | 现行 GUI 下通常失败，保留但标不可靠。`TELEAGENT_WIN_SKIP_PEB` 可跳过 |
 | 3 | **stdin_wrap（本刀）** | 受控父进程用与 GUI 相同的 stdin payload 拉起 `{USERPROFILE}/.local/share/TeleAgent/runtimes/super-agent-code/bin/TeleAgent.exe`（或 `TELEAGENT_KERNEL_BIN` / LOCALAPPDATA / HOME 变体）。父进程内存持有密钥 → doctor/glue 用 |
 
-通道开关：`auto`（本进程缺凭据且 PEB 失败或跳过 PEB → 尝试 wrap）\| `stdin_wrap`（强制 wrap）\| `env`（只本进程 env）\| `off`（不 wrap）。
+通道开关：`auto`（本进程缺凭据且 PEB 失败；**若 loopback 4399 / 4397 / 4398 任一在听则不 wrap**，fail-closed `MISSING_CREDS`。优先接现场 GUI 走 NewApi；Local Storage wrap 可能 40108）\| `stdin_wrap`（强制 wrap，即使 GUI 在听）\| `env`（只本进程 env）\| `off`（不 wrap）。
+
+`auto` 下 wrap **仅**在 GUI 工人端口均未监听时发生。现场 GUI 已在听时不要并行 LS wrap：NewApi 登录态应以 GUI 为准，wrap 可能 40108。
 
 stdin payload 至少含：`SERVER_PORT`、`OPENCODE_SERVER_USERNAME`（默认 `super-agent`）、`OPENCODE_SERVER_PASSWORD`、`SUPER_AGENT_LOCAL_SESSION_KEY`、`SUPER_AGENT_SERVER_URL=http://127.0.0.1:{port}`。子进程 **OS environ** 仅 `SystemRoot` / `PATH` / `TEMP` / `USERPROFILE` / `XDG_DATA_HOME` 等非密；SECRET 键禁止留在子进程 OS environ。`XDG_DATA_HOME` 建议 `{TEMP}/teleagent-collab-wrap/xdg`，减轻与 GUI 数据打架。找不到内核二进制 → `creds_blocker=stdin_wrap_bin_missing`（blocker，不要猜 Program Files GUI exe）。
 
@@ -78,7 +80,7 @@ stdin payload 至少含：`SERVER_PORT`、`OPENCODE_SERVER_USERNAME`（默认 `s
 
 1. **本进程**环境变量：`OPENCODE_SERVER_PASSWORD`（别名 `SUPER_AGENT_OPENCODE_PASSWORD`）+ `SUPER_AGENT_LOCAL_SESSION_KEY`；用户名 `OPENCODE_SERVER_USERNAME` / `SUPER_AGENT_OPENCODE_USERNAME`，缺省 `super-agent`。
 2. **其它进程 environ**（仅当本进程缺 password 或 session key，且通道不是 `env` / `stdin_wrap`、未设 `TELEAGENT_WIN_SKIP_PEB`）：枚举本机相关进程（`TeleAgent.exe`，以及镜像路径含 `TeleAgent` / `super-agent-code` / `opencode` 等），读其环境块中的同上键。仅当 password **与** session key 都在时才采用。**现行 GUI 下通常失败。**
-3. **stdin_wrap**（`auto` 且前两步失败，或通道 `stdin_wrap`）：受控并行内核，见上节。
+3. **stdin_wrap**（通道 `stdin_wrap`，或 `auto` 且前两步失败 **且 4399/4397/4398 均未监听**）：受控并行内核，见上节。`auto` + GUI 已在听 + 无本进程/PEB 凭据 → 不 wrap，直接 `MISSING_CREDS`（fail-closed；优先现场 GUI / NewApi，LS wrap 可能 40108）。
 4. 仍找不到 → `AdapterError(MISSING_CREDS)`。文案说明已扫其它进程 environ、非本进程 env；并点明现行 TeleAgent 可能经 stdin 注入 SECRET_ENV_KEYS、PEB/environ 可能无效。**不要**关鉴权 / 刮 CM / 抬 SeDebug。
 
 HMAC session key 在进程内存，重启即换。官方数据根可能在 `%APPDATA%\TeleAgent` / `%LOCALAPPDATA%\TeleAgent`（含 OAuth `token.json`）——**只读路径备忘，本适配器不读盘、不刮 CM**。
@@ -183,6 +185,7 @@ python bin/run-live-grok-lead.py
 
 - Fix (same day): `resolve_windows_local_v1_creds` no longer trusts process env when `TELEAGENT_WIN_CREDS_CHANNEL=stdin_wrap` or `TELEAGENT_CREDS_SOURCE=stdin_wrap` — fall through to `ensure_stdin_wrap` so doctor `/version` matches the live handle (avoids auth_failed from stale env after hard reset).
 - GUI model reuse: stdin_wrap injects `SUPER_AGENT_AUTH_STATE` + `OPENCODE_CONFIG_CONTENT` from GUI Local Storage `opencowork-auth` + `device-meta.json` (AES-256-GCM). After inject, live children should use `TELEAGENT_WIN_CREDS_CHANNEL=env`. Orphan wrap port waits until not LISTENING before respawn.
+- `auto` + GUI worker TCP already on **4399 / 4397 / 4398**: do **not** `ensure_stdin_wrap`. Prefer the live GUI for NewApi; LS wrap can 40108. No process/foreign creds → fail-closed `MISSING_CREDS`. Wrap only when those ports are down, or `TELEAGENT_WIN_CREDS_CHANNEL=stdin_wrap`.
 
 ## GUI model reuse (stdin_wrap)
 

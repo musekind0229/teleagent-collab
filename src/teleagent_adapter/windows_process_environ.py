@@ -13,7 +13,11 @@ them). PEB/environ discovery is therefore ineffective on current Win builds.
 This-process env → foreign environ remains a historical / injection fallback,
 not a reliable source for GUI-launched TeleAgent. When those fail, a
 controlled parent-process **stdin_wrap** (see ``windows_stdin_wrap``) may
-spawn a parallel kernel on :4401 with the same stdin payload.
+spawn a parallel kernel on :4401 with the same stdin payload, but **not**
+when ``TELEAGENT_WIN_CREDS_CHANNEL=auto`` and a GUI worker port (4399 / 4397
+/ 4398) is already listening — fail-closed ``MISSING_CREDS`` instead of a
+parallel wrap (prefer the live GUI for NewApi; Local Storage wrap can 40108).
+Wrap only if no GUI ports are listening, or the channel is ``stdin_wrap``.
 
 Doctor extras may set ``creds_blocker`` to ``openprocess_vm_read_denied``,
 ``environ_secrets_stripped``, or stdin_wrap codes
@@ -31,6 +35,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import socket
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -93,6 +98,12 @@ CREDS_BLOCKER_GUI_MODEL_AUTH_MISSING = "gui_model_auth_missing"
 WIN_CREDS_CHANNEL_ENV = "TELEAGENT_WIN_CREDS_CHANNEL"
 WIN_SKIP_PEB_ENV = "TELEAGENT_WIN_SKIP_PEB"
 CREDS_SOURCE_MARKER_ENV = "TELEAGENT_CREDS_SOURCE"
+
+# GUI worker HTTP discovery ports (same order as windows_local_v1). auto wrap
+# is skipped when any of these is already listening on loopback.
+GUI_WORKER_PORTS: tuple[int, ...] = (4399, 4397, 4398)
+_GUI_LISTEN_HOST = "127.0.0.1"
+_GUI_LISTEN_TIMEOUT = 0.2
 
 # Fail-closed copy for doctor details / AdapterError — names of keys only, never values.
 CREDS_FAIL_CLOSED_HINT = (
@@ -704,18 +715,53 @@ def _truthy_env(val: str | None) -> bool:
     return (val or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _tcp_port_open(
+    host: str, port: int, timeout: float = _GUI_LISTEN_TIMEOUT
+) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _gui_worker_listening(
+    *,
+    listen_fn: Callable[[int], bool] | None = None,
+    ports: Sequence[int] = GUI_WORKER_PORTS,
+) -> bool:
+    """True if any GUI worker port (4399 / 4397 / 4398) accepts TCP on loopback."""
+
+    def _default(port: int) -> bool:
+        return _tcp_port_open(_GUI_LISTEN_HOST, int(port))
+
+    probe = listen_fn or _default
+    for port in ports:
+        try:
+            if probe(int(port)):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _should_try_stdin_wrap(
     channel: str,
     *,
     wrap_fn: Callable[..., Any] | None,
     platform: str | None = None,
+    gui_listening: bool = False,
 ) -> bool:
     if channel in ("off", "env"):
         return False
     if channel == "stdin_wrap":
         return True
-    # auto: on Windows always; on other hosts only when tests inject wrap_fn
+    # auto: wrap only when no GUI worker port is already listening.
+    # Prefer the live GUI for NewApi; a parallel LS wrap can 40108.
+    # On Windows that means spawn; on other hosts only when tests inject wrap_fn
     # so existing Linux mock suites stay fail-closed without spawning.
+    if gui_listening:
+        return False
     if wrap_fn is not None:
         return True
     return _is_windows(platform)
@@ -731,8 +777,15 @@ def resolve_windows_local_v1_creds(
     skip_pid: int | None = None,
     wrap_fn: Callable[..., Any] | None = None,
     skip_peb: bool = False,
+    listen_fn: Callable[[int], bool] | None = None,
 ) -> tuple[tuple[str, str, str] | None, WindowsCredsPresence]:
-    """This-process env, then foreign PEB/environ, then stdin_wrap (channel-gated)."""
+    """This-process env, then foreign PEB/environ, then stdin_wrap (channel-gated).
+
+    ``auto`` does not call ``ensure_stdin_wrap`` when a GUI worker port
+    (4399 / 4397 / 4398) is listening; missing process/foreign creds then
+    yields ``MISSING_CREDS`` (fail-closed). Wrap only if no GUI ports listen,
+    or ``TELEAGENT_WIN_CREDS_CHANNEL=stdin_wrap``. Tests inject ``listen_fn``.
+    """
     env = environ if environ is not None else os.environ
     channel = _creds_channel(env)
     pw_here = bool(_first_env(env, PASSWORD_KEYS))
@@ -804,7 +857,12 @@ def resolve_windows_local_v1_creds(
             )
 
     wrap_blocker: str | None = None
-    if _should_try_stdin_wrap(channel, wrap_fn=wrap_fn):
+    gui_listening = False
+    if channel == "auto" and _should_try_stdin_wrap(
+        channel, wrap_fn=wrap_fn, gui_listening=False
+    ):
+        gui_listening = _gui_worker_listening(listen_fn=listen_fn)
+    if _should_try_stdin_wrap(channel, wrap_fn=wrap_fn, gui_listening=gui_listening):
         try:
             from teleagent_adapter.windows_stdin_wrap import (
                 ensure_stdin_wrap,
@@ -866,6 +924,7 @@ def probe_windows_creds_presence(
     skip_pid: int | None = None,
     wrap_fn: Callable[..., Any] | None = None,
     skip_peb: bool = False,
+    listen_fn: Callable[[int], bool] | None = None,
 ) -> WindowsCredsPresence:
     """Doctor-facing probe: source + bool presence, never secret values."""
     _creds, presence = resolve_windows_local_v1_creds(
@@ -877,6 +936,7 @@ def probe_windows_creds_presence(
         skip_pid=skip_pid,
         wrap_fn=wrap_fn,
         skip_peb=skip_peb,
+        listen_fn=listen_fn,
     )
     return presence
 
@@ -894,6 +954,7 @@ __all__ = [
     "CREDS_SOURCE_PROCESS_ENV",
     "CREDS_SOURCE_STDIN_WRAP",
     "DEFAULT_BASIC_USER",
+    "GUI_WORKER_PORTS",
     "MISSING_CREDS_MESSAGE",
     "PASSWORD_KEYS",
     "SESSION_KEY_KEYS",

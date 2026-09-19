@@ -253,6 +253,7 @@ class TestEnsureStdinWrap(_WrapTestCase):
             environ={},
             foreign_finder=lambda: None,
             wrap_fn=lambda: handle,
+            listen_fn=lambda _p: False,
         )
         self.assertEqual(presence.source, CREDS_SOURCE_STDIN_WRAP)
         self.assertEqual(creds, (handle.username, handle.password, handle.session_key))
@@ -406,6 +407,7 @@ class TestEnsureStdinWrap(_WrapTestCase):
                 session_key="sim-key",
                 pid=11,
             ),
+            listen_fn=lambda _p: False,
         )
         self.assertEqual(presence.source, CREDS_SOURCE_STDIN_WRAP)
         r = doctor(
@@ -469,6 +471,7 @@ class TestEnsureStdinWrap(_WrapTestCase):
             environ=marked,
             foreign_finder=lambda: (_ for _ in ()).throw(AssertionError("peb skipped")),
             wrap_fn=lambda: handle,
+            listen_fn=lambda _p: False,
         )
         self.assertEqual(presence.source, CREDS_SOURCE_STDIN_WRAP)
         self.assertEqual(creds, ("super-agent", "sim-pass", "sim-key"))

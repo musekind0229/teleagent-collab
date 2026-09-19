@@ -6,6 +6,7 @@ Fake values only: sim-pass / sim-key. Never real secrets.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -24,6 +25,8 @@ from teleagent_adapter.windows_process_environ import (  # noqa: E402
     CREDS_SOURCE_FOREIGN,
     CREDS_SOURCE_MISSING,
     CREDS_SOURCE_PROCESS_ENV,
+    CREDS_SOURCE_STDIN_WRAP,
+    GUI_WORKER_PORTS,
     MISSING_CREDS_MESSAGE,
     ProcessSnapshot,
     WindowsCredsPresence,
@@ -37,6 +40,7 @@ from teleagent_adapter.windows_process_environ import (  # noqa: E402
     probe_windows_creds_presence,
     read_process_environ_via_peb,
     resolve_windows_local_v1_creds,
+    _should_try_stdin_wrap,
 )
 
 SIMULATED = True
@@ -238,6 +242,7 @@ class TestDefaultFindCredsOrder(unittest.TestCase):
             default_find_creds_windows(
                 environ={"OPENCODE_SERVER_PASSWORD": "sim-pass"},
                 foreign_finder=lambda: None,
+                wrap_fn=lambda: None,
             )
         self.assertEqual(cm.exception.status, AdapterStatus.MISSING_CREDS)
 
@@ -456,10 +461,6 @@ class TestCredsBlockerDiagnosis(unittest.TestCase):
         self.assertFalse(r.extras.get("windows_live_verified", True))
 
 
-if __name__ == "__main__":
-    raise SystemExit(unittest.main())
-
-
 class TestPbiClassNotShadowed(unittest.TestCase):
     def test_process_basic_information_class_is_int_zero(self):
         from teleagent_adapter import windows_process_environ as m
@@ -467,4 +468,190 @@ class TestPbiClassNotShadowed(unittest.TestCase):
         self.assertIsInstance(m._PROCESS_BASIC_INFORMATION_CLASS, int)
         self.assertEqual(m._PROCESS_BASIC_INFORMATION_CLASS, 0)
         self.assertTrue(issubclass(m._PROCESS_BASIC_INFORMATION_STRUCT, object))
+
+
+class _WrapHandle:
+    """Minimal wrap handle for resolve tests. Fake secrets only."""
+
+    def __init__(self) -> None:
+        self.username = "super-agent"
+        self.password = "sim-pass"
+        self.session_key = "sim-key"
+        self.base_url = "http://127.0.0.1:4401"
+        self.owns_base_url = False
+
+
+_WRAP_INJECT_KEYS = (
+    "OPENCODE_SERVER_USERNAME",
+    "OPENCODE_SERVER_PASSWORD",
+    "SUPER_AGENT_LOCAL_SESSION_KEY",
+    "TELEAGENT_BASE_URL",
+    "TELEAGENT_CREDS_SOURCE",
+)
+
+
+class TestAutoSkipsWrapWhenGuiListening(unittest.TestCase):
+    """auto must not ensure_stdin_wrap while GUI worker ports listen."""
+
+    def setUp(self) -> None:
+        self._saved = {k: os.environ.get(k) for k in _WRAP_INJECT_KEYS}
+
+    def tearDown(self) -> None:
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_gui_worker_ports_are_4399_4397_4398(self):
+        self.assertEqual(GUI_WORKER_PORTS, (4399, 4397, 4398))
+
+    def test_should_try_stdin_wrap_matrix(self):
+        self.assertFalse(_should_try_stdin_wrap("off", wrap_fn=lambda: None))
+        self.assertFalse(_should_try_stdin_wrap("env", wrap_fn=lambda: None))
+        self.assertTrue(
+            _should_try_stdin_wrap("stdin_wrap", wrap_fn=None, gui_listening=True)
+        )
+        self.assertFalse(
+            _should_try_stdin_wrap(
+                "auto", wrap_fn=lambda: None, gui_listening=True, platform="win32"
+            )
+        )
+        self.assertTrue(
+            _should_try_stdin_wrap(
+                "auto", wrap_fn=lambda: None, gui_listening=False, platform="win32"
+            )
+        )
+        self.assertTrue(
+            _should_try_stdin_wrap(
+                "auto", wrap_fn=lambda: None, gui_listening=False, platform="linux"
+            )
+        )
+        self.assertFalse(
+            _should_try_stdin_wrap(
+                "auto", wrap_fn=None, gui_listening=False, platform="linux"
+            )
+        )
+        self.assertTrue(
+            _should_try_stdin_wrap(
+                "auto", wrap_fn=None, gui_listening=False, platform="win32"
+            )
+        )
+
+    def test_auto_gui_listening_does_not_call_wrap(self):
+        for port in GUI_WORKER_PORTS:
+            with self.subTest(port=port):
+
+                def nope():
+                    raise AssertionError(
+                        f"wrap must not run when GUI :{port} is listening"
+                    )
+
+                creds, presence = resolve_windows_local_v1_creds(
+                    environ={"TELEAGENT_WIN_CREDS_CHANNEL": "auto"},
+                    foreign_finder=lambda: None,
+                    enumerator=lambda: [],
+                    wrap_fn=nope,
+                    listen_fn=lambda p, want=port: p == want,
+                )
+                self.assertIsNone(creds)
+                self.assertEqual(presence.source, CREDS_SOURCE_MISSING)
+                self.assertIsNone(presence.blocker)
+                blob = str(presence.__dict__)
+                self.assertNotIn("sim-pass", blob)
+                self.assertNotIn("sim-key", blob)
+
+    def test_auto_no_gui_ports_wraps(self):
+        creds, presence = resolve_windows_local_v1_creds(
+            environ={"TELEAGENT_WIN_CREDS_CHANNEL": "auto"},
+            foreign_finder=lambda: None,
+            enumerator=lambda: [],
+            wrap_fn=lambda: _WrapHandle(),
+            listen_fn=lambda _p: False,
+        )
+        self.assertEqual(presence.source, CREDS_SOURCE_STDIN_WRAP)
+        self.assertEqual(creds, ("super-agent", "sim-pass", "sim-key"))
+        self.assertTrue(presence.password_present)
+        self.assertTrue(presence.session_key_present)
+        blob = str(presence.__dict__)
+        self.assertNotIn("sim-pass", blob)
+        self.assertNotIn("sim-key", blob)
+
+    def test_stdin_wrap_channel_wraps_even_when_gui_listening(self):
+        creds, presence = resolve_windows_local_v1_creds(
+            environ={"TELEAGENT_WIN_CREDS_CHANNEL": "stdin_wrap"},
+            foreign_finder=lambda: (_ for _ in ()).throw(AssertionError("peb skipped")),
+            wrap_fn=lambda: _WrapHandle(),
+            listen_fn=lambda _p: True,
+        )
+        self.assertEqual(presence.source, CREDS_SOURCE_STDIN_WRAP)
+        self.assertEqual(creds, ("super-agent", "sim-pass", "sim-key"))
+
+    def test_auto_gui_listening_still_uses_foreign_creds(self):
+        def nope():
+            raise AssertionError("wrap must not run when foreign creds exist")
+
+        creds, presence = resolve_windows_local_v1_creds(
+            environ={"TELEAGENT_WIN_CREDS_CHANNEL": "auto"},
+            foreign_finder=lambda: ("super-agent", "sim-pass", "sim-key"),
+            wrap_fn=nope,
+            listen_fn=lambda p: p == 4398,
+        )
+        self.assertEqual(presence.source, CREDS_SOURCE_FOREIGN)
+        self.assertEqual(creds, ("super-agent", "sim-pass", "sim-key"))
+
+    def test_auto_wrap_marker_gui_listening_does_not_trust_stale_or_wrap(self):
+        marked = {
+            "TELEAGENT_WIN_CREDS_CHANNEL": "auto",
+            "TELEAGENT_CREDS_SOURCE": CREDS_SOURCE_STDIN_WRAP,
+            "OPENCODE_SERVER_USERNAME": "super-agent",
+            "OPENCODE_SERVER_PASSWORD": "sim-pass",
+            "SUPER_AGENT_LOCAL_SESSION_KEY": "sim-key",
+        }
+
+        def nope():
+            raise AssertionError("must not wrap while GUI worker port is listening")
+
+        creds, presence = resolve_windows_local_v1_creds(
+            environ=marked,
+            foreign_finder=lambda: (_ for _ in ()).throw(AssertionError("peb skipped")),
+            enumerator=lambda: [],
+            wrap_fn=nope,
+            listen_fn=lambda p: p == 4398,
+        )
+        self.assertIsNone(creds)
+        self.assertEqual(presence.source, CREDS_SOURCE_MISSING)
+        self.assertTrue(presence.password_present)
+        self.assertTrue(presence.session_key_present)
+
+    def test_auto_gui_listening_fail_closed_missing_creds(self):
+        def nope():
+            raise AssertionError("wrap must not run; fail-closed MISSING_CREDS")
+
+        creds, presence = resolve_windows_local_v1_creds(
+            environ={"TELEAGENT_WIN_CREDS_CHANNEL": "auto"},
+            foreign_finder=lambda: None,
+            enumerator=lambda: [],
+            wrap_fn=nope,
+            listen_fn=lambda p: p == 4398,
+        )
+        self.assertIsNone(creds)
+        self.assertEqual(presence.source, CREDS_SOURCE_MISSING)
+        self.assertFalse(presence.password_present)
+        self.assertFalse(presence.session_key_present)
+        # Finder maps None creds → AdapterError(MISSING_CREDS).
+        with self.assertRaises(AdapterError) as cm:
+            default_find_creds_windows(
+                environ={"TELEAGENT_WIN_CREDS_CHANNEL": "auto"},
+                foreign_finder=lambda: None,
+                wrap_fn=lambda: None,
+            )
+        self.assertEqual(cm.exception.status, AdapterStatus.MISSING_CREDS)
+        self.assertNotIn("sim-pass", str(cm.exception))
+        self.assertNotIn("sim-key", str(cm.exception))
+
+
+if __name__ == "__main__":
+    raise SystemExit(unittest.main())
+
 
