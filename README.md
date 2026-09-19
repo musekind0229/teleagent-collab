@@ -1,7 +1,6 @@
 # teleagent-collab
 
-> 本地 Windows 适配分支：`windows-codex-lead`。见 [Windows 预览说明](windows/README.zh-CN.md) 和 [原版设计评审](docs/DESIGN-REVIEW.zh-CN.md)。
-> Windows 新入口为 `windows/collab.ps1` / `python -m win_collab`；下方原版 `src/` 仍保留供对照，其安全与验收限制见评审。真实 Windows 鉴权接入尚待验证。
+> Windows 有两条互补路径：通用框架使用 `src/teleagent_adapter/windows_local_v1.py`，已实机验证的监督控制器使用 `windows/collab.ps1` / `python -m win_collab`。整合状态与边界见 [Windows 整合说明](docs/WINDOWS-UNIFIED.zh-CN.md)，操作见 [Windows 预览说明](windows/README.zh-CN.md)。
 
 把天翼星辰 **TeleAgent** 当成编排里的便宜工人：用本地 HTTP（`:4399`）下单、等完结、接权限弹窗；**组长/门禁可插拔**（烟测默认 Grok Build），不焊死某一家。
 
@@ -15,7 +14,7 @@
 
 - **工人**：TeleAgent 本地 HTTP（Basic + HMAC），不靠 GUI 点窗口开工
 - **审批环**：`GET /permission`（按 sessionID 过滤）→ 硬规则/组长 → `once|reject`（禁自动 always；批准前 reconfirm）
-- **适配层**：`teleagent_adapter`（Linux Basic+HMAC；Win 2.4.1 blocked）
+- **适配层**：`teleagent_adapter`（Linux Basic+HMAC；Windows local-v1 适配已实现，当前上游通道仍需本机 live 验收）
 - **验收环**：全部产物齐全 + 统一 `run-evidence.txt`；`force_lead_review` 串/并行生效；批准前 hash/mtime 门闩（见 `docs/completion-criteria.md`）
 - **完成判定**：缺失/错误/超时/取消 ≠ 成功；返工受 `ReworkBudget` 约束（不可靠重启重置墙钟）
 - **组长适配**：`lead_adapter`（Grok CLI / inprocess 当前对话 / DeepSeek harness JSON 包装 → `dsh --profile headless`）；结构化 JSON 绑定 `application_id`（见 `docs/lead-adapter.md`）

@@ -1,6 +1,7 @@
 """Map legacy charter → single-task Goal + Task. Never invent unlimited allow_*."""
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 from framework.delegation import autonomy_is_known, normalize_autonomy
@@ -105,6 +106,21 @@ def map_charter_to_goal_task(
     except Exception as e:
         raise CharterMapError(f"invalid depends_on: {e}") from e
 
+    declared_platforms = charter.get("platform_allowlist")
+    if declared_platforms is None:
+        platform_allowlist = ["windows" if sys.platform.startswith("win") else "linux"]
+    else:
+        platform_allowlist = _as_list(declared_platforms)
+        if not platform_allowlist or not all(isinstance(x, str) and x.strip() for x in platform_allowlist):
+            raise CharterMapError("platform_allowlist must contain non-empty strings")
+        platform_allowlist = [str(x).strip().lower() for x in platform_allowlist]
+    default_backend = (
+        "teleagent.windows.local_v1"
+        if platform_allowlist == ["windows"]
+        else "teleagent.linux.local_v1"
+    )
+    backend_requirement = str(charter.get("backend_requirement") or default_backend).strip()
+
     goal = {
         "contract_version": CONTRACT_VERSION,
         "goal_id": gid,
@@ -114,7 +130,7 @@ def map_charter_to_goal_task(
         "acceptance": acceptance,
         "budget": budget,
         "capability_requirements": [],
-        "platform_allowlist": ["linux"],
+        "platform_allowlist": platform_allowlist,
         "source_charter_path": str(charter.get("_source") or ""),
     }
     if charter.get("force_lead_review"):
@@ -168,7 +184,7 @@ def map_charter_to_goal_task(
         "done_when": charter.get("done_when") if isinstance(charter.get("done_when"), dict) else {"artifacts": expected},
         "status": "queued",
         "assignee_role": "executor",
-        "backend_requirement": "teleagent.linux.local_v1",
+        "backend_requirement": backend_requirement,
     }
 
     out: dict[str, Any] = {

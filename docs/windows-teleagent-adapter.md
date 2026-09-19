@@ -107,7 +107,7 @@ Win doctor 在 extras 中写入（**永不写 secret 值**）：
 | `environ_secrets_stripped` | 至少一个候选进程 **成功** 读到 environ 块，但块内 **没有** password+session_key（现行 stdin 化典型：renderer 可读但无密钥；或工人 environ 被掏空） |
 | `stdin_wrap_bin_missing` | stdin_wrap 通道已尝试，但运行时内核 `TeleAgent.exe` 不在 `TELEAGENT_KERNEL_BIN` / `{USERPROFILE}/.local/share/TeleAgent/runtimes/super-agent-code/bin/`（及 LOCALAPPDATA/HOME 变体） |
 | `stdin_wrap_ready_timeout` | wrap 已 spawn，等待 `http://127.0.0.1:{port}/ready` 超时（fail-closed） |
-| `stdin_wrap_spawn_failed` | wrap spawn / 写 stdin payload 失败，或内核在 `/ready` 前退出，或杀旧 wrap 后端口仍 LISTENING |
+| `stdin_wrap_spawn_failed` | wrap spawn / 写 stdin payload 失败，或内核在 `/ready` 前退出，或未知进程占用 wrap 端口 |
 | `gui_model_auth_missing` | `TELEAGENT_WIN_REUSE_GUI_MODEL=1` 或 auto 已发现 GUI 鉴权文件但读/加密失败；**fail-closed，不 spawn 半配置 wrap** |
 
 PEB 两码都有时优先 `environ_secrets_stripped`（证明 environ 路径已空）。wrap 已尝试且失败时优先 wrap 三码 / `gui_model_auth_missing`。都无则 `creds_blocker` 为空，`creds_source` 仍为 `missing`。`missing_creds` 时 `details` 带 fail-closed 说明（stdin / 禁止关鉴权、刮 CM、SeDebug）。
@@ -184,7 +184,7 @@ python bin/run-live-grok-lead.py
 - `windows_live_verified` stays **false**.
 
 - Fix (same day): `resolve_windows_local_v1_creds` no longer trusts process env when `TELEAGENT_WIN_CREDS_CHANNEL=stdin_wrap` or `TELEAGENT_CREDS_SOURCE=stdin_wrap` — fall through to `ensure_stdin_wrap` so doctor `/version` matches the live handle (avoids auth_failed from stale env after hard reset).
-- GUI model reuse: stdin_wrap injects `SUPER_AGENT_AUTH_STATE` + `OPENCODE_CONFIG_CONTENT` from GUI Local Storage `opencowork-auth` + `device-meta.json` (AES-256-GCM). After inject, live children should use `TELEAGENT_WIN_CREDS_CHANNEL=env`. Orphan wrap port waits until not LISTENING before respawn.
+- GUI model reuse: stdin_wrap injects `SUPER_AGENT_AUTH_STATE` + `OPENCODE_CONFIG_CONTENT` from GUI Local Storage `opencowork-auth` + `device-meta.json` (AES-256-GCM). After inject, live children should use `TELEAGENT_WIN_CREDS_CHANNEL=env`. 已由本控制器记录的旧 wrap 可停止；未知进程占用端口时等待后 fail-closed，不按端口误杀进程。
 - `auto` + GUI worker TCP already on **4399 / 4397 / 4398**: do **not** `ensure_stdin_wrap`. Prefer the live GUI for NewApi; LS wrap can 40108. No process/foreign creds → fail-closed `MISSING_CREDS`. Wrap only when those ports are down, or `TELEAGENT_WIN_CREDS_CHANNEL=stdin_wrap`.
 
 ## GUI model reuse (stdin_wrap)
@@ -218,7 +218,7 @@ wrap 的 XDG 与 GUI 隔离，未注入 model 鉴权时 live `create_session` / 
 | `1` / `true` / `on` | 必须注入；缺文件或损坏 → `creds_blocker=gui_model_auth_missing` |
 | `0` / `false` / `off` | 不复用 GUI model（仅 local-v1 Basic + HMAC wrap） |
 
-**孤儿端口：** 杀掉先前 wrap / wrap 端口上的外国 LISTEN 之后，**等到端口不再 LISTENING**（默认约 10s，测例可 hook）再 spawn。否则新密钥打到旧内核 → `local_auth_signature_invalid`。超时仍占用 → `stdin_wrap_spawn_failed`。
+**孤儿端口：** 只停止本控制器状态文件记录的旧 wrap，并等待端口不再 LISTENING（默认约 10s，测例可 hook）再 spawn。未知进程占用 wrap 端口时不终止它，直接等待后 fail-closed。否则新密钥打到旧内核会得到 `local_auth_signature_invalid`。超时仍占用 → `stdin_wrap_spawn_failed`。
 
 **注入成功后：** 后续 live 子进程应设 `TELEAGENT_WIN_CREDS_CHANNEL=env`，走本进程已注入的 env，**不要再 `ensure_stdin_wrap`**（会杀 wrap）。永不 log / extras / git 写入 token 或 ciphertext。永不提交真实密钥。
 

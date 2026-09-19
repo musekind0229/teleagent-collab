@@ -36,11 +36,11 @@ _ADAPTER = None
 
 
 def get_ta_adapter():
-    """Lazy Linux local-v1 adapter (shared with scheduler). Dry tests may never call this."""
+    """Lazy platform local-v1 adapter (shared with scheduler)."""
     global _ADAPTER
     if _ADAPTER is None:
         from teleagent_adapter import get_adapter
-        _ADAPTER = get_adapter(platform="linux")
+        _ADAPTER = get_adapter(platform=sys.platform)
     return _ADAPTER
 
 def _default_collab_dir() -> Path:
@@ -167,13 +167,21 @@ def sign_headers(method: str, url: str) -> dict:
 
 
 def call(method: str, path: str, body=None, extra_headers=None, timeout=120):
-    """HTTP to TeleAgent — prefers teleagent_adapter.LinuxLocalV1Adapter."""
+    """HTTP to TeleAgent through the platform adapter, with legacy fallback."""
+    global BASE
     try:
         ad = get_ta_adapter()
-        # Keep adapter base in sync with glue.BASE
-        if getattr(ad, "base_url", None) and ad.base_url.rstrip("/") != BASE.rstrip("/"):
+        # An explicit URL remains authoritative. On Windows auto-discovery may
+        # move from the GUI listener to an owned stdin-wrap listener after the
+        # credential refresh; do not overwrite that transition with stale BASE.
+        explicit_base = (os.environ.get("TELEAGENT_BASE_URL") or "").strip().rstrip("/")
+        if (explicit_base or not sys.platform.startswith("win")) and (
+                getattr(ad, "base_url", None) and ad.base_url.rstrip("/") != BASE.rstrip("/")):
             ad.base_url = BASE.rstrip("/")
-        return ad.call(method, path, body=body, extra_headers=extra_headers, timeout=timeout)
+        result = ad.call(method, path, body=body, extra_headers=extra_headers, timeout=timeout)
+        if sys.platform.startswith("win") and getattr(ad, "base_url", None):
+            BASE = ad.base_url.rstrip("/")
+        return result
     except Exception:
         # Fallback to legacy inline HMAC if adapter import/creds fail mid-flight
         url = f"{BASE}{path}"
@@ -1223,6 +1231,7 @@ def _write_status(name: str, report: dict):
         "job_end_contract": report.get("job_end_contract"),
         "lead_advisory": report.get("lead_advisory"),
     }
+    COLLAB.mkdir(parents=True, exist_ok=True)
     (COLLAB / f"status-{name}.json").write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
 
 

@@ -643,6 +643,10 @@ def ensure_stdin_wrap(
             extra_pids.append(rec_pid)
         _remove_pid_file(environ=env)
 
+    # Never terminate an arbitrary process merely because it owns the desired
+    # TCP port. We may stop a PID recorded in our own state file; callers may
+    # inject a narrowly scoped reclaimer for tests or an external owner registry.
+    # The live default waits and fails closed on an unknown owner.
     reclaim_os = spawn_fn is None or listening_fn is not None or kill_listeners_fn is not None
     if extra_pids or reclaim_os:
         for pid in extra_pids:
@@ -652,8 +656,6 @@ def ensure_stdin_wrap(
                 pass
         if reclaim_os:
             killer = kill_listeners_fn
-            if killer is None and spawn_fn is None:
-                killer = _kill_listeners_on_port
             if killer is not None:
                 try:
                     killer(wrap_port)

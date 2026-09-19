@@ -97,6 +97,8 @@ class TestPathScopeNotStringMatch(unittest.TestCase):
         )
 
     def test_execution_revalidate_posix_realpath(self):
+        if os.name == "nt":
+            self.skipTest("POSIX realpath containment requires a POSIX host")
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "safe"
             root.mkdir()

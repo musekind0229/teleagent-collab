@@ -58,6 +58,14 @@ def public_system_action(action):
     }
 
 
+def worker_charter(charter):
+    """Return the full worker contract without controller-only package sources."""
+    clean = json.loads(json.dumps(charter))
+    if clean.get('task_kind', 'file_task') == 'system_install' and clean.get('system_action'):
+        clean['system_action'] = public_system_action(clean['system_action'])
+    return clean
+
+
 def verified_msi_source(action):
     package = action['package']
     declared = Path(package['source'])
@@ -352,6 +360,7 @@ class Engine:
         c = job['charter']
         if c.get('task_kind', 'file_task') == 'system_install':
             action = public_system_action(c['system_action'])
+            worker_contract = worker_charter(c)
             request_name = c.get('action_request_artifact', 'system-action-request.json')
             if phase == 'execute':
                 package = contained(job['workspace'], action['package']['filename'])
@@ -365,6 +374,7 @@ class Engine:
                     'credentials, or repeat the installation. Write only the required report artifacts in the '
                     'assigned workspace, then stop. A Windows UAC prompt may require the human to approve elevation.\n'
                     f'WORKSPACE: {job["workspace"]}\nPACKAGE: {package}\n'
+                    'CHARTER:\n' + json.dumps(worker_contract, ensure_ascii=True) + '\n'
                     'APPROVED_ACTION:\n' + json.dumps(action, ensure_ascii=True) + '\n'
                     'ROLLBACK:\n' + c['rollback'] + '\n'
                     'FINAL_ARTIFACTS:\n' + json.dumps(c['artifacts'], ensure_ascii=True) + '\n'
@@ -375,7 +385,8 @@ class Engine:
                     'Do not execute an installer, shell, PowerShell, network request, service change, or firewall change. '
                     f'Create only {request_name} in the assigned workspace, containing exactly the JSON action below, '
                     'then stop. The installer is deliberately unavailable until the lead approves this exact request.\n'
-                    f'WORKSPACE: {job["workspace"]}\nPROPOSED_ACTION:\n' +
+                    f'WORKSPACE: {job["workspace"]}\nCHARTER:\n' +
+                    json.dumps(worker_contract, ensure_ascii=True) + '\nPROPOSED_ACTION:\n' +
                     json.dumps(action, ensure_ascii=True))
             return {'parts': [{'type': 'text', 'text': text}],
                     'model': {'providerID': c.get('provider', 'NewApi'), 'modelID': c.get('model', 'chat-lite')},

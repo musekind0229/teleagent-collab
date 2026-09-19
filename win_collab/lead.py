@@ -13,7 +13,8 @@ from pathlib import Path
 
 def schema_for(packet):
     choices = {'permission':['once','reject','deny_job'], 'review':['pass','fail'],
-               'question':['answer','deny_job']}[packet['kind']]
+               'question':['answer','deny_job'],
+               'system_action':['approve','reject','deny_job']}[packet['kind']]
     return {'type':'object','properties':{
         'request_id':{'type':'string','const':packet['request_id']},
         'context_hash':{'type':'string','const':packet['context_hash']},

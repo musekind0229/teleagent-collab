@@ -385,6 +385,26 @@ class EnsureReuseTests(unittest.TestCase):
         self.assertEqual(order[-1], "spawn")
         self.assertLess(order.index("kill"), order.index("spawn"))
 
+    def test_unknown_listener_is_not_killed_by_default(self) -> None:
+        spawned = {"n": 0}
+
+        def spawn(argv, *, stdin_payload, env):
+            spawned["n"] += 1
+            return _FakeProc()
+
+        with self.assertRaises(StdinWrapError) as cm:
+            ensure_stdin_wrap(
+                kernel_bin="TeleAgent.exe",
+                spawn_fn=spawn,
+                ready_fn=lambda url: True,
+                environ={"TELEAGENT_WIN_REUSE_GUI_MODEL": "0"},
+                listening_fn=lambda _p: True,
+                sleep_fn=lambda _s: None,
+                wait_port_free_timeout=0,
+            )
+        self.assertEqual(cm.exception.blocker, "stdin_wrap_spawn_failed")
+        self.assertEqual(spawned["n"], 0)
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())

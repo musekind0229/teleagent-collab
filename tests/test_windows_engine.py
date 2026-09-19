@@ -353,7 +353,11 @@ class Tests(unittest.TestCase):
         self.assertTrue(result['action_dispatched'])
         prompts=[c for c in self.client.calls if c[1].endswith('/prompt_async')]
         self.assertEqual(len(prompts),2)
-        self.assertIn('APPROVED_ACTION',prompts[-1][2]['parts'][0]['text'])
+        execute_text=prompts[-1][2]['parts'][0]['text']
+        self.assertIn('APPROVED_ACTION',execute_text)
+        self.assertIn('CHARTER:',execute_text)
+        self.assertIn(j['charter']['goal'],execute_text)
+        self.assertNotIn(str(source),execute_text)
 
     def test_system_install_review_requires_bound_runas_invocation(self):
         _source,j,p=self.prepare_install()

@@ -13,3 +13,12 @@ class LeadContractTests(unittest.TestCase):
     def test_prose_is_not_a_decision(self):
         with self.assertRaises(ValueError):
             validate_response({'kind':'review','request_id':'p','context_hash':'h'},'do not pass until tested')
+
+    def test_system_action_contract(self):
+        p={'kind':'system_action','request_id':'a','context_hash':'ctx'}
+        good={'request_id':'a','context_hash':'ctx','decision':'approve',
+              'reason':'Exact staged action is within the charter','answers':[]}
+        self.assertEqual(validate_response(p,good),good)
+        for decision in ('once','always','pass'):
+            with self.subTest(decision=decision),self.assertRaises(ValueError):
+                validate_response(p,{**good,'decision':decision})

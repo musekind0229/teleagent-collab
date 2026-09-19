@@ -374,6 +374,8 @@ class TestWindowsBackendUnit(unittest.TestCase):
         self.assertEqual(win.WindowsFileLock.name, "windows.lockfileex")
 
     def test_windows_acquire_without_kernel32_raises_not_succeeds(self):
+        if os.name == "nt":
+            self.skipTest("kernel32 is expected to be available on Windows")
         from platform_services.file_lock import FileLockUnsupported
         from platform_services.windows import WindowsFileLock, reset_kernel32_for_tests
 
