@@ -704,6 +704,19 @@ def _task_record(task: Mapping[str, Any] | None, *, goal_id: str, default_status
         "done_when": dict(src.get("done_when") or {}) if isinstance(src.get("done_when"), Mapping) else {},
         "terminate_requested": bool(src.get("terminate_requested")),
     }
+    # Preserve routing and authority fields that are part of the Task
+    # contract.  The application coordinator fills these when it turns a
+    # lead plan into durable work; dropping them here would force execution
+    # backends to infer policy from process-local state.
+    for key in (
+        "assignee_role",
+        "backend_requirement",
+        "environment_id",
+        "authz_snapshot_ref",
+    ):
+        value = _norm_key(src.get(key))
+        if value:
+            rec[key] = value
     return rec
 
 
@@ -1212,6 +1225,29 @@ class DurableLayer:
                 out["goal"] = copied
             return out
 
+    def list_goals(self) -> dict[str, Any]:
+        """Return compact readonly Goal summaries for an application facade."""
+        with self._rmw():
+            rows = []
+            for gid, snap in sorted(
+                self.goals.items(),
+                key=lambda item: float((item[1] or {}).get("created_at") or 0),
+            ):
+                tasks = [t for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
+                rows.append(
+                    {
+                        "goal_id": gid,
+                        "state": snap.get("state"),
+                        "title": ((snap.get("goal") or {}).get("title") if isinstance(snap.get("goal"), Mapping) else ""),
+                        "task_count": len(tasks),
+                        "pending_count": len(snap.get("pending_decisions") or []),
+                        "updated_at": snap.get("updated_at"),
+                        "updated_at_iso": snap.get("updated_at_iso"),
+                        "readonly": True,
+                    }
+                )
+            return {"ok": True, "reason": REASON_READY, "goals": rows, "goal_count": len(rows)}
+
     def add_child_task(
         self,
         goal_id: str,
@@ -1306,6 +1342,144 @@ class DurableLayer:
             self._touch(snap)
             self._persist_unlocked()
             return {"ok": True, "reason": REASON_READY, "task": found, "state": snap.get("state")}
+
+    def bind_task_run(
+        self,
+        goal_id: str,
+        task_id: str,
+        *,
+        run_id: str,
+        native_handle: str = "",
+        backend: str = "",
+    ) -> dict[str, Any]:
+        """Persist the opaque backend handle before an asynchronous Run is polled.
+
+        A coordinator restart must never turn an already-dispatched Task back
+        into queued work.  Persisting the handle makes the running Task
+        recoverable by backends whose run handles survive the process.
+        """
+        gid = _norm_key(goal_id)
+        tid = _norm_key(task_id)
+        rid = _norm_key(run_id)
+        if not rid:
+            return {"ok": False, "reason": "missing_run_id", "error": "run_id is required"}
+        with self._rmw():
+            snap = self.goals.get(gid)
+            if snap is None:
+                return {"ok": False, "reason": REASON_UNKNOWN_GOAL, "error": f"unknown goal_id {gid!r}"}
+            tasks = [dict(t) for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
+            found = next((t for t in tasks if t.get("task_id") == tid), None)
+            if found is None:
+                return {"ok": False, "reason": "unknown_task", "error": f"unknown task_id {tid!r}"}
+            if _norm_key(found.get("status")) != "running":
+                return {
+                    "ok": False,
+                    "reason": REASON_ILLEGAL_STATE,
+                    "error": "run handle can only be bound to a running task",
+                }
+            existing = _norm_key(found.get("run_id"))
+            if existing and existing != rid:
+                return {
+                    "ok": False,
+                    "reason": "run_binding_conflict",
+                    "error": f"task already bound to run_id {existing!r}",
+                }
+            found["run_id"] = rid
+            handle = _norm_key(native_handle)
+            if handle:
+                found["native_handle"] = handle
+            backend_id = _norm_key(backend)
+            if backend_id:
+                found["backend"] = backend_id
+            snap["tasks"] = tasks
+            self._append_history(snap, "bind_task_run", task_id=tid, run_id=rid)
+            self._touch(snap)
+            self._persist_unlocked()
+            return {"ok": True, "reason": REASON_READY, "task": found, "state": snap.get("state")}
+
+    def finish_task(
+        self,
+        goal_id: str,
+        task_id: str,
+        *,
+        succeeded: bool,
+        result: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Record one worker result and derive the Goal terminal state.
+
+        This is the durable counterpart to ``start_task``. A failed child
+        fails the current bounded Goal; callers may submit a later explicit
+        plan revision/reopen rather than silently retrying here.
+        """
+        gid = _norm_key(goal_id)
+        tid = _norm_key(task_id)
+        forbidden = _forbid_identity_memory(result)
+        if forbidden:
+            return {"ok": False, "reason": REASON_IDENTITY_MEMORY_FORBIDDEN, "error": forbidden}
+        with self._rmw():
+            snap = self.goals.get(gid)
+            if snap is None:
+                return {"ok": False, "reason": REASON_UNKNOWN_GOAL, "error": f"unknown goal_id {gid!r}"}
+            tasks = [dict(t) for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
+            found = next((t for t in tasks if t.get("task_id") == tid), None)
+            if found is None:
+                return {"ok": False, "reason": "unknown_task", "error": f"unknown task_id {tid!r}"}
+            src = _norm_key(found.get("status") or "") or "queued"
+            dst = "succeeded" if succeeded else "failed"
+            if src != dst:
+                try:
+                    assert_transition("task", src, dst)
+                except LifecycleError as e:
+                    return {"ok": False, "reason": REASON_ILLEGAL_STATE, "error": str(e)}
+            found["status"] = dst
+            if isinstance(result, Mapping):
+                found["result"] = dict(result)
+                run_id = _norm_key(result.get("run_id") or result.get("native_handle"))
+                if run_id:
+                    found["run_id"] = run_id
+            snap["tasks"] = tasks
+            terminal = [str(t.get("status") or "") for t in tasks]
+            if not succeeded:
+                if snap.get("state") not in _TERMINAL_GOAL:
+                    self._set_state(snap, "failed")
+            elif terminal and all(st == "succeeded" for st in terminal):
+                if snap.get("state") not in _TERMINAL_GOAL:
+                    self._set_state(snap, "completed")
+            self._append_history(snap, "finish_task", task_id=tid, task_state=dst)
+            self._touch(snap)
+            self._persist_unlocked()
+            return {
+                "ok": True,
+                "reason": REASON_READY,
+                "goal_id": gid,
+                "task": found,
+                "state": snap.get("state"),
+            }
+
+    def fail_goal(self, goal_id: str, *, phase: str, error: str) -> dict[str, Any]:
+        """Close a Goal when coordination fails before a worker result exists."""
+        gid = _norm_key(goal_id)
+        with self._rmw():
+            snap = self.goals.get(gid)
+            if snap is None:
+                return {"ok": False, "reason": REASON_UNKNOWN_GOAL, "error": f"unknown goal_id {gid!r}"}
+            if snap.get("state") not in _TERMINAL_GOAL:
+                self._set_state(snap, "failed")
+            failure = {
+                "phase": _norm_key(phase) or "coordination",
+                "error": _norm_key(error)[:500],
+            }
+            snap["failure"] = failure
+            self._append_history(snap, "fail_goal", **failure)
+            self._touch(snap)
+            self._persist_unlocked()
+            return {
+                "ok": False,
+                "reason": "goal_failed",
+                "goal_id": gid,
+                "state": snap.get("state"),
+                "failure": failure,
+            }
 
     def open_decision(
         self,

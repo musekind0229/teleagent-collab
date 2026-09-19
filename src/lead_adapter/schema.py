@@ -174,6 +174,15 @@ def format_lead_request_prompt(request: dict, *, allow_hint: str = "") -> str:
             "} "
             f"{echo_rules} Never choose always."
         )
+    elif kind == "plan":
+        out_hint = (
+            "Create a bounded task graph that stays inside the supplied scope, prohibitions, "
+            "acceptance criteria, budget, and max_tasks. Output strict JSON matching the "
+            "provided response schema. Each task needs a stable task_key, title, concrete "
+            "worker instruction, dependency keys, and relative artifact paths. "
+            f"Copy application_id={app_id_json} and context_summary={summary_json} exactly. "
+            "Do not execute the work yourself and do not add permissions."
+        )
     else:
         out_hint = (
             "Output strict JSON only: "

@@ -26,6 +26,12 @@
 - 两条路径使用不同的持久化格式。当前不迁移在途任务，也不让旧程序读取新状态。
 - 普通自动允许工具仍缺少操作系统级强制隔离；审批日志和最终工具轨迹不是完整 capability 沙箱。
 
+## 应用入口预览
+
+本分支新增 `bin/collab-service.py`，外部调用方只提交 Goal、边界和验收条件。框架内部再调用可插拔规划组长、生成 Task 依赖并派给 ExecutionBackend，因此永续层不需要知道具体组长或工人的接口。请求、任务、运行句柄、事件和报告均进入 durable store；入口只绑定本机 loopback，并支持 Bearer token。
+
+当前默认工人是确定性的 `inprocess.local_v1`，用于验证应用协议和协调状态机；它生成占位产物，不算 TeleAgent 实际施工。Grok 可作为规划器使用，但公共 TeleAgent ExecutionBackend 尚未接入此入口。使用方法和 HTTP 契约见 [`application-api.zh-CN.md`](application-api.zh-CN.md)。
+
 ## 后续收敛顺序
 
 1. 用只读 doctor 和隔离 hello 工单验证上游 Windows 连接适配，不启动第二个内核、不重启 GUI TeleAgent。

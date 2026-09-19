@@ -1,6 +1,6 @@
 # teleagent-collab
 
-> Windows 有两条互补路径：通用框架使用 `src/teleagent_adapter/windows_local_v1.py`，已实机验证的监督控制器使用 `windows/collab.ps1` / `python -m win_collab`。整合状态与边界见 [Windows 整合说明](docs/WINDOWS-UNIFIED.zh-CN.md)，操作见 [Windows 预览说明](windows/README.zh-CN.md)。
+> Windows 有两条互补路径：通用框架使用 `src/teleagent_adapter/windows_local_v1.py`，已实机验证的监督控制器使用 `windows/collab.ps1` / `python -m win_collab`。整合状态与边界见 [Windows 整合说明](docs/WINDOWS-UNIFIED.zh-CN.md)，操作见 [Windows 预览说明](windows/README.zh-CN.md)。面向外部调用方的本机 Goal API 见 [应用入口 API](docs/application-api.zh-CN.md)。
 
 把天翼星辰 **TeleAgent** 当成编排里的便宜工人：用本地 HTTP（`:4399`）下单、等完结、接权限弹窗；**组长/门禁可插拔**（烟测默认 Grok Build），不焊死某一家。
 
@@ -37,6 +37,7 @@
 ```
 bin/run-job.py        # 永续入口：读章程 → glue.run_job → 落报告
 bin/run-scheduler.py  # 并行调度 + 自适应审批扫描（scan ≠ lead）
+bin/collab-service.py # 应用入口：外部 Goal → 组长规划 → 工人后端
 jobs/examples/        # 样例章程（*.charter.yaml）
 jobs/runs/            # 收件目录（status/report；gitignore）
 docs/                 # 工人契约、适配层、backlog、发现笔记、永续骨架
@@ -49,6 +50,15 @@ templates/            # 报告模板（脱敏）
 ```
 
 ## 快速使用
+
+如果调用方只想提交目标，不想直接联系组长或工人，可先启动 v0.1 本机应用入口：
+
+```powershell
+$env:COLLAB_API_TOKEN = '换成一个本机随机值'
+python bin/collab-service.py --persist .collab-app --port 8765
+```
+
+默认 in-process 工人用于验证协议和状态机，不代表 TeleAgent 真机闭环。请求格式和当前边界见 [`docs/application-api.zh-CN.md`](docs/application-api.zh-CN.md)。
 
 1. TeleAgent 桌面已登录，本地 `:4399` 在听。
 2. 安装并登录可插拔组长（默认 Grok Build CLI）。
