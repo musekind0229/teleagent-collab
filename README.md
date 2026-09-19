@@ -60,6 +60,15 @@ python bin/collab-service.py --persist .collab-app --port 8765
 
 默认 in-process 工人用于验证协议和状态机，不代表 TeleAgent 真机闭环。请求格式和当前边界见 [`docs/application-api.zh-CN.md`](docs/application-api.zh-CN.md)。
 
+连接真实 Grok 规划组长和 Windows 监督控制器：
+
+```powershell
+python bin/collab-service.py --persist .collab-app --port 8765 `
+  --planner grok --backend teleagent-windows --teleagent-stdin-wrap
+```
+
+普通权限与产物验收由 Grok 自动处理；Question、系统动作和组长失败会出现在 decision API。当前实机已创建真实 TeleAgent session，但模型登录态仍返回错误，尚未完成真实产物闭环。
+
 1. TeleAgent 桌面已登录，本地 `:4399` 在听。
 2. 安装并登录可插拔组长（默认 Grok Build CLI）。
 3. 设置环境变量后跑胶水：

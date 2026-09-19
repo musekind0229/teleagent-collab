@@ -194,6 +194,49 @@ class LeadAdapterPlanner:
             )
         return validate_plan(parsed, request)
 
+    def decide_action(
+        self,
+        goal_snapshot: Mapping[str, Any],
+        task: Mapping[str, Any],
+        action: Mapping[str, Any],
+    ) -> dict[str, str]:
+        """Ask the same pluggable lead about routine worker gates."""
+        from lead_adapter.schema import (
+            build_lead_request,
+            lead_permission_response_schema,
+            lead_review_response_schema,
+            validate_lead_decision,
+        )
+
+        backend_kind = str(action.get("kind") or "")
+        if backend_kind not in {"permission", "review"}:
+            raise AppError("decision requires external authority", code="external_decision_required")
+        goal = goal_snapshot.get("goal") if isinstance(goal_snapshot.get("goal"), Mapping) else {}
+        boundaries = goal.get("boundaries") if isinstance(goal.get("boundaries"), Mapping) else {}
+        request = build_lead_request(
+            kind=backend_kind,
+            goal=str(goal.get("desired_outcome") or ""),
+            authorized_scope=list(boundaries.get("must") or []),
+            prohibitions=list(boundaries.get("must_not") or []),
+            acceptance_criteria=goal.get("acceptance") or {},
+            current_application={
+                "goal_id": goal_snapshot.get("goal_id"),
+                "task_id": task.get("task_id"),
+                "run_id": task.get("run_id"),
+            },
+            extra={"worker_request": action.get("payload") or {}},
+        )
+        schema = lead_permission_response_schema() if backend_kind == "permission" else lead_review_response_schema()
+        raw, parsed = self.adapter.decide(
+            request,
+            schema=schema,
+            cwd=self.cwd,
+            timeout_sec=self.timeout_sec,
+        )
+        decision = validate_lead_decision(raw, parsed, request=request, kind=backend_kind)
+        verdict = str(decision.get("decision") or decision.get("verdict") or "")
+        return {"verdict": verdict, "reason": str(decision.get("reason") or "")}
+
 
 def build_planning_request(goal_snapshot: Mapping[str, Any]) -> dict[str, Any]:
     goal = goal_snapshot.get("goal") if isinstance(goal_snapshot.get("goal"), Mapping) else {}
@@ -250,17 +293,51 @@ class AppCoordinator:
         if not current.get("ok"):
             return current
         snap = current["goal"]
-        if snap.get("state") in {"completed", "failed", "cancelled", "cancel_requested"}:
+        if snap.get("state") == "cancel_requested":
+            active = [
+                t
+                for t in (snap.get("tasks") or [])
+                if isinstance(t, Mapping) and str(t.get("run_id") or "").strip()
+                and t.get("status") in {"running", "cancel_requested", "awaiting_decision", "review"}
+            ]
+            if not active:
+                effected = self.layer.effect_cancel(goal_id, reason="No worker Run remains active")
+                return {**effected, "action": "cancelled"}
+            all_stopped = True
+            outcomes = []
+            for task in active:
+                run_id = str(task.get("run_id") or "")
+                try:
+                    code, body = self.backend.cancel(run_id)
+                    stopped = int(code) < 300 and isinstance(body, Mapping) and bool(body.get("ok"))
+                except Exception as e:
+                    code, body, stopped = 503, {"error": type(e).__name__}, False
+                outcomes.append({"run_id": run_id, "http": code, "stopped": stopped})
+                all_stopped = all_stopped and stopped
+            if all_stopped:
+                effected = self.layer.effect_cancel(goal_id, reason="Worker cancellation confirmed")
+                return {**effected, "action": "cancelled", "backend_cancellations": outcomes}
+            return {
+                "ok": True,
+                "goal_id": goal_id,
+                "state": "cancel_requested",
+                "action": "cancellation_pending",
+                "backend_cancellations": outcomes,
+            }
+        if snap.get("state") in {"completed", "failed", "cancelled"}:
             return {"ok": True, "goal_id": goal_id, "state": snap.get("state"), "action": "terminal"}
         tasks = [dict(t) for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
         if not tasks:
             try:
                 plan = self.planner.plan(snap)
             except Exception as e:
+                detail = f"planner failed: {type(e).__name__}"
+                if isinstance(e, AppError):
+                    detail = f"planner failed [{e.code}]: {str(e)[:300]}"
                 failed = self.layer.fail_goal(
                     goal_id,
                     phase="planning",
-                    error=f"planner failed: {type(e).__name__}",
+                    error=detail,
                 )
                 return {**failed, "action": "planning_failed"}
             key_to_id = {row["task_key"]: _task_id(goal_id, row["task_key"]) for row in plan["tasks"]}
@@ -291,8 +368,31 @@ class AppCoordinator:
         # A real worker backend is normally asynchronous.  Resume polling a
         # persisted Run before considering new queued work.
         for task in tasks:
+            if task.get("status") == "awaiting_decision":
+                return {
+                    "ok": True,
+                    "goal_id": goal_id,
+                    "state": "running",
+                    "action": "decision_required",
+                }
             if task.get("status") != "running":
                 continue
+            existing_decision = next(
+                (
+                    d
+                    for d in (snap.get("pending_decisions") or [])
+                    if isinstance(d, Mapping) and str(d.get("task_id") or "") == str(task.get("task_id") or "")
+                ),
+                None,
+            )
+            if existing_decision is not None:
+                return {
+                    "ok": True,
+                    "goal_id": goal_id,
+                    "state": "running",
+                    "action": "decision_required",
+                    "decision_id": existing_decision.get("decision_id"),
+                }
             run_id = str(task.get("run_id") or "").strip()
             if not run_id:
                 return self.layer.finish_task(
@@ -301,6 +401,106 @@ class AppCoordinator:
                     succeeded=False,
                     result={"ok": False, "error": "running task has no persisted run handle"},
                 )
+            try:
+                pending_code, pending = self.backend.list_pending_actions(session_id=run_id)
+            except Exception as e:
+                pending_code, pending = 503, []
+                pending_error = f"pending action scan failed: {type(e).__name__}"
+            else:
+                pending_error = ""
+            if int(pending_code) >= 300:
+                return self.layer.finish_task(
+                    goal_id,
+                    str(task["task_id"]),
+                    succeeded=False,
+                    result={"ok": False, "run_id": run_id, "error": pending_error or "pending action scan failed"},
+                )
+            if pending:
+                action = pending[0] if isinstance(pending[0], Mapping) else {}
+                request_id = str(action.get("request_id") or "").strip()
+                if not request_id:
+                    return self.layer.finish_task(
+                        goal_id,
+                        str(task["task_id"]),
+                        succeeded=False,
+                        result={"ok": False, "run_id": run_id, "error": "backend decision has no request_id"},
+                    )
+                backend_kind = str(action.get("kind") or "permission")
+                public_kind = {
+                    "permission": "action_approval",
+                    "question": "question",
+                    "review": "artifact_review",
+                    "system_action": "action_approval",
+                }.get(backend_kind, "action_approval")
+                decision_id = f"dec_{hashlib.sha256(request_id.encode('utf-8')).hexdigest()[:12]}"
+                opened = self.layer.open_decision(
+                    goal_id,
+                    kind=public_kind,
+                    task_id=str(task["task_id"]),
+                    run_id=run_id,
+                    decision_id=decision_id,
+                    request_id=request_id,
+                    actions=[{"request_id": request_id, "kind": backend_kind}],
+                    title=f"TeleAgent {backend_kind}",
+                    return_to_upper=False,
+                    details={
+                        "backend_kind": backend_kind,
+                        "backend_request_id": request_id,
+                        "context_hash": action.get("context_hash"),
+                        "payload": action.get("payload"),
+                    },
+                    reason="TeleAgent worker requires a bounded decision",
+                )
+                lead_decider = getattr(self.planner, "decide_action", None)
+                backend_resolver = getattr(self.backend, "resolve_decision", None)
+                if opened.get("ok") and callable(lead_decider) and callable(backend_resolver) and backend_kind in {
+                    "permission",
+                    "review",
+                }:
+                    try:
+                        lead_choice = lead_decider(snap, task, action)
+                        lead_verdict = str(lead_choice.get("verdict") or "")
+                        lead_reason = str(lead_choice.get("reason") or "")
+                        transport = backend_resolver(
+                            request_id,
+                            verdict=lead_verdict,
+                            reason=lead_reason,
+                            answers=None,
+                        )
+                        if not isinstance(transport, Mapping) or not transport.get("ok"):
+                            raise AppError("worker decision was not applied", code="worker_decision_failed")
+                        durable_verdict = (
+                            "reject"
+                            if lead_verdict in {"deny_job", "demand_safe_path"}
+                            else lead_verdict
+                        )
+                        resolved = self.layer.resolve_decision(
+                            goal_id,
+                            decision_id=decision_id,
+                            verdict=durable_verdict,
+                            reason=lead_reason,
+                            extra={
+                                "actor_id": str(
+                                    ((snap.get("ownership") or {}).get("coordinator_id"))
+                                    if isinstance(snap.get("ownership"), Mapping)
+                                    else ""
+                                )
+                                or "app-coordinator"
+                            },
+                        )
+                        if not resolved.get("ok"):
+                            return resolved
+                        return {**resolved, "action": "decision_resolved", "lead": self.planner.name}
+                    except Exception as e:
+                        # Keep the durable decision pending so an external
+                        # caller can inspect and answer it; never guess an
+                        # approval after a lead or transport failure.
+                        return {
+                            **opened,
+                            "action": "decision_required",
+                            "lead_error": type(e).__name__,
+                        }
+                return {**opened, "action": "decision_required"}
             try:
                 observation = self.backend.observe_run(run_id)
                 if observation.get("busy"):
@@ -543,11 +743,51 @@ class CollabApplication:
         current = self.layer.get_goal(goal_id)
         if not current.get("ok"):
             raise AppError("unknown request", status=404, code="not_found")
-        actor = str(current.get("submitter_id") or "")
+        snap = current.get("goal") if isinstance(current.get("goal"), Mapping) else {}
+        pending = [d for d in (snap.get("pending_decisions") or []) if isinstance(d, Mapping)]
+        target = next((d for d in pending if str(d.get("decision_id") or "") == decision_id), None)
+        if target is None:
+            resolved = [d for d in (snap.get("resolved_decisions") or []) if isinstance(d, Mapping)]
+            if not any(str(d.get("decision_id") or "") == decision_id for d in resolved):
+                raise AppError("unknown decision", status=404, code="not_found")
+        details = target.get("details") if isinstance(target, Mapping) and isinstance(target.get("details"), Mapping) else {}
+        backend_request_id = str(details.get("backend_request_id") or "")
+        raw_verdict = str(payload.get("verdict") or "")
+        if backend_request_id:
+            resolver = getattr(self.coordinator.backend, "resolve_decision", None)
+            if not callable(resolver):
+                raise AppError("worker backend cannot resolve this decision", status=409, code="unsupported")
+            try:
+                transport = resolver(
+                    backend_request_id,
+                    verdict=raw_verdict,
+                    reason=str(payload.get("reason") or "Resolved through the application API"),
+                    answers=payload.get("answers") if isinstance(payload.get("answers"), list) else None,
+                )
+            except Exception as e:
+                raise AppError(
+                    f"worker decision failed: {type(e).__name__}",
+                    status=409,
+                    code="worker_decision_failed",
+                ) from e
+            if not isinstance(transport, Mapping) or not transport.get("ok"):
+                raise AppError("worker decision was not applied", status=409, code="worker_decision_failed")
+        actor = (
+            str(current.get("submitter_id") or "")
+            if isinstance(target, Mapping) and target.get("return_to_upper")
+            else self.coordinator_id
+        )
+        backend_kind = str(details.get("backend_kind") or "")
+        if backend_kind == "question" and raw_verdict == "answer":
+            durable_verdict = "approve"
+        elif raw_verdict in {"deny_job", "demand_safe_path"}:
+            durable_verdict = "reject"
+        else:
+            durable_verdict = raw_verdict
         out = self.layer.resolve_decision(
             goal_id,
             decision_id=decision_id,
-            verdict=str(payload.get("verdict") or ""),
+            verdict=durable_verdict,
             reason=str(payload.get("reason") or ""),
             actions=payload.get("actions"),
             extra={

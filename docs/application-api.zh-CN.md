@@ -13,7 +13,9 @@
 
 v0.1 已提供真实的请求、防重、持久化、规划、任务依赖、派发、异步 Run 恢复、取消、决定回传、事件和报告接口。服务仅允许绑定 loopback；配置 `COLLAB_API_TOKEN` 后，除健康检查外都要求 Bearer token。
 
-默认组合是 `deterministic` 规划器和 `inprocess.local_v1` 工人。它用于验证入口与状态机，会按验收清单生成占位产物，不会完成真实开发任务。`--planner grok` 可让 Grok 生成任务图，但工人仍是 in-process。公共 TeleAgent ExecutionBackend 尚未接入这个入口，所以当前版本不能当作无人值守 TeleAgent 生产入口。
+默认组合是 `deterministic` 规划器和 `inprocess.local_v1` 工人。它用于验证入口与状态机，会按验收清单生成占位产物，不会完成真实开发任务。`--planner grok` 让 Grok 生成任务图；`--backend teleagent-windows` 把任务交给原 Windows 监督控制器。两者同时启用时，Grok 还会自动处理普通 permission 和 artifact review；Question、系统动作或组长调用失败仍进入外部 decision 接口。
+
+Windows 后端保留旧控制器的 session 级 `ask`、请求去重、同 session 恢复、独立产物验收、取消确认和不确定派发不重放。控制器继续使用自己的纯 ASCII UUID 工作区，避免含中文的 Goal ID 进入 TeleAgent HTTP 头。
 
 同一个持久化目录只运行一个服务实例。运行句柄会在首次派工后立刻持久化；服务重启后会继续观察支持持久句柄的后端，无法恢复的后端会把任务明确标成失败，不会静默重派。
 
@@ -30,6 +32,20 @@ python bin/collab-service.py --persist .collab-app --port 8765
 
 ```powershell
 python bin/collab-service.py --persist .collab-app --port 8765 --planner grok
+```
+
+启用完整的 Grok 组长和 Windows TeleAgent 工人桥接：
+
+```powershell
+python bin/collab-service.py --persist .collab-app --port 8765 `
+  --planner grok --backend teleagent-windows
+```
+
+如果 GUI TeleAgent 没有向当前进程暴露本地 API 凭据，可显式启用受控辅助内核。服务退出时会停止自己创建的辅助内核：
+
+```powershell
+python bin/collab-service.py --persist .collab-app --port 8765 `
+  --planner grok --backend teleagent-windows --teleagent-stdin-wrap
 ```
 
 启动时输出当前监听地址、规划器、工人后端和持久化目录。默认只监听 `127.0.0.1`。
@@ -80,9 +96,10 @@ $opened
 
 PowerShell 会自动对含中文的请求 ID 做 URL 编码；自行拼 URL 的客户端必须对 `{id}` 做 percent-encoding。
 
-## 接 TeleAgent 前还要完成
+## 当前实机结果（2026-09-20）
 
-1. 实现公共 `ExecutionBackend`，把 TeleAgent 的 session、permission、Question、取消和结果收集映射到同一个 Run。
-2. 把 pending permission/question 转成 durable decision，并在决定后恢复原 Run。
-3. 将现有 Windows 两阶段系统动作与独立验收接入公共 Task/Run，而不是绕回旧控制器。
-4. 用普通文件任务跑一次真实 Goal → 组长规划 → TeleAgent → 报告验收，再开放系统安装任务。
+真实 `grok.exe` 已通过本入口生成两项有依赖关系的计划；修复 Windows 上 Grok UTF-8 输出被系统 GBK 解码的问题后，规划和任务推进完成。
+
+Windows TeleAgent 后端已从新入口真实创建 session `ses_f4443d3f4ffeRzqOFW9zR1dxv6`，证明入口、控制器、本地 HTTP 和 session 派发已经连通。该 session 的模型调用随后报错且没有生成产物，控制器正确将 Run 和 Goal 标成失败。当前阻塞位于 GUI 模型登录态/上游模型授权，不在桥接状态机；修复登录态后需重跑普通文件任务，才可宣布真实交付闭环通过。
+
+后续还需把 Question 的自动处理策略和两阶段系统动作投影成更专门的公共类型；当前两者会留给外部 decision API，避免组长越权处理。

@@ -148,7 +148,12 @@ class GrokCliLeadAdapter(LeadAdapterABC):
         # Intentionally NO retry that drops --disallowed-tools (条3: delete that degradation).
         try:
             proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=float(timeout_sec)
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=float(timeout_sec),
             )
         except subprocess.TimeoutExpired:
             return safe_failure("timeout", "grok_cli timeout")

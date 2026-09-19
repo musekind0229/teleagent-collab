@@ -207,7 +207,7 @@ class TestLeadAdapter(unittest.TestCase):
         text = src.read_text(encoding="utf-8")
         self.assertNotIn("retry without disallowed-tools", text)
         self.assertNotIn("disallowed-tools if tool names invalid", text)
-        grok_src = (Path(__file__).resolve().parent / "lead_adapter" / "grok_cli.py").read_text()
+        grok_src = (Path(__file__).resolve().parent / "lead_adapter" / "grok_cli.py").read_text(encoding="utf-8")
         self.assertIn("NO retry that drops", grok_src)
         self.assertIn("--disallowed-tools", grok_src)
 

@@ -10,6 +10,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
@@ -34,6 +36,19 @@ def _planner(name: str, persist: Path):
     raise ValueError(f"unknown planner {name!r}")
 
 
+def _backend(name: str, persist: Path, *, teleagent_stdin_wrap: bool = False):
+    if name == "inprocess":
+        return None
+    if name == "teleagent-windows":
+        from execution_backend.windows_supervised_v1 import WindowsSupervisedExecutionBackend
+
+        return WindowsSupervisedExecutionBackend(
+            state_dir=persist / "windows-controller",
+            stdin_wrap=teleagent_stdin_wrap,
+        )
+    raise ValueError(f"unknown backend {name!r}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Local Goal API: ingress -> lead planning -> worker backend",
@@ -42,15 +57,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--planner", choices=("deterministic", "grok"), default="deterministic")
+    parser.add_argument("--backend", choices=("inprocess", "teleagent-windows"), default="inprocess")
+    parser.add_argument(
+        "--teleagent-stdin-wrap",
+        action="store_true",
+        help="spawn the controlled loopback TeleAgent kernel when GUI credentials are unavailable",
+    )
     parser.add_argument("--token-env", default="COLLAB_API_TOKEN")
     parser.add_argument("--once", action="store_true", help="process all queued Goals once and exit")
     args = parser.parse_args(argv)
 
     persist = Path(args.persist).resolve()
     planner = _planner(args.planner, persist)
-    app = CollabApplication(persist, planner=planner)
+    backend = _backend(args.backend, persist, teleagent_stdin_wrap=args.teleagent_stdin_wrap)
+    app = CollabApplication(persist, planner=planner, backend=backend)
     if args.once:
-        print(json.dumps(app.coordinator.process_all(), ensure_ascii=False, indent=2, default=str))
+        try:
+            print(json.dumps(app.coordinator.process_all(), ensure_ascii=False, indent=2, default=str))
+        finally:
+            close_backend = getattr(app.coordinator.backend, "close", None)
+            if callable(close_backend):
+                close_backend()
         return 0
 
     token = (os.environ.get(args.token_env) or "").strip()
@@ -80,6 +107,9 @@ def main(argv: list[str] | None = None) -> int:
         server.shutdown()
         loop.stop()
         server.server_close()
+        close_backend = getattr(app.coordinator.backend, "close", None)
+        if callable(close_backend):
+            close_backend()
     return 0
 
 

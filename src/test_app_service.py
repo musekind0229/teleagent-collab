@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import tempfile
 import threading
 import unittest
@@ -16,6 +17,8 @@ from framework.app_service import (
     LeadAdapterPlanner,
     build_planning_request,
 )
+from execution_backend.windows_supervised_v1 import WindowsSupervisedExecutionBackend
+from win_collab.core import Store
 
 
 def _request() -> dict:
@@ -66,6 +69,41 @@ class _BrokenPlanner:
         raise RuntimeError("simulated planner outage")
 
 
+class _AutoLead:
+    def decide(self, request, *, schema, cwd, timeout_sec=180):
+        if request["kind"] == "permission":
+            out = {
+                "application_id": request["application_id"],
+                "context_summary": request["context_summary"],
+                "decision": "once",
+                "reason": "Write is confined to the assigned workspace",
+            }
+        elif request["kind"] == "review":
+            out = {
+                "application_id": request["application_id"],
+                "context_summary": request["context_summary"],
+                "verdict": "pass",
+                "reason": "Required artifact and evidence are present",
+            }
+        else:
+            artifacts = list((request.get("acceptance_criteria") or {}).get("artifacts") or [])
+            out = {
+                "application_id": request["application_id"],
+                "context_summary": request["context_summary"],
+                "summary": "one task",
+                "tasks": [
+                    {
+                        "task_key": "deliver",
+                        "title": "Deliver",
+                        "instruction": request["task_goal"],
+                        "depends_on": [],
+                        "artifacts": artifacts,
+                    }
+                ],
+            }
+        return json.dumps(out), out
+
+
 class _AsyncBackend:
     backend_id = "fake.async_v1"
 
@@ -98,11 +136,80 @@ class _AsyncBackend:
             written.append(str(path))
         return {"ok": True, "run_id": run_id, "artifacts": written}
 
+    def list_pending_actions(self, *, session_id=None):
+        return 200, []
+
     def cancel(self, run_id):
         return 200, {"ok": True, "run_id": run_id, "state": "cancelled"}
 
 
+class _TeleAgentClient:
+    base = "http://127.0.0.1:4398"
+    instance_id = "fake-windows-teleagent"
+
+    def __init__(self) -> None:
+        self.pending = []
+        self.questions = []
+        self.status = {}
+        self.messages = {}
+        self.calls = []
+        self.count = 0
+
+    def call(self, method, path, body=None, workspace=None):
+        self.calls.append((method, path, copy.deepcopy(body), workspace))
+        if method == "POST" and path == "/session":
+            self.count += 1
+            sid = f"ses-{self.count}"
+            self.status[sid] = {"type": "busy"}
+            self.messages[sid] = []
+            return {"id": sid, "permission": body.get("permission")}
+        if path.endswith("/prompt_async"):
+            sid = path.split("/")[2]
+            self.messages[sid].append({"info": {"role": "user"}})
+            self.status[sid] = {"type": "busy"}
+            return None
+        if method == "GET" and path == "/permission":
+            return copy.deepcopy(self.pending)
+        if method == "GET" and path == "/question":
+            return copy.deepcopy(self.questions)
+        if method == "GET" and path == "/session/status":
+            return copy.deepcopy(self.status)
+        if method == "GET" and path.endswith("/message"):
+            return copy.deepcopy(self.messages[path.split("/")[2]])
+        if path.startswith("/permission/") and path.endswith("/reply"):
+            request_id = path.split("/")[2]
+            self.pending = [p for p in self.pending if p.get("id") != request_id]
+            return True
+        if path.endswith("/abort"):
+            self.status[path.split("/")[2]] = {"type": "idle"}
+            return True
+        raise AssertionError((method, path))
+
+
+class _PendingCancelBackend(_AsyncBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancel_calls = 0
+
+    def cancel(self, run_id):
+        self.cancel_calls += 1
+        if self.cancel_calls == 1:
+            return 200, {"ok": False, "run_id": run_id, "state": "stopping", "pending": True}
+        return 200, {"ok": True, "run_id": run_id, "state": "cancelled"}
+
+
 class AppServiceTests(unittest.TestCase):
+    @staticmethod
+    def _force_controller_scan(state_dir: Path, run_id: str) -> None:
+        store = Store(state_dir)
+        try:
+            with store.transaction():
+                job = store.get(run_id)
+                job["next_scan"] = 0
+                store.save(job)
+        finally:
+            store.db.close()
+
     def test_external_request_plans_runs_and_reports_without_agent_addressing(self):
         with tempfile.TemporaryDirectory() as td:
             app = CollabApplication(td)
@@ -185,6 +292,124 @@ class AppServiceTests(unittest.TestCase):
             self.assertEqual(cancelled["state"], "cancelled")
             self.assertTrue(cancelled["backend_cancellations"][0]["ok"])
             self.assertEqual(app.status(opened["goal_id"])["state"], "cancelled")
+
+    def test_pending_backend_cancel_is_rechecked_by_coordinator(self):
+        with tempfile.TemporaryDirectory() as td:
+            backend = _PendingCancelBackend()
+            app = CollabApplication(td, backend=backend)
+            opened = app.submit(_request())
+            app.coordinator.process_goal(opened["goal_id"])
+            requested = app.cancel(opened["goal_id"], "test pending cancellation")
+            self.assertEqual(requested["state"], "cancel_requested")
+            self.assertFalse(requested["backend_cancellations"][0]["ok"])
+            effected = app.coordinator.process_goal(opened["goal_id"])
+            self.assertEqual(effected["action"], "cancelled")
+            self.assertEqual(app.status(opened["goal_id"])["state"], "cancelled")
+
+    def test_windows_controller_bridge_handles_permission_review_and_completion(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            client = _TeleAgentClient()
+            controller_state = root / "controller"
+            backend = WindowsSupervisedExecutionBackend(state_dir=controller_state, client=client)
+            app = CollabApplication(root / "app", backend=backend)
+            opened = app.submit(_request())
+
+            first = app.coordinator.process_goal(opened["goal_id"])
+            self.assertEqual(first["action"], "worker_running")
+            task = app.status(opened["goal_id"])["tasks"][0]
+            run_id = task["run_id"]
+            store = Store(controller_state)
+            try:
+                job = store.get(run_id)
+            finally:
+                store.db.close()
+            sid = job["session_id"]
+            self.assertEqual(client.count, 1)
+
+            client.pending.append(
+                {
+                    "id": "perm-1",
+                    "sessionID": sid,
+                    "permission": "edit",
+                    "patterns": [str(Path(job["workspace"]) / "delivery.txt")],
+                    "metadata": {"diff": "create delivery"},
+                }
+            )
+            self._force_controller_scan(controller_state, run_id)
+            self.assertEqual(app.coordinator.process_goal(opened["goal_id"])["action"], "worker_running")
+            decision_tick = app.coordinator.process_goal(opened["goal_id"])
+            self.assertEqual(decision_tick["action"], "decision_required")
+            decision = app.status(opened["goal_id"])["pending_decisions"][0]
+            resolved = app.resolve(
+                opened["goal_id"],
+                decision["decision_id"],
+                {"verdict": "once", "reason": "Bounded write in assigned workspace"},
+            )
+            self.assertTrue(resolved["ok"])
+            self.assertEqual(client.pending, [])
+
+            artifact = Path(job["workspace"]) / "delivery.txt"
+            artifact.write_text("completed by TeleAgent\n", encoding="utf-8")
+            client.status[sid] = {"type": "idle"}
+            client.messages[sid].append({"info": {"role": "assistant", "finish": "stop"}, "parts": []})
+            self._force_controller_scan(controller_state, run_id)
+            self.assertEqual(app.coordinator.process_goal(opened["goal_id"])["action"], "worker_running")
+            review_tick = app.coordinator.process_goal(opened["goal_id"])
+            self.assertEqual(review_tick["action"], "decision_required")
+            review = app.status(opened["goal_id"])["pending_decisions"][0]
+            self.assertEqual(review["kind"], "artifact_review")
+            app.resolve(
+                opened["goal_id"],
+                review["decision_id"],
+                {"verdict": "pass", "reason": "Artifact content and tool evidence accepted"},
+            )
+            final = app.coordinator.process_goal(opened["goal_id"])
+            self.assertEqual(final["action"], "task_finished")
+            self.assertEqual(app.status(opened["goal_id"])["state"], "completed")
+            self.assertEqual(client.count, 1)
+
+    def test_pluggable_lead_auto_resolves_routine_worker_gates(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            client = _TeleAgentClient()
+            controller_state = root / "controller"
+            backend = WindowsSupervisedExecutionBackend(state_dir=controller_state, client=client)
+            planner = LeadAdapterPlanner(_AutoLead(), cwd=root / "lead")
+            app = CollabApplication(root / "app", backend=backend, planner=planner)
+            opened = app.submit(_request())
+            self.assertEqual(app.coordinator.process_goal(opened["goal_id"])["action"], "worker_running")
+            task = app.status(opened["goal_id"])["tasks"][0]
+            run_id = task["run_id"]
+            store = Store(controller_state)
+            try:
+                job = store.get(run_id)
+            finally:
+                store.db.close()
+            sid = job["session_id"]
+            client.pending.append(
+                {
+                    "id": "auto-perm",
+                    "sessionID": sid,
+                    "permission": "edit",
+                    "patterns": [str(Path(job["workspace"]) / "delivery.txt")],
+                }
+            )
+            self._force_controller_scan(controller_state, run_id)
+            app.coordinator.process_goal(opened["goal_id"])
+            auto_permission = app.coordinator.process_goal(opened["goal_id"])
+            self.assertEqual(auto_permission["action"], "decision_resolved")
+            self.assertEqual(app.status(opened["goal_id"])["pending_decisions"], [])
+
+            (Path(job["workspace"]) / "delivery.txt").write_text("done\n", encoding="utf-8")
+            client.status[sid] = {"type": "idle"}
+            client.messages[sid].append({"info": {"role": "assistant", "finish": "stop"}, "parts": []})
+            self._force_controller_scan(controller_state, run_id)
+            app.coordinator.process_goal(opened["goal_id"])
+            auto_review = app.coordinator.process_goal(opened["goal_id"])
+            self.assertEqual(auto_review["action"], "decision_resolved")
+            self.assertEqual(app.coordinator.process_goal(opened["goal_id"])["action"], "task_finished")
+            self.assertEqual(app.status(opened["goal_id"])["state"], "completed")
 
     def test_http_api_requires_configured_bearer_and_runs_tick(self):
         with tempfile.TemporaryDirectory() as td:

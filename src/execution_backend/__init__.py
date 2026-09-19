@@ -192,4 +192,8 @@ def get_execution_backend(name: str | None = None, **kwargs):
     if key in ("antigravity", "antigravity.cli_v1", "agy", "agy.cli_v1"):
         kw = inject_agy_pool_into_backend_kwargs(kwargs)
         return AntigravityCliExecutionBackend(**kw)
+    if key in ("teleagent-windows", "teleagent.windows.supervised_v1", "windows-supervised"):
+        from execution_backend.windows_supervised_v1 import WindowsSupervisedExecutionBackend
+
+        return WindowsSupervisedExecutionBackend(**kwargs)
     raise BackendError(BackendStatus.UNSUPPORTED, f"unknown execution backend={name!r}", capability="get_execution_backend")

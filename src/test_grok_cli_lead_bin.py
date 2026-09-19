@@ -242,9 +242,11 @@ class TestGrokCliAdapterDefaults(unittest.TestCase):
             "current_application": {},
         }
         calls: list[list[str]] = []
+        run_kwargs = {}
 
         def fake_run(cmd, **kwargs):
             calls.append(list(cmd))
+            run_kwargs.update(kwargs)
 
             class P:
                 returncode = 2
@@ -258,6 +260,8 @@ class TestGrokCliAdapterDefaults(unittest.TestCase):
             raw, parsed = ad.decide(req, schema={"type": "object"}, cwd="/tmp")
         self.assertEqual(len(calls), 1)
         self.assertIn("--disallowed-tools", calls[0])
+        self.assertEqual(run_kwargs.get("encoding"), "utf-8")
+        self.assertEqual(run_kwargs.get("errors"), "replace")
         self.assertEqual((parsed or {}).get("_lead_status"), "call_failed")
         src = Path(__file__).resolve().parent / "lead_adapter" / "grok_cli.py"
         text = src.read_text(encoding="utf-8")
