@@ -8,7 +8,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from win_collab.client import Client, KEYS, pick_unique_creds, same_local_creds
+from win_collab.client import Client, KEYS, discovery_failure_message, pick_unique_creds, same_local_creds
 from win_collab.protected_auth import save, load
 
 
@@ -61,6 +61,17 @@ class ClientTests(unittest.TestCase):
         creds=dict(zip(KEYS,['super-agent','synthetic-password','synthetic-local-key']))
         self.assertTrue(same_local_creds(creds, dict(creds)))
         self.assertEqual(pick_unique_creds([(1,creds),(2,dict(creds))]), creds)
+
+    def test_discovery_failure_message_follows_counts(self):
+        stripped = discovery_failure_message(verified_candidates=5, vm_read_denied=0, keys_unavailable=5)
+        self.assertIn('keys were not in the environment block', stripped)
+        self.assertNotIn('higher-integrity', stripped)
+        self.assertNotIn('VM_READ was denied', stripped)
+        denied = discovery_failure_message(verified_candidates=4, vm_read_denied=4, keys_unavailable=0)
+        self.assertIn('VM_READ was denied', denied)
+        self.assertNotIn('higher-integrity', denied)
+        missing = discovery_failure_message(verified_candidates=0, vm_read_denied=0, keys_unavailable=0)
+        self.assertIn('no verified SAC/node runtime images were found', missing)
 
     def test_divergent_credential_sources_are_rejected(self):
         a=dict(zip(KEYS,['super-agent','synthetic-password','synthetic-local-key']))
