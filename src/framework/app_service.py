@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import threading
 import time
 import uuid
@@ -22,6 +23,7 @@ from urllib.parse import unquote, urlparse
 
 from execution_backend.base import ExecutionBackend
 from execution_backend.inprocess_v1 import InProcessExecutionBackend
+from framework.artifact_handoff import HandoffError, handoff_direct_dependency_artifacts
 from framework.durable_api import DurableLayer
 from lead_adapter.schema import context_summary_of, unwrap_structured
 
@@ -67,6 +69,224 @@ def _safe_artifacts(value: Any) -> list[str]:
 def _task_id(goal_id: str, key: str) -> str:
     digest = hashlib.sha256(f"{goal_id}\0{key}".encode("utf-8")).hexdigest()[:16]
     return f"task_{digest}"
+
+
+GOAL_HTTP_TERMINAL = frozenset({"completed", "failed", "cancelled"})
+TASK_HTTP_TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
+MAX_FORBIDDEN_TOOLS = 32
+
+
+def project_forbidden_tools(
+    *,
+    payload: Mapping[str, Any] | None = None,
+    goal_text: str = "",
+    must: list[str] | None = None,
+    must_not: list[str] | None = None,
+) -> list[str]:
+    """Return the explicit Goal.forbidden_tools field after legal validation.
+
+    Goal/must/must_not text is ignored: wording such as "use PowerShell" is
+    not a ban. The persisted list is copied into the worker charter for
+    post-hoc acceptance detection after a tool has completed. It is not OS
+    isolation and cannot prevent TeleAgent from auto-allowing a tool.
+    """
+    del goal_text, must, must_not
+    src = payload if isinstance(payload, Mapping) else {}
+    if "forbidden_tools" not in src or src.get("forbidden_tools") is None:
+        return []
+    found = _strings(src.get("forbidden_tools"), field="forbidden_tools")
+    if len(found) > MAX_FORBIDDEN_TOOLS:
+        raise AppError(
+            f"forbidden_tools must have at most {MAX_FORBIDDEN_TOOLS} entries",
+            code="invalid_forbidden_tools",
+        )
+    if len(found) != len(set(found)):
+        raise AppError(
+            "forbidden_tools must be a unique list of non-empty tool names",
+            code="invalid_forbidden_tools",
+        )
+    return found
+
+
+def worker_charter_for_task(
+    *,
+    goal: Mapping[str, Any] | None,
+    task: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Per-task worker contract. Do not send the whole Goal as the worker goal."""
+    goal_obj = goal if isinstance(goal, Mapping) else {}
+    boundaries = goal_obj.get("boundaries") if isinstance(goal_obj.get("boundaries"), Mapping) else {}
+    instruction = str((task.get("inputs") or {}).get("instruction") or task.get("title") or "").strip()
+    budget = goal_obj.get("budget") if isinstance(goal_obj.get("budget"), Mapping) else {}
+    charter: dict[str, Any] = {
+        "goal": instruction,
+        "must": [str(x) for x in (boundaries.get("must") or [])],
+        "must_not": [str(x) for x in (boundaries.get("must_not") or [])],
+        "done_when": task.get("done_when") or {},
+        "timeout_sec": budget.get("wall_sec"),
+        "max_redos": budget.get("max_reworks"),
+    }
+    raw_forbidden = goal_obj.get("forbidden_tools")
+    if isinstance(raw_forbidden, list):
+        forbidden = [str(x).strip() for x in raw_forbidden if str(x).strip()]
+        if forbidden:
+            charter["forbidden_tools"] = forbidden
+    raw_inputs = (task.get("inputs") or {}).get("input_files") if isinstance(task.get("inputs"), Mapping) else None
+    if isinstance(raw_inputs, list) and raw_inputs:
+        names: list[str] = []
+        for item in raw_inputs:
+            if isinstance(item, Mapping) and str(item.get("relative") or "").strip():
+                names.append(str(item.get("relative")).strip())
+            elif isinstance(item, str) and item.strip():
+                names.append(item.strip())
+        if names:
+            charter["input_files"] = names
+    return charter
+
+
+MAX_LEAD_ATTEMPTS_PER_DECISION = 2
+AUTO_RESOLVE_BACKEND_KINDS = frozenset({"permission", "review"})
+_NONRETRYABLE_LEAD_MARKERS = (
+    "quota",
+    "rate limit",
+    "rate_limit",
+    "429",
+    "401",
+    "unauthorized",
+    "login",
+    "sign in",
+    "signin",
+    "authentication",
+    "not logged",
+    "credit",
+    "billing",
+    "insufficient_quota",
+    "payment",
+    "spawn failed",
+)
+TASK_REVIEW_HINT = (
+    "This is a Task-level review for the current task only, not Goal completion. "
+    "Pass if this task's expected artifacts and this task's tool evidence satisfy "
+    "task acceptance_criteria. Do not fail because later tasks or remaining Goal "
+    "artifacts are unfinished. Still fail if this task violated prohibitions or "
+    "did not produce its own artifacts."
+)
+
+
+def task_acceptance_criteria(task: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Acceptance used for a single Task review. Goal remaining work stays on the Goal."""
+    row = task if isinstance(task, Mapping) else {}
+    done = row.get("done_when") if isinstance(row.get("done_when"), Mapping) else {}
+    artifacts = [str(x) for x in (done.get("artifacts") or row.get("expected_artifacts") or []) if str(x).strip()]
+    text = str(done.get("text") or "").strip()
+    return {"artifacts": artifacts, "text": text}
+
+
+_TASK_LABEL_RE = re.compile(r"\btask\s+([a-z])\b", re.IGNORECASE)
+
+
+def _task_letters(siblings: list[Mapping[str, Any]]) -> dict[str, str]:
+    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    return {
+        str(row.get("task_id") or ""): letters[i]
+        for i, row in enumerate(siblings)
+        if isinstance(row, Mapping) and i < len(letters) and str(row.get("task_id") or "").strip()
+    }
+
+
+def _mentions_task_label(text: str, letter: str) -> bool:
+    if not letter or len(letter) != 1 or not letter.isalpha():
+        return False
+    return bool(re.search(rf"\btask\s+{re.escape(letter)}\b", text, re.IGNORECASE))
+
+
+def _mentions_task_title(text: str, title: str) -> bool:
+    phrase = str(title or "").strip()
+    if len(phrase) < 2:
+        return False
+    return phrase.lower() in text.lower()
+
+
+def split_task_musts(
+    *,
+    musts: list[str],
+    task: Mapping[str, Any] | None,
+    siblings: list[Mapping[str, Any]] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Keep Goal musts; only defer items that name a later Task and not this Task.
+
+    Deferred items remain on the Goal and in extra.goal_must. They must not be
+    used as this Task's pass/fail authorized_scope. Unknown Task labels stay
+    in scope so the lead still sees them.
+    """
+    rows = [row for row in (siblings or []) if isinstance(row, Mapping)]
+    current = task if isinstance(task, Mapping) else {}
+    letters = _task_letters(rows)
+    current_id = str(current.get("task_id") or "")
+    current_letter = letters.get(current_id, "")
+    current_title = str(current.get("title") or "").strip()
+    current_idx = next(
+        (i for i, row in enumerate(rows) if str(row.get("task_id") or "") == current_id),
+        -1,
+    )
+    known_letters = {letter.upper() for letter in letters.values() if letter}
+    later_letters: list[str] = []
+    later_titles: list[str] = []
+    for i, row in enumerate(rows):
+        rid = str(row.get("task_id") or "")
+        if rid == current_id or i <= current_idx:
+            continue
+        letter = letters.get(rid, "")
+        if letter:
+            later_letters.append(letter)
+        title = str(row.get("title") or "").strip()
+        if len(title) >= 2:
+            later_titles.append(title)
+    scoped: list[str] = []
+    deferred: list[str] = []
+    for raw in musts:
+        text = str(raw)
+        mentioned = {mark.upper() for mark in _TASK_LABEL_RE.findall(text)}
+        unknown = bool(mentioned - known_letters)
+        mentions_current = _mentions_task_label(text, current_letter) or _mentions_task_title(
+            text, current_title
+        )
+        mentions_later = any(_mentions_task_label(text, letter) for letter in later_letters) or any(
+            _mentions_task_title(text, title) for title in later_titles
+        )
+        if mentions_later and not mentions_current and not unknown:
+            deferred.append(text)
+        else:
+            scoped.append(text)
+    return scoped, deferred
+
+
+def lead_error_retryable(exc: BaseException) -> bool:
+    code = str(getattr(exc, "code", "") or "").lower()
+    blob = f"{code} {exc} {type(exc).__name__}".lower()
+    if any(marker in blob for marker in _NONRETRYABLE_LEAD_MARKERS):
+        return False
+    if code == "timeout" or "timed out" in blob or "timeout" == code:
+        return True
+    if code in {
+        "illegal_json",
+        "application_id_mismatch",
+        "context_summary_mismatch",
+        "illegal_verdict",
+        "missing_reason",
+    }:
+        return True
+    return False
+
+
+def _lead_error_record(exc: BaseException) -> dict[str, Any]:
+    code = str(getattr(exc, "code", "") or type(exc).__name__)
+    return {
+        "type": type(exc).__name__,
+        "code": code[:80],
+        "message": str(exc)[:240],
+        "retryable": lead_error_retryable(exc),
+    }
 
 
 def planning_response_schema() -> dict[str, Any]:
@@ -213,18 +433,49 @@ class LeadAdapterPlanner:
             raise AppError("decision requires external authority", code="external_decision_required")
         goal = goal_snapshot.get("goal") if isinstance(goal_snapshot.get("goal"), Mapping) else {}
         boundaries = goal.get("boundaries") if isinstance(goal.get("boundaries"), Mapping) else {}
+        instruction = str((task.get("inputs") or {}).get("instruction") or task.get("title") or "").strip()
+        siblings = [row for row in (goal_snapshot.get("tasks") or []) if isinstance(row, Mapping)]
+        goal_must = [str(x) for x in (boundaries.get("must") or [])]
+        scoped_must, deferred_must = split_task_musts(musts=goal_must, task=task, siblings=siblings)
+        task_accept = task_acceptance_criteria(task)
+        extra = {
+            "worker_request": action.get("payload") or {},
+            "review_scope": "task",
+            "task_acceptance": task_accept,
+            "goal_acceptance": dict(goal.get("acceptance") or {}),
+            "goal_must": goal_must,
+            "deferred_must": deferred_must,
+            "current_task": {
+                "task_id": task.get("task_id"),
+                "title": task.get("title"),
+                "expected_artifacts": list(task.get("expected_artifacts") or []),
+                "instruction": instruction,
+            },
+            "sibling_tasks": [
+                {
+                    "task_id": row.get("task_id"),
+                    "title": row.get("title"),
+                    "status": row.get("status"),
+                    "expected_artifacts": list(row.get("expected_artifacts") or []),
+                }
+                for row in siblings
+            ],
+        }
+        if backend_kind == "review":
+            extra["allow_hint"] = TASK_REVIEW_HINT
         request = build_lead_request(
             kind=backend_kind,
-            goal=str(goal.get("desired_outcome") or ""),
-            authorized_scope=list(boundaries.get("must") or []),
+            goal=instruction or str(goal.get("desired_outcome") or ""),
+            authorized_scope=scoped_must,
             prohibitions=list(boundaries.get("must_not") or []),
-            acceptance_criteria=goal.get("acceptance") or {},
+            acceptance_criteria=task_accept if backend_kind == "review" else dict(goal.get("acceptance") or {}),
             current_application={
                 "goal_id": goal_snapshot.get("goal_id"),
                 "task_id": task.get("task_id"),
                 "run_id": task.get("run_id"),
+                "review_scope": "task",
             },
-            extra={"worker_request": action.get("payload") or {}},
+            extra=extra,
         )
         schema = lead_permission_response_schema() if backend_kind == "permission" else lead_review_response_schema()
         raw, parsed = self.adapter.decide(
@@ -386,13 +637,7 @@ class AppCoordinator:
                 None,
             )
             if existing_decision is not None:
-                return {
-                    "ok": True,
-                    "goal_id": goal_id,
-                    "state": "running",
-                    "action": "decision_required",
-                    "decision_id": existing_decision.get("decision_id"),
-                }
+                return self._continue_pending_decision(snap, task, existing_decision)
             run_id = str(task.get("run_id") or "").strip()
             if not run_id:
                 return self.layer.finish_task(
@@ -451,55 +696,14 @@ class AppCoordinator:
                     },
                     reason="TeleAgent worker requires a bounded decision",
                 )
-                lead_decider = getattr(self.planner, "decide_action", None)
-                backend_resolver = getattr(self.backend, "resolve_decision", None)
-                if opened.get("ok") and callable(lead_decider) and callable(backend_resolver) and backend_kind in {
-                    "permission",
-                    "review",
-                }:
-                    try:
-                        lead_choice = lead_decider(snap, task, action)
-                        lead_verdict = str(lead_choice.get("verdict") or "")
-                        lead_reason = str(lead_choice.get("reason") or "")
-                        transport = backend_resolver(
-                            request_id,
-                            verdict=lead_verdict,
-                            reason=lead_reason,
-                            answers=None,
-                        )
-                        if not isinstance(transport, Mapping) or not transport.get("ok"):
-                            raise AppError("worker decision was not applied", code="worker_decision_failed")
-                        durable_verdict = (
-                            "reject"
-                            if lead_verdict in {"deny_job", "demand_safe_path"}
-                            else lead_verdict
-                        )
-                        resolved = self.layer.resolve_decision(
-                            goal_id,
-                            decision_id=decision_id,
-                            verdict=durable_verdict,
-                            reason=lead_reason,
-                            extra={
-                                "actor_id": str(
-                                    ((snap.get("ownership") or {}).get("coordinator_id"))
-                                    if isinstance(snap.get("ownership"), Mapping)
-                                    else ""
-                                )
-                                or "app-coordinator"
-                            },
-                        )
-                        if not resolved.get("ok"):
-                            return resolved
-                        return {**resolved, "action": "decision_resolved", "lead": self.planner.name}
-                    except Exception as e:
-                        # Keep the durable decision pending so an external
-                        # caller can inspect and answer it; never guess an
-                        # approval after a lead or transport failure.
-                        return {
-                            **opened,
-                            "action": "decision_required",
-                            "lead_error": type(e).__name__,
-                        }
+                if opened.get("ok"):
+                    rec = opened.get("decision") if isinstance(opened.get("decision"), Mapping) else {}
+                    return self._lead_resolve_opened(
+                        snap,
+                        task,
+                        decision=rec or {"decision_id": decision_id, "request_id": request_id},
+                        action=action,
+                    )
                 return {**opened, "action": "decision_required"}
             try:
                 observation = self.backend.observe_run(run_id)
@@ -535,17 +739,32 @@ class AppCoordinator:
             root = self.workspaces_root / goal_id / str(task["task_id"])
             root.mkdir(parents=True, exist_ok=True)
             try:
+                staged = handoff_direct_dependency_artifacts(
+                    task=task,
+                    siblings=tasks,
+                    dest_root=root,
+                )
+            except HandoffError as e:
+                return self.layer.finish_task(
+                    goal_id,
+                    str(task["task_id"]),
+                    succeeded=False,
+                    result={"ok": False, "error": f"dependency handoff failed: {e}"},
+                )
+            if staged:
+                inputs = dict(task.get("inputs") or {})
+                inputs["input_files"] = [row["relative"] for row in staged]
+                task["inputs"] = inputs
+            try:
                 launched = self.backend.start_run(
                     title=str(task.get("title") or task["task_id"]),
                     directory=str(root),
                     instruction=str((task.get("inputs") or {}).get("instruction") or ""),
                     artifacts=[str(x) for x in (task.get("expected_artifacts") or [])],
-                    charter={
-                        "goal": ((snap.get("goal") or {}).get("desired_outcome") if isinstance(snap.get("goal"), Mapping) else ""),
-                        "must": (((snap.get("goal") or {}).get("boundaries") or {}).get("must") if isinstance(snap.get("goal"), Mapping) else []),
-                        "must_not": (((snap.get("goal") or {}).get("boundaries") or {}).get("must_not") if isinstance(snap.get("goal"), Mapping) else []),
-                        "done_when": task.get("done_when") or {},
-                    },
+                    charter=worker_charter_for_task(
+                        goal=snap.get("goal") if isinstance(snap.get("goal"), Mapping) else {},
+                        task=task,
+                    ),
                 )
             except Exception as e:
                 launched = {"ok": False, "error": f"backend dispatch failed: {type(e).__name__}"}
@@ -582,6 +801,133 @@ class AppCoordinator:
             )
             return {**finished, "action": "task_finished"}
         return {"ok": True, "goal_id": goal_id, "state": snap.get("state"), "action": "waiting"}
+
+    def _continue_pending_decision(
+        self,
+        snap: Mapping[str, Any],
+        task: Mapping[str, Any],
+        decision: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        details = decision.get("details") if isinstance(decision.get("details"), Mapping) else {}
+        backend_kind = str(details.get("backend_kind") or "")
+        lead_decider = getattr(self.planner, "decide_action", None)
+        backend_resolver = getattr(self.backend, "resolve_decision", None)
+        if not (
+            callable(lead_decider)
+            and callable(backend_resolver)
+            and backend_kind in AUTO_RESOLVE_BACKEND_KINDS
+        ):
+            return {
+                "ok": True,
+                "goal_id": snap.get("goal_id"),
+                "state": "running",
+                "action": "decision_required",
+                "decision_id": decision.get("decision_id"),
+            }
+        err = details.get("lead_error") if isinstance(details.get("lead_error"), Mapping) else {}
+        if not err and isinstance(decision.get("lead_error"), Mapping):
+            err = dict(decision.get("lead_error") or {})
+        attempts = int(details.get("lead_attempts") or 0)
+        if attempts >= MAX_LEAD_ATTEMPTS_PER_DECISION or (attempts >= 1 and not err.get("retryable", False)):
+            return {
+                "ok": True,
+                "goal_id": snap.get("goal_id"),
+                "state": "running",
+                "action": "decision_required",
+                "decision_id": decision.get("decision_id"),
+                "lead_error": err or {"code": "lead_exhausted", "retryable": False},
+            }
+        action = {
+            "kind": backend_kind,
+            "request_id": str(details.get("backend_request_id") or decision.get("request_id") or ""),
+            "payload": details.get("payload") or {},
+            "context_hash": details.get("context_hash"),
+        }
+        return self._lead_resolve_opened(snap, task, decision=decision, action=action)
+
+    def _lead_resolve_opened(
+        self,
+        snap: Mapping[str, Any],
+        task: Mapping[str, Any],
+        *,
+        decision: Mapping[str, Any],
+        action: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        lead_decider = getattr(self.planner, "decide_action", None)
+        backend_resolver = getattr(self.backend, "resolve_decision", None)
+        backend_kind = str(action.get("kind") or "")
+        decision_id = str(decision.get("decision_id") or "")
+        request_id = str(action.get("request_id") or decision.get("request_id") or "")
+        details = decision.get("details") if isinstance(decision.get("details"), Mapping) else {}
+        if not (
+            callable(lead_decider)
+            and callable(backend_resolver)
+            and backend_kind in AUTO_RESOLVE_BACKEND_KINDS
+        ):
+            return {
+                "ok": True,
+                "goal_id": snap.get("goal_id"),
+                "state": "running",
+                "action": "decision_required",
+                "decision_id": decision_id,
+            }
+        try:
+            lead_choice = lead_decider(snap, task, action)
+            lead_verdict = str(lead_choice.get("verdict") or "")
+            lead_reason = str(lead_choice.get("reason") or "")
+            transport = backend_resolver(
+                request_id,
+                verdict=lead_verdict,
+                reason=lead_reason,
+                answers=None,
+            )
+            if not isinstance(transport, Mapping) or not transport.get("ok"):
+                raise AppError("worker decision was not applied", code="worker_decision_failed")
+            durable_verdict = (
+                "reject"
+                if lead_verdict in {"deny_job", "demand_safe_path"}
+                else lead_verdict
+            )
+            resolved = self.layer.resolve_decision(
+                str(snap.get("goal_id") or ""),
+                decision_id=decision_id,
+                verdict=durable_verdict,
+                reason=lead_reason,
+                extra={
+                    "actor_id": str(
+                        ((snap.get("ownership") or {}).get("coordinator_id"))
+                        if isinstance(snap.get("ownership"), Mapping)
+                        else ""
+                    )
+                    or "app-coordinator"
+                },
+            )
+            if not resolved.get("ok"):
+                return resolved
+            return {**resolved, "action": "decision_resolved", "lead": self.planner.name}
+        except Exception as e:
+            rec = _lead_error_record(e)
+            attempts = int(details.get("lead_attempts") or 0) + 1
+            rec["attempts"] = attempts
+            if decision_id:
+                self.layer.annotate_decision(
+                    str(snap.get("goal_id") or ""),
+                    decision_id=decision_id,
+                    details={
+                        "lead_error": rec,
+                        "lead_attempts": attempts,
+                        "lead_attempt_at": time.time(),
+                    },
+                    lead_error=rec,
+                )
+            return {
+                "ok": True,
+                "goal_id": snap.get("goal_id"),
+                "state": "running",
+                "action": "decision_required",
+                "decision_id": decision_id,
+                "lead_error": rec,
+            }
 
 
 class CollabApplication:
@@ -628,6 +974,7 @@ class CollabApplication:
             submit_key = f"req_{uuid.uuid4().hex}"
         client_id = str(payload.get("client_id") or "local-api").strip() or "local-api"
         title = str(payload.get("title") or goal_text[:80]).strip()
+        forbidden_tools = project_forbidden_tools(payload=payload)
         goal = {
             "title": title,
             "desired_outcome": goal_text,
@@ -637,6 +984,8 @@ class CollabApplication:
             "platform_allowlist": [str(x) for x in (payload.get("platform_allowlist") or ["windows"])],
             "role_hints": {"entrypoint": API_VERSION},
         }
+        if forbidden_tools:
+            goal["forbidden_tools"] = forbidden_tools
         result = self.layer.submit_goal(
             submit_key=submit_key,
             title=title,
@@ -943,5 +1292,13 @@ __all__ = [
     "LeadAdapterPlanner",
     "build_planning_request",
     "planning_response_schema",
+    "project_forbidden_tools",
     "validate_plan",
+    "worker_charter_for_task",
+    "task_acceptance_criteria",
+    "split_task_musts",
+    "lead_error_retryable",
+    "TASK_REVIEW_HINT",
+    "GOAL_HTTP_TERMINAL",
+    "TASK_HTTP_TERMINAL",
 ]

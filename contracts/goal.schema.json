@@ -152,6 +152,16 @@
     },
     "source_charter_path": {
       "type": "string"
+    },
+    "forbidden_tools": {
+      "type": "array",
+      "description": "Explicit tool names banned at post-hoc acceptance after a tool has completed. Not OS isolation and not inferred from Goal wording. Unique, non-empty, at most 32.",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
     }
   }
 }

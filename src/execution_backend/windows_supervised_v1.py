@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
 from execution_backend.base import BackendError, BackendStatus, ExecutionBackendABC
+from framework.artifact_handoff import HandoffError, copy_staged_inputs
 from win_collab.client import Client, KEYS
 from win_collab.core import Engine, Store, TERMINAL
 
@@ -114,6 +115,16 @@ class WindowsSupervisedExecutionBackend(ExecutionBackendABC):
         for key in ("forbidden_tools", "external_inputs", "min_approved_permissions"):
             if key in src:
                 body[key] = src[key]
+        raw_inputs = src.get("input_files")
+        if isinstance(raw_inputs, list) and raw_inputs:
+            names: list[str] = []
+            for item in raw_inputs:
+                if isinstance(item, Mapping) and str(item.get("relative") or "").strip():
+                    names.append(str(item.get("relative")).strip())
+                elif isinstance(item, str) and item.strip():
+                    names.append(item.strip())
+            if names:
+                body["input_files"] = names
         return body
 
     def start_run(
@@ -129,16 +140,40 @@ class WindowsSupervisedExecutionBackend(ExecutionBackendABC):
             # The verified controller owns an ASCII UUID workspace.  The
             # application Goal id may contain Unicode and TeleAgent carries
             # the workspace in an HTTP header, whose Windows client encoding
-            # cannot safely represent such paths.
-            del directory
-            job = engine.submit(
-                self._charter(
-                    title=title,
-                    instruction=instruction,
-                    artifacts=list(artifacts or []),
-                    charter=charter,
-                )
+            # cannot safely represent such paths.  `directory` is only the
+            # staging source for declared dependency files, never the worker root.
+            built = self._charter(
+                title=title,
+                instruction=instruction,
+                artifacts=list(artifacts or []),
+                charter=charter,
             )
+            job = engine.submit(built)
+            names = [str(x) for x in (built.get("input_files") or [])]
+            try:
+                copied = copy_staged_inputs(Path(directory), Path(job["workspace"]), names)
+            except (HandoffError, OSError, ValueError) as e:
+                try:
+                    engine.cancel(job["id"])
+                except (ValueError, RuntimeError, OSError):
+                    pass
+                return {
+                    "ok": False,
+                    "backend": self.backend_id,
+                    "run_id": job["id"],
+                    "native_handle": job.get("session_id") or job["id"],
+                    "state": "failed",
+                    "error": f"input handoff failed: {e}",
+                    "contract_version": "contract.v0.1-draft",
+                }
+            if copied:
+                with store.transaction():
+                    job = store.get(job["id"])
+                    updated = dict(job.get("charter") or {})
+                    updated["input_files"] = list(copied)
+                    updated["input_file_paths"] = [str(Path(job["workspace"]) / rel) for rel in copied]
+                    job["charter"] = updated
+                    store.save(job)
             engine.tick()
             job = store.get(job["id"])
             failed = job.get("state") in {"failed", "timed_out"}
@@ -200,6 +235,7 @@ class WindowsSupervisedExecutionBackend(ExecutionBackendABC):
                 "state": "ok" if ok else state,
                 "finish": "stop" if ok else ("cancelled" if state == "cancelled" else "error"),
                 "artifacts": present,
+                "workspace": str(root),
                 "missing": missing,
                 "error": job.get("error") or "",
                 "controller_state": state,

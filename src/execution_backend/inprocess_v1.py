@@ -155,6 +155,7 @@ class InProcessExecutionBackend(ExecutionBackendABC):
             "state": "ok" if ok else ("cancelled" if rec.get("cancelled") else "fail"),
             "finish": obs.get("finish"),
             "artifacts": present,
+            "workspace": str(rec["directory"]),
             "missing": [a for a in (rec.get("artifacts") or []) if not (Path(rec["directory"]) / a).is_file()],
             "error": rec.get("assistant_error") or "",
             "run_observation": {

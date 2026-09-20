@@ -657,7 +657,13 @@ def _default_goal_body(
         body["idempotency_key"] = str(src.get("idempotency_key") or "")
     if isinstance(src.get("role_hints"), Mapping):
         body["role_hints"] = dict(src["role_hints"])
-    for extra_key in ("capability_requirements", "platform_allowlist", "context_refs", "source_charter_path"):
+    for extra_key in (
+        "capability_requirements",
+        "platform_allowlist",
+        "context_refs",
+        "source_charter_path",
+        "forbidden_tools",
+    ):
         if extra_key in src:
             body[extra_key] = src[extra_key]
     return body
@@ -1565,6 +1571,53 @@ class DurableLayer:
             self._touch(snap)
             self._persist_unlocked()
             return {"ok": True, "reason": REASON_READY, "decision": rec, "pending_count": len(pending)}
+
+    def annotate_decision(
+        self,
+        goal_id: str,
+        *,
+        decision_id: str,
+        details: Mapping[str, Any] | None = None,
+        lead_error: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Merge notes onto one pending decision. Does not resolve or grant."""
+        gid = _norm_key(goal_id)
+        did = _norm_key(decision_id)
+        if not did:
+            return {"ok": False, "reason": REASON_UNKNOWN_DECISION, "error": "decision_id required"}
+        with self._rmw():
+            snap = self.goals.get(gid)
+            if snap is None:
+                return {"ok": False, "reason": REASON_UNKNOWN_GOAL, "error": f"unknown goal_id {gid!r}"}
+            pending = [dict(d) for d in (snap.get("pending_decisions") or []) if isinstance(d, Mapping)]
+            target = next((d for d in pending if d.get("decision_id") == did), None)
+            if target is None:
+                return {
+                    "ok": False,
+                    "reason": REASON_UNKNOWN_DECISION,
+                    "error": f"unknown pending decision {did!r}",
+                    "goal_id": gid,
+                }
+            merged = dict(target.get("details") or {}) if isinstance(target.get("details"), Mapping) else {}
+            if isinstance(details, Mapping):
+                merged.update(dict(details))
+            target["details"] = merged
+            if isinstance(lead_error, Mapping):
+                target["lead_error"] = dict(lead_error)
+                merged.setdefault("lead_error", dict(lead_error))
+                target["details"] = merged
+            snap["pending_decisions"] = [
+                target if d.get("decision_id") == did else d for d in pending
+            ]
+            self._append_history(
+                snap,
+                "annotate_decision",
+                decision_id=did,
+                lead_error_code=(lead_error or {}).get("code") if isinstance(lead_error, Mapping) else None,
+            )
+            self._touch(snap)
+            self._persist_unlocked()
+            return {"ok": True, "reason": REASON_READY, "decision": dict(target), "pending_count": len(pending)}
 
     def resolve_decision(
         self,

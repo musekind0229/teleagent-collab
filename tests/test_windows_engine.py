@@ -116,6 +116,13 @@ class Tests(unittest.TestCase):
         self.rescan(j)
         return self.store.inbox()[0]
 
+    def test_file_task_prompt_requires_relative_artifact_names(self):
+        j=self.start()
+        text=self.engine.prompt(j)['parts'][0]['text']
+        self.assertIn('relative names listed in CHARTER.artifacts', text)
+        self.assertIn('Do not retype or invent absolute directory paths', text)
+        self.assertIn(j['workspace'], text)
+
     def test_foreign_permissions_are_never_touched(self):
         j=self.start()
         self.client.pending=[{'id':'foreign','sessionID':'other','patterns':['.env']}]
