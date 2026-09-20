@@ -1,7 +1,8 @@
 """Local TeleAgent HTTP adapter. Credentials stay in memory, never in reports.
 
-Windows discovery reads only the environment block of verified TeleAgent runtime processes,
-using normal OS read permissions. It does not elevate or dump process memory.
+Windows discovery reads only the environment block of verified TeleAgent
+runtime or installed GUI processes, using normal OS read permissions.
+It does not elevate or dump process memory.
 The three local API values can alternatively be supplied by environment variables.
 """
 from __future__ import annotations
@@ -129,6 +130,32 @@ def windows_environment(pid: int, *, expected_images: tuple[Path, ...] | None = 
         kernel.CloseHandle(handle)
 
 
+def installed_gui_images() -> tuple[Path, ...]:
+    """Desktop TeleAgent.exe used on this workshop host; never the SAC runtime."""
+    found = []
+    for raw in (Path(r'G:\teleagent\TeleAgent.exe'),):
+        if raw.is_file():
+            found.append(raw.resolve())
+    return tuple(found)
+
+
+def same_local_creds(left: dict, right: dict) -> bool:
+    if set(left) != set(KEYS) or set(right) != set(KEYS):
+        return False
+    return all(hmac.compare_digest(str(left[k]), str(right[k])) for k in KEYS)
+
+
+def pick_unique_creds(sources: list[tuple[int, dict]]) -> dict:
+    if not sources:
+        raise RuntimeError('Expected one verified TeleAgent credential source, found 0')
+    creds = sources[0][1]
+    for _, other in sources[1:]:
+        if not same_local_creds(creds, other):
+            raise RuntimeError(
+                f'Expected one verified TeleAgent credential source, found {len(sources)}')
+    return creds
+
+
 def discover() -> tuple[str, dict]:
     explicit = {k: os.environ.get(k, '') for k in KEYS}
     if all(explicit.values()):
@@ -142,29 +169,42 @@ def discover() -> tuple[str, dict]:
     runtime = Path.home() / '.local/share/TeleAgent/runtimes'
     sac_image = runtime / 'super-agent-code/bin/TeleAgent.exe'
     node_image = runtime / 'node/node.exe'
-    # List only exact installed runtime images; never command lines (which may contain credentials).
-    script = (
-        "$sac=[IO.Path]::GetFullPath('" + str(sac_image).replace("'", "''") + "');"
-        "$node=[IO.Path]::GetFullPath('" + str(node_image).replace("'", "''") + "');"
-        "Get-Process TeleAgent,node -ErrorAction SilentlyContinue | Where-Object {"
-        "$_.Path -and ([IO.Path]::GetFullPath($_.Path) -ieq $sac -or "
-        "[IO.Path]::GetFullPath($_.Path) -ieq $node)} | Select-Object -ExpandProperty Id"
-    )
-    result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', script],
-                            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=15,
-                            creationflags=subprocess.CREATE_NO_WINDOW)
+    images = (sac_image, node_image, *installed_gui_images())
+    # PID list only; image checks use QUERY_LIMITED. Do not require PowerShell
+    # $_.Path, which is empty for higher-integrity processes.
+    result = subprocess.run(
+        ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
+         'Get-Process TeleAgent,node -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id'],
+        capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=15,
+        creationflags=subprocess.CREATE_NO_WINDOW)
     pids = [int(x) for x in result.stdout.split() if x.isdigit()]
     credential_sources = []
+    verified_candidates = 0
+    vm_read_denied = 0
+    keys_unavailable = 0
     for candidate in pids:
         try:
-            credential_sources.append((candidate, windows_environment(
-                candidate, expected_images=(sac_image, node_image))))
+            windows_process_image(candidate, expected_images=images)
         except (PermissionError, RuntimeError, ValueError):
             continue
-    if len(credential_sources) != 1:
+        verified_candidates += 1
+        try:
+            credential_sources.append((candidate, windows_environment(
+                candidate, expected_images=images)))
+        except PermissionError:
+            vm_read_denied += 1
+        except RuntimeError:
+            keys_unavailable += 1
+        except ValueError:
+            continue
+    if not credential_sources:
         raise RuntimeError(
-            f'Expected one verified TeleAgent credential source, found {len(credential_sources)}')
-    _, creds = credential_sources[0]
+            'Expected one verified TeleAgent credential source, found 0 '
+            f'(verified_images={verified_candidates}, vm_read_denied={vm_read_denied}, '
+            f'keys_unavailable={keys_unavailable}). '
+            'This process cannot read higher-integrity TeleAgent runtime environments; '
+            'restart TeleAgent at the same integrity or supply TELEAGENT_URL and local API env keys.')
+    creds = pick_unique_creds(credential_sources)
     # Find the listener first, then require its process image to be the exact SAC executable.
     result = subprocess.run(['netstat.exe', '-ano', '-p', 'tcp'], capture_output=True,
                             text=True, encoding='mbcs', errors='replace', timeout=15,

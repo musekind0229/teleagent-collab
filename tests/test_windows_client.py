@@ -8,7 +8,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from win_collab.client import Client, KEYS
+from win_collab.client import Client, KEYS, pick_unique_creds, same_local_creds
 from win_collab.protected_auth import save, load
 
 
@@ -56,6 +56,17 @@ class ClientTests(unittest.TestCase):
     def test_remote_endpoint_rejected(self):
         for url in ('http://example.com','http://127.0.0.1@evil.test','https://127.0.0.1:4397'):
             with self.assertRaises(ValueError):Client(url,self.creds)
+
+    def test_identical_credential_sources_are_accepted(self):
+        creds=dict(zip(KEYS,['super-agent','synthetic-password','synthetic-local-key']))
+        self.assertTrue(same_local_creds(creds, dict(creds)))
+        self.assertEqual(pick_unique_creds([(1,creds),(2,dict(creds))]), creds)
+
+    def test_divergent_credential_sources_are_rejected(self):
+        a=dict(zip(KEYS,['super-agent','synthetic-password','synthetic-local-key']))
+        b=dict(zip(KEYS,['super-agent','other-password','synthetic-local-key']))
+        with self.assertRaisesRegex(RuntimeError,'found 2'):
+            pick_unique_creds([(1,a),(2,b)])
 
     @unittest.skipUnless(os.name=='nt','DPAPI is Windows-only')
     def test_dpapi_roundtrip_synthetic_local_keys(self):
