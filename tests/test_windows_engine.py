@@ -127,6 +127,22 @@ class Tests(unittest.TestCase):
         j=self.start();self.rescan(j)
         self.assertEqual(self.store.get(j['id'])['lead_requests'],0)
 
+    def test_worker_error_keeps_safe_diagnostics_only(self):
+        j=self.start()
+        self.client.status[j['session_id']]={'type':'idle'}
+        self.client.messages[j['session_id']].append({'info':{
+            'role':'assistant','finish':'error','error':{
+                'name':'APIError','data':{'statusCode':401,'message':'token=secret-value; 40108 invalid token'},
+                'headers':{'authorization':'secret-value'},
+            }}})
+        self.rescan(j)
+        failed=self.store.get(j['id'])
+        self.assertEqual(failed['state'],'failed')
+        self.assertIn('name=APIError',failed['error'])
+        self.assertIn('statusCode=401',failed['error'])
+        self.assertIn('message=token=<redacted>; 40108 invalid token',failed['error'])
+        self.assertNotIn('secret-value',failed['error'])
+
     def test_request_id_dedupe_and_serial_same_path(self):
         j=self.start();p=self.pending(j)
         self.rescan(j);self.assertEqual(len(self.store.inbox()),1)

@@ -32,7 +32,7 @@
 
 当前默认工人仍是确定性的 `inprocess.local_v1`。显式选择 `--backend teleagent-windows` 后，新入口会通过 `teleagent.windows.supervised_v1` 复用旧 Windows 控制器；Grok 组长可负责规划、普通权限和产物验收，Question 与系统动作继续上交外部 decision API。使用方法和 HTTP 契约见 [`application-api.zh-CN.md`](application-api.zh-CN.md)。
 
-2026-09-20 实机验证中，真实 Grok 成功生成两项依赖计划；Windows TeleAgent 桥接真实创建 session `ses_f4443d3f4ffeRzqOFW9zR1dxv6`，随后模型调用失败且无产物。控制器和 Goal 均正确记录失败，辅助 4401 内核在服务退出时关闭，GUI 4398 保持运行。当前剩余阻塞是 TeleAgent GUI 模型登录态/上游授权。
+2026-09-20 实机验证中，真实 Grok 成功生成两项依赖计划；Windows TeleAgent 桥接真实创建 session，随后辅助内核的模型调用返回 `HTTP 401 / invalid token` 且无产物。控制器和 Goal 均正确记录失败，辅助 4401 内核在服务退出时关闭，GUI 内核保持独立运行。重新登录、发送 GUI 消息、按 LevelDB 当前记录读取 token 和去除 token 类型前缀均未解决问题；GUI 同期模型调用成功。当前阻塞是 GUI 主进程与模型内核之间尚无受支持的外部认证交接，而不是用户需要反复登录。
 
 ## 后续收敛顺序
 
@@ -50,6 +50,7 @@
 - `win_collab` 回归 41 项通过；公共 Windows 适配、框架及 glue 相关抽测 156 项通过（5 项按平台跳过）；Python compileall 与 diff check 通过。
 - 公共 glue 原先仍创建 Linux adapter，并会把 Windows stdin-wrap 从 4401 改回旧的 GUI 地址。本分支改为按当前平台创建适配器，并保留 Windows 适配器在凭据刷新后选择的实际地址；新增回归覆盖。
 - `run-job` 第一次真实调用发现状态目录直到独立 `glue.main()` 才创建；本分支改为每次写状态前创建目录，并新增回归覆盖。
-- 强制使用受控 stdin-wrap 后，本地 API 成功创建真实 session `ses_f4558b675ffeyRnL0FQJfxCRpz`，但复制的 GUI 模型登录态返回 `40108 invalid token`。任务没有产物，结果正确记为 fail；不算 Windows worker live 闭环通过。
-- 试验用 4401 辅助内核已停止并清理；原 GUI TeleAgent 的 4398 监听保持运行。未重装 RustDesk、未执行系统动作、未输出任何 token。
+- 强制使用受控 stdin-wrap 后，本地 API 成功创建真实 session，但复制的 GUI 模型登录态返回 `40108 invalid token`。重新登录和发送消息后复测仍为 `HTTP 401`；任务没有产物，结果正确记为 fail，不算 Windows worker live 闭环通过。
+- GUI 当前把本地 API 密钥通过 stdin 交给内核，密钥不在子进程环境中；管理员 GUI 与普通权限入口之间还会触发 `OpenProcess` 拒绝。需要正式 broker/交接接口，不能把每次登录后发消息当初始化步骤。
+- 试验用 4401 辅助内核与应用服务均已停止。未重装 RustDesk、未执行系统动作、未输出任何 token。
 - 完整 `src` 测试发现运行 545 项，其中 24 项未通过、10 项跳过；失败集中在上游 Antigravity/DeepSeek/POSIX 测例对 Windows 路径、脚本执行格式和外部二进制的假设。这些不由本次 Windows glue 修改引入，但说明仓库尚不能宣称全平台全套回归通过。

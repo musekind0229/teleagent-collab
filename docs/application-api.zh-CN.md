@@ -41,7 +41,7 @@ python bin/collab-service.py --persist .collab-app --port 8765 `
   --planner grok --backend teleagent-windows
 ```
 
-如果 GUI TeleAgent 没有向当前进程暴露本地 API 凭据，可显式启用受控辅助内核。服务退出时会停止自己创建的辅助内核：
+如果 GUI TeleAgent 没有向当前进程暴露本地 API 凭据，可显式启用受控辅助内核。服务退出时会停止自己创建的辅助内核。该选项目前只验证了本地 API 和 session 派发；GUI 模型授权复用尚未通过实机验收，不能作为生产入口：
 
 ```powershell
 python bin/collab-service.py --persist .collab-app --port 8765 `
@@ -100,6 +100,8 @@ PowerShell 会自动对含中文的请求 ID 做 URL 编码；自行拼 URL 的�
 
 真实 `grok.exe` 已通过本入口生成两项有依赖关系的计划；修复 Windows 上 Grok UTF-8 输出被系统 GBK 解码的问题后，规划和任务推进完成。
 
-Windows TeleAgent 后端已从新入口真实创建 session `ses_f4443d3f4ffeRzqOFW9zR1dxv6`，证明入口、控制器、本地 HTTP 和 session 派发已经连通。该 session 的模型调用随后报错且没有生成产物，控制器正确将 Run 和 Goal 标成失败。当前阻塞位于 GUI 模型登录态/上游模型授权，不在桥接状态机；修复登录态后需重跑普通文件任务，才可宣布真实交付闭环通过。
+Windows TeleAgent 后端已从新入口真实创建多个 session，证明入口、控制器、本地 HTTP 和 session 派发已经连通。重新登录 GUI 并发送消息后，Chromium Local Storage 确实写入了新的当前记录；辅助内核仍返回 `HTTP 401 / invalid token` 且没有产物。按 LevelDB 当前记录读取、原始扫描和去除 token 类型前缀三种检查均未改变结果，因此反复登录或发送消息不是解决办法，也不应成为日常流程。
+
+同一时间 GUI 自己的 `NewApi/chat-lite` 与 `chat-pro` 调用成功，说明账号和模型可用。剩余差异位于 GUI 主进程向模型内核交接认证状态的私有流程。GUI 内核的本地 API 密钥通过 stdin 注入，不存在于子进程环境；GUI 以管理员权限运行而入口进程为普通权限时，进程检查还会得到 Windows `Access denied (5)`。生产方案需要 TeleAgent 提供受支持的本地 broker/凭据交接接口，或让入口直接运行在能够取得该接口的同一可信宿主中。完成该项后仍需重跑普通文件任务，才可宣布真实交付闭环通过。
 
 后续还需把 Question 的自动处理策略和两阶段系统动作投影成更专门的公共类型；当前两者会留给外部 decision API，避免组长越权处理。

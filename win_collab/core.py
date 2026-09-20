@@ -224,6 +224,40 @@ def permission_owner(p):
     return None
 
 
+def safe_assistant_error(error):
+    """Return bounded diagnostic fields without copying request/auth material."""
+    allowed = ('name', 'code', 'status', 'statusCode', 'message')
+    values = []
+    seen = set()
+
+    def redact(text):
+        text = re.sub(
+            r'(?i)\b(authorization|api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;]+',
+            r'\1=<redacted>', text,
+        )
+        return re.sub(
+            r'\b[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}(?:\.[A-Za-z0-9_-]{8,})?\b',
+            '<redacted-token>', text,
+        )
+
+    def visit(value, depth=0):
+        if depth > 3 or not isinstance(value, dict):
+            return
+        for key in allowed:
+            item = value.get(key)
+            if isinstance(item, (str, int, float, bool)):
+                text = redact(str(item).replace('\r', ' ').replace('\n', ' ').strip())[:240]
+                pair = (key, text)
+                if text and pair not in seen:
+                    seen.add(pair)
+                    values.append(f'{key}={text}')
+        for key in ('data', 'error', 'cause'):
+            visit(value.get(key), depth + 1)
+
+    visit(error)
+    return '; '.join(values[:8])
+
+
 def hard_reject(p, workspace=None, external_inputs=()):
     """Conservative secret prefilter only. All other requests go to the lead."""
     text = json.dumps(p, ensure_ascii=True)
@@ -613,7 +647,13 @@ class Engine:
             return
         last = assistants[-1]['info']
         if last.get('error'):
-            self.stop(job, 'failed', 'Worker reported an error; inspect its task in TeleAgent')
+            detail = safe_assistant_error(last['error'])
+            reason = 'Worker reported an error'
+            if detail:
+                reason += ': ' + detail
+            else:
+                reason += '; inspect its task in TeleAgent'
+            self.stop(job, 'failed', reason)
             return
         if last.get('finish') != 'stop':
             return
