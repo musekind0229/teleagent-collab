@@ -54,3 +54,7 @@ API：`scheduler.request_cancel(job_id)` → `effect_cancel(job_id)`（refresh �
 - 取消/超时：`effect_cancel` 与墙钟超时先 `POST /session/{id}/abort`；abort 失败保留 `cancel_requested` / `stop_pending_confirm`，不得把请求收到当成已停止。
 - 恢复合同：`JobRecord` 持久化完整 charter（must/must_not/产物/force_lead_review/授权/预算）+ `contract_version`；缺失或不兼容 → restore **阻塞**（FAIL），禁止空约束续跑。
 - 回归：`src/test_astra_p1_fixes.py`、`review/reproduce_ac1279a.py`。
+
+## Windows supervised in-flight recovery
+
+GUI path (default `Client()` discovery; do not default to stdin_wrap). After TeleAgent restart, port change, or local cred refresh: probe backend/session; if unrecoverable, fail-closed to `failed` with `need_human:` reason — never silent redispatch or invent idle for a missing session. `TELEAGENT_BASE_URL` optional when GUI discovery works.

@@ -18,6 +18,7 @@ import uuid
 from pathlib import Path, PureWindowsPath
 
 TERMINAL = {'passed', 'failed', 'cancelled', 'timed_out'}
+SCAN_ERROR_LIMIT = 3  # consecutive scan failures -> need_human fail-closed
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_HOME = REPO / '.collab-state'
 SYSTEM_EFFECTS = {'install_files', 'service_change', 'firewall_change', 'shortcuts'}
@@ -526,6 +527,26 @@ class Engine:
         self.store.db.execute('UPDATE requests SET resolved=1 WHERE job_id=?', (job['id'],))
         self.store.event(job, state, {'reason': reason})
 
+
+    def fail_need_human(self, job, reason):
+        """Terminal fail-closed for restart/port/cred/session loss. Never silent redispatch."""
+        msg = reason if str(reason).startswith('need_human:') else f'need_human: {reason}'
+        # Local terminal only: do not abort against a possibly dead/replaced TeleAgent.
+        job['session_id'] = None
+        self.stop(job, 'failed', msg)
+
+    def probe_in_flight(self, job):
+        """Return True if scan may continue; False if job was failed closed."""
+        backend = self.client.base
+        backend_id = getattr(self.client, 'instance_id', backend)
+        if job.get('backend') != backend or job.get('backend_id') != backend_id:
+            self.fail_need_human(
+                job,
+                'TeleAgent backend/port/cred instance changed; refusing silent redispatch',
+            )
+            return False
+        return True
+
     def tick(self):
         """One bounded cycle. Durable errors cannot be confused with idle/success."""
         with self.store.transaction():
@@ -564,8 +585,7 @@ class Engine:
                     self.store.save(job)
                 if job['state'] in TERMINAL | {'queued'}:
                     continue
-                if job['backend'] != self.client.base or job.get('backend_id') != getattr(self.client, 'instance_id', self.client.base):
-                    job['error'] = 'Backend changed; refusing to replay against another server'
+                if not self.probe_in_flight(job):
                     self.store.save(job)
                     continue
                 if job['deadline'] and time.time() >= job['deadline']:
@@ -582,9 +602,25 @@ class Engine:
                     self.scan(job)
                     if job['state'] not in TERMINAL | {'stopping'}:
                         job['error'] = None
+                        job['scan_error_streak'] = 0
                 except Exception as error:
                     job['error'] = str(error)
-                    self.store.event(job, 'scan_error', {'error_type': type(error).__name__})
+                    job['scan_error_streak'] = int(job.get('scan_error_streak') or 0) + 1
+                    self.store.event(job, 'scan_error', {
+                        'error_type': type(error).__name__,
+                        'streak': job['scan_error_streak'],
+                    })
+                    err_s = str(error)
+                    if 'HTTP 401' in err_s or 'HTTP 403' in err_s:
+                        self.fail_need_human(
+                            job,
+                            'local API auth failed after cred refresh; refusing silent redispatch',
+                        )
+                    elif job['scan_error_streak'] >= SCAN_ERROR_LIMIT:
+                        self.fail_need_human(
+                            job,
+                            f'repeated scan failures ({type(error).__name__}): {error}',
+                        )
                 job['next_scan'] = time.time() + (2 if job['state'] == 'running' else 3)
                 self.store.save(job)
         return self.summary()
@@ -636,7 +672,16 @@ class Engine:
         statuses = self.api(job, 'GET', '/session/status')
         if not isinstance(statuses, dict):
             raise RuntimeError('Invalid session status response')
-        state = statuses.get(sid, {}).get('type', 'idle')
+        if sid not in statuses:
+            # Missing session after TeleAgent restart: fail-closed, do not invent idle.
+            # Drop session_id so stop() does not attempt abort against a dead instance.
+            job['session_id'] = None
+            self.fail_need_human(
+                job,
+                'session lost after TeleAgent restart; refusing silent redispatch',
+            )
+            return
+        state = (statuses.get(sid) or {}).get('type', 'idle')
         if state != 'idle':
             job['state'] = 'running'
             return
