@@ -61,6 +61,7 @@ from framework.lifecycle import (
     LifecycleError,
     assert_transition,
 )
+from framework.need_human import enrich_result_for_need_human, parse_need_human
 from framework.models import CONTRACT_VERSION, contract_fingerprint, new_goal_id, new_task_id
 from framework.persist_lock import (
     StoreIncompatibleError,
@@ -1438,20 +1439,48 @@ class DurableLayer:
                 except LifecycleError as e:
                     return {"ok": False, "reason": REASON_ILLEGAL_STATE, "error": str(e)}
             found["status"] = dst
+            stored_result = None
             if isinstance(result, Mapping):
-                found["result"] = dict(result)
-                run_id = _norm_key(result.get("run_id") or result.get("native_handle"))
+                stored_result = enrich_result_for_need_human(result) or dict(result)
+                found["result"] = stored_result
+                run_id = _norm_key(stored_result.get("run_id") or stored_result.get("native_handle"))
                 if run_id:
                     found["run_id"] = run_id
             snap["tasks"] = tasks
             terminal = [str(t.get("status") or "") for t in tasks]
+            hist_extra: dict[str, Any] = {"task_id": tid, "task_state": dst}
             if not succeeded:
                 if snap.get("state") not in _TERMINAL_GOAL:
                     self._set_state(snap, "failed")
+                nh = None
+                if isinstance(stored_result, Mapping):
+                    if stored_result.get("need_human") is True:
+                        parsed = parse_need_human(stored_result.get("error"))
+                        reason = str(
+                            stored_result.get("failure_reason")
+                            or (parsed or {}).get("reason")
+                            or stored_result.get("error")
+                            or "need_human"
+                        )
+                        nh = {"need_human": True, "reason": reason}
+                    else:
+                        nh = parse_need_human(stored_result.get("error"))
+                if nh is not None:
+                    reason = str(nh.get("reason") or "need_human")[:500]
+                    snap["failure"] = {
+                        "phase": "worker",
+                        "error": f"need_human: {reason}",
+                        "need_human": True,
+                        "failure_reason": reason,
+                        "task_id": tid,
+                    }
+                    hist_extra["need_human"] = True
+                    hist_extra["failure_reason"] = reason
+                    hist_extra["event_kind"] = "need_human"
             elif terminal and all(st == "succeeded" for st in terminal):
                 if snap.get("state") not in _TERMINAL_GOAL:
                     self._set_state(snap, "completed")
-            self._append_history(snap, "finish_task", task_id=tid, task_state=dst)
+            self._append_history(snap, "finish_task", **hist_extra)
             self._touch(snap)
             self._persist_unlocked()
             return {

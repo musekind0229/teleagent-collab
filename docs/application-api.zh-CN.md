@@ -107,3 +107,27 @@ Windows TeleAgent 后端已从新入口真实创建多个 session，证明入口
 同一时间 GUI 自己的 `NewApi/chat-lite` 与 `chat-pro` 调用成功，说明账号和模型可用。剩余差异位于 GUI 主进程向模型内核交接认证状态的私有流程。GUI 内核的本地 API 密钥通过 stdin 注入，不存在于子进程环境；GUI 以管理员权限运行而入口进程为普通权限时，进程检查还会得到 Windows `Access denied (5)`。生产方案需要 TeleAgent 提供受支持的本地 broker/凭据交接接口，或让入口直接运行在能够取得该接口的同一可信宿主中。完成该项后仍需重跑普通文件任务，才可宣布真实交付闭环通过。
 
 后续还需把 Question 的自动处理策略和两阶段系统动作投影成更专门的公共类型；当前两者会留给外部 decision API，避免组长越权处理。
+
+## need_human（Windows 监督恢复失败）
+
+Windows 监督后端在 TeleAgent 重启 / 端口或凭据实例变化 / 会话丢失 / 连续扫描失败时会 **fail-closed**：job 进入 ailed，error 以 
+eed_human: 开头（不含密钥）。
+
+调用方怎么看：
+
+1. GET /v1/requests/{id} 顶层：
+   - 
+eed_human: bool
+   - ailure_reason: 短原因摘要（已脱敏）
+   - ailure: 若为 need_human，含 
+eed_human / ailure_reason / phase=worker / 	ask_id
+   - 	asks[].result.need_human / 	asks[].result.failure_reason / 	asks[].result.error
+2. GET /v1/requests/{id}/events：历史里 inish_task 在 need_human 时带 
+eed_human=true、ailure_reason、event_kind=need_human，可按这些字段检索。
+
+### decisions 缺口（文档化，本刀不接）
+
+POST /v1/requests/{id}/decisions/{decision_id} 只回答 **进行中** 工单的 TeleAgent 待决（permission / question 等，任务处于 waiting_decision）。
+
+恢复失败是 **终态** ailed：此时没有可续的 pending decision。人工修好环境后应 **重新提交** 新请求（或走计划修订 / reopen），不能用 decisions 把已失败 Goal「续跑」回来。
+

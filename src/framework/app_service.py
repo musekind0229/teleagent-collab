@@ -24,6 +24,7 @@ from urllib.parse import unquote, urlparse
 from execution_backend.base import ExecutionBackend
 from execution_backend.inprocess_v1 import InProcessExecutionBackend
 from framework.artifact_handoff import HandoffError, handoff_direct_dependency_artifacts
+from framework.need_human import goal_need_human_view
 from framework.durable_api import DurableLayer
 from lead_adapter.schema import context_summary_of, unwrap_structured
 
@@ -1015,17 +1016,26 @@ class CollabApplication:
         if not result.get("ok"):
             raise AppError(str(result.get("error")), status=404, code="not_found")
         snap = result["goal"]
-        return {
+        tasks = snap.get("tasks") or []
+        failure = snap.get("failure")
+        nh_view = goal_need_human_view(
+            failure=failure if isinstance(failure, Mapping) else None,
+            tasks=tasks if isinstance(tasks, list) else [],
+        )
+        out = {
             "ok": True,
             "api_version": API_VERSION,
             "request_id": goal_id,
             "state": snap.get("state"),
             "goal": snap.get("goal"),
-            "tasks": snap.get("tasks") or [],
+            "tasks": tasks,
             "pending_decisions": snap.get("pending_decisions") or [],
-            "failure": snap.get("failure"),
+            "failure": failure,
+            "need_human": bool(nh_view.get("need_human")),
+            "failure_reason": nh_view.get("failure_reason") or "",
             "updated_at": snap.get("updated_at_iso"),
         }
+        return out
 
     def list_requests(self) -> dict[str, Any]:
         out = self.layer.list_goals()

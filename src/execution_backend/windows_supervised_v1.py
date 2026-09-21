@@ -19,6 +19,15 @@ from win_collab.client import Client, KEYS
 from win_collab.core import Engine, Store, TERMINAL
 
 
+
+def _need_human_fields(error: str) -> dict:
+    raw = str(error or "").strip()
+    if not raw.lower().startswith("need_human:"):
+        return {"need_human": False}
+    reason = " ".join(raw.split(":", 1)[-1].split())[:300]
+    return {"need_human": True, "failure_reason": reason}
+
+
 class WindowsSupervisedExecutionBackend(ExecutionBackendABC):
     backend_id = "teleagent.windows.supervised_v1"
 
@@ -202,6 +211,8 @@ class WindowsSupervisedExecutionBackend(ExecutionBackendABC):
             successful = state == "passed"
             cancelled = state == "cancelled"
             errored = state in {"failed", "timed_out"}
+            err = job.get("error") or ""
+            nh = _need_human_fields(err)
             return {
                 "session_id": job.get("session_id") or "",
                 "native_handle": job.get("session_id") or run_id,
@@ -209,13 +220,15 @@ class WindowsSupervisedExecutionBackend(ExecutionBackendABC):
                 "busy": state not in TERMINAL,
                 "status_ok": True,
                 "finish": "stop" if successful else ("cancelled" if cancelled else ("error" if errored else None)),
-                "assistant_error": job.get("error") or "",
+                "assistant_error": err,
                 "finish_successful": successful,
                 "cancelled": cancelled,
                 "errored": errored,
                 "controller_state": state,
                 "readonly": True,
                 "backend": self.backend_id,
+                "need_human": bool(nh.get("need_human")),
+                "failure_reason": nh.get("failure_reason") or "",
             }
 
     def collect_result(self, run_id: str) -> dict[str, Any]:
@@ -227,7 +240,9 @@ class WindowsSupervisedExecutionBackend(ExecutionBackendABC):
             present = [str(root / rel) for rel in expected if (root / rel).is_file()]
             missing = [rel for rel in expected if not (root / rel).is_file()]
             ok = state == "passed" and not missing
-            return {
+            err = job.get("error") or ""
+            nh = _need_human_fields(err)
+            out = {
                 "ok": ok,
                 "backend": self.backend_id,
                 "run_id": run_id,
@@ -237,9 +252,13 @@ class WindowsSupervisedExecutionBackend(ExecutionBackendABC):
                 "artifacts": present,
                 "workspace": str(root),
                 "missing": missing,
-                "error": job.get("error") or "",
+                "error": err,
                 "controller_state": state,
             }
+            if nh.get("need_human"):
+                out["need_human"] = True
+                out["failure_reason"] = nh.get("failure_reason") or ""
+            return out
 
     def list_pending_actions(self, *, session_id: str | None = None) -> tuple[int, list]:
         with self._lock:
