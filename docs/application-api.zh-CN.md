@@ -93,6 +93,7 @@ $opened
 | `GET` | `/v1/requests/{id}/events` | 查询持久化事件 |
 | `GET` | `/v1/requests/{id}/report` | 获取交付报告 |
 | `POST` | `/v1/requests/{id}/cancel` | 请求取消，body 如 `{"reason":"用户取消"}` |
+| `POST` | `/v1/requests/{id}/retry` | 仅当终态 `failed` 且 `need_human=true`：doctor 探活后重试失败 Task（见下） |
 | `POST` | `/v1/requests/{id}/decisions/{decision_id}` | 由外部授权者回答决定 |
 | `POST` | `/v1/coordinator/tick` | 测试或诊断时手动推进一次 |
 
@@ -121,9 +122,54 @@ Windows 监督后端在 TeleAgent 重启 / 端口或凭据实例变化 / 会话�
    - `tasks[].result.need_human` / `tasks[].result.failure_reason` / `tasks[].result.error`
 2. `GET /v1/requests/{id}/events`：历史里 `finish_task` 在 need_human 时带 `need_human=true`、`failure_reason`、`event_kind=need_human`，可按这些字段检索。
 
-### decisions 缺口（文档化，本刀不接）
+### decisions 不能续跑终态 need_human
 
 `POST /v1/requests/{id}/decisions/{decision_id}` 只回答 **进行中** 工单的 TeleAgent 待决（permission / question 等，任务处于 `awaiting_decision`）。
 
-恢复失败是 **终态** `failed`：此时没有可续的 pending decision。人工修好环境后应 **重新提交** 新请求（或走计划修订 / reopen），不能用 decisions 把已失败 Goal「续跑」回来。
+恢复失败是 **终态** `failed`：此时没有可续的 pending decision，不能用 decisions 把已失败 Goal「续跑」回来。
+
+### 受控重试（failed + need_human）
+
+人工修好桌面 TeleAgent / 凭据后，调用方可以在 **同一 Goal id** 上重试，无需整单重提：
+
+```http
+POST /v1/requests/{id}/retry
+Content-Type: application/json
+
+{}
+```
+
+前置条件（任一不满足 → `409`）：
+
+1. Goal `state=failed`
+2. `need_human=true`（顶层 / `failure` / 失败 Task 的 `result`）
+3. 连接探活通过：对 GUI TeleAgent 端口（优先 **4399 / 4397 / 4398**）跑 doctor；**不默认** stdin_wrap。探活失败示例：
+
+```json
+{
+  "ok": false,
+  "code": "connection_not_ready",
+  "error": "connection not ready for retry: GUI TeleAgent credentials unavailable"
+}
+```
+
+非 need_human 的普通失败：
+
+```json
+{ "ok": false, "code": "not_need_human", "error": "retry only allowed when need_human=true" }
+```
+
+成功时优先 **resume/observe** 仍存活的 GUI session；否则只把 **失败 Task** 重新入队（`failed→queued`），Goal 回到 `queued`/`running`，预算与自治度不变，历史追加 `retry_task`，**不擦除** 既有 `finish_task` / need_human 事件。
+
+```json
+{
+  "ok": true,
+  "request_id": "<goal_id>",
+  "state": "running",
+  "task_id": "<failed_task_id>",
+  "mode": "redispatch"
+}
+```
+
+`mode` 可能为 `resume`（续观察原 run）或 `redispatch`（仅失败 Task 有界重派）。
 

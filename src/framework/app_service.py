@@ -18,13 +18,13 @@ from collections.abc import Mapping
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from urllib.parse import unquote, urlparse
 
 from execution_backend.base import ExecutionBackend
 from execution_backend.inprocess_v1 import InProcessExecutionBackend
 from framework.artifact_handoff import HandoffError, handoff_direct_dependency_artifacts
-from framework.need_human import goal_need_human_view
+from framework.need_human import goal_need_human_view, sanitize_reason
 from framework.durable_api import DurableLayer
 from lead_adapter.schema import context_summary_of, unwrap_structured
 
@@ -931,6 +931,42 @@ class AppCoordinator:
             }
 
 
+
+def probe_win_gui_connection(
+    *,
+    simulated: bool = False,
+    simulate_status: str | None = None,
+    port_open_fn: Callable[[str, int], bool] | None = None,
+    creds_presence_fn: Callable[[], Any] | None = None,
+) -> dict[str, Any]:
+    """Fail-closed doctor probe against desktop GUI TeleAgent ports (4399/4397/4398).
+
+    Never defaults to stdin_wrap. Uncertain / non-ok statuses are not success.
+    """
+    from teleagent_adapter.base import AdapterStatus
+    from teleagent_adapter.doctor import doctor
+
+    report = doctor(
+        base_url="http://127.0.0.1:4399",
+        platform="win32",
+        simulated=simulated,
+        simulate_status=simulate_status,
+        port_open_fn=port_open_fn,
+        creds_presence_fn=creds_presence_fn,
+    )
+    status = str(report.status or "")
+    ok = status == AdapterStatus.OK.value
+    detail = "; ".join(str(x) for x in (report.details or [])[:3])
+    reason = sanitize_reason(detail or status or "connection_not_ready")
+    return {
+        "ok": ok,
+        "status": status,
+        "reason": reason if not ok else "",
+        "base_url": report.base_url,
+        "simulated": bool(report.simulated),
+    }
+
+
 class CollabApplication:
     def __init__(
         self,
@@ -939,6 +975,7 @@ class CollabApplication:
         planner: GoalPlanner | None = None,
         backend: ExecutionBackend | None = None,
         coordinator_id: str = "app-coordinator",
+        connection_probe: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
         self.persist_root = Path(persist_root)
         self.layer = DurableLayer.open(self.persist_root, use_cache=False)
@@ -949,6 +986,7 @@ class CollabApplication:
             backend=backend,
             workspaces_root=self.persist_root / "workspaces",
         )
+        self._connection_probe = connection_probe
 
     def submit(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(payload, Mapping):
@@ -1098,6 +1136,168 @@ class CollabApplication:
             return effected
         return {**out, "backend_cancellations": cancelled_runs}
 
+
+    def _probe_connection(self) -> dict[str, Any]:
+        if self._connection_probe is not None:
+            raw = self._connection_probe()
+            if not isinstance(raw, Mapping):
+                return {"ok": False, "status": "invalid_probe", "reason": "connection probe returned non-object"}
+            ok = bool(raw.get("ok"))
+            status = str(raw.get("status") or ("ok" if ok else "not_ready"))
+            reason = sanitize_reason(str(raw.get("reason") or status))
+            # Fail-closed: only explicit ok=True counts.
+            ok_flag = bool(raw.get("ok")) is True
+            status_ok = (not status) or status == "ok"
+            ready = ok_flag and status_ok
+            return {"ok": ready, "status": status or ("ok" if ready else "not_ready"), "reason": reason if not ready else ""}
+        backend = self.coordinator.backend
+        backend_id = str(getattr(backend, "backend_id", "") or "")
+        # Non-TeleAgent backends (in-process fakes) need no GUI doctor.
+        if "teleagent" not in backend_id and "windows" not in backend_id:
+            return {"ok": True, "status": "ok", "reason": ""}
+        # Prefer GUI doctor; never invent stdin_wrap readiness here.
+        return probe_win_gui_connection()
+
+    def retry(self, goal_id: str, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Controlled retry for terminal failed+need_human after a human fix.
+
+        1) Gate: state=failed and need_human=true
+        2) Doctor/connection probe (GUI ports) — 409 if not ready
+        3) Prefer resume/observe when the prior run is still recoverable
+        4) Else requeue only the failed Task (keep Goal id / budget / history)
+        """
+        del payload  # reserved; body currently unused
+        current = self.layer.get_goal(goal_id)
+        if not current.get("ok"):
+            raise AppError(str(current.get("error") or "unknown request"), status=404, code="not_found")
+        snap = current.get("goal") if isinstance(current.get("goal"), Mapping) else {}
+        state = str(snap.get("state") or "")
+        tasks = snap.get("tasks") if isinstance(snap.get("tasks"), list) else []
+        failure = snap.get("failure") if isinstance(snap.get("failure"), Mapping) else None
+        nh_view = goal_need_human_view(failure=failure, tasks=tasks)
+        if state != "failed":
+            raise AppError(
+                f"retry only allowed for terminal failed requests (state={state!r})",
+                status=409,
+                code="retry_not_allowed",
+            )
+        if not nh_view.get("need_human"):
+            raise AppError(
+                "retry only allowed when need_human=true",
+                status=409,
+                code="not_need_human",
+            )
+
+        probe = self._probe_connection()
+        if not probe.get("ok"):
+            raise AppError(
+                f"connection not ready for retry: {probe.get('reason') or probe.get('status') or 'not_ready'}",
+                status=409,
+                code="connection_not_ready",
+            )
+
+        # Locate failed need_human task + prior run_id for possible resume.
+        preferred = str((failure or {}).get("task_id") or "")
+        target = None
+        for t in tasks:
+            if not isinstance(t, Mapping):
+                continue
+            if preferred and str(t.get("task_id") or "") == preferred:
+                target = t
+                break
+        if target is None:
+            for t in tasks:
+                if not isinstance(t, Mapping) or str(t.get("status") or "") != "failed":
+                    continue
+                result = t.get("result") if isinstance(t.get("result"), Mapping) else {}
+                if result.get("need_human") is True or str(result.get("error") or "").lower().startswith("need_human:"):
+                    target = t
+                    break
+        if target is None:
+            for t in tasks:
+                if isinstance(t, Mapping) and str(t.get("status") or "") == "failed":
+                    target = t
+                    break
+        prior_run = str((target or {}).get("run_id") or "").strip()
+
+        resume_mode = False
+        if prior_run:
+            observe = getattr(self.coordinator.backend, "observe_run", None)
+            if callable(observe):
+                try:
+                    observation = observe(prior_run)
+                except Exception:
+                    # Uncertain observe → do not treat as recoverable; fall through to redispatch.
+                    observation = None
+                if isinstance(observation, Mapping):
+                    busy = bool(observation.get("busy"))
+                    errored = bool(observation.get("errored"))
+                    still_nh = bool(observation.get("need_human"))
+                    # Recoverable: still-alive session (busy) and not a fresh need_human terminal.
+                    if busy and not still_nh and not errored:
+                        resume_mode = True
+
+        reopened = self.layer.retry_need_human(goal_id, resume=resume_mode)
+        if not reopened.get("ok"):
+            raise AppError(
+                str(reopened.get("error") or reopened.get("reason")),
+                status=409,
+                code=str(reopened.get("reason") or "retry_failed"),
+            )
+
+        mode = str(reopened.get("mode") or "redispatch")
+        tid = str(reopened.get("task_id") or "")
+        if mode == "resume" and tid and prior_run:
+            started = self.layer.start_task(goal_id, tid)
+            if not started.get("ok"):
+                raise AppError(
+                    str(started.get("error") or started.get("reason")),
+                    status=409,
+                    code=str(started.get("reason") or "resume_start_failed"),
+                )
+            # Ensure run binding survives start_task.
+            bound = self.layer.bind_task_run(
+                goal_id,
+                tid,
+                run_id=prior_run,
+                backend=str(getattr(self.coordinator.backend, "backend_id", "") or ""),
+            )
+            if not bound.get("ok"):
+                # start_task may have left run_id; non-fatal if already bound.
+                if bound.get("reason") != "run_binding_conflict":
+                    raise AppError(
+                        str(bound.get("error") or bound.get("reason")),
+                        status=409,
+                        code=str(bound.get("reason") or "resume_bind_failed"),
+                    )
+            tick = self.coordinator.process_goal(goal_id)
+            return {
+                "ok": True,
+                "api_version": API_VERSION,
+                "request_id": goal_id,
+                "goal_id": goal_id,
+                "state": (tick.get("state") or started.get("state") or "running"),
+                "task_id": tid,
+                "mode": "resume",
+                "action": tick.get("action") or "resumed",
+                "run_id": prior_run,
+            }
+
+        # Bounded redispatch: leave task queued; one coordinator tick starts it.
+        tick = self.coordinator.process_goal(goal_id)
+        st = self.layer.get_goal(goal_id).get("goal") or {}
+        return {
+            "ok": True,
+            "api_version": API_VERSION,
+            "request_id": goal_id,
+            "goal_id": goal_id,
+            "state": st.get("state") or tick.get("state") or "queued",
+            "task_id": tid,
+            "mode": "redispatch",
+            "action": tick.get("action") or "requeued",
+        }
+
+
     def resolve(self, goal_id: str, decision_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         current = self.layer.get_goal(goal_id)
         if not current.get("ok"):
@@ -1232,6 +1432,14 @@ class _Handler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[3] == "cancel" and self.command == "POST":
                 body = self._json_body()
                 self._send(200, self.app.cancel(gid, str(body.get("reason") or "")))
+                return
+            if len(parts) == 4 and parts[3] == "retry" and self.command == "POST":
+                try:
+                    length = int(self.headers.get("Content-Length", "0") or "0")
+                except ValueError:
+                    length = 0
+                body = self._json_body() if length > 0 else {}
+                self._send(200, self.app.retry(gid, body))
                 return
             if len(parts) == 5 and parts[3] == "decisions" and self.command == "POST":
                 self._send(200, self.app.resolve(gid, parts[4], self._json_body()))

@@ -66,4 +66,6 @@ When Win supervised fail-closed sets `need_human: …` on the job error, Goal HT
 - `GET /v1/requests/{id}` → `need_human`, `failure_reason`, and `failure.need_human`
 - `GET /v1/requests/{id}/events` → `finish_task` history rows with `event_kind=need_human`
 
-`POST …/decisions/{id}` cannot resume a terminal need_human failure; resubmit after the human fix.
+`POST …/decisions/{id}` cannot resume a terminal need_human failure.
+
+After the human fixes desktop TeleAgent / creds, callers use **`POST /v1/requests/{id}/retry`** (same Goal id): doctor probe against GUI ports 4399/4397/4398 (fail-closed; never default stdin_wrap). Prefer resume/observe a still-alive run; else requeue only the failed Task (`retry_task` history, prior need_human events kept). Non-need_human failures and probe-not-ready → HTTP 409.

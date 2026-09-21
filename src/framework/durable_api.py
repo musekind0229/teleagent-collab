@@ -61,7 +61,7 @@ from framework.lifecycle import (
     LifecycleError,
     assert_transition,
 )
-from framework.need_human import enrich_result_for_need_human, parse_need_human
+from framework.need_human import enrich_result_for_need_human, goal_need_human_view, parse_need_human
 from framework.models import CONTRACT_VERSION, contract_fingerprint, new_goal_id, new_task_id
 from framework.persist_lock import (
     StoreIncompatibleError,
@@ -95,6 +95,8 @@ REASON_ALREADY_TERMINAL = "already_terminal"
 REASON_NOT_CANCEL_REQUESTED = "not_cancel_requested"
 REASON_IDENTITY_MEMORY_FORBIDDEN = "identity_memory_forbidden"
 REASON_ILLEGAL_STATE = "illegal_state"
+REASON_NOT_NEED_HUMAN = "not_need_human"
+REASON_RETRY_NOT_ALLOWED = "retry_not_allowed"
 REASON_EMPTY_VERDICT = "empty_verdict"
 REASON_SUBMIT_CONTENT_CONFLICT = "submit_content_conflict"
 REASON_ACTOR_REQUIRED = "actor_required"
@@ -1489,6 +1491,126 @@ class DurableLayer:
                 "goal_id": gid,
                 "task": found,
                 "state": snap.get("state"),
+            }
+
+    def retry_need_human(
+        self,
+        goal_id: str,
+        *,
+        resume: bool = False,
+    ) -> dict[str, Any]:
+        """Explicit reopen after terminal failed+need_human.
+
+        Requeues only the failed need_human Task (failed -> queued) and the Goal
+        (failed -> queued). Appends ``retry_task`` history; does not wipe prior
+        ``finish_task`` / need_human events. Budget / autonomy / other tasks stay.
+        When ``resume`` is False the prior run_id is cleared so the coordinator
+        redispatches; when True the run_id is kept for observe-only resume.
+        """
+        gid = _norm_key(goal_id)
+        with self._rmw():
+            snap = self.goals.get(gid)
+            if snap is None:
+                return {"ok": False, "reason": REASON_UNKNOWN_GOAL, "error": f"unknown goal_id {gid!r}"}
+            state = _norm_key(snap.get("state") or "") or "queued"
+            if state != "failed":
+                return {
+                    "ok": False,
+                    "reason": REASON_RETRY_NOT_ALLOWED,
+                    "error": f"retry only allowed for terminal failed goals (state={state!r})",
+                    "state": state,
+                }
+            tasks = [dict(t) for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
+            nh_view = goal_need_human_view(
+                failure=snap.get("failure") if isinstance(snap.get("failure"), Mapping) else None,
+                tasks=tasks,
+            )
+            if not nh_view.get("need_human"):
+                return {
+                    "ok": False,
+                    "reason": REASON_NOT_NEED_HUMAN,
+                    "error": "retry only allowed when need_human=true",
+                    "state": state,
+                }
+            failure = snap.get("failure") if isinstance(snap.get("failure"), Mapping) else {}
+            preferred = _norm_key(failure.get("task_id") or "")
+            target = None
+            if preferred:
+                target = next((t for t in tasks if t.get("task_id") == preferred), None)
+            if target is None:
+                for t in tasks:
+                    if _norm_key(t.get("status")) != "failed":
+                        continue
+                    result = t.get("result") if isinstance(t.get("result"), Mapping) else {}
+                    if result.get("need_human") is True or parse_need_human(result.get("error")) is not None:
+                        target = t
+                        break
+            if target is None:
+                for t in tasks:
+                    if _norm_key(t.get("status")) == "failed":
+                        target = t
+                        break
+            if target is None:
+                return {
+                    "ok": False,
+                    "reason": REASON_RETRY_NOT_ALLOWED,
+                    "error": "no failed task to retry",
+                    "state": state,
+                }
+            tid = _norm_key(target.get("task_id"))
+            src = _norm_key(target.get("status") or "") or "queued"
+            if src != "queued":
+                try:
+                    assert_transition("task", src, "queued")
+                except LifecycleError as e:
+                    return {"ok": False, "reason": REASON_ILLEGAL_STATE, "error": str(e)}
+            prior_run = _norm_key(target.get("run_id") or "")
+            prior_reason = str(nh_view.get("failure_reason") or "")
+            target["status"] = "queued"
+            # Drop active need_human markers so status is clean; history keeps prior events.
+            if isinstance(target.get("result"), Mapping):
+                target["last_failure"] = {
+                    "need_human": bool((target.get("result") or {}).get("need_human")),
+                    "failure_reason": str(
+                        (target.get("result") or {}).get("failure_reason")
+                        or (target.get("result") or {}).get("error")
+                        or ""
+                    )[:300],
+                }
+            target["result"] = None
+            if resume and prior_run:
+                target["run_id"] = prior_run
+            else:
+                target.pop("run_id", None)
+                target.pop("native_handle", None)
+            snap["tasks"] = tasks
+            if "failure" in snap:
+                del snap["failure"]
+            try:
+                self._set_state(snap, "queued")
+            except DurableError as e:
+                return {"ok": False, "reason": REASON_ILLEGAL_STATE, "error": str(e)}
+            mode = "resume" if (resume and prior_run) else "redispatch"
+            self._append_history(
+                snap,
+                "retry_task",
+                task_id=tid,
+                mode=mode,
+                prior_run_id=prior_run if prior_run else "",
+                prior_failure_reason=prior_reason[:300],
+                event_kind="retry_task",
+            )
+            self._touch(snap)
+            self._persist_unlocked()
+            return {
+                "ok": True,
+                "reason": REASON_READY,
+                "goal_id": gid,
+                "task_id": tid,
+                "task": target,
+                "state": snap.get("state"),
+                "mode": mode,
+                "prior_run_id": prior_run,
             }
 
     def fail_goal(self, goal_id: str, *, phase: str, error: str) -> dict[str, Any]:
