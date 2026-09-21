@@ -110,24 +110,20 @@ Windows TeleAgent 后端已从新入口真实创建多个 session，证明入口
 
 ## need_human（Windows 监督恢复失败）
 
-Windows 监督后端在 TeleAgent 重启 / 端口或凭据实例变化 / 会话丢失 / 连续扫描失败时会 **fail-closed**：job 进入 ailed，error 以 
-eed_human: 开头（不含密钥）。
+Windows 监督后端在 TeleAgent 重启 / 端口或凭据实例变化 / 会话丢失 / 连续扫描失败时会 **fail-closed**：job 进入 `failed`，`error` 以 `need_human:` 开头（不含密钥）。
 
 调用方怎么看：
 
-1. GET /v1/requests/{id} 顶层：
-   - 
-eed_human: bool
-   - ailure_reason: 短原因摘要（已脱敏）
-   - ailure: 若为 need_human，含 
-eed_human / ailure_reason / phase=worker / 	ask_id
-   - 	asks[].result.need_human / 	asks[].result.failure_reason / 	asks[].result.error
-2. GET /v1/requests/{id}/events：历史里 inish_task 在 need_human 时带 
-eed_human=true、ailure_reason、event_kind=need_human，可按这些字段检索。
+1. `GET /v1/requests/{id}` 顶层：
+   - `need_human`: bool
+   - `failure_reason`: 短原因摘要（已脱敏）
+   - `failure`: 若为 need_human，含 `need_human` / `failure_reason` / `phase=worker` / `task_id`
+   - `tasks[].result.need_human` / `tasks[].result.failure_reason` / `tasks[].result.error`
+2. `GET /v1/requests/{id}/events`：历史里 `finish_task` 在 need_human 时带 `need_human=true`、`failure_reason`、`event_kind=need_human`，可按这些字段检索。
 
 ### decisions 缺口（文档化，本刀不接）
 
-POST /v1/requests/{id}/decisions/{decision_id} 只回答 **进行中** 工单的 TeleAgent 待决（permission / question 等，任务处于 waiting_decision）。
+`POST /v1/requests/{id}/decisions/{decision_id}` 只回答 **进行中** 工单的 TeleAgent 待决（permission / question 等，任务处于 `awaiting_decision`）。
 
-恢复失败是 **终态** ailed：此时没有可续的 pending decision。人工修好环境后应 **重新提交** 新请求（或走计划修订 / reopen），不能用 decisions 把已失败 Goal「续跑」回来。
+恢复失败是 **终态** `failed`：此时没有可续的 pending decision。人工修好环境后应 **重新提交** 新请求（或走计划修订 / reopen），不能用 decisions 把已失败 Goal「续跑」回来。
 

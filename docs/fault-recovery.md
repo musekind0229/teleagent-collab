@@ -61,11 +61,9 @@ GUI path (default `Client()` discovery; do not default to stdin_wrap). After Tel
 
 ## Goal API visibility (need_human)
 
-When Win supervised fail-closed sets 
-eed_human: … on the job error, Goal HTTP surfaces it as:
+When Win supervised fail-closed sets `need_human: …` on the job error, Goal HTTP surfaces it as:
 
-- GET /v1/requests/{id} → 
-eed_human, ailure_reason, and ailure.need_human
-- GET /v1/requests/{id}/events → inish_task history rows with event_kind=need_human
+- `GET /v1/requests/{id}` → `need_human`, `failure_reason`, and `failure.need_human`
+- `GET /v1/requests/{id}/events` → `finish_task` history rows with `event_kind=need_human`
 
-POST …/decisions/{id} cannot resume a terminal need_human failure; resubmit after the human fix.
+`POST …/decisions/{id}` cannot resume a terminal need_human failure; resubmit after the human fix.
