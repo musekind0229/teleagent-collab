@@ -36,21 +36,30 @@ python bin/collab-service.py --persist .collab-app --port 8765
 python bin/collab-service.py --persist .collab-app --port 8765 --planner grok
 ```
 
-启用完整的 Grok 组长和 Windows TeleAgent 工人桥接：
+## 推荐入口（桌面 GUI）
+
+生产与日常联调只走**已登录的桌面 TeleAgent**。先探活，再开服务；**不要**加 `--teleagent-stdin-wrap`。
 
 ```powershell
+python bin/collab-service.py --check-gui
+# 失败：先打开并登录桌面 TeleAgent，确认 doctor 绿（端口发现 4399/4397/4398，默认 :4397）
+
 python bin/collab-service.py --persist .collab-app --port 8765 `
   --planner grok --backend teleagent-windows
 ```
 
-如果 GUI TeleAgent 没有向当前进程暴露本地 API 凭据，可显式启用受控辅助内核。服务退出时会停止自己创建的辅助内核。该选项目前只验证了本地 API 和 session 派发；GUI 模型授权复用尚未通过实机验收，不能作为生产入口：
+也可用 `python -m win_collab doctor` 或 `.\windows\collab.ps1 doctor` 做同一探活。
+
+## 诊断专用：stdin-wrap（非生产）
+
+仅当显式排查「无 GUI 凭据」时才启用受控辅助内核。服务退出时会停止自己创建的辅助内核。该选项只验证了本地 API 和 session 派发；GUI 模型授权复用尚未通过实机验收，**不能作为生产入口**：
 
 ```powershell
 python bin/collab-service.py --persist .collab-app --port 8765 `
   --planner grok --backend teleagent-windows --teleagent-stdin-wrap
 ```
 
-启动时输出当前监听地址、规划器、工人后端和持久化目录。默认只监听 `127.0.0.1`。
+启动时输出当前监听地址、规划器、工人后端和持久化目录。默认只监听 `127.0.0.1`。启用 wrap 时 stderr 会打一条 diagnostic-only 警告。
 
 ## 提交请求
 

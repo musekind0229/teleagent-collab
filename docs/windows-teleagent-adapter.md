@@ -4,6 +4,8 @@
 > 不要把 unittest 绿灯当成 live Win TeleAgent 已通。
 > Live doctor / hello 由工坊在 **DESKTOP-TBB531F** 另验；未 live 前 `windows_live_verified=false`。
 
+> **生产入口**：已登录桌面 GUI（发现 4399/4397/4398，默认 :4397）。`auto` 在 GUI 端口已监听时不得改走 wrap；`TELEAGENT_WIN_CREDS_CHANNEL=stdin_wrap` / `--teleagent-stdin-wrap` 仅诊断。
+
 ## 工厂
 
 ```python

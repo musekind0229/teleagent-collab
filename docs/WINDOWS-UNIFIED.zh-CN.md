@@ -1,17 +1,32 @@
 # Windows 整合状态
 
-> 最新状态：2026-09-20 晚间，桌面 TeleAgent 2.5.2 的外部入口两步文件依赖任务已真实完成；见 [实机验收记录](WINDOWS-LIVE-20260920.zh-CN.md)。下文早期 401 记录针对 stdin-wrap 辅助路径，普通桌面路径请勿加该选项。
+> 最新状态：统一推荐入口 = **已登录桌面 GUI TeleAgent**（端口发现 **4399 / 4397 / 4398**，默认桌面 **:4397**）。`stdin_wrap` 仅诊断，不是生产路径。2026-09-20 晚间外部入口两步文件依赖任务已在桌面路径真实完成；见 [实机验收记录](WINDOWS-LIVE-20260920.zh-CN.md)。
 
 本分支以 Grok 上游公共框架为基线，合入 Codex 在 Windows TeleAgent 上真机验证过的监督控制器。目标是保留可复现的真实工人证据，同时逐步把能力接入公共 Goal / Task / Run 框架；当前不声称两条状态机已经完全合一。
 
-## 两条路径
+## 推荐操作入口（只推桌面 GUI）
+
+1. 打开并登录桌面 TeleAgent（不要为通单改走 stdin-wrap）。
+2. 探活：`python bin/collab-service.py --check-gui`（或 `python -m win_collab doctor` / `.\windows\collab.ps1 doctor`）。非绿则停，先修 GUI。
+3. 开应用入口（**不加** `--teleagent-stdin-wrap`）：
+
+```powershell
+python bin/collab-service.py --persist .collab-app --port 8765 `
+  --planner grok --backend teleagent-windows
+```
+
+4. HTTP 契约见 [`application-api.zh-CN.md`](application-api.zh-CN.md)。`failed+need_human` 后的受控重试同样只探 GUI 端口，不会默认 wrap。
+
+**陷阱（已折叠）**：示例里若仍出现 `--teleagent-stdin-wrap`，那是历史诊断配方；wrap 可建 session，但模型授权复用未闭环（401），不得当日常入口。`TELEAGENT_WIN_CREDS_CHANNEL=stdin_wrap` 等同强制 wrap，生产勿设。
+
+## 两条控制器路径（框架 vs win_collab，不是 GUI vs wrap）
 
 | 路径 | 入口 | 当前用途 |
 | --- | --- | --- |
 | 公共框架 | `src/framework/`、`src/execution_backend/`、`src/teleagent_adapter/` | Goal/Task/Run、预算、依赖、持久化决定、跨平台连接 |
 | Windows 监督控制器 | `windows/collab.ps1`、`win_collab/` | 已验证的派工、一次性审批、拒绝、返工、独立验收和两阶段 MSI 系统动作 |
 
-公共框架是后续主线。Windows 监督控制器暂作为兼容及实机验收通道，避免在公共 TeleAgent ExecutionBackend 尚未覆盖审批状态机前丢失已经跑通的能力。不要同时让两条控制器接管同一个 session 或工作目录。
+公共框架是后续主线。Windows 监督控制器暂作为兼容及实机验收通道，避免在公共 TeleAgent ExecutionBackend 尚未覆盖审批状态机前丢失已经跑通的能力。不要同时让两条控制器接管同一个 session 或工作目录。两条控制器底层工人都应接到**同一桌面 GUI**，而不是各起一个 wrap 内核。
 
 ## 本次整合保留和修正的能力
 
@@ -30,9 +45,9 @@
 
 ## 应用入口预览
 
-本分支新增 `bin/collab-service.py`，外部调用方只提交 Goal、边界和验收条件。框架内部再调用可插拔规划组长、生成 Task 依赖并派给 ExecutionBackend，因此永续层不需要知道具体组长或工人的接口。请求、任务、运行句柄、事件和报告均进入 durable store；入口只绑定本机 loopback，并支持 Bearer token。
+本分支新增 `bin/collab-service.py`，外部调用方只提交 Goal、边界和验收条件。框架内部再调用可插拔规划组长、生成 Task 依赖并派给 ExecutionBackend，因此永续层不需要知道具体组长或工人的接口。请求、任务、运行句柄、事件和报告均进入 durable store；入口只绑定本机 loopback，并支持 Bearer token。`--check-gui` 提供一键 GUI doctor，不启服务、不走 wrap。
 
-当前默认工人仍是确定性的 `inprocess.local_v1`。显式选择 `--backend teleagent-windows` 后，新入口会通过 `teleagent.windows.supervised_v1` 复用旧 Windows 控制器；Grok 组长可负责规划、普通权限和产物验收，Question 与系统动作继续上交外部 decision API。使用方法和 HTTP 契约见 [`application-api.zh-CN.md`](application-api.zh-CN.md)。
+当前默认工人仍是确定性的 `inprocess.local_v1`。显式选择 `--backend teleagent-windows` 后，新入口会通过 `teleagent.windows.supervised_v1` 复用旧 Windows 控制器（默认 `stdin_wrap=False`）；Grok 组长可负责规划、普通权限和产物验收，Question 与系统动作继续上交外部 decision API。使用方法和 HTTP 契约见 [`application-api.zh-CN.md`](application-api.zh-CN.md)。
 
 2026-09-20 实机验证中，真实 Grok 成功生成两项依赖计划；Windows TeleAgent 桥接真实创建 session，随后辅助内核的模型调用返回 `HTTP 401 / invalid token` 且无产物。控制器和 Goal 均正确记录失败，辅助 4401 内核在服务退出时关闭，GUI 内核保持独立运行。重新登录、发送 GUI 消息、按 LevelDB 当前记录读取 token 和去除 token 类型前缀均未解决问题；GUI 同期模型调用成功。当前阻塞是 GUI 主进程与模型内核之间尚无受支持的外部认证交接，而不是用户需要反复登录。
 

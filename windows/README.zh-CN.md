@@ -1,9 +1,9 @@
 # Windows 本地执行器（预览）
 
 从仓库根目录运行。Python 3.12+，运行时无需 pip 安装依赖。
-命令行入口 `windows/collab.ps1`；使用已安装并登录的 TeleAgent，控制器不会创建其他云账号。
+命令行入口 `windows/collab.ps1`；使用**已安装并登录的桌面 TeleAgent**（端口发现 4399/4397/4398，默认 :4397），控制器不会创建其他云账号，也**不要**为通单默认启用 stdin-wrap。
 
-本入口是从 Windows 真机验证分支合入的兼容通道；公共框架及当前版本差异见 [Windows 整合状态](../docs/WINDOWS-UNIFIED.zh-CN.md)。
+本入口是从 Windows 真机验证分支合入的兼容通道；统一推荐入口与双控制器边界见 [Windows 整合状态](../docs/WINDOWS-UNIFIED.zh-CN.md)。应用 Goal API 侧一键探活：`python bin/collab-service.py --check-gui`。
 
 ## 当前状态
 

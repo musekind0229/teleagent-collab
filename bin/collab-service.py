@@ -61,11 +61,49 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--teleagent-stdin-wrap",
         action="store_true",
-        help="spawn the controlled loopback TeleAgent kernel when GUI credentials are unavailable",
+        help=(
+            "DIAGNOSTIC ONLY: spawn controlled loopback TeleAgent kernel. "
+            "Not the production entry — prefer logged-in desktop GUI "
+            "(discover 4399/4397/4398; default desktop :4397). "
+            "Wrap model-auth reuse is not live-verified."
+        ),
+    )
+    parser.add_argument(
+        "--check-gui",
+        action="store_true",
+        help=(
+            "run fail-closed doctor against desktop GUI TeleAgent ports "
+            "(4399/4397/4398) and exit; does not start the HTTP service "
+            "and never uses stdin_wrap"
+        ),
     )
     parser.add_argument("--token-env", default="COLLAB_API_TOKEN")
     parser.add_argument("--once", action="store_true", help="process all queued Goals once and exit")
     args = parser.parse_args(argv)
+
+    if args.check_gui:
+        from framework.app_service import probe_win_gui_connection
+
+        result = probe_win_gui_connection()
+        print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+        return 0 if result.get("ok") else 1
+
+    if args.teleagent_stdin_wrap:
+        print(
+            json.dumps(
+                {
+                    "warning": (
+                        "teleagent-stdin-wrap is diagnostic-only; "
+                        "preferred entry is logged-in desktop GUI TeleAgent "
+                        "(ports 4399/4397/4398, default :4397). "
+                        "Do not use wrap for production."
+                    )
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
 
     persist = Path(args.persist).resolve()
     planner = _planner(args.planner, persist)

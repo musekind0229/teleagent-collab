@@ -60,16 +60,22 @@ python bin/collab-service.py --persist .collab-app --port 8765
 
 默认 in-process 工人用于验证协议和状态机，不代表 TeleAgent 真机闭环。请求格式和当前边界见 [`docs/application-api.zh-CN.md`](docs/application-api.zh-CN.md)。
 
-连接真实 Grok 规划组长和 Windows 监督控制器：
+连接真实 Grok 规划组长和 Windows 监督控制器时，**只推桌面 GUI TeleAgent**（已登录；端口发现 **4399 / 4397 / 4398**，默认桌面 **:4397**）。不要默认加 `--teleagent-stdin-wrap`。
 
 ```powershell
+# 一键探活（绿再开服务；失败则先开桌面 TeleAgent，勿改走 wrap）
+python bin/collab-service.py --check-gui
+# 或：python -m win_collab doctor
+
 python bin/collab-service.py --persist .collab-app --port 8765 `
-  --planner grok --backend teleagent-windows --teleagent-stdin-wrap
+  --planner grok --backend teleagent-windows
 ```
 
-普通权限与产物验收由 Grok 自动处理；Question、系统动作和组长失败会出现在 decision API。 普通桌面路径已通过两步真实文件依赖任务，见 [2026-09-20 实机验收](docs/WINDOWS-LIVE-20260920.zh-CN.md)；启动时不要加 `--teleagent-stdin-wrap`。`--teleagent-stdin-wrap` 当前是诊断兼容通道：实机已创建真实 TeleAgent session，但 GUI 模型授权复用仍返回 `HTTP 401 / invalid token`，该辅助路径尚未完成真实产物闭环。重新登录后发送消息不是规定步骤，也不能修复该问题。
+普通权限与产物验收由 Grok 自动处理；Question、系统动作和组长失败会出现在 decision API。普通桌面路径已通过两步真实文件依赖任务，见 [2026-09-20 实机验收](docs/WINDOWS-LIVE-20260920.zh-CN.md)。
 
-1. TeleAgent 桌面已登录，本地 worker 端口已监听（通常位于 `4397..4410`，以 `python -m win_collab doctor` 的结果为准）。
+`--teleagent-stdin-wrap` 仅诊断兼容：可建真实 session，但 GUI 模型授权复用仍会 `HTTP 401 / invalid token`，**未完成产物闭环，不是生产入口**。重新登录后发消息不是规定步骤，也不能修复该问题。
+
+1. TeleAgent 桌面已登录，本地 worker 端口已监听（发现顺序 4399→4397→4398，以 `python bin/collab-service.py --check-gui` / `python -m win_collab doctor` 为准）。
 2. 安装并登录可插拔组长（默认 Grok Build CLI）。
 3. 设置环境变量后跑胶水：
 
