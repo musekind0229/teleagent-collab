@@ -147,6 +147,9 @@ def worker_charter_for_task(
 
 MAX_LEAD_ATTEMPTS_PER_DECISION = 2
 AUTO_RESOLVE_BACKEND_KINDS = frozenset({"permission", "review"})
+# Permission / question / review surface through Goal decision API.
+# system_action stays on the worker inbox until a dedicated knife; never project it.
+PROJECTABLE_BACKEND_KINDS = frozenset({"permission", "question", "review"})
 _NONRETRYABLE_LEAD_MARKERS = (
     "quota",
     "rate limit",
@@ -662,7 +665,26 @@ class AppCoordinator:
                     result={"ok": False, "run_id": run_id, "error": pending_error or "pending action scan failed"},
                 )
             if pending:
-                action = pending[0] if isinstance(pending[0], Mapping) else {}
+                action: Mapping[str, Any] = {}
+                for candidate in pending:
+                    if not isinstance(candidate, Mapping):
+                        continue
+                    kind = str(candidate.get("kind") or "").strip()
+                    if kind in PROJECTABLE_BACKEND_KINDS:
+                        action = candidate
+                        break
+                if not action:
+                    return {
+                        "ok": True,
+                        "goal_id": goal_id,
+                        "state": "running",
+                        "action": "backend_gate_unprojected",
+                        "pending_kinds": [
+                            str(row.get("kind") or "")
+                            for row in pending
+                            if isinstance(row, Mapping)
+                        ],
+                    }
                 request_id = str(action.get("request_id") or "").strip()
                 if not request_id:
                     return self.layer.finish_task(
@@ -676,8 +698,7 @@ class AppCoordinator:
                     "permission": "action_approval",
                     "question": "question",
                     "review": "artifact_review",
-                    "system_action": "action_approval",
-                }.get(backend_kind, "action_approval")
+                }[backend_kind]
                 decision_id = f"dec_{hashlib.sha256(request_id.encode('utf-8')).hexdigest()[:12]}"
                 opened = self.layer.open_decision(
                     goal_id,

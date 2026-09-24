@@ -15,7 +15,7 @@
 
 v0.1 已提供真实的请求、防重、持久化、规划、任务依赖、派发、异步 Run 恢复、取消、决定回传、事件和报告接口。服务仅允许绑定 loopback；配置 `COLLAB_API_TOKEN` 后，除健康检查外都要求 Bearer token。
 
-默认组合是 `deterministic` 规划器和 `inprocess.local_v1` 工人。它用于验证入口与状态机，会按验收清单生成占位产物，不会完成真实开发任务。`--planner grok` 让 Grok 生成任务图；`--backend teleagent-windows` 把任务交给原 Windows 监督控制器。两者同时启用时，Grok 还会自动处理普通 permission 和 artifact review；Question、系统动作或组长调用失败仍进入外部 decision 接口。
+默认挂载 `deterministic` 规划器与 `inprocess.local_v1` 后端。适合验证编排与状态机；会按验收清单写出占位产物，不会调用真实外部工具。`--planner grok` 让 Grok 担任规划组长；`--backend teleagent-windows` 把任务交给原 Windows 监督后端。二者同时启用时：Grok 组长可自动处理普通 permission 与 artifact review；Question 一律经外部 decision API 回传；system_action 本刀不投影到公共 decision（留在监督后端收件箱，待专刀），协调器不会把 system_action 交给组长或外部 decision 越权批准。
 
 Windows 后端保留旧控制器的 session 级 `ask`、请求去重、同 session 恢复、独立产物验收、取消确认和不确定派发不重放。控制器继续使用自己的纯 ASCII UUID 工作区，避免含中文的 Goal ID 进入 TeleAgent HTTP 头。
 
@@ -116,7 +116,7 @@ Windows TeleAgent 后端已从新入口真实创建多个 session，证明入口
 
 同一时间 GUI 自己的 `NewApi/chat-lite` 与 `chat-pro` 调用成功，说明账号和模型可用。剩余差异位于 GUI 主进程向模型内核交接认证状态的私有流程。GUI 内核的本地 API 密钥通过 stdin 注入，不存在于子进程环境；GUI 以管理员权限运行而入口进程为普通权限时，进程检查还会得到 Windows `Access denied (5)`。生产方案需要 TeleAgent 提供受支持的本地 broker/凭据交接接口，或让入口直接运行在能够取得该接口的同一可信宿主中。完成该项后仍需重跑普通文件任务，才可宣布真实交付闭环通过。
 
-后续还需把 Question 的自动处理策略和两阶段系统动作投影成更专门的公共类型；当前两者会留给外部 decision API，避免组长越权处理。
+permission / question 经 `POST /v1/requests/{id}/decisions/{decision_id}` 回传到监督后端；Question 永不由组长自动代答。system_action 暂不投影（`backend_gate_unprojected`），待后续专刀。
 
 ## need_human（Windows 监督恢复失败）
 
