@@ -6,7 +6,7 @@ import time
 import unittest
 
 from desktop_lock_isolation import install_desktop_lock_isolation
-from win_collab.core import SCAN_ERROR_LIMIT, TERMINAL, Engine, Store
+from win_collab.core import SCAN_ERROR_LIMIT, SESSION_STATUS_GRACE_S, TERMINAL, Engine, Store
 
 
 class FakeClient:
@@ -90,7 +90,10 @@ class TestInFlightRecovery(unittest.TestCase):
         self.assertFalse(any(p == "/session" and m == "POST" for m, p, _ in client.calls))
 
     def test_missing_session_fails_need_human_no_redispatch(self):
-        _running_job(self.store, session_id="sess-gone")
+        job = _running_job(self.store, session_id="sess-gone")
+        job["dispatched_at"] = time.time() - (SESSION_STATUS_GRACE_S + 1)
+        with self.store.transaction():
+            self.store.save(job)
         client = FakeClient()
         client.routes[("GET", "/permission")] = []
         client.routes[("GET", "/question")] = []
@@ -99,7 +102,65 @@ class TestInFlightRecovery(unittest.TestCase):
         job = self.store.get("jobdeadbeef01")
         self.assertEqual(job["state"], "failed")
         self.assertIn("need_human", job["error"])
-        self.assertIn("session lost", job["error"])
+        self.assertIn("session missing from status", job["error"])
+        self.assertIn(f"after {SESSION_STATUS_GRACE_S:g}s grace", job["error"])
+        self.assertIn("scans=1", job["error"])
+        self.assertIn("refusing silent redispatch", job["error"])
+        self.assertNotIn("restart", job["error"].lower())
+        self.assertIsNone(job.get("session_id"))
+        self.assertFalse(any(p == "/session" and m == "POST" for m, p, _ in client.calls))
+
+    def test_just_started_missing_session_within_grace_stays_running(self):
+        job = _running_job(self.store, session_id="sess-new")
+        job["dispatched_at"] = time.time()
+        with self.store.transaction():
+            self.store.save(job)
+        client = FakeClient()
+        client.routes[("GET", "/permission")] = []
+        client.routes[("GET", "/question")] = []
+        client.routes[("GET", "/session/status")] = {}
+        started = time.time()
+        Engine(self.store, client).tick()
+        job = self.store.get("jobdeadbeef01")
+        self.assertEqual(job["state"], "running")
+        self.assertEqual(job.get("session_id"), "sess-new")
+        self.assertNotIn(job["state"], TERMINAL)
+        self.assertFalse(job.get("error"))
+        self.assertGreater(job["next_scan"], started)
+        self.assertLess(job["next_scan"] - started, 3)
+        self.assertFalse(any(p == "/session" and m == "POST" for m, p, _ in client.calls))
+        self.assertFalse(any(str(p).endswith("/abort") for _, p, _ in client.calls))
+
+    def test_missing_session_within_grace_falls_back_to_created_at(self):
+        _running_job(self.store, session_id="sess-new")
+        client = FakeClient()
+        client.routes[("GET", "/permission")] = []
+        client.routes[("GET", "/question")] = []
+        client.routes[("GET", "/session/status")] = {}
+        Engine(self.store, client).tick()
+        job = self.store.get("jobdeadbeef01")
+        self.assertEqual(job["state"], "running")
+        self.assertEqual(job.get("session_id"), "sess-new")
+        self.assertFalse(job.get("error"))
+        self.assertFalse(any(p == "/session" and m == "POST" for m, p, _ in client.calls))
+
+    def test_deleted_session_fails_immediately_inside_grace(self):
+        job = _running_job(self.store, session_id="sess-gone")
+        job["dispatched_at"] = time.time()
+        with self.store.transaction():
+            self.store.save(job)
+        client = FakeClient()
+        client.routes[("GET", "/permission")] = []
+        client.routes[("GET", "/question")] = []
+        client.routes[("GET", "/session/status")] = {"deleted-session-ids": ["sess-gone"]}
+        Engine(self.store, client).tick()
+        job = self.store.get("jobdeadbeef01")
+        self.assertEqual(job["state"], "failed")
+        self.assertIn("need_human", job["error"])
+        self.assertIn("session missing from status deleted", job["error"])
+        self.assertIn("refusing silent redispatch", job["error"])
+        self.assertNotIn("grace", job["error"])
+        self.assertNotIn("restart", job["error"].lower())
         self.assertIsNone(job.get("session_id"))
         self.assertFalse(any(p == "/session" and m == "POST" for m, p, _ in client.calls))
 

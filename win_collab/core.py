@@ -39,6 +39,7 @@ from .desktop_lock import (
 
 TERMINAL = {'passed', 'failed', 'cancelled', 'timed_out'}
 SCAN_ERROR_LIMIT = 3  # consecutive scan failures -> need_human fail-closed
+SESSION_STATUS_GRACE_S = 5  # create can return before the new sid appears in GET /session/status
 DEFAULT_COLLAB_MAX_WALL_S = 14400  # 4 hours since dispatch
 DEFAULT_COLLAB_MAX_STEPS = 400  # assistant messages in the scanned transcript
 COLLAB_WALL_S_CEILING = 7 * 24 * 3600
@@ -141,6 +142,39 @@ def dispatch_started_at(job):
         return float(deadline) - float(timeout)
     except (TypeError, ValueError):
         return None
+
+
+def session_status_anchor(job):
+    """Unix time for the create-vs-status grace window.
+
+    Prefers ``dispatched_at``. Falls back to ``created_at``.
+    """
+    if not isinstance(job, dict):
+        return None
+    for key in ('dispatched_at', 'created_at'):
+        raw = job.get(key)
+        if raw is None:
+            continue
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def session_explicitly_gone(sid, statuses):
+    """True when status already lists this sid as deleted or gone."""
+    if not isinstance(statuses, dict):
+        return False
+    deleted = statuses.get('deleted-session-ids')
+    if isinstance(deleted, (list, tuple, set)) and str(sid) in {str(item) for item in deleted}:
+        return True
+    info = statuses.get(sid)
+    if isinstance(info, dict) and (
+        info.get('gone') or info.get('deleted') or info.get('type') in ('gone', 'deleted')
+    ):
+        return True
+    return False
 
 
 def confirmed_owned_session_id(job, stored_jobs, *, backend, backend_id):
@@ -818,6 +852,8 @@ class Engine:
                             job['state'] = 'running'
                             if not job.get('dispatched_at'):
                                 job['dispatched_at'] = time.time()
+                            # First status read often races the create; wait out the grace window.
+                            job['next_scan'] = time.time() + SESSION_STATUS_GRACE_S
                             self.store.event(job, 'started', {'session_id': job['session_id']})
                             active += 1
                     except Exception as error:
@@ -865,7 +901,9 @@ class Engine:
                             job,
                             f'repeated scan failures ({type(error).__name__}): {error}',
                         )
-                job['next_scan'] = time.time() + (2 if job['state'] == 'running' else 3)
+                # A grace miss schedules a short retry; do not overwrite that with the normal cadence.
+                if time.time() >= (job.get('next_scan') or 0):
+                    job['next_scan'] = time.time() + (2 if job['state'] == 'running' else 3)
                 self.store.save(job)
         self._release_desktop_if_idle(jobs)
         return self.summary()
@@ -917,13 +955,27 @@ class Engine:
         statuses = self.api(job, 'GET', '/session/status')
         if not isinstance(statuses, dict):
             raise RuntimeError('Invalid session status response')
-        if sid not in statuses:
-            # Missing session after TeleAgent restart: fail-closed, do not invent idle.
-            # Drop session_id so stop() does not attempt abort against a dead instance.
+        if session_explicitly_gone(sid, statuses):
+            # Deleted or gone is a real disappearance: do not wait out the create race.
             job['session_id'] = None
             self.fail_need_human(
                 job,
-                'session lost after TeleAgent restart; refusing silent redispatch',
+                'session missing from status deleted; refusing silent redispatch',
+            )
+            return
+        if sid not in statuses:
+            # Absent from the status map. A just-created sid can lag the create response.
+            # Drop session_id only once grace has passed, so stop() does not abort a live session.
+            anchor = session_status_anchor(job)
+            if anchor is not None and time.time() - anchor < SESSION_STATUS_GRACE_S:
+                job['state'] = 'running'
+                job['next_scan'] = time.time() + 1
+                return
+            job['session_id'] = None
+            self.fail_need_human(
+                job,
+                'session missing from status after '
+                f'{SESSION_STATUS_GRACE_S:g}s grace, scans={job["scans"]}; refusing silent redispatch',
             )
             return
         state = (statuses.get(sid) or {}).get('type', 'idle')
