@@ -17,6 +17,13 @@ import time
 import uuid
 from pathlib import Path, PureWindowsPath
 
+from .desktop_lock import (
+    DESKTOP_SESSION_BUSY,
+    claim_desktop,
+    foreign_desktop_busy,
+    release_desktop_if_idle,
+)
+
 TERMINAL = {'passed', 'failed', 'cancelled', 'timed_out'}
 SCAN_ERROR_LIMIT = 3  # consecutive scan failures -> need_human fail-closed
 REPO = Path(__file__).resolve().parents[1]
@@ -547,6 +554,26 @@ class Engine:
             return False
         return True
 
+    def _desktop_blocked(self, job, jobs):
+        """Fail closed before POST /session. Never abort or steal a foreign session."""
+        base = getattr(self.client, 'base', None)
+        if not base or not claim_desktop(base, self.store.home):
+            self.fail_need_human(job, DESKTOP_SESSION_BUSY)
+            return True
+        statuses = self.api(job, 'GET', '/session/status')
+        owned = [item.get('session_id') for item in jobs if item.get('session_id')]
+        if foreign_desktop_busy(statuses, owned):
+            self.fail_need_human(job, DESKTOP_SESSION_BUSY)
+            return True
+        return False
+
+    def _release_desktop_if_idle(self, jobs):
+        client = self.client
+        base = getattr(client, 'base', None) if client is not None else None
+        if not base:
+            return
+        release_desktop_if_idle(base, self.store.home, jobs, TERMINAL)
+
     def tick(self):
         """One bounded cycle. Durable errors cannot be confused with idle/success."""
         with self.store.transaction():
@@ -563,23 +590,26 @@ class Engine:
                         job['deadline'] = time.time() + job['charter'].get('timeout_sec', 900)
                         job['backend'] = self.client.base
                         job['backend_id'] = getattr(self.client, 'instance_id', self.client.base)
-                        self.start_journal(job, {'stage':'creating', 'run_id':job['run_id']})
-                        # This is session-local policy, not global auto-approval.
-                        created = self.api(job, 'POST', '/session', {'title': 'codex-collab-' + job['id'][:8],
-                              'directory': job['workspace'],
-                              'permission': [{'permission': '*', 'pattern': '*', 'action': 'ask'}]})
-                        if not isinstance(created, dict) or not created.get('id'):
-                            raise RuntimeError('Invalid create-session response')
-                        job['session_id'] = created['id']
-                        self.start_journal(job, {'stage':'created', 'run_id':job['run_id'], 'session_id':job['session_id']})
-                        # Require server to acknowledge the requested session policy.
-                        if created.get('permission') != [{'permission': '*', 'pattern': '*', 'action': 'ask'}]:
-                            raise RuntimeError('Server did not acknowledge session-local ask policy')
-                        self.start_journal(job, {'stage':'prompt_issued', 'run_id':job['run_id'], 'session_id':job['session_id']})
-                        self.api(job, 'POST', f'/session/{job["session_id"]}/prompt_async', self.prompt(job))
-                        job['state'] = 'running'
-                        self.store.event(job, 'started', {'session_id': job['session_id']})
-                        active += 1
+                        # Occupancy before the creating journal: a refused desktop must not
+                        # look like an ambiguous POST /session.
+                        if not self._desktop_blocked(job, jobs):
+                            self.start_journal(job, {'stage':'creating', 'run_id':job['run_id']})
+                            # This is session-local policy, not global auto-approval.
+                            created = self.api(job, 'POST', '/session', {'title': 'codex-collab-' + job['id'][:8],
+                                  'directory': job['workspace'],
+                                  'permission': [{'permission': '*', 'pattern': '*', 'action': 'ask'}]})
+                            if not isinstance(created, dict) or not created.get('id'):
+                                raise RuntimeError('Invalid create-session response')
+                            job['session_id'] = created['id']
+                            self.start_journal(job, {'stage':'created', 'run_id':job['run_id'], 'session_id':job['session_id']})
+                            # Require server to acknowledge the requested session policy.
+                            if created.get('permission') != [{'permission': '*', 'pattern': '*', 'action': 'ask'}]:
+                                raise RuntimeError('Server did not acknowledge session-local ask policy')
+                            self.start_journal(job, {'stage':'prompt_issued', 'run_id':job['run_id'], 'session_id':job['session_id']})
+                            self.api(job, 'POST', f'/session/{job["session_id"]}/prompt_async', self.prompt(job))
+                            job['state'] = 'running'
+                            self.store.event(job, 'started', {'session_id': job['session_id']})
+                            active += 1
                     except Exception as error:
                         self.stop(job, 'failed', str(error))
                     self.store.save(job)
@@ -623,6 +653,7 @@ class Engine:
                         )
                 job['next_scan'] = time.time() + (2 if job['state'] == 'running' else 3)
                 self.store.save(job)
+        self._release_desktop_if_idle(jobs)
         return self.summary()
 
     def scan(self, job):

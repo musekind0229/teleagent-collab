@@ -122,7 +122,7 @@ permission / question / system_action 经 `POST /v1/requests/{id}/decisions/{dec
 
 ## need_human（Windows 监督恢复失败）
 
-Windows 监督后端在 TeleAgent 重启 / 端口或凭据实例变化 / 会话丢失 / 连续扫描失败时会 **fail-closed**：job 进入 `failed`，`error` 以 `need_human:` 开头（不含密钥）。
+Windows 监督后端在 TeleAgent 重启 / 端口或凭据实例变化 / 会话丢失 / 连续扫描失败 / 桌面 GUI 已被其他控制器占用（`desktop_session_busy`）时会 **fail-closed**：job 进入 `failed`，`error` 以 `need_human:` 开头（不含密钥）。
 
 调用方怎么看：
 

@@ -26,7 +26,7 @@ python bin/collab-service.py --persist .collab-app --port 8765 `
 | 公共框架 | `src/framework/`、`src/execution_backend/`、`src/teleagent_adapter/` | Goal/Task/Run、预算、依赖、持久化决定、跨平台连接 |
 | Windows 监督控制器 | `windows/collab.ps1`、`win_collab/` | 已验证的派工、一次性审批、拒绝、返工、独立验收和两阶段 MSI 系统动作 |
 
-公共框架是后续主线。Windows 监督控制器暂作为兼容及实机验收通道，避免在公共 TeleAgent ExecutionBackend 尚未覆盖审批状态机前丢失已经跑通的能力。不要同时让两条控制器接管同一个 session 或工作目录。两条控制器底层工人都应接到**同一桌面 GUI**，而不是各起一个 wrap 内核。
+公共框架是后续主线。Windows 监督控制器暂作为兼容及实机验收通道，避免在公共 TeleAgent ExecutionBackend 尚未覆盖审批状态机前丢失已经跑通的能力。不要同时让两条控制器接管同一个 session 或工作目录。两条控制器底层工人都应接到**同一桌面 GUI**，而不是各起一个 wrap 内核。同一 GUI 的派工有本机独占锁：锁被其他控制器持有，或 `/session/status` 中存在非本控制器的非 idle session 时，fail-closed 为 `need_human: desktop_session_busy`（不 POST 新 session，也不中止对方工人）。
 
 ## 本次整合保留和修正的能力
 

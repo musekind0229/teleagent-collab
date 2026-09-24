@@ -186,15 +186,21 @@ class WindowsSupervisedExecutionBackend(ExecutionBackendABC):
             engine.tick()
             job = store.get(job["id"])
             failed = job.get("state") in {"failed", "timed_out"}
-            return {
+            err = job.get("error") or ""
+            nh = _need_human_fields(err)
+            out = {
                 "ok": not failed,
                 "backend": self.backend_id,
                 "run_id": job["id"],
                 "native_handle": job.get("session_id") or job["id"],
                 "state": job.get("state"),
-                "error": job.get("error") or "",
+                "error": err,
                 "contract_version": "contract.v0.1-draft",
             }
+            if nh.get("need_human"):
+                out["need_human"] = True
+                out["failure_reason"] = nh.get("failure_reason") or ""
+            return out
 
     def observe_run(
         self,
