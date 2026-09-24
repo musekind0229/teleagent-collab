@@ -99,7 +99,7 @@ $opened
 | `POST` | `/v1/requests` | 提交高层目标 |
 | `GET` | `/v1/requests` | 列出请求摘要 |
 | `GET` | `/v1/requests/{id}` | 查询 Goal、Task、待决定和失败信息 |
-| `GET` | `/v1/requests/{id}/events` | 查询持久化事件 |
+| `GET` | `/v1/requests/{id}/events` | 查询持久化事件 |（与 status 对齐露出 pending_decisions）
 | `GET` | `/v1/requests/{id}/report` | 获取交付报告 |
 | `POST` | `/v1/requests/{id}/cancel` | 请求取消，body 如 `{"reason":"用户取消"}` |
 | `POST` | `/v1/requests/{id}/retry` | 仅当终态 `failed` 且 `need_human=true`：doctor 探活后重试失败 Task（见下） |
@@ -129,7 +129,7 @@ Windows 监督后端在 TeleAgent 重启 / 端口或凭据实例变化 / 会话�
    - `failure_reason`: 短原因摘要（已脱敏）
    - `failure`: 若为 need_human，含 `need_human` / `failure_reason` / `phase=worker` / `task_id`
    - `tasks[].result.need_human` / `tasks[].result.failure_reason` / `tasks[].result.error`
-2. `GET /v1/requests/{id}/events`：历史里 `finish_task` 在 need_human 时带 `need_human=true`、`failure_reason`、`event_kind=need_human`，可按这些字段检索。
+2. `GET /v1/requests/{id}/events`：历史里 `finish_task` 在 need_human 时带 `need_human=true`、`failure_reason`、`event_kind=need_human`，可按这些字段检索。（与 status 对齐露出 pending_decisions）
 
 ### decisions 不能续跑终态 need_human
 

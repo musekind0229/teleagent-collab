@@ -989,6 +989,31 @@ def probe_win_gui_connection(
     }
 
 
+
+def public_pending_decisions(rows: Any) -> list[dict[str, Any]]:
+    """Stable public shape for status/events: kind includes system_action_approval."""
+    out: list[dict[str, Any]] = []
+    for row in rows or []:
+        if not isinstance(row, Mapping):
+            continue
+        details = row.get("details") if isinstance(row.get("details"), Mapping) else {}
+        out.append(
+            {
+                "decision_id": str(row.get("decision_id") or ""),
+                "request_id": str(row.get("request_id") or ""),
+                "kind": str(row.get("kind") or ""),
+                "title": str(row.get("title") or ""),
+                "task_id": str(row.get("task_id") or ""),
+                "run_id": str(row.get("run_id") or ""),
+                "status": str(row.get("status") or ""),
+                "backend_kind": str(details.get("backend_kind") or ""),
+                "backend_request_id": str(details.get("backend_request_id") or ""),
+                "details": dict(details),
+            }
+        )
+    return out
+
+
 class CollabApplication:
     def __init__(
         self,
@@ -1082,6 +1107,7 @@ class CollabApplication:
             failure=failure if isinstance(failure, Mapping) else None,
             tasks=tasks if isinstance(tasks, list) else [],
         )
+        pending = public_pending_decisions(snap.get("pending_decisions") or [])
         out = {
             "ok": True,
             "api_version": API_VERSION,
@@ -1089,7 +1115,9 @@ class CollabApplication:
             "state": snap.get("state"),
             "goal": snap.get("goal"),
             "tasks": tasks,
-            "pending_decisions": snap.get("pending_decisions") or [],
+            "pending_decisions": pending,
+            "pending_decision_count": len(pending),
+            "awaiting_decision": bool(pending),
             "failure": failure,
             "need_human": bool(nh_view.get("need_human")),
             "failure_reason": nh_view.get("failure_reason") or "",
@@ -1105,7 +1133,14 @@ class CollabApplication:
         out = self.layer.list_events(goal_id)
         if not out.get("ok"):
             raise AppError(str(out.get("error")), status=404, code="not_found")
-        return out
+        pending = public_pending_decisions(out.get("pending") or out.get("pending_decisions") or [])
+        return {
+            **out,
+            "pending": pending,
+            "pending_decisions": pending,
+            "pending_decision_count": len(pending),
+            "awaiting_decision": bool(pending),
+        }
 
     def report(self, goal_id: str) -> dict[str, Any]:
         out = self.layer.get_report(goal_id)

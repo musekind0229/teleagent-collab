@@ -293,5 +293,32 @@ class DecisionApiHandoffTests(unittest.TestCase):
         self.assertEqual(pending, [])
 
 
+    def test_status_and_events_expose_pending_decisions(self):
+        app, backend, gid = self._boot()
+        run_id = self._ensure_run(app, gid)
+        backend.pending.append(
+            {
+                "request_id": "sys_vis",
+                "kind": "system_action",
+                "run_id": run_id,
+                "context_hash": "hv",
+                "payload": {"proposal": "msi"},
+            }
+        )
+        self._drive_until_decision(app, gid)
+        st = app.status(gid)
+        self.assertTrue(st.get("awaiting_decision"), st)
+        self.assertEqual(st.get("pending_decision_count"), 1)
+        row = (st.get("pending_decisions") or [])[0]
+        self.assertEqual(row.get("kind"), "system_action_approval")
+        self.assertEqual(row.get("backend_kind"), "system_action")
+        self.assertEqual(row.get("backend_request_id"), "sys_vis")
+        ev = app.events(gid)
+        self.assertTrue(ev.get("awaiting_decision"), ev)
+        self.assertEqual(ev.get("pending_decision_count"), 1)
+        self.assertEqual((ev.get("pending_decisions") or [])[0].get("kind"), "system_action_approval")
+        self.assertEqual((ev.get("pending") or [])[0].get("backend_kind"), "system_action")
+
+
 if __name__ == "__main__":
     unittest.main()
