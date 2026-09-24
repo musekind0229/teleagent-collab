@@ -1,10 +1,21 @@
 {
   "name": "windows-hello",
-  "goal": "Create hello.txt containing exactly Hello from TeleAgent on Windows! followed by a newline.",
-  "must": ["Create only hello.txt in the assigned workspace", "Use a file-writing tool; do not run a shell"],
-  "must_not": ["Access other directories", "Use the network", "Read credentials or change settings"],
+  "goal": "Create hello.txt whose entire contents are exactly Hello from TeleAgent on Windows! followed by a single newline (U+000A). Write that listed artifact only with a shell redirect (PowerShell Set-Content -NoNewline, cmd echo, or printf). Shell and PowerShell are allowed only for that redirect write. TeleAgent Write/AIGC injects ZWSP/ZWJ and the 「AI生成」 watermark even when the tool arguments are the clean line; a shell redirect avoids that post-process so exact-byte review can pass.",
+  "must": [
+    "Create only hello.txt in the assigned workspace",
+    "Write the listed artifact only via a shell redirect such as PowerShell Set-Content -NoNewline -Encoding ascii of the exact line plus one `n, cmd echo only when the bytes stay LF-only, or a printf redirect (printf 'Hello from TeleAgent on Windows!\\n' > hello.txt). Shell and PowerShell are allowed only for that redirect write of the listed artifact.",
+    "Do not use the TeleAgent write tool or Edit. TeleAgent Write/AIGC injects ZWSP (U+200B) and ZWJ (U+200D) plus the 「AI生成」 watermark onto disk even when the tool arguments are clean; a shell redirect skips that post-process."
+  ],
+  "must_not": [
+    "Access other directories",
+    "Use the network",
+    "Read credentials or change settings",
+    "Use the TeleAgent write tool or Edit on hello.txt",
+    "Use shell or PowerShell for anything other than the redirect write of hello.txt"
+  ],
+  "forbidden_tools": ["write"],
   "artifacts": ["hello.txt"],
-  "acceptance": "The lead independently reads hello.txt and verifies the exact line. A file merely existing is insufficient.",
+  "acceptance": "The lead independently reads hello.txt and verifies the exact line. A file merely existing is insufficient. Pass only when the bytes are exactly Hello from TeleAgent on Windows! followed by a single U+000A newline, with no BOM, CR, ZWSP, ZWJ, or AIGC watermark.",
   "timeout_sec": 600,
   "max_lead_requests": 8,
   "max_redos": 1
