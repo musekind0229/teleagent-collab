@@ -47,6 +47,31 @@ GOAL_SCHEMA = json.loads(
 )
 
 
+def _task_finish_events(events_payload, task_id: str = "") -> list:
+    """History rows that record one task finish (``finish_task`` / ``task_finished``)."""
+    rows = []
+    if isinstance(events_payload, dict):
+        rows = events_payload.get("events") or []
+    elif isinstance(events_payload, list):
+        rows = events_payload
+    hits = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        markers = {
+            str(row.get("action") or ""),
+            str(row.get("op") or ""),
+            str(row.get("event_kind") or ""),
+        }
+        if "task_finished" not in markers and "finish_task" not in markers:
+            continue
+        row_task = str(row.get("task_id") or "")
+        if task_id and row_task and row_task != task_id:
+            continue
+        hits.append(row)
+    return hits
+
+
 def _request() -> dict:
     return {
         "idempotency_key": "pilot-1",
@@ -535,13 +560,20 @@ class AppServiceTests(unittest.TestCase):
             self.assertEqual(review_tick["action"], "decision_required")
             review = app.status(opened["goal_id"])["pending_decisions"][0]
             self.assertEqual(review["kind"], "artifact_review")
-            app.resolve(
+            resolved_review = app.resolve(
                 opened["goal_id"],
                 review["decision_id"],
                 {"verdict": "pass", "reason": "Artifact content and tool evidence accepted"},
             )
+            self.assertTrue(resolved_review["ok"], resolved_review)
+            self.assertEqual(resolved_review["tick"]["action"], "task_finished", resolved_review)
+            task_id = str(task["task_id"])
+            finishes = _task_finish_events(app.events(opened["goal_id"]), task_id)
+            self.assertEqual(len(finishes), 1, finishes)
             final = app.coordinator.process_goal(opened["goal_id"])
-            self.assertEqual(final["action"], "task_finished")
+            self.assertEqual(final["action"], "terminal", final)
+            finishes_after = _task_finish_events(app.events(opened["goal_id"]), task_id)
+            self.assertEqual(len(finishes_after), 1, finishes_after)
             self.assertEqual(app.status(opened["goal_id"])["state"], "completed")
             self.assertEqual(client.count, 1)
 

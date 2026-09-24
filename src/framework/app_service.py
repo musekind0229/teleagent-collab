@@ -1209,26 +1209,34 @@ def assess_win_gui_readiness(
 
 
 def public_pending_decisions(rows: Any) -> list[dict[str, Any]]:
-    """Stable public shape for status/events: kind includes system_action_approval."""
+    """Stable public shape for status/events: kind includes system_action_approval.
+
+    ``lead_error`` is copied onto the public row when the durable decision stored
+    it at the top level or under ``details`` (annotate_decision writes both).
+    """
     out: list[dict[str, Any]] = []
     for row in rows or []:
         if not isinstance(row, Mapping):
             continue
         details = row.get("details") if isinstance(row.get("details"), Mapping) else {}
-        out.append(
-            {
-                "decision_id": str(row.get("decision_id") or ""),
-                "request_id": str(row.get("request_id") or ""),
-                "kind": str(row.get("kind") or ""),
-                "title": str(row.get("title") or ""),
-                "task_id": str(row.get("task_id") or ""),
-                "run_id": str(row.get("run_id") or ""),
-                "status": str(row.get("status") or ""),
-                "backend_kind": str(details.get("backend_kind") or ""),
-                "backend_request_id": str(details.get("backend_request_id") or ""),
-                "details": dict(details),
-            }
-        )
+        item = {
+            "decision_id": str(row.get("decision_id") or ""),
+            "request_id": str(row.get("request_id") or ""),
+            "kind": str(row.get("kind") or ""),
+            "title": str(row.get("title") or ""),
+            "task_id": str(row.get("task_id") or ""),
+            "run_id": str(row.get("run_id") or ""),
+            "status": str(row.get("status") or ""),
+            "backend_kind": str(details.get("backend_kind") or ""),
+            "backend_request_id": str(details.get("backend_request_id") or ""),
+            "details": dict(details),
+        }
+        lead_error = row.get("lead_error")
+        if not isinstance(lead_error, Mapping):
+            lead_error = details.get("lead_error")
+        if isinstance(lead_error, Mapping) and lead_error:
+            item["lead_error"] = dict(lead_error)
+        out.append(item)
     return out
 
 
