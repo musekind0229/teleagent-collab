@@ -901,12 +901,140 @@ class Engine:
                             job,
                             f'repeated scan failures ({type(error).__name__}): {error}',
                         )
-                # A grace miss schedules a short retry; do not overwrite that with the normal cadence.
+                # A grace or status-miss retry sets a short next_scan; do not overwrite it.
                 if time.time() >= (job.get('next_scan') or 0):
                     job['next_scan'] = time.time() + (2 if job['state'] == 'running' else 3)
                 self.store.save(job)
         self._release_desktop_if_idle(jobs)
         return self.summary()
+
+    def _fetch_messages(self, job, sid):
+        messages = self.api(job, 'GET', f'/session/{sid}/message')
+        if not isinstance(messages, list):
+            raise RuntimeError('Invalid message response')
+        return messages
+
+    def _note_status_soft_miss(self, job):
+        """Sid omitted from status and the transcript is not terminal yet.
+
+        One empty map is not disappearance. Stay running until consecutive
+        misses reach SCAN_ERROR_LIMIT, then fail closed. session_id stays
+        set until that failure so stop() can still reach a live session.
+        """
+        streak = int(job.get('status_miss_streak') or 0) + 1
+        job['status_miss_streak'] = streak
+        if streak >= SCAN_ERROR_LIMIT:
+            self.fail_need_human(
+                job,
+                'session missing from status after '
+                f'{SESSION_STATUS_GRACE_S:g}s grace, scans={job["scans"]}; refusing silent redispatch',
+            )
+            return
+        job['state'] = 'running'
+        job['next_scan'] = time.time() + 1
+
+    def _settle_idle_transcript(self, job, messages):
+        """Apply the idle finish path to a transcript already fetched for this job.
+
+        Returns True when the transcript is message-terminal (assistant
+        ``finish == "stop"`` or an assistant error) or the step budget
+        stopped the job. Returns False when the worker is still in progress.
+        """
+        # Step cap uses this transcript only — no extra message fetch, and no
+        # look at sessions that are not this job's session_id.
+        if self._enforce_step_budget(job, messages):
+            return True
+        last_user = max((i for i,m in enumerate(messages) if m.get('info', {}).get('role') == 'user'), default=-1)
+        assistants = [m for m in messages[last_user+1:] if m.get('info', {}).get('role') == 'assistant']
+        if not assistants:
+            return False
+        last = assistants[-1]['info']
+        if last.get('error'):
+            detail = safe_assistant_error(last['error'])
+            reason = 'Worker reported an error'
+            if detail:
+                reason += ': ' + detail
+            else:
+                reason += '; inspect its task in TeleAgent'
+            self.stop(job, 'failed', reason)
+            return True
+        if last.get('finish') != 'stop':
+            return False
+        if job['charter'].get('task_kind', 'file_task') == 'system_install' and not job.get('action_dispatched'):
+            tools = []
+            for message in messages[last_user+1:]:
+                for part in message.get('parts', []):
+                    if part.get('type') == 'tool':
+                        state = part.get('state', {})
+                        tools.append({'tool': part.get('tool'), 'status': state.get('status'),
+                                      'input': state.get('input'), 'output': str(state.get('output', ''))[:6000]})
+            forbidden_before_approval = {'powershell', 'bash', 'shell', 'exec'}
+            violations = [item for item in tools
+                          if item['status'] == 'completed' and item['tool'] in forbidden_before_approval]
+            if violations:
+                self.stop(job, 'failed', 'Worker executed a system-capable tool before action approval')
+                return True
+            request_name = job['charter'].get('action_request_artifact', 'system-action-request.json')
+            try:
+                request_path = contained(job['workspace'], request_name)
+                raw = request_path.read_bytes()
+                if len(raw) > 32 * 1024:
+                    raise ValueError('System action request is too large')
+                proposed = json.loads(raw.decode('utf-8-sig'))
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+                self.stop(job, 'failed', f'Invalid system action request: {error}')
+                return True
+            expected = public_system_action(job['charter']['system_action'])
+            if proposed != expected:
+                self.stop(job, 'failed', 'Worker system action request differs from the charter')
+                return True
+            try:
+                package = verified_msi_source(job['charter']['system_action'])
+            except ValueError:
+                self.stop(job, 'failed', 'MSI package changed before action approval')
+                return True
+            self.request(job, 'system_action', {
+                'proposal': proposed,
+                'proposal_sha256': hashlib.sha256(raw).hexdigest(),
+                'package_bytes': package.stat().st_size,
+                'package_sha256': file_sha256(package),
+                'preapproval_tools': tools,
+                'user_authorized_effects': job['charter']['user_authorized_effects'],
+                'rollback': job['charter']['rollback'],
+            })
+            if job['state'] not in TERMINAL | {'stopping'}:
+                job['state'] = 'awaiting_action'
+            return True
+        try:
+            artifacts = snapshot(job['workspace'], job['charter']['artifacts'])
+            missing = None
+        except ValueError as error:
+            artifacts, missing = {}, str(error)
+        # Evidence is API-observed tool results, not just a file written by the worker.
+        tools = []
+        for message in messages[last_user+1:]:
+            for part in message.get('parts', []):
+                if part.get('type') == 'tool':
+                    s = part.get('state', {})
+                    tools.append({'tool': part.get('tool'), 'status': s.get('status'),
+                                  'input': s.get('input'), 'output': str(s.get('output', ''))[:6000]})
+        forbidden = set(job['charter'].get('forbidden_tools', []))
+        violations = [
+            {'tool': item['tool'], 'status': item['status']}
+            for item in tools
+            if item['tool'] in forbidden and item['status'] == 'completed'
+        ]
+        violations.extend(system_action_trace_violations(job, tools))
+        self.request(job, 'review', {'artifacts': artifacts, 'artifact_hash': digest(artifacts),
+                                  'artifact_error': missing, 'tools': tools[-30:],
+                                  'tools_truncated': len(tools)>30,
+                                  'policy_violations': violations,
+                                  'approved_permissions': job.get('approved_permissions', 0),
+                                  'approved_system_action_hash': job.get('approved_system_action_hash'),
+                                  'finish': 'stop'})
+        if job['state'] not in TERMINAL | {'stopping'}:
+            job['state'] = 'awaiting_review'
+        return True
 
     def scan(self, job):
         sid = job['session_id']
@@ -964,121 +1092,26 @@ class Engine:
             )
             return
         if sid not in statuses:
-            # Absent from the status map. A just-created sid can lag the create response.
-            # Drop session_id only once grace has passed, so stop() does not abort a live session.
+            # Status omits idle/completed sids. A just-created sid can also lag.
+            # Keep session_id until a real need_human failure so stop() can still abort.
             anchor = session_status_anchor(job)
             if anchor is not None and time.time() - anchor < SESSION_STATUS_GRACE_S:
                 job['state'] = 'running'
                 job['next_scan'] = time.time() + 1
                 return
-            job['session_id'] = None
-            self.fail_need_human(
-                job,
-                'session missing from status after '
-                f'{SESSION_STATUS_GRACE_S:g}s grace, scans={job["scans"]}; refusing silent redispatch',
-            )
+            messages = self._fetch_messages(job, sid)
+            if self._settle_idle_transcript(job, messages):
+                job['status_miss_streak'] = 0
+                return
+            self._note_status_soft_miss(job)
             return
+        if job.get('status_miss_streak'):
+            job['status_miss_streak'] = 0
         state = (statuses.get(sid) or {}).get('type', 'idle')
         if state != 'idle':
             job['state'] = 'running'
             return
-        messages = self.api(job, 'GET', f'/session/{sid}/message')
-        if not isinstance(messages, list):
-            raise RuntimeError('Invalid message response')
-        # Step cap uses this transcript only — no extra message fetch, and no
-        # look at sessions that are not this job's session_id.
-        if self._enforce_step_budget(job, messages):
-            return
-        last_user = max((i for i,m in enumerate(messages) if m.get('info', {}).get('role') == 'user'), default=-1)
-        assistants = [m for m in messages[last_user+1:] if m.get('info', {}).get('role') == 'assistant']
-        if not assistants:
-            return
-        last = assistants[-1]['info']
-        if last.get('error'):
-            detail = safe_assistant_error(last['error'])
-            reason = 'Worker reported an error'
-            if detail:
-                reason += ': ' + detail
-            else:
-                reason += '; inspect its task in TeleAgent'
-            self.stop(job, 'failed', reason)
-            return
-        if last.get('finish') != 'stop':
-            return
-        if job['charter'].get('task_kind', 'file_task') == 'system_install' and not job.get('action_dispatched'):
-            tools = []
-            for message in messages[last_user+1:]:
-                for part in message.get('parts', []):
-                    if part.get('type') == 'tool':
-                        state = part.get('state', {})
-                        tools.append({'tool': part.get('tool'), 'status': state.get('status'),
-                                      'input': state.get('input'), 'output': str(state.get('output', ''))[:6000]})
-            forbidden_before_approval = {'powershell', 'bash', 'shell', 'exec'}
-            violations = [item for item in tools
-                          if item['status'] == 'completed' and item['tool'] in forbidden_before_approval]
-            if violations:
-                self.stop(job, 'failed', 'Worker executed a system-capable tool before action approval')
-                return
-            request_name = job['charter'].get('action_request_artifact', 'system-action-request.json')
-            try:
-                request_path = contained(job['workspace'], request_name)
-                raw = request_path.read_bytes()
-                if len(raw) > 32 * 1024:
-                    raise ValueError('System action request is too large')
-                proposed = json.loads(raw.decode('utf-8-sig'))
-            except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
-                self.stop(job, 'failed', f'Invalid system action request: {error}')
-                return
-            expected = public_system_action(job['charter']['system_action'])
-            if proposed != expected:
-                self.stop(job, 'failed', 'Worker system action request differs from the charter')
-                return
-            try:
-                package = verified_msi_source(job['charter']['system_action'])
-            except ValueError:
-                self.stop(job, 'failed', 'MSI package changed before action approval')
-                return
-            self.request(job, 'system_action', {
-                'proposal': proposed,
-                'proposal_sha256': hashlib.sha256(raw).hexdigest(),
-                'package_bytes': package.stat().st_size,
-                'package_sha256': file_sha256(package),
-                'preapproval_tools': tools,
-                'user_authorized_effects': job['charter']['user_authorized_effects'],
-                'rollback': job['charter']['rollback'],
-            })
-            if job['state'] not in TERMINAL | {'stopping'}:
-                job['state'] = 'awaiting_action'
-            return
-        try:
-            artifacts = snapshot(job['workspace'], job['charter']['artifacts'])
-            missing = None
-        except ValueError as error:
-            artifacts, missing = {}, str(error)
-        # Evidence is API-observed tool results, not just a file written by the worker.
-        tools = []
-        for message in messages[last_user+1:]:
-            for part in message.get('parts', []):
-                if part.get('type') == 'tool':
-                    s = part.get('state', {})
-                    tools.append({'tool': part.get('tool'), 'status': s.get('status'),
-                                  'input': s.get('input'), 'output': str(s.get('output', ''))[:6000]})
-        forbidden = set(job['charter'].get('forbidden_tools', []))
-        violations = [
-            {'tool': item['tool'], 'status': item['status']}
-            for item in tools
-            if item['tool'] in forbidden and item['status'] == 'completed'
-        ]
-        violations.extend(system_action_trace_violations(job, tools))
-        self.request(job, 'review', {'artifacts': artifacts, 'artifact_hash': digest(artifacts),
-                                  'artifact_error': missing, 'tools': tools[-30:],
-                                  'tools_truncated': len(tools)>30,
-                                  'policy_violations': violations,
-                                  'approved_permissions': job.get('approved_permissions', 0),
-                                  'approved_system_action_hash': job.get('approved_system_action_hash'),
-                                  'finish': 'stop'})
-        if job['state'] not in TERMINAL | {'stopping'}:
-            job['state'] = 'awaiting_review'
+        self._settle_idle_transcript(job, self._fetch_messages(job, sid))
 
     def decide(self, decision):
         required = {'request_id', 'context_hash', 'decision', 'reason'}
