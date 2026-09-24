@@ -2,6 +2,19 @@
 
 tick() never calls a language model. It emits bounded requests to an inbox.
 No source-suffix heuristics or regex parsing may grant permission.
+
+Collab-owned sessions — a ``session_id`` recorded on a job in this controller's
+Store — have a wall-clock and assistant-step budget, separate from charter
+``timeout_sec`` (that path still ends ``timed_out``). Defaults are 14400
+seconds (4h, ``COLLAB_WIN_MAX_WALL_S``) and 400 assistant messages
+(``COLLAB_WIN_MAX_STEPS``). Optional charter keys ``max_wall_s`` and
+``max_steps`` override those when they are positive integers. Invalid or
+non-positive values fall back to the default; values above the ceiling clamp.
+
+Exceeding either limit aborts only that owned session and fails the job with
+``need_human: budget_exceeded`` (which limit, the observed value, and the max).
+GUI sessions that are not in this store are never budget-checked or aborted.
+If ownership is unclear, the job fails closed to need_human and is not aborted.
 """
 from __future__ import annotations
 
@@ -26,10 +39,151 @@ from .desktop_lock import (
 
 TERMINAL = {'passed', 'failed', 'cancelled', 'timed_out'}
 SCAN_ERROR_LIMIT = 3  # consecutive scan failures -> need_human fail-closed
+DEFAULT_COLLAB_MAX_WALL_S = 14400  # 4 hours since dispatch
+DEFAULT_COLLAB_MAX_STEPS = 400  # assistant messages in the scanned transcript
+COLLAB_WALL_S_CEILING = 7 * 24 * 3600
+COLLAB_STEPS_CEILING = 100_000
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_HOME = REPO / '.collab-state'
 SYSTEM_EFFECTS = {'install_files', 'service_change', 'firewall_change', 'shortcuts'}
 USER_GATED_EFFECTS = {'service_change', 'firewall_change'}
+
+
+def _budget_limit(value, default, ceiling):
+    """Positive int budget. Invalid or non-positive values use default; values above ceiling clamp."""
+    if isinstance(value, bool) or value is None:
+        return default
+    if isinstance(value, int):
+        number = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return default
+        try:
+            number = int(text, 10)
+        except (TypeError, ValueError):
+            return default
+    if number <= 0:
+        return default
+    if number > ceiling:
+        return ceiling
+    return number
+
+
+def collab_max_wall_s(job=None):
+    """Seconds since dispatch for one collab-owned session.
+
+    Default 14400 (4h) via ``COLLAB_WIN_MAX_WALL_S``. Charter ``max_wall_s``
+    overrides when it is a positive int; invalid charter values keep the env/default.
+    """
+    wall = _budget_limit(
+        os.environ.get('COLLAB_WIN_MAX_WALL_S'),
+        DEFAULT_COLLAB_MAX_WALL_S,
+        COLLAB_WALL_S_CEILING,
+    )
+    charter = job.get('charter') if isinstance(job, dict) else None
+    if isinstance(charter, dict) and 'max_wall_s' in charter:
+        wall = _budget_limit(charter.get('max_wall_s'), wall, COLLAB_WALL_S_CEILING)
+    return wall
+
+
+def collab_max_steps(job=None):
+    """Assistant-message cap for one collab-owned session.
+
+    Default 400 via ``COLLAB_WIN_MAX_STEPS``. Charter ``max_steps`` overrides
+    when it is a positive int; invalid charter values keep the env/default.
+    """
+    steps = _budget_limit(
+        os.environ.get('COLLAB_WIN_MAX_STEPS'),
+        DEFAULT_COLLAB_MAX_STEPS,
+        COLLAB_STEPS_CEILING,
+    )
+    charter = job.get('charter') if isinstance(job, dict) else None
+    if isinstance(charter, dict) and 'max_steps' in charter:
+        steps = _budget_limit(charter.get('max_steps'), steps, COLLAB_STEPS_CEILING)
+    return steps
+
+
+def assistant_step_count(messages):
+    """Count transcript rows with ``info.role == assistant``. Non-lists count as zero."""
+    if not isinstance(messages, list):
+        return 0
+    count = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        info = message.get('info')
+        if isinstance(info, dict) and info.get('role') == 'assistant':
+            count += 1
+    return count
+
+
+def dispatch_started_at(job):
+    """Unix time the owned session was dispatched, or None if that time is unknown.
+
+    Prefers ``dispatched_at`` (set when the session starts). Otherwise uses
+    ``deadline - timeout_sec``, which tick records at the same dispatch.
+    """
+    if not isinstance(job, dict):
+        return None
+    raw = job.get('dispatched_at')
+    if raw is not None:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+    deadline = job.get('deadline')
+    if deadline is None:
+        return None
+    charter = job.get('charter') if isinstance(job.get('charter'), dict) else {}
+    timeout = charter.get('timeout_sec', 900)
+    try:
+        return float(deadline) - float(timeout)
+    except (TypeError, ValueError):
+        return None
+
+
+def confirmed_owned_session_id(job, stored_jobs, *, backend, backend_id):
+    """Return ``session_id`` only when this store records it on this job and backend.
+
+    An empty session id is not a budget subject (returns None).
+    A session id that is missing, duplicated, mismatched, or on another backend
+    also returns None — the caller must not abort.
+    """
+    if not isinstance(job, dict):
+        return None
+    raw = job.get('session_id')
+    if raw is None:
+        return None
+    sid = str(raw).strip()
+    if not sid:
+        return None
+    if not isinstance(stored_jobs, list):
+        return None
+    matches = [
+        row for row in stored_jobs
+        if isinstance(row, dict) and str(row.get('session_id') or '').strip() == sid
+    ]
+    if len(matches) != 1:
+        return None
+    row = matches[0]
+    if str(row.get('id') or '') != str(job.get('id') or ''):
+        return None
+    if row.get('backend') != backend or row.get('backend_id') != backend_id:
+        return None
+    if job.get('backend') != backend or job.get('backend_id') != backend_id:
+        return None
+    return sid
+
+
+def budget_exceeded_reason(kind, observed, limit):
+    observed = int(observed)
+    limit = int(limit)
+    if kind == 'wall':
+        return f'need_human: budget_exceeded wall wall_s={observed} max={limit}'
+    if kind == 'steps':
+        return f'need_human: budget_exceeded steps steps={observed} max={limit}'
+    raise ValueError('unknown budget kind')
 
 
 def digest(value):
@@ -574,6 +728,60 @@ class Engine:
             return
         release_desktop_if_idle(base, self.store.home, jobs, TERMINAL)
 
+    def _client_backend(self):
+        backend = getattr(self.client, 'base', None)
+        return backend, getattr(self.client, 'instance_id', backend)
+
+    def _owned_sid(self, job):
+        backend, backend_id = self._client_backend()
+        return confirmed_owned_session_id(
+            job, self.store.jobs(), backend=backend, backend_id=backend_id,
+        )
+
+    def _enforce_wall_budget(self, job):
+        """Stop an owned job that exceeded the wall budget. True if this tick stopped it.
+
+        Does not implement charter ``timeout_sec``. Unclear ownership does not abort.
+        """
+        sid = str(job.get('session_id') or '').strip()
+        if not sid:
+            return False
+        started = dispatch_started_at(job)
+        if started is None:
+            return False
+        limit = collab_max_wall_s(job)
+        observed = int(time.time() - started)
+        if observed < 0:
+            observed = 0
+        if observed <= limit:
+            return False
+        reason = budget_exceeded_reason('wall', observed, limit)
+        if self._owned_sid(job) == sid:
+            self.stop(job, 'failed', reason)
+        else:
+            self.fail_need_human(job, reason + ' ownership_unclear')
+        return True
+
+    def _enforce_step_budget(self, job, messages):
+        """Stop an owned job whose already-fetched transcript exceeds the step cap.
+
+        ``messages`` is the list scan loaded for this job's session. Unclear
+        ownership does not abort. Returns True if this call stopped the job.
+        """
+        sid = str(job.get('session_id') or '').strip()
+        if not sid:
+            return False
+        observed = assistant_step_count(messages)
+        limit = collab_max_steps(job)
+        if observed <= limit:
+            return False
+        reason = budget_exceeded_reason('steps', observed, limit)
+        if self._owned_sid(job) == sid:
+            self.stop(job, 'failed', reason)
+        else:
+            self.fail_need_human(job, reason + ' ownership_unclear')
+        return True
+
     def tick(self):
         """One bounded cycle. Durable errors cannot be confused with idle/success."""
         with self.store.transaction():
@@ -608,6 +816,8 @@ class Engine:
                             self.start_journal(job, {'stage':'prompt_issued', 'run_id':job['run_id'], 'session_id':job['session_id']})
                             self.api(job, 'POST', f'/session/{job["session_id"]}/prompt_async', self.prompt(job))
                             job['state'] = 'running'
+                            if not job.get('dispatched_at'):
+                                job['dispatched_at'] = time.time()
                             self.store.event(job, 'started', {'session_id': job['session_id']})
                             active += 1
                     except Exception as error:
@@ -624,6 +834,10 @@ class Engine:
                     continue
                 if job['state'] == 'stopping':
                     self.stop(job, job.get('stop_target', 'failed'), job['error'])
+                    self.store.save(job)
+                    continue
+                # Separate from timeout_sec. Only an owned session_id can be aborted.
+                if self._enforce_wall_budget(job):
                     self.store.save(job)
                     continue
                 if job['state'] in ('awaiting_review', 'awaiting_action') or time.time() < job['next_scan']:
@@ -719,6 +933,10 @@ class Engine:
         messages = self.api(job, 'GET', f'/session/{sid}/message')
         if not isinstance(messages, list):
             raise RuntimeError('Invalid message response')
+        # Step cap uses this transcript only — no extra message fetch, and no
+        # look at sessions that are not this job's session_id.
+        if self._enforce_step_budget(job, messages):
+            return
         last_user = max((i for i,m in enumerate(messages) if m.get('info', {}).get('role') == 'user'), default=-1)
         assistants = [m for m in messages[last_user+1:] if m.get('info', {}).get('role') == 'assistant']
         if not assistants:

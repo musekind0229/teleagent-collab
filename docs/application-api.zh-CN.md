@@ -125,6 +125,10 @@ permission / question / system_action 经 `POST /v1/requests/{id}/decisions/{dec
 
 Windows 监督后端在 TeleAgent 重启 / 端口或凭据实例变化 / 会话丢失 / 连续扫描失败 / 桌面 GUI 已被其他控制器占用（`desktop_session_busy`）时会 **fail-closed**：job 进入 `failed`，`error` 以 `need_human:` 开头（不含密钥）。
 
+`need_human:` 原因码还包括：
+
+- `budget_exceeded`：本控制器 store 里记录的 collab session 达到墙钟或步数预算。`failure_reason` 标明 `wall` 或 `steps`，以及观测值和上限（例如 `budget_exceeded wall wall_s=14401 max=14400`）。只 abort 该 session。GUI 上不属于本 store 的会话不检查、不中止。与 charter `timeout_sec` 的 `timed_out` 是两条路径。
+
 调用方怎么看：
 
 1. `GET /v1/requests/{id}` 顶层：

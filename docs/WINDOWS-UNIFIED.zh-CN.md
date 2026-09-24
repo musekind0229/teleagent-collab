@@ -28,6 +28,8 @@ python bin/collab-service.py --persist .collab-app --port 8765 `
 
 公共框架是后续主线。Windows 监督控制器暂作为兼容及实机验收通道，避免在公共 TeleAgent ExecutionBackend 尚未覆盖审批状态机前丢失已经跑通的能力。不要同时让两条控制器接管同一个 session 或工作目录。两条控制器底层工人都应接到**同一桌面 GUI**，而不是各起一个 wrap 内核。同一 GUI 的派工有本机独占锁：锁被其他控制器持有，或 `/session/status` 中存在非本控制器的非 idle session 时，fail-closed 为 `need_human: desktop_session_busy`（不 POST 新 session，也不中止对方工人）。
 
+本控制器只对 **自己 store 中记录了 `session_id` 的作业** 做墙钟和步数预算。环境变量 `COLLAB_WIN_MAX_WALL_S` 默认 14400 秒（4 小时），`COLLAB_WIN_MAX_STEPS` 默认 400 条 assistant 消息。超限只 abort 该 collab 会话，并记 `need_human: budget_exceeded`（标明哪一项超限）。`/session/status` 里不属于本 store 的会话从不因预算被检查或中止。这与 charter `timeout_sec` 记为 `timed_out` 相互独立。
+
 ## 本次整合保留和修正的能力
 
 - Windows 监督控制器的 40 项回归及 RustDesk 真机验证记录随代码合入；不会在回归中重装 RustDesk。
