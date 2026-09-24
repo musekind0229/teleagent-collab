@@ -147,9 +147,9 @@ def worker_charter_for_task(
 
 MAX_LEAD_ATTEMPTS_PER_DECISION = 2
 AUTO_RESOLVE_BACKEND_KINDS = frozenset({"permission", "review"})
-# Permission / question / review surface through Goal decision API.
-# system_action stays on the worker inbox until a dedicated knife; never project it.
-PROJECTABLE_BACKEND_KINDS = frozenset({"permission", "question", "review"})
+# Permission / question / review / system_action surface through Goal decision API.
+# system_action maps to system_action_approval and is NEVER in AUTO_RESOLVE_BACKEND_KINDS.
+PROJECTABLE_BACKEND_KINDS = frozenset({"permission", "question", "review", "system_action"})
 _NONRETRYABLE_LEAD_MARKERS = (
     "quota",
     "rate limit",
@@ -698,6 +698,7 @@ class AppCoordinator:
                     "permission": "action_approval",
                     "question": "question",
                     "review": "artifact_review",
+                    "system_action": "system_action_approval",
                 }[backend_kind]
                 decision_id = f"dec_{hashlib.sha256(request_id.encode('utf-8')).hexdigest()[:12]}"
                 opened = self.layer.open_decision(

@@ -179,7 +179,7 @@ class DecisionApiHandoffTests(unittest.TestCase):
         self.assertEqual(backend.resolved[0]["verdict"], "answer")
         self.assertEqual(backend.resolved[0]["answers"], [["a"]])
 
-    def test_system_action_not_projected_permission_still_wins(self):
+    def test_system_action_projects_before_later_permission(self):
         app, backend, gid = self._boot()
         run_id = self._ensure_run(app, gid)
         backend.pending = [
@@ -188,7 +188,7 @@ class DecisionApiHandoffTests(unittest.TestCase):
                 "kind": "system_action",
                 "run_id": run_id,
                 "context_hash": "hs",
-                "payload": {"action": "reboot"},
+                "payload": {"action": "install"},
             },
             {
                 "request_id": "perm_2",
@@ -202,10 +202,11 @@ class DecisionApiHandoffTests(unittest.TestCase):
         self.assertEqual(tick.get("action"), "decision_required", tick)
         pending = app.layer.get_goal(gid)["goal"].get("pending_decisions") or []
         self.assertEqual(len(pending), 1)
-        self.assertEqual((pending[0].get("details") or {}).get("backend_kind"), "permission")
-        self.assertEqual((pending[0].get("details") or {}).get("backend_request_id"), "perm_2")
+        self.assertEqual(pending[0].get("kind"), "system_action_approval")
+        self.assertEqual((pending[0].get("details") or {}).get("backend_kind"), "system_action")
+        self.assertEqual((pending[0].get("details") or {}).get("backend_request_id"), "sys_1")
 
-    def test_system_action_only_stays_unprojected(self):
+    def test_system_action_resolve_reaches_backend_without_lead_auto(self):
         app, backend, gid = self._boot()
         run_id = self._ensure_run(app, gid)
         backend.pending = [
@@ -214,13 +215,19 @@ class DecisionApiHandoffTests(unittest.TestCase):
                 "kind": "system_action",
                 "run_id": run_id,
                 "context_hash": "hs",
-                "payload": {},
+                "payload": {"proposal_sha256": "abc"},
             }
         ]
-        tick = app.coordinator.process_goal(gid)
-        self.assertEqual(tick.get("action"), "backend_gate_unprojected", tick)
+        tick = self._drive_until_decision(app, gid)
+        self.assertEqual(tick.get("action"), "decision_required", tick)
         pending = app.layer.get_goal(gid)["goal"].get("pending_decisions") or []
-        self.assertEqual(pending, [])
+        self.assertEqual(pending[0].get("kind"), "system_action_approval")
+        did = pending[0]["decision_id"]
+        # ExternalOnlyPlanner has decide_action=None; even if lead existed, AUTO_RESOLVE excludes system_action.
+        out = app.resolve(gid, did, {"verdict": "approve", "reason": "user authorized MSI"})
+        self.assertTrue(out.get("ok"), out)
+        self.assertEqual(backend.resolved[0]["verdict"], "approve")
+        self.assertEqual(backend.resolved[0]["kind"], "system_action")
 
     def test_http_decision_route(self):
         app, backend, gid = self._boot()

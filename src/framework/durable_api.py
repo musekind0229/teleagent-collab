@@ -114,6 +114,7 @@ REASON_STALE_DECISION_BINDING = REASON_STALE_DECISION_BINDING
 DECISION_KINDS = frozenset(
     {
         "action_approval",
+        "system_action_approval",
         "question",
         "artifact_review",
         "plan_review",
