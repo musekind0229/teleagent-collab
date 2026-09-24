@@ -343,5 +343,49 @@ class DecisionApiHandoffTests(unittest.TestCase):
         self.assertGreaterEqual(int(hit.get("pending_decision_count") or 0), 1)
 
 
+
+    def test_get_decisions_lists_pending(self):
+        app, backend, gid = self._boot()
+        run_id = self._ensure_run(app, gid)
+        backend.pending.append(
+            {
+                "request_id": "sys_getdec",
+                "kind": "system_action",
+                "run_id": run_id,
+                "context_hash": "gd",
+                "payload": {"action": "restart"},
+            }
+        )
+        self._drive_until_decision(app, gid)
+        listed = app.list_decisions(gid)
+        self.assertTrue(listed.get("ok"), listed)
+        self.assertTrue(listed.get("awaiting_decision"), listed)
+        self.assertEqual(listed.get("pending_decision_count"), 1)
+        row = (listed.get("pending_decisions") or [])[0]
+        self.assertEqual(row.get("kind"), "system_action_approval")
+        self.assertEqual(row.get("backend_kind"), "system_action")
+        self.assertEqual(row.get("backend_request_id"), "sys_getdec")
+
+        server = CollabHttpServer(("127.0.0.1", 0), app, api_token="")
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("GET", f"/v1/requests/{gid}/decisions")
+            resp = conn.getresponse()
+            payload = json.loads(resp.read().decode("utf-8"))
+            self.assertEqual(resp.status, 200, payload)
+            self.assertTrue(payload.get("awaiting_decision"), payload)
+            self.assertEqual(payload.get("pending_decision_count"), 1)
+            self.assertEqual(
+                (payload.get("pending_decisions") or [])[0].get("kind"),
+                "system_action_approval",
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
 if __name__ == "__main__":
     unittest.main()

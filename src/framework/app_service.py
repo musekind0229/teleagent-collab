@@ -1143,6 +1143,23 @@ class CollabApplication:
             "awaiting_decision_count": sum(1 for r in rows if r.get("awaiting_decision")),
         }
 
+
+    def list_decisions(self, goal_id: str) -> dict[str, Any]:
+        """GET …/decisions: pending only, same public rows as status/events."""
+        current = self.layer.get_goal(goal_id)
+        if not current.get("ok"):
+            raise AppError(str(current.get("error")), status=404, code="not_found")
+        snap = current.get("goal") if isinstance(current.get("goal"), Mapping) else {}
+        pending = public_pending_decisions(snap.get("pending_decisions") or [])
+        return {
+            "ok": True,
+            "api_version": API_VERSION,
+            "request_id": goal_id,
+            "pending_decisions": pending,
+            "pending_decision_count": len(pending),
+            "awaiting_decision": bool(pending),
+        }
+
     def events(self, goal_id: str) -> dict[str, Any]:
         out = self.layer.list_events(goal_id)
         if not out.get("ok"):
@@ -1518,6 +1535,9 @@ class _Handler(BaseHTTPRequestHandler):
                     length = 0
                 body = self._json_body() if length > 0 else {}
                 self._send(200, self.app.retry(gid, body))
+                return
+            if len(parts) == 4 and parts[3] == "decisions" and self.command == "GET":
+                self._send(200, self.app.list_decisions(gid))
                 return
             if len(parts) == 5 and parts[3] == "decisions" and self.command == "POST":
                 self._send(200, self.app.resolve(gid, parts[4], self._json_body()))
