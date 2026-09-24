@@ -1378,6 +1378,13 @@ class CollabApplication:
         )
         if not out.get("ok"):
             raise AppError(str(out.get("error") or out.get("reason")), status=409, code=str(out.get("reason")))
+        # External decision applied to the worker — resume coordination without waiting for a separate tick.
+        try:
+            tick = self.coordinator.process_goal(goal_id)
+        except Exception as e:
+            tick = {"ok": False, "action": "tick_failed", "error": type(e).__name__}
+        if isinstance(out, dict):
+            out = {**out, "tick": tick if isinstance(tick, Mapping) else {"ok": False, "action": "tick_failed"}}
         return out
 
 

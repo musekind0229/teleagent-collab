@@ -267,5 +267,31 @@ class DecisionApiHandoffTests(unittest.TestCase):
             server.server_close()
 
 
+    def test_resolve_auto_ticks_coordinator(self):
+        app, backend, gid = self._boot()
+        run_id = self._ensure_run(app, gid)
+        backend.pending.append(
+            {
+                "request_id": "perm_tick",
+                "kind": "permission",
+                "run_id": run_id,
+                "context_hash": "ht",
+                "payload": {},
+            }
+        )
+        self._drive_until_decision(app, gid)
+        did = app.layer.get_goal(gid)["goal"]["pending_decisions"][0]["decision_id"]
+        # After resolve, backend has no pending; observe should go idle and collect.
+        backend._runs[run_id]["busy"] = False
+        out = app.resolve(gid, did, {"verdict": "once", "reason": "tick after decide"})
+        self.assertTrue(out.get("ok"), out)
+        tick = out.get("tick") or {}
+        self.assertTrue(isinstance(tick, dict), tick)
+        self.assertIn(tick.get("action"), {"task_finished", "worker_running", "decision_required", "goal_finished"}, tick)
+        # Pending decision cleared by durable resolve.
+        pending = app.layer.get_goal(gid)["goal"].get("pending_decisions") or []
+        self.assertEqual(pending, [])
+
+
 if __name__ == "__main__":
     unittest.main()

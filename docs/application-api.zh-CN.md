@@ -116,7 +116,7 @@ Windows TeleAgent 后端已从新入口真实创建多个 session，证明入口
 
 同一时间 GUI 自己的 `NewApi/chat-lite` 与 `chat-pro` 调用成功，说明账号和模型可用。剩余差异位于 GUI 主进程向模型内核交接认证状态的私有流程。GUI 内核的本地 API 密钥通过 stdin 注入，不存在于子进程环境；GUI 以管理员权限运行而入口进程为普通权限时，进程检查还会得到 Windows `Access denied (5)`。生产方案需要 TeleAgent 提供受支持的本地 broker/凭据交接接口，或让入口直接运行在能够取得该接口的同一可信宿主中。完成该项后仍需重跑普通文件任务，才可宣布真实交付闭环通过。
 
-permission / question / system_action 经 `POST /v1/requests/{id}/decisions/{decision_id}` 回传到监督后端；Question 与 system_action 永不由组长自动代答/代批（`system_action_approval` 专类）。
+permission / question / system_action 经 `POST /v1/requests/{id}/decisions/{decision_id}` 回传到监督后端；Question 与 system_action 永不由组长自动代答/代批（`system_action_approval` 专类）。 回传成功后协调器立即 `process_goal`（响应含 `tick`），无需另调 tick。
 
 ## need_human（Windows 监督恢复失败）
 
