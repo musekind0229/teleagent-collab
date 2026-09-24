@@ -1127,7 +1127,21 @@ class CollabApplication:
 
     def list_requests(self) -> dict[str, Any]:
         out = self.layer.list_goals()
-        return {"ok": True, "api_version": API_VERSION, "requests": out.get("goals") or []}
+        rows: list[dict[str, Any]] = []
+        for row in out.get("goals") or []:
+            if not isinstance(row, Mapping):
+                continue
+            pending_count = int(row.get("pending_count") or row.get("pending_decision_count") or 0)
+            item = dict(row)
+            item["pending_decision_count"] = pending_count
+            item["awaiting_decision"] = pending_count > 0
+            rows.append(item)
+        return {
+            "ok": True,
+            "api_version": API_VERSION,
+            "requests": rows,
+            "awaiting_decision_count": sum(1 for r in rows if r.get("awaiting_decision")),
+        }
 
     def events(self, goal_id: str) -> dict[str, Any]:
         out = self.layer.list_events(goal_id)

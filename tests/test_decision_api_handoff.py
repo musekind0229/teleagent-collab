@@ -320,5 +320,28 @@ class DecisionApiHandoffTests(unittest.TestCase):
         self.assertEqual((ev.get("pending") or [])[0].get("backend_kind"), "system_action")
 
 
+    def test_list_requests_summarizes_awaiting_decision(self):
+        app, backend, gid = self._boot()
+        run_id = self._ensure_run(app, gid)
+        backend.pending.append(
+            {
+                "request_id": "perm_list",
+                "kind": "permission",
+                "run_id": run_id,
+                "context_hash": "hl",
+                "payload": {},
+            }
+        )
+        self._drive_until_decision(app, gid)
+        listing = app.list_requests()
+        self.assertTrue(listing.get("ok"), listing)
+        self.assertGreaterEqual(int(listing.get("awaiting_decision_count") or 0), 1)
+        hit = next((r for r in (listing.get("requests") or []) if str(r.get("goal_id") or "") == gid), None)
+        self.assertIsNotNone(hit, listing)
+        assert hit is not None
+        self.assertTrue(hit.get("awaiting_decision"), hit)
+        self.assertGreaterEqual(int(hit.get("pending_decision_count") or 0), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
