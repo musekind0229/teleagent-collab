@@ -23,8 +23,8 @@ def context_summary_of(payload: dict, *, max_len: int = 240) -> str:
     """Stable short digest so illegal replies cannot be detached from the ask."""
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
     digest = hashlib.sha256(blob.encode()).hexdigest()[:16]
-    goal = str(payload.get("goal") or payload.get("task_goal") or "")[:80]
-    return f"{digest}:{goal}"[:max_len]
+    goal = str(payload.get("goal") or payload.get("task_goal") or "")[:80].rstrip()
+    return f"{digest}:{goal}"[:max_len].rstrip()
 
 
 def build_lead_request(
@@ -318,7 +318,7 @@ def validate_lead_decision(
     """
     kind = kind or request.get("kind") or "permission"
     expected_id = str(request.get("application_id") or "")
-    expected_summary = str(request.get("context_summary") or "")
+    expected_summary_cmp = str(request.get("context_summary") or "").rstrip()
 
     if raw == "TIMEOUT" or (isinstance(parsed, dict) and parsed.get("_lead_status") == "timeout"):
         raise LeadDecisionError("timeout", "lead call timed out")
@@ -339,11 +339,11 @@ def validate_lead_decision(
         )
 
     # context_summary: if present must match; if absent we still accept when id binds
-    got_summary = str(inner.get("context_summary") or "").strip()
-    if got_summary and expected_summary and got_summary != expected_summary:
+    got_summary = str(inner.get("context_summary") or "").rstrip()
+    if got_summary and expected_summary_cmp and got_summary != expected_summary_cmp:
         raise LeadDecisionError(
             "context_summary_mismatch",
-            f"expected {expected_summary!r} got {got_summary!r}",
+            f"expected {expected_summary_cmp!r} got {got_summary!r}",
         )
 
     if kind == "permission":
@@ -359,7 +359,7 @@ def validate_lead_decision(
             raise LeadDecisionError("missing_reason", "reason required")
         return {
             "application_id": app_id,
-            "context_summary": got_summary or expected_summary,
+            "context_summary": got_summary or expected_summary_cmp,
             "decision": decision,
             "reason": str(inner.get("reason") or ""),
             "safe_path_hint": str(inner.get("safe_path_hint") or ""),
@@ -374,7 +374,7 @@ def validate_lead_decision(
             raise LeadDecisionError("missing_reason", "reason required")
         return {
             "application_id": app_id,
-            "context_summary": got_summary or expected_summary,
+            "context_summary": got_summary or expected_summary_cmp,
             "verdict": verdict,
             "reason": str(inner.get("reason") or ""),
         }

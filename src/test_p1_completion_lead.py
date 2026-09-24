@@ -33,7 +33,11 @@ from lead_adapter import (
 )
 from lead_adapter.inprocess import InProcessLeadAdapter
 from lead_adapter.grok_cli import GrokCliLeadAdapter
-from lead_adapter.schema import format_lead_request_prompt, unwrap_structured
+from lead_adapter.schema import (
+    context_summary_of,
+    format_lead_request_prompt,
+    unwrap_structured,
+)
 from scheduler import ParallelScheduler, JobState
 
 SIMULATED = True
@@ -297,10 +301,10 @@ class TestSchedulerForceLeadAndTimeout(unittest.TestCase):
 
 
 class TestLiveGrokEchoAndUnwrap(unittest.TestCase):
-    def _req(self, kind="review"):
+    def _req(self, kind="review", goal="stay in ws"):
         return build_lead_request(
             kind=kind,
-            goal="stay in ws",
+            goal=goal,
             authorized_scope=["ws"],
             prohibitions=["secrets"],
             acceptance_criteria={"artifacts": ["a.txt"]},
@@ -384,6 +388,80 @@ class TestLiveGrokEchoAndUnwrap(unittest.TestCase):
         }
         with self.assertRaises(LeadDecisionError) as cm:
             validate_lead_decision(json.dumps(rewritten), rewritten, request=req, kind="review")
+        self.assertEqual(cm.exception.code, "context_summary_mismatch")
+
+    def test_context_summary_rstrip_truncate_on_space_echo_passes(self):
+        goal = ("g" * 79) + " tail-beyond-slice"
+        self.assertTrue(goal[:80].endswith(" "))
+        self.assertEqual(goal[:80].rstrip(), "g" * 79)
+
+        bare = context_summary_of({"goal": goal})
+        self.assertFalse(bare[-1].isspace())
+        self.assertTrue(bare.endswith("g" * 79))
+        self.assertNotIn("tail-beyond-slice", bare)
+
+        space_at = "hello world".index(" ")
+        cut = context_summary_of(
+            {"goal": "hello world"}, max_len=16 + 1 + space_at + 1
+        )
+        self.assertFalse(cut[-1].isspace())
+        self.assertTrue(cut.endswith("hello"))
+
+        req = self._req("review", goal=goal)
+        summary = req["context_summary"]
+        self.assertFalse(summary[-1].isspace())
+        self.assertEqual(summary, summary.rstrip())
+        self.assertTrue(summary.endswith("g" * 79))
+        self.assertNotIn("tail-beyond-slice", summary)
+
+        good = {
+            "application_id": req["application_id"],
+            "context_summary": summary,
+            "verdict": "pass",
+            "reason": "exact rstripped echo",
+        }
+        out = validate_lead_decision(json.dumps(good), good, request=req, kind="review")
+        self.assertEqual(out["verdict"], "pass")
+        self.assertEqual(out["context_summary"], summary)
+        self.assertFalse(out["context_summary"][-1].isspace())
+
+        padded = dict(good)
+        padded["context_summary"] = summary + " \t"
+        out_pad = validate_lead_decision(
+            json.dumps(padded), padded, request=req, kind="review"
+        )
+        self.assertEqual(out_pad["verdict"], "pass")
+        self.assertEqual(out_pad["context_summary"], summary)
+
+        legacy = dict(req)
+        legacy["context_summary"] = summary + " "
+        out_legacy = validate_lead_decision(
+            json.dumps(good), good, request=legacy, kind="review"
+        )
+        self.assertEqual(out_legacy["verdict"], "pass")
+        self.assertEqual(out_legacy["context_summary"], summary)
+
+    def test_context_summary_rstrip_different_content_still_mismatches(self):
+        goal = ("g" * 79) + " tail-beyond-slice"
+        req = self._req("review", goal=goal)
+        bad = {
+            "application_id": req["application_id"],
+            "context_summary": req["context_summary"] + "X",
+            "verdict": "pass",
+            "reason": "different summary",
+        }
+        with self.assertRaises(LeadDecisionError) as cm:
+            validate_lead_decision(json.dumps(bad), bad, request=req, kind="review")
+        self.assertEqual(cm.exception.code, "context_summary_mismatch")
+
+        leading = {
+            "application_id": req["application_id"],
+            "context_summary": " " + req["context_summary"],
+            "verdict": "pass",
+            "reason": "leading space is not rstrip",
+        }
+        with self.assertRaises(LeadDecisionError) as cm:
+            validate_lead_decision(json.dumps(leading), leading, request=req, kind="review")
         self.assertEqual(cm.exception.code, "context_summary_mismatch")
 
     def test_nested_structured_output_unwrap_validates(self):

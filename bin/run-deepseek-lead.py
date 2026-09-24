@@ -235,11 +235,11 @@ def validate_decision(parsed: dict | None, envelope: dict) -> tuple[dict | None,
     got_id = str(parsed.get("application_id") or "")
     if not expected_id or got_id != expected_id:
         return None, f"application_id_mismatch expected {expected_id!r} got {got_id!r}"
-    expected_summary = str(req.get("context_summary") or "")
-    got_summary = str(parsed.get("context_summary") or "")
-    if expected_summary and got_summary and got_summary != expected_summary:
+    expected_summary_cmp = str(req.get("context_summary") or "").rstrip()
+    got_summary = str(parsed.get("context_summary") or "").rstrip()
+    if expected_summary_cmp and got_summary and got_summary != expected_summary_cmp:
         return None, (
-            f"context_summary_mismatch expected {expected_summary!r} got {got_summary!r}"
+            f"context_summary_mismatch expected {expected_summary_cmp!r} got {got_summary!r}"
         )
     if kind == "permission":
         decision = str(parsed.get("decision") or "").strip().lower()
