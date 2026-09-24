@@ -91,8 +91,8 @@ class TestInFlightRecovery(unittest.TestCase):
         self.assertFalse(any(p == "/session" and m == "POST" for m, p, _ in client.calls))
 
     def test_missing_session_fails_need_human_no_redispatch(self):
-        # One empty status map is not disappearance. Fail closed only after
-        # consecutive non-terminal misses, and still do not redispatch.
+        # An empty transcript is not in flight. Fail closed only after
+        # consecutive status misses, and still do not redispatch.
         job = _running_job(self.store, session_id="sess-gone")
         job["dispatched_at"] = time.time() - (SESSION_STATUS_GRACE_S + 1)
         with self.store.transaction():
@@ -101,9 +101,7 @@ class TestInFlightRecovery(unittest.TestCase):
         client.routes[("GET", "/permission")] = []
         client.routes[("GET", "/question")] = []
         client.routes[("GET", "/session/status")] = {}
-        client.routes[("GET", "/session/sess-gone/message")] = [
-            {"info": {"role": "assistant"}},
-        ]
+        client.routes[("GET", "/session/sess-gone/message")] = []
         engine = Engine(self.store, client)
         job = None
         for i in range(SCAN_ERROR_LIMIT):
@@ -279,9 +277,46 @@ class TestInFlightRecovery(unittest.TestCase):
         job = self.store.get("jobdeadbeef01")
         self.assertEqual(job["state"], "running", job)
         self.assertEqual(job.get("session_id"), sid)
-        self.assertEqual(job.get("status_miss_streak"), 1)
+        # A bare assistant is in flight; do not burn the miss streak.
+        self.assertFalse(job.get("status_miss_streak"))
         self.assertFalse(job.get("error"))
         self.assertNotIn(job["state"], TERMINAL)
+        self.assertGreater(job["next_scan"], started)
+        self.assertTrue(any(p == f"/session/{sid}/message" for _, p, _ in client.calls))
+        self.assertFalse(any(p == "/session" and m == "POST" for m, p, _ in client.calls))
+        self.assertFalse(any(str(p).endswith("/abort") for _, p, _ in client.calls))
+
+    def test_tool_calls_inflight_empty_status_does_not_bump_miss_streak(self):
+        # Status often drops a sid while the worker is mid-turn on tool_calls.
+        sid = "sess-inflight"
+        job = _running_job(self.store, session_id=sid)
+        job["dispatched_at"] = time.time() - (SESSION_STATUS_GRACE_S + 1)
+        with self.store.transaction():
+            self.store.save(job)
+        client = FakeClient()
+        client.routes[("GET", "/permission")] = []
+        client.routes[("GET", "/question")] = []
+        client.routes[("GET", "/session/status")] = {}
+        client.routes[("GET", f"/session/{sid}/message")] = [
+            {"info": {"role": "user"}},
+            {"info": {"role": "assistant", "finish": "tool_calls"}, "parts": []},
+        ]
+        engine = Engine(self.store, client)
+        started = time.time()
+        job = None
+        for _ in range(SCAN_ERROR_LIMIT + 1):
+            current = self.store.get("jobdeadbeef01")
+            current["next_scan"] = 0
+            with self.store.transaction():
+                self.store.save(current)
+            engine.tick()
+            job = self.store.get("jobdeadbeef01")
+            self.assertEqual(job["state"], "running", job)
+            self.assertEqual(job.get("session_id"), sid)
+            self.assertFalse(job.get("status_miss_streak"))
+            self.assertFalse(job.get("error"))
+            self.assertNotIn(job["state"], TERMINAL)
+            self.assertNotIn("need_human", job.get("error") or "")
         self.assertGreater(job["next_scan"], started)
         self.assertTrue(any(p == f"/session/{sid}/message" for _, p, _ in client.calls))
         self.assertFalse(any(p == "/session" and m == "POST" for m, p, _ in client.calls))
@@ -381,7 +416,8 @@ class TestInFlightRecovery(unittest.TestCase):
         engine.tick()
         job = self.store.get("jobdeadbeef01")
         self.assertEqual(job["state"], "running", job)
-        self.assertEqual(job.get("status_miss_streak"), 1)
+        # In-flight assistant: soft-retry without bumping the streak.
+        self.assertFalse(job.get("status_miss_streak"))
         self.assertEqual(job.get("session_id"), sid)
         self.assertFalse(job.get("error"))
 

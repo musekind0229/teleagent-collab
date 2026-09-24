@@ -914,8 +914,23 @@ class Engine:
             raise RuntimeError('Invalid message response')
         return messages
 
+    def _transcript_has_post_user_assistant(self, messages):
+        """True when any assistant row sits after the last user turn.
+
+        Includes ``finish=tool_calls`` and assistants with no finish. An empty
+        transcript, or a user turn with nothing after it, is not in flight.
+        """
+        last_user = max(
+            (i for i, m in enumerate(messages) if m.get('info', {}).get('role') == 'user'),
+            default=-1,
+        )
+        return any(
+            m.get('info', {}).get('role') == 'assistant'
+            for m in messages[last_user + 1:]
+        )
+
     def _note_status_soft_miss(self, job):
-        """Sid omitted from status and the transcript is not terminal yet.
+        """Sid omitted from status and no assistant follows the last user.
 
         One empty map is not disappearance. Stay running until consecutive
         misses reach SCAN_ERROR_LIMIT, then fail closed. session_id stays
@@ -1102,6 +1117,11 @@ class Engine:
             messages = self._fetch_messages(job, sid)
             if self._settle_idle_transcript(job, messages):
                 job['status_miss_streak'] = 0
+                return
+            # In flight (tool_calls or unfinished assistant): retry, leave the streak.
+            if self._transcript_has_post_user_assistant(messages):
+                job['state'] = 'running'
+                job['next_scan'] = time.time() + 1
                 return
             self._note_status_soft_miss(job)
             return
