@@ -104,6 +104,7 @@ $opened
 | `POST` | `/v1/requests/{id}/cancel` | 请求取消，body 如 `{"reason":"用户取消"}` |
 | `POST` | `/v1/requests/{id}/retry` | 仅当终态 `failed` 且 `need_human=true`：doctor 探活后重试失败 Task（见下） |
 | `GET` | `/v1/requests/{id}/decisions` | 列出该 Goal 待决 decisions（与 status 同形 public 行） |
+| `GET` | `/v1/requests/{id}/decisions/{decision_id}` | 查询单条待决 decision（pending only，同形 public 行） |
 | `POST` | `/v1/requests/{id}/decisions/{decision_id}` | 由外部授权者回答决定 |
 | `POST` | `/v1/coordinator/tick` | 测试或诊断时手动推进一次 |
 

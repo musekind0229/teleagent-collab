@@ -387,5 +387,53 @@ class DecisionApiHandoffTests(unittest.TestCase):
             server.server_close()
 
 
+    def test_get_decision_by_id(self):
+        app, backend, gid = self._boot()
+        run_id = self._ensure_run(app, gid)
+        backend.pending.append(
+            {
+                "request_id": "sys_getone",
+                "kind": "system_action",
+                "run_id": run_id,
+                "context_hash": "g1",
+                "payload": {"action": "restart"},
+            }
+        )
+        self._drive_until_decision(app, gid)
+        did = app.layer.get_goal(gid)["goal"]["pending_decisions"][0]["decision_id"]
+        got = app.get_decision(gid, did)
+        self.assertTrue(got.get("ok"), got)
+        self.assertTrue(got.get("awaiting_decision"), got)
+        self.assertEqual(got.get("pending_decision_count"), 1)
+        row = got.get("decision") or {}
+        self.assertEqual(row.get("kind"), "system_action_approval")
+        self.assertEqual(row.get("backend_kind"), "system_action")
+        self.assertEqual(row.get("backend_request_id"), "sys_getone")
+        self.assertEqual(row.get("decision_id"), did)
+
+        server = CollabHttpServer(("127.0.0.1", 0), app, api_token="")
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("GET", f"/v1/requests/{gid}/decisions/{did}")
+            resp = conn.getresponse()
+            payload = json.loads(resp.read().decode("utf-8"))
+            self.assertEqual(resp.status, 200, payload)
+            self.assertEqual((payload.get("decision") or {}).get("kind"), "system_action_approval")
+            conn.close()
+
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("GET", f"/v1/requests/{gid}/decisions/does-not-exist")
+            resp = conn.getresponse()
+            payload = json.loads(resp.read().decode("utf-8"))
+            self.assertEqual(resp.status, 404, payload)
+            conn.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
 if __name__ == "__main__":
     unittest.main()

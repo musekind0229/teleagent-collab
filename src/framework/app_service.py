@@ -1160,6 +1160,26 @@ class CollabApplication:
             "awaiting_decision": bool(pending),
         }
 
+    def get_decision(self, goal_id: str, decision_id: str) -> dict[str, Any]:
+        """GET …/decisions/{decision_id}: one pending public row."""
+        current = self.layer.get_goal(goal_id)
+        if not current.get("ok"):
+            raise AppError(str(current.get("error")), status=404, code="not_found")
+        snap = current.get("goal") if isinstance(current.get("goal"), Mapping) else {}
+        pending = public_pending_decisions(snap.get("pending_decisions") or [])
+        want = str(decision_id or "")
+        row = next((item for item in pending if str(item.get("decision_id") or "") == want), None)
+        if row is None:
+            raise AppError("decision not found", status=404, code="not_found")
+        return {
+            "ok": True,
+            "api_version": API_VERSION,
+            "request_id": goal_id,
+            "decision": row,
+            "pending_decision_count": 1,
+            "awaiting_decision": True,
+        }
+
     def events(self, goal_id: str) -> dict[str, Any]:
         out = self.layer.list_events(goal_id)
         if not out.get("ok"):
@@ -1538,6 +1558,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if len(parts) == 4 and parts[3] == "decisions" and self.command == "GET":
                 self._send(200, self.app.list_decisions(gid))
+                return
+            if len(parts) == 5 and parts[3] == "decisions" and self.command == "GET":
+                self._send(200, self.app.get_decision(gid, parts[4]))
                 return
             if len(parts) == 5 and parts[3] == "decisions" and self.command == "POST":
                 self._send(200, self.app.resolve(gid, parts[4], self._json_body()))
