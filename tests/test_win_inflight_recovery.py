@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 
+from desktop_lock_isolation import install_desktop_lock_isolation
 from win_collab.core import SCAN_ERROR_LIMIT, TERMINAL, Engine, Store
 
 
@@ -66,6 +67,7 @@ def _running_job(store, *, backend="http://127.0.0.1:4397", backend_id=None, ses
 
 class TestInFlightRecovery(unittest.TestCase):
     def setUp(self):
+        install_desktop_lock_isolation(self)
         self.tmp = tempfile.TemporaryDirectory()
         self.store = Store(home=self.tmp.name)
 

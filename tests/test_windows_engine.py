@@ -7,6 +7,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
+from desktop_lock_isolation import install_desktop_lock_isolation
 from win_collab.core import Engine, Store, contained, validate_charter
 
 
@@ -82,6 +83,7 @@ class FakeClient:
 
 class Tests(unittest.TestCase):
     def setUp(self):
+        install_desktop_lock_isolation(self)
         self.tmp=tempfile.TemporaryDirectory()
         self.store=Store(Path(self.tmp.name))
         self.client=FakeClient()

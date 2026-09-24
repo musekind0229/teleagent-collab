@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import copy
+import sys
 import tempfile
 import threading
 import unittest
@@ -12,6 +13,12 @@ from pathlib import Path
 
 from jsonschema import Draft202012Validator
 
+# tests/ is not a package. The shared lock-isolation helper lives there.
+_TESTS_DIR = str(Path(__file__).resolve().parents[1] / "tests")
+if _TESTS_DIR not in sys.path:
+    sys.path.append(_TESTS_DIR)
+
+from desktop_lock_isolation import install_desktop_lock_isolation
 from framework.app_service import (
     AppError,
     CollabApplication,
@@ -332,6 +339,9 @@ class _PendingCancelBackend(_AsyncBackend):
 
 
 class AppServiceTests(unittest.TestCase):
+    def setUp(self):
+        install_desktop_lock_isolation(self)
+
     @staticmethod
     def _force_controller_scan(state_dir: Path, run_id: str) -> None:
         store = Store(state_dir)

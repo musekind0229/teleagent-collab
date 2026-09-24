@@ -9,6 +9,7 @@ from http.client import HTTPConnection
 from pathlib import Path
 from typing import Any
 
+from desktop_lock_isolation import install_desktop_lock_isolation
 from framework.app_service import CollabApplication, CollabHttpServer, DeterministicPlanner
 
 
@@ -95,6 +96,9 @@ class FakeSupervisedBackend:
 
 
 class DecisionApiHandoffTests(unittest.TestCase):
+    def setUp(self):
+        install_desktop_lock_isolation(self)
+
     def _boot(self) -> tuple[CollabApplication, FakeSupervisedBackend, str]:
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)

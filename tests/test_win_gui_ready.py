@@ -9,6 +9,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+from desktop_lock_isolation import install_desktop_lock_isolation
 from framework.app_service import assess_win_gui_readiness, probe_win_gui_connection
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,6 +48,9 @@ class _FakeClient:
 
 
 class ReadyGateTests(unittest.TestCase):
+    def setUp(self):
+        install_desktop_lock_isolation(self)
+
     def _assess(self, status, **kwargs):
         calls = []
 

@@ -9,10 +9,17 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from desktop_lock_isolation import (
+    install_desktop_lock_isolation,
+    lock_dir_snapshot,
+    real_desktop_lock_root,
+)
 from execution_backend.windows_supervised_v1 import WindowsSupervisedExecutionBackend
 from win_collab.core import Engine, Store
 from win_collab.desktop_lock import (
+    claim_desktop,
     controller_id_for,
+    lock_root,
     read_holder,
     reset_desktop_locks_for_tests,
 )
@@ -78,6 +85,7 @@ def aborts(client):
 
 class DesktopOccupancyTests(unittest.TestCase):
     def setUp(self):
+        self.desktop_lock_dir = install_desktop_lock_isolation(self)
         reset_desktop_locks_for_tests()
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
@@ -249,6 +257,22 @@ class DesktopOccupancyTests(unittest.TestCase):
         self.assertTrue(again['ok'], again)
         self.assertFalse(again.get('need_human'))
         self.assertEqual(len(posts(client)), 2)
+
+    def test_claim_does_not_write_real_localappdata_lock_dir(self):
+        real = real_desktop_lock_root()
+        before = lock_dir_snapshot(real)
+        existed = real.exists()
+        base = 'http://127.0.0.1:9'
+        state = self.root / 'guard'
+        state.mkdir()
+        self.assertTrue(claim_desktop(base, state))
+        locked = lock_root().resolve()
+        temp = Path(self.desktop_lock_dir).resolve()
+        self.assertTrue(locked.is_relative_to(temp))
+        self.assertTrue(any(locked.iterdir()))
+        self.assertIsNotNone(read_holder(base))
+        self.assertEqual(lock_dir_snapshot(real), before)
+        self.assertEqual(real.exists(), existed)
 
 
 if __name__ == '__main__':
