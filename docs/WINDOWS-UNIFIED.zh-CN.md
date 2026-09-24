@@ -7,7 +7,7 @@
 ## 推荐操作入口（只推桌面 GUI）
 
 1. 打开并登录桌面 TeleAgent（不要为通单改走 stdin-wrap）。
-2. 探活：`python bin/collab-service.py --check-gui`（或 `python -m win_collab doctor` / `.\windows\collab.ps1 doctor`）。非绿则停，先修 GUI。
+2. 每日派工门（只读）：`python bin/collab-service.py --ready`（或 `python -m win_collab ready`）。退出码 0 才表示 GUI doctor 为 ok 且桌面 session 空闲；`busy` / `unknown` 会给出 `不要派工`。见 [每日开工](WINDOWS-DAILY-STARTUP.zh-CN.md)。`--check-gui` 只做 doctor，不读占用。
 3. 开应用入口（**不加** `--teleagent-stdin-wrap`）：
 
 ```powershell
@@ -45,7 +45,7 @@ python bin/collab-service.py --persist .collab-app --port 8765 `
 
 ## 应用入口预览
 
-本分支新增 `bin/collab-service.py`，外部调用方只提交 Goal、边界和验收条件。框架内部再调用可插拔规划组长、生成 Task 依赖并派给 ExecutionBackend，因此永续层不需要知道具体组长或工人的接口。请求、任务、运行句柄、事件和报告均进入 durable store；入口只绑定本机 loopback，并支持 Bearer token。`--check-gui` 提供一键 GUI doctor，不启服务、不走 wrap。
+本分支新增 `bin/collab-service.py`，外部调用方只提交 Goal、边界和验收条件。框架内部再调用可插拔规划组长、生成 Task 依赖并派给 ExecutionBackend，因此永续层不需要知道具体组长或工人的接口。请求、任务、运行句柄、事件和报告均进入 durable store；入口只绑定本机 loopback，并支持 Bearer token。`--check-gui` 提供一键 GUI doctor，不启服务、不走 wrap。每日派工前用 `--ready` 额外只读 `/session/status`（见 [每日开工](WINDOWS-DAILY-STARTUP.zh-CN.md)）。
 
 当前默认工人仍是确定性的 `inprocess.local_v1`。显式选择 `--backend teleagent-windows` 后，新入口会通过 `teleagent.windows.supervised_v1` 复用旧 Windows 控制器（默认 `stdin_wrap=False`）；Grok 组长可负责规划、普通权限和产物验收，Question 与系统动作继续上交外部 decision API。使用方法和 HTTP 契约见 [`application-api.zh-CN.md`](application-api.zh-CN.md)。
 

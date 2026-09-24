@@ -954,6 +954,43 @@ class AppCoordinator:
 
 
 
+def _run_win_gui_doctor(
+    *,
+    simulated: bool = False,
+    simulate_status: str | None = None,
+    port_open_fn: Callable[[str, int], bool] | None = None,
+    creds_presence_fn: Callable[[], Any] | None = None,
+) -> Any:
+    from teleagent_adapter.doctor import doctor
+
+    return doctor(
+        base_url="http://127.0.0.1:4399",
+        platform="win32",
+        simulated=simulated,
+        simulate_status=simulate_status,
+        port_open_fn=port_open_fn,
+        creds_presence_fn=creds_presence_fn,
+    )
+
+
+def _probe_from_doctor_report(report: Any) -> dict[str, Any]:
+    from teleagent_adapter.base import AdapterStatus
+
+    status = str(getattr(report, "status", "") or "")
+    ok = status == AdapterStatus.OK.value
+    details = [str(x) for x in (getattr(report, "details", None) or [])]
+    detail = "; ".join(details[:3])
+    reason = sanitize_reason(detail or status or "connection_not_ready")
+    return {
+        "ok": ok,
+        "status": status,
+        "reason": reason if not ok else "",
+        "base_url": getattr(report, "base_url", "") or "",
+        "simulated": bool(getattr(report, "simulated", False)),
+        "details": [sanitize_reason(x) for x in details],
+    }
+
+
 def probe_win_gui_connection(
     *,
     simulated: bool = False,
@@ -964,28 +1001,209 @@ def probe_win_gui_connection(
     """Fail-closed doctor probe against desktop GUI TeleAgent ports (4399/4397/4398).
 
     Never defaults to stdin_wrap. Uncertain / non-ok statuses are not success.
+    ``details`` is additive; ``ok`` / ``status`` / ``reason`` / ``base_url`` / ``simulated`` stay the gate.
     """
-    from teleagent_adapter.base import AdapterStatus
-    from teleagent_adapter.doctor import doctor
-
-    report = doctor(
-        base_url="http://127.0.0.1:4399",
-        platform="win32",
+    report = _run_win_gui_doctor(
         simulated=simulated,
         simulate_status=simulate_status,
         port_open_fn=port_open_fn,
         creds_presence_fn=creds_presence_fn,
     )
-    status = str(report.status or "")
-    ok = status == AdapterStatus.OK.value
-    detail = "; ".join(str(x) for x in (report.details or [])[:3])
-    reason = sanitize_reason(detail or status or "connection_not_ready")
+    return _probe_from_doctor_report(report)
+
+
+_HOLDER_KEYS = ("controller_id", "pid", "state_dir", "base_url")
+
+
+def _readonly_creds_presence() -> Any:
+    """Doctor creds probe with the wrap channel forced off.
+
+    Daily readiness must not spawn stdin_wrap. Presence still uses process env
+    and foreign environ reads; a missing secret stays missing.
+    """
+    import os
+
+    from teleagent_adapter.windows_process_environ import (
+        WIN_CREDS_CHANNEL_ENV,
+        probe_windows_creds_presence,
+    )
+
+    env = dict(os.environ)
+    env[WIN_CREDS_CHANNEL_ENV] = "off"
+    return probe_windows_creds_presence(environ=env)
+
+
+def _public_lock_holder(raw: Any) -> dict[str, Any] | None:
+    """Holder JSON is diagnostic and may be stale. Never echo secret-shaped extras."""
+    if not isinstance(raw, dict):
+        return None
+    out: dict[str, Any] = {}
+    for key in _HOLDER_KEYS:
+        if key not in raw:
+            continue
+        value = raw[key]
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            continue
+        out[key] = value
+    return out or None
+
+
+def _fetch_session_status_readonly(base_url: str) -> Any:
+    """GET /session/status via the existing win_collab client.
+
+    Does not POST /session, claim the desktop lock, or start stdin_wrap.
+    """
+    from win_collab.client import Client, discover
+
+    discovered_base, creds = discover()
+    base = str(base_url or discovered_base).strip().rstrip("/")
+    client = Client(base=base, creds=creds)
+    return client.call("GET", "/session/status")
+
+
+def _read_lock_holder_readonly(base_url: str) -> dict[str, Any] | None:
+    from win_collab.desktop_lock import read_holder
+
+    return read_holder(base_url)
+
+
+def _classify_desktop_occupancy(status_obj: Any) -> dict[str, Any]:
+    """Whole-desktop idle | busy | unknown from the strict session parsers.
+
+    glue.parse_session_activity is the three-state parser. foreign_desktop_busy
+    is the dispatch fail-closed check (no owned sessions). They must agree
+    before the desktop is reported idle.
+    """
+    import glue as g
+
+    session_types: dict[str, int] = {}
+    session_count = 0
+    state = "unknown"
+    if isinstance(status_obj, dict):
+        activities: list[str] = []
+        for key, val in status_obj.items():
+            session_count += 1
+            label = "invalid"
+            if isinstance(val, dict):
+                raw = val.get("type") if val.get("type") is not None else val.get("status")
+                label = str(raw) if raw is not None else "missing"
+            session_types[label] = session_types.get(label, 0) + 1
+            activities.append(g.parse_session_activity(status_obj, str(key)))
+        if not status_obj:
+            probe = g.parse_session_activity(status_obj, "_ready_probe")
+            state = "idle" if probe == "idle" else "unknown"
+        elif any(item == "busy" for item in activities):
+            state = "busy"
+        elif any(item != "idle" for item in activities):
+            state = "unknown"
+        else:
+            state = "idle"
+        if state == "idle":
+            blocked = True
+            try:
+                from win_collab.desktop_lock import foreign_desktop_busy
+
+                blocked = bool(foreign_desktop_busy(status_obj, ()))
+            except Exception:
+                blocked = True
+            if blocked:
+                state = "unknown"
     return {
-        "ok": ok,
-        "status": status,
-        "reason": reason if not ok else "",
-        "base_url": report.base_url,
-        "simulated": bool(report.simulated),
+        "state": state,
+        "session_count": session_count,
+        "session_types": session_types,
+    }
+
+
+def _occupancy_block_reasons(state: str, *, detail: str = "") -> list[str]:
+    if state == "busy":
+        lines = [
+            "DO NOT DISPATCH: desktop session occupancy is busy",
+            "不要派工：桌面 session 正忙",
+        ]
+    else:
+        lines = [
+            "DO NOT DISPATCH: desktop session occupancy is unknown",
+            "不要派工：无法确认桌面 session 是否空闲",
+        ]
+    cleaned = sanitize_reason(detail)
+    if cleaned:
+        lines.append(cleaned)
+    return lines
+
+
+def assess_win_gui_readiness(
+    *,
+    simulated: bool = False,
+    simulate_status: str | None = None,
+    port_open_fn: Callable[[str, int], bool] | None = None,
+    creds_presence_fn: Callable[[], Any] | None = None,
+    session_status_fn: Callable[[str], Any] | None = None,
+    lock_holder_fn: Callable[[str], Any] | None = None,
+) -> dict[str, Any]:
+    """Read-only daily gate: doctor + /session/status + lock-holder metadata.
+
+    Does not start stdin_wrap, create a session, claim or steal the desktop
+    lock, or stop the GUI. ``busy`` and ``unknown`` fail closed.
+    Lock-holder JSON is reported even when stale and does not by itself allow
+    or deny dispatch.
+    """
+    report = _run_win_gui_doctor(
+        simulated=simulated,
+        simulate_status=simulate_status,
+        port_open_fn=port_open_fn,
+        creds_presence_fn=creds_presence_fn or _readonly_creds_presence,
+    )
+    gui = _probe_from_doctor_report(report)
+    base_url = str(gui.get("base_url") or "")
+    holder_fn = lock_holder_fn or _read_lock_holder_readonly
+    lock_holder: dict[str, Any] | None = None
+    if base_url:
+        try:
+            lock_holder = _public_lock_holder(holder_fn(base_url))
+        except Exception:
+            lock_holder = None
+
+    occupancy: dict[str, Any]
+    reasons: list[str]
+    if not gui.get("ok"):
+        occupancy = {"state": "unknown", "session_count": 0, "session_types": {}}
+        reasons = _occupancy_block_reasons("unknown", detail=str(gui.get("reason") or gui.get("status") or ""))
+    else:
+        fetch = session_status_fn or _fetch_session_status_readonly
+        try:
+            status_obj = fetch(base_url)
+        except Exception as exc:
+            occupancy = {"state": "unknown", "session_count": 0, "session_types": {}}
+            reasons = _occupancy_block_reasons(
+                "unknown",
+                detail=f"session status read failed: {type(exc).__name__}: {exc}",
+            )
+        else:
+            occupancy = _classify_desktop_occupancy(status_obj)
+            if occupancy["state"] == "idle":
+                reasons = []
+            else:
+                reasons = _occupancy_block_reasons(str(occupancy["state"]))
+
+    dispatch_allowed = bool(gui.get("ok")) and occupancy["state"] == "idle"
+    ready = dispatch_allowed
+    return {
+        "ready": ready,
+        "gui": {
+            "status": gui.get("status") or "",
+            "ok": bool(gui.get("ok")),
+            "reason": gui.get("reason") or "",
+            "simulated": bool(gui.get("simulated")),
+            "details": list(gui.get("details") or []),
+        },
+        "base_url": base_url,
+        "occupancy": occupancy,
+        "session_count": occupancy["session_count"],
+        "session_types": occupancy["session_types"],
+        "lock_holder": lock_holder,
+        "dispatch_allowed": dispatch_allowed,
+        "reasons": reasons,
     }
 
 

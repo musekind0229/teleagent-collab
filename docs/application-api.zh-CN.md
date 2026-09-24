@@ -41,14 +41,15 @@ python bin/collab-service.py --persist .collab-app --port 8765 --planner grok
 生产与日常联调只走**已登录的桌面 TeleAgent**。先探活，再开服务；**不要**加 `--teleagent-stdin-wrap`。
 
 ```powershell
-python bin/collab-service.py --check-gui
-# 失败：先打开并登录桌面 TeleAgent，确认 doctor 绿（端口发现 4399/4397/4398，默认 :4397）
+python bin/collab-service.py --ready
+# 退出码 0 才可派工。busy/unknown 含「不要派工」。步骤见 docs/WINDOWS-DAILY-STARTUP.zh-CN.md
+# doctor-only（不看 session 占用）：python bin/collab-service.py --check-gui
 
 python bin/collab-service.py --persist .collab-app --port 8765 `
   --planner grok --backend teleagent-windows
 ```
 
-也可用 `python -m win_collab doctor` 或 `.\windows\collab.ps1 doctor` 做同一探活。
+也可用 `python -m win_collab ready` 做同一就绪门。`python -m win_collab doctor` 只探活，不读占用。
 
 ## 诊断专用：stdin-wrap（非生产）
 

@@ -69,17 +69,39 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--ready",
+        action="store_true",
+        help=(
+            "read-only daily gate: GUI doctor plus /session/status occupancy "
+            "and lock-holder metadata. Exit 0 only when ready and "
+            "dispatch_allowed. Does not start the HTTP service, stdin_wrap, "
+            "a session, or the desktop lock"
+        ),
+    )
+    parser.add_argument(
         "--check-gui",
         action="store_true",
         help=(
-            "run fail-closed doctor against desktop GUI TeleAgent ports "
-            "(4399/4397/4398) and exit; does not start the HTTP service "
-            "and never uses stdin_wrap"
+            "doctor-only probe of desktop GUI TeleAgent ports (4399/4397/4398) "
+            "and exit; does not read session occupancy, start the HTTP service, "
+            "or use stdin_wrap. Daily dispatch gate is --ready"
         ),
     )
     parser.add_argument("--token-env", default="COLLAB_API_TOKEN")
     parser.add_argument("--once", action="store_true", help="process all queued Goals once and exit")
     args = parser.parse_args(argv)
+
+    if args.ready:
+        from framework.app_service import assess_win_gui_readiness
+
+        result = assess_win_gui_readiness()
+        if hasattr(sys.stdout, "reconfigure"):
+            try:
+                sys.stdout.reconfigure(encoding="utf-8")
+            except Exception:
+                pass
+        print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+        return 0 if result.get("ready") and result.get("dispatch_allowed") else 1
 
     if args.check_gui:
         from framework.app_service import probe_win_gui_connection

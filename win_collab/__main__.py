@@ -10,11 +10,22 @@ from .client import Client
 from .core import DEFAULT_HOME, Engine, Store
 
 
-def main():
+def _ready_report():
+    """Thin alias of the canonical read-only readiness aggregator."""
+    root = Path(__file__).resolve().parents[1]
+    src = str(root / 'src')
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    from framework.app_service import assess_win_gui_readiness
+    return assess_win_gui_readiness()
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description='TeleAgent worker with a persistent, pluggable lead inbox')
     parser.add_argument('--home', type=Path, default=DEFAULT_HOME)
     subs = parser.add_subparsers(dest='command', required=True)
     subs.add_parser('doctor')
+    subs.add_parser('ready', help='Read-only daily gate (doctor + session occupancy). Does not dispatch')
     s = subs.add_parser('submit'); s.add_argument('charter', type=Path)
     subs.add_parser('status')
     subs.add_parser('inbox')
@@ -26,9 +37,15 @@ def main():
     s = subs.add_parser('lead', help='Run a separately selected lead command for one request')
     s.add_argument('request_id'); s.add_argument('--backend',choices=['codex','json-command'],required=True)
     s.add_argument('--exe',required=True,help='Absolute path to the selected lead executable')
-    args = parser.parse_args()
-    sys.stdout.reconfigure(encoding='utf-8')
+    args = parser.parse_args(argv)
+    reconfigure = getattr(sys.stdout, 'reconfigure', None)
+    if reconfigure is not None:
+        reconfigure(encoding='utf-8')
     try:
+        if args.command == 'ready':
+            output = _ready_report()
+            print(json.dumps(output, ensure_ascii=False, indent=2))
+            return 0 if output.get('ready') and output.get('dispatch_allowed') else 1
         if args.command == 'doctor':
             client = Client()
             health = client.call('GET', '/global/health')
