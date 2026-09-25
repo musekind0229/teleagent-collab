@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import subprocess
 import threading
 import time
 import uuid
@@ -1132,6 +1134,214 @@ def _occupancy_block_reasons(state: str, *, detail: str = "") -> list[str]:
     return lines
 
 
+# src/framework/app_service.py -> repo root
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_DEFAULT_RUNNING_TIP_NAME = "running_tip.json"
+_TIP_MISMATCH_ZH = "不要派工：运行 tip 与磁盘 HEAD 不一致，请重启 collab-service 后再派工"
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_STILL_ACTIVE = 259
+_ERROR_ACCESS_DENIED = 5
+
+# In-memory tip of this process. Captured once at import so a later HEAD move
+# cannot be mistaken for the code this process already loaded.
+_PROCESS_START_TIP = ""
+
+
+def repo_root() -> Path:
+    return _REPO_ROOT
+
+
+def default_running_tip_path(persist_root: str | Path | None = None) -> Path:
+    if persist_root is None:
+        return _REPO_ROOT / ".collab-app" / _DEFAULT_RUNNING_TIP_NAME
+    return Path(persist_root) / _DEFAULT_RUNNING_TIP_NAME
+
+
+def read_git_head(repo_root: str | Path | None = None) -> str:
+    """``git rev-parse HEAD`` in ``repo_root``. Empty string when unknown."""
+    root = _REPO_ROOT if repo_root is None else Path(repo_root)
+    run_kwargs: dict[str, Any] = {
+        "cwd": str(root),
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "timeout": 15,
+        "check": False,
+        "stdin": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        run_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        proc = subprocess.run(["git", "rev-parse", "HEAD"], **run_kwargs)
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def process_start_tip() -> str:
+    """Tip loaded with this process. Stable for the life of the process."""
+    return _PROCESS_START_TIP
+
+
+def _coerce_tip(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
+def _invoke_tip(fn: Callable[[], Any]) -> str:
+    try:
+        return _coerce_tip(fn())
+    except Exception:
+        return ""
+
+
+def _pid_is_alive(pid: Any) -> bool:
+    """True when ``pid`` is a live process.
+
+    Windows ``os.kill(pid, 0)`` terminates the process via TerminateProcess.
+    Query with PROCESS_QUERY_LIMITED_INFORMATION and never signal it.
+    Access denied still counts as alive so a live service is not ignored.
+    """
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    handle = kernel.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return ctypes.get_last_error() == _ERROR_ACCESS_DENIED
+    try:
+        code = wintypes.DWORD()
+        if not kernel.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return True
+        return int(code.value) == _STILL_ACTIVE
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def _fallback_running_tip() -> str:
+    started = process_start_tip().strip()
+    if started:
+        return started
+    return read_git_head(_REPO_ROOT)
+
+
+def read_running_tip_for_ready(tip_path: str | Path | None = None) -> str:
+    """Tip of a live service recorded on disk, else this process's start tip.
+
+    A missing file, a dead pid, or an unreadable record means no live stale
+    service. An empty tip on a still-live pid is returned as empty so the
+    compare fails closed.
+    """
+    path = default_running_tip_path() if tip_path is None else Path(tip_path)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return _fallback_running_tip()
+    if not isinstance(raw, dict):
+        return _fallback_running_tip()
+    pid = raw.get("pid")
+    if not _pid_is_alive(pid):
+        return _fallback_running_tip()
+    return _coerce_tip(raw.get("tip"))
+
+
+def write_running_tip(
+    tip_path: str | Path,
+    *,
+    tip: str | None = None,
+    pid: int | None = None,
+) -> dict[str, Any]:
+    """Record this service process's tip. Caller must not commit the file."""
+    path = Path(tip_path)
+    recorded = process_start_tip() if tip is None else _coerce_tip(tip)
+    recorded_pid = os.getpid() if pid is None else int(pid)
+    body = {"tip": recorded, "pid": recorded_pid}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(body, ensure_ascii=False) + "\n", encoding="utf-8")
+    return body
+
+
+def _format_tip_mismatch(running_tip: str, head_tip: str) -> str:
+    running = running_tip.strip() or "unknown"
+    head = head_tip.strip() or "unknown"
+    return (
+        f"DO NOT DISPATCH: running tip <{running}> != HEAD <{head}> "
+        "(restart collab-service to align)"
+    )
+
+
+def assess_tip_consistency(
+    *,
+    running_tip: str | None = None,
+    head_tip: str | None = None,
+    running_tip_fn: Callable[[], Any] | None = None,
+    head_tip_fn: Callable[[], Any] | None = None,
+    tip_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Fail closed unless the running tip and ``HEAD`` are the same non-empty SHA."""
+    if running_tip is None:
+        running = _invoke_tip(running_tip_fn) if running_tip_fn is not None else read_running_tip_for_ready(tip_path)
+    else:
+        running = _coerce_tip(running_tip)
+    if head_tip is None:
+        head = _invoke_tip(head_tip_fn) if head_tip_fn is not None else read_git_head(_REPO_ROOT)
+    else:
+        head = _coerce_tip(head_tip)
+    ok = bool(running) and bool(head) and running == head
+    return {
+        "ok": ok,
+        "running_tip": running,
+        "head_tip": head,
+        "reason": "" if ok else _format_tip_mismatch(running, head),
+    }
+
+
+def tip_mismatch_lines(assessment: Mapping[str, Any]) -> list[str]:
+    reason = str(assessment.get("reason") or "").strip()
+    if not reason:
+        return []
+    lines = [reason]
+    if _TIP_MISMATCH_ZH not in reason:
+        lines.append(_TIP_MISMATCH_ZH)
+    return lines
+
+
+def _refuse_dispatch_if_tip_mismatch() -> None:
+    """This process's start tip vs the checkout HEAD. Raises AppError on drift."""
+    assessment = assess_tip_consistency(
+        running_tip=process_start_tip(),
+        head_tip=read_git_head(_REPO_ROOT),
+    )
+    if assessment["ok"]:
+        return
+    raise AppError(
+        "\n".join(tip_mismatch_lines(assessment)),
+        status=409,
+        code="running_tip_mismatch",
+    )
+
+
+_PROCESS_START_TIP = read_git_head(_REPO_ROOT)
+
+
 def assess_win_gui_readiness(
     *,
     simulated: bool = False,
@@ -1140,11 +1350,17 @@ def assess_win_gui_readiness(
     creds_presence_fn: Callable[[], Any] | None = None,
     session_status_fn: Callable[[str], Any] | None = None,
     lock_holder_fn: Callable[[str], Any] | None = None,
+    running_tip: str | None = None,
+    head_tip: str | None = None,
+    running_tip_fn: Callable[[], Any] | None = None,
+    head_tip_fn: Callable[[], Any] | None = None,
+    tip_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Read-only daily gate: doctor + /session/status + lock-holder metadata.
 
     Does not start stdin_wrap, create a session, claim or steal the desktop
-    lock, or stop the GUI. ``busy`` and ``unknown`` fail closed.
+    lock, or stop the GUI. ``busy``, ``unknown``, and a running tip that
+    differs from HEAD fail closed.
     Lock-holder JSON is reported even when stale and does not by itself allow
     or deny dispatch.
     """
@@ -1186,7 +1402,16 @@ def assess_win_gui_readiness(
             else:
                 reasons = _occupancy_block_reasons(str(occupancy["state"]))
 
-    dispatch_allowed = bool(gui.get("ok")) and occupancy["state"] == "idle"
+    tip = assess_tip_consistency(
+        running_tip=running_tip,
+        head_tip=head_tip,
+        running_tip_fn=running_tip_fn,
+        head_tip_fn=head_tip_fn,
+        tip_path=tip_path,
+    )
+    if not tip["ok"]:
+        reasons.extend(tip_mismatch_lines(tip))
+    dispatch_allowed = bool(gui.get("ok")) and occupancy["state"] == "idle" and bool(tip["ok"])
     ready = dispatch_allowed
     return {
         "ready": ready,
@@ -1204,6 +1429,9 @@ def assess_win_gui_readiness(
         "lock_holder": lock_holder,
         "dispatch_allowed": dispatch_allowed,
         "reasons": reasons,
+        "running_tip": tip["running_tip"],
+        "head_tip": tip["head_tip"],
+        "tip_ok": bool(tip["ok"]),
     }
 
 
@@ -1262,6 +1490,7 @@ class CollabApplication:
         self._connection_probe = connection_probe
 
     def submit(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        _refuse_dispatch_if_tip_mismatch()
         if not isinstance(payload, Mapping):
             raise AppError("request body must be a JSON object")
         goal_text = str(payload.get("goal") or payload.get("desired_outcome") or "").strip()

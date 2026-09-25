@@ -21,6 +21,7 @@ from framework.app_service import (  # noqa: E402
     CoordinatorLoop,
     DeterministicPlanner,
     LeadAdapterPlanner,
+    write_running_tip,
 )
 
 
@@ -94,7 +95,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.ready:
         from framework.app_service import assess_win_gui_readiness
 
-        result = assess_win_gui_readiness()
+        result = assess_win_gui_readiness(
+            tip_path=Path(args.persist).resolve() / "running_tip.json",
+        )
         if hasattr(sys.stdout, "reconfigure"):
             try:
                 sys.stdout.reconfigure(encoding="utf-8")
@@ -142,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
 
     token = (os.environ.get(args.token_env) or "").strip()
     server = CollabHttpServer((args.host, args.port), app, api_token=token)
+    write_running_tip(persist / "running_tip.json")
     loop = CoordinatorLoop(app)
     loop.start()
     auth = f"Bearer token required from {args.token_env}" if token else "loopback only; no bearer token configured"
