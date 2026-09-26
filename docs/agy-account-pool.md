@@ -10,14 +10,23 @@
 2. 复制示例 `jobs/examples/agy_account_pool.example.json` 到**不会进 git** 的路径（例如 `jobs/agy-account-pool.json`），把 `home` 改成绝对路径。
 3. 派工：
 
+hello / agy 烟测要写出 `hello-from-worker.txt`，必须显式打开 skip-permissions，否则权限通道 unsupported：产物空或缺失，finish 即使像 stop 也会假失败。章程 `must_not` 里的 always-approve 保持不变；这是**环境**开关，不是所有工单的默认。
+
 ```bash
-COLLAB_AGY_ACCOUNT_POOL=/path/to/agy-account-pool.json \
+AGY_AUTO_APPROVE=1 COLLAB_AGY_ACCOUNT_POOL=/path/to/agy-account-pool.json \
   python3 bin/run-job.py --backend antigravity jobs/examples/hello.charter.yaml
 
-python3 bin/run-job.py --backend antigravity \
+AGY_AUTO_APPROVE=1 python3 bin/run-job.py --backend antigravity \
   --agy-account-pool /path/to/agy-account-pool.json \
   jobs/examples/hello.charter.yaml
 ```
+
+```powershell
+$env:AGY_AUTO_APPROVE = '1'
+python bin/run-job.py --backend antigravity --agy-account-pool jobs/agy-account-pool.json jobs/examples/hello.charter.yaml
+```
+
+等价开关：`COLLAB_AGY_AUTO_APPROVE=1`，或章程 `agy_auto_approve: true`。依赖：`agy` 在 PATH（或 `AGY_BIN`）；池 JSON 可选；配了代理才注入；文件凭据靠下方子进程 `SSH_*`。
 
 选中账号后注入的环境（一次 spawn 固定）：
 
@@ -67,8 +76,8 @@ Win 上 agy **1.2.11** 走文件凭据的真实触发是子进程里的伪 `SSH_
 | `auth_invalid` | `unavailable`，不派，试下一个 |
 | `quota_exhausted`（含模型 `503` / `No capacity`） | `exhausted`（≠ eligibility） |
 | `rate_limit` | `cooldown`（到期可回到 available） |
-| `ok` | 选中 |
-| `ordinary_task_failure` | 任务失败，不把账号标坏 |
+| `ok` | 选中。含 JSON `SUCCESS`/`OK`/`COMPLETED`/`STOP`/`DONE`，以及 `agy models` 成功时的纯文本模型列表（rc 为 0 或未给、输出非空、未命中上面几类、也不是 FAIL status） |
+| `ordinary_task_failure` | 非 0 退出或 JSON `ERROR`/`FAILED`/`FAIL`。不把账号标坏，也不选中 |
 
 剧本：A 可派 → 把 A 标 `exhausted` → 下一单选 C。B 因 eligibility 为 `unavailable`，**永不被选**。
 

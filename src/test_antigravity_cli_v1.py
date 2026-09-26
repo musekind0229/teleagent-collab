@@ -75,7 +75,15 @@ raise SystemExit(int(os.environ.get("AGY_FAKE_EXIT", "0")))
 
 
 def _write_fake_agy(dirpath: str | Path) -> Path:
-    p = Path(dirpath) / "fake-agy"
+    """Return a spawnable fake agy. Windows cannot CreateProcess a shebang script."""
+    root = Path(dirpath)
+    if os.name == "nt":
+        script = root / "fake-agy.py"
+        script.write_text(_FAKE_AGY, encoding="utf-8")
+        cmd = root / "fake-agy.cmd"
+        cmd.write_text(f'@"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
+        return cmd
+    p = root / "fake-agy"
     p.write_text(_FAKE_AGY, encoding="utf-8")
     p.chmod(p.stat().st_mode | stat.S_IEXEC)
     return p

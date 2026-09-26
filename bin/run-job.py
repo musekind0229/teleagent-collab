@@ -5,12 +5,15 @@ Usage:
   python3 bin/run-job.py jobs/examples/hello.charter.yaml
   python3 bin/run-job.py --dry-run jobs/examples/hello.charter.yaml
   python3 bin/run-job.py --backend inprocess jobs/examples/hello.charter.yaml
-  python3 bin/run-job.py --backend antigravity jobs/examples/hello.charter.yaml
+  AGY_AUTO_APPROVE=1 python3 bin/run-job.py --backend antigravity jobs/examples/hello.charter.yaml
   COLLAB_EXECUTION_BACKEND=inprocess.local_v1 python3 bin/run-job.py jobs/examples/hello.charter.yaml
-  COLLAB_EXECUTION_BACKEND=antigravity.cli_v1 python3 bin/run-job.py jobs/examples/hello.charter.yaml
+  AGY_AUTO_APPROVE=1 COLLAB_EXECUTION_BACKEND=antigravity.cli_v1 python3 bin/run-job.py jobs/examples/hello.charter.yaml
 
 Default backend is TeleAgent (glue). inprocess and antigravity use ExecutionBackend
 public API only (no TeleAgent HTTP). Reports land under jobs/runs/<name>-<utc>/.
+
+Hello/agy smoke sets AGY_AUTO_APPROVE=1 (or COLLAB_AGY_AUTO_APPROVE=1) so the
+worker can write the artifact. Skip-permissions stays off for other jobs.
 """
 from __future__ import annotations
 

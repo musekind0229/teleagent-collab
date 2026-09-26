@@ -9,9 +9,13 @@ Classes (first match wins):
   quota_exhausted       -- MODEL_CAPACITY_EXHAUSTED / RESOURCE_EXHAUSTED / credits
                            / model 503 No capacity (NOT eligibility)
   rate_limit            -- 429 / overloaded / try again later
-  ok                    -- JSON status SUCCESS/OK/COMPLETED/STOP/DONE
+  ok                    -- JSON status SUCCESS/OK/COMPLETED/STOP/DONE, or rc in
+                           (None, 0) with non-empty output that matched none of
+                           the classes above and is not a FAIL status.
+                           ``agy models`` success is a plain model list (no
+                           JSON status field) and must be ok.
   empty_failure         -- no stdout and no stderr
-  ordinary_task_failure -- other ERROR / non-zero / leftover failure text
+  ordinary_task_failure -- non-zero rc, or JSON status ERROR/FAILED/FAIL
 
 eligibility_blocked is not auth_invalid and not quota_exhausted: oauth may
 already be on disk; the account is simply not eligible in this location.
@@ -94,7 +98,9 @@ def classify(stdout: str = "", stderr: str = "", rc: int | None = None) -> str:
         return CLASS_ORDINARY
     if not (stdout or stderr):
         return CLASS_EMPTY_FAILURE
-    return CLASS_ORDINARY
+    # rc is None or 0, output is non-empty, and nothing above matched.
+    # Successful ``agy models`` is a plain list, not a JSON status.
+    return CLASS_OK
 
 
 def classify_agy_error(

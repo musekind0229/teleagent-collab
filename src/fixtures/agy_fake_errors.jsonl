@@ -7,5 +7,6 @@
 {"id":"rate_overloaded_1","source":"binary_string_sim","stderr":"The model API is currently overloaded and may experience intermittent errors.","stdout":"{\"status\":\"ERROR\",\"error\":\"overloaded\"}","expect":"rate_limit"}
 {"id":"ordinary_1","source":"simulated","stderr":"","stdout":"{\"status\":\"ERROR\",\"error\":\"tool failed: file not found\"}","expect":"ordinary_task_failure"}
 {"id":"ok_1","source":"live_shape","stderr":"","stdout":"{\"status\":\"SUCCESS\",\"response\":\"PONG\"}","expect":"ok"}
+{"id":"ok_models_list_1","source":"agy_models_shape","stderr":"","stdout":"gemini-3.8-flash-low\ngemini-2.5-pro\n","rc":0,"expect":"ok"}
 {"id":"elig_location_1","source":"live_homeB","stderr":"error: Eligibility check failed: Your current account is not eligible for Antigravity, because it is not currently available in your location.\n","stdout":"{\"conversation_id\":\"\",\"status\":\"ERROR\",\"response\":\"\",\"error\":\"Eligibility check failed: Your current account is not eligible for Antigravity, because it is not currently available in your location.\"}","expect":"eligibility_blocked"}
 {"id":"elig_location_2","source":"simulated","stderr":"not currently available in your location","stdout":"","expect":"eligibility_blocked"}

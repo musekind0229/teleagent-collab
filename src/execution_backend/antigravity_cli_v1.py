@@ -400,6 +400,10 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
     def _kill_proc(self, proc: subprocess.Popen) -> bool:
         if proc.poll() is not None:
             return True
+        # Windows has no os.killpg. taskkill /T is the process-tree equivalent
+        # (a .cmd agy shim otherwise leaves the Python child holding the pipes).
+        if not hasattr(os, "killpg"):
+            return self._kill_proc_tree_windows(proc)
         killed = False
         try:
             os.killpg(proc.pid, signal.SIGTERM)
@@ -425,6 +429,33 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             except subprocess.TimeoutExpired:
                 return proc.poll() is not None
         return killed or proc.poll() is not None
+
+    def _kill_proc_tree_windows(self, proc: subprocess.Popen) -> bool:
+        kwargs: dict[str, Any] = {
+            "capture_output": True,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "timeout": 10,
+            "check": False,
+        }
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        if flags:
+            kwargs["creationflags"] = flags
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], **kwargs)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                return False
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            return proc.poll() is not None
+        return proc.poll() is not None
 
     def _harvest(self, rec: dict[str, Any]) -> None:
         if rec.get("harvested"):

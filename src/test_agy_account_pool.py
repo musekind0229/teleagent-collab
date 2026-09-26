@@ -246,10 +246,19 @@ class TestClassifierFixture(unittest.TestCase):
         self.assertGreaterEqual(len(elig), 2, "must include both eligibility fixtures")
         failed = []
         for r in rows:
-            got = classify(r.get("stdout", ""), r.get("stderr", ""))
+            got = classify(r.get("stdout", ""), r.get("stderr", ""), r.get("rc"))
             if got != r["expect"]:
                 failed.append({"id": r["id"], "expect": r["expect"], "got": got})
         self.assertEqual(failed, [], failed)
+
+    def test_models_list_rc0_is_ok_stop_stays_ok(self):
+        text = "gemini-3.8-flash-low\ngemini-2.5-pro\n"
+        self.assertEqual(classify(text, "", 0), "ok")
+        self.assertEqual(classify(text, "", None), "ok")
+        self.assertEqual(classify('{"status":"STOP","response":""}', "", 0), "ok")
+        self.assertNotEqual(classify('{"status":"STOP","response":""}', "", 0), "empty_failure")
+        self.assertEqual(classify("", "", 0), "empty_failure")
+        self.assertEqual(classify(text, "", 1), "ordinary_task_failure")
 
     def test_model_503_no_capacity_is_quota_not_eligibility(self):
         blob = (
@@ -369,6 +378,25 @@ class TestPoolSelectHandoff(unittest.TestCase):
             self.assertEqual(picked.id, "C")
             self.assertEqual(pool.by_id("A").state, "exhausted")
             self.assertEqual(pool.by_id("B").state, "cooldown")
+
+    def test_precheck_models_list_rc0_selects_available(self):
+        """Plain ``agy models`` stdout (rc 0, no JSON status) must select."""
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_pool_file(
+                td,
+                _pool_dict(a_state="available", b_state="unavailable", c_state="available"),
+            )
+            pool = load_pool(path)
+            stdout = "gemini-3.8-flash-low\ngemini-2.5-pro\n"
+
+            def precheck(acc):
+                return {"stdout": stdout, "stderr": "", "rc": 0}
+
+            picked = select_account(pool, precheck=precheck)
+            self.assertIsNotNone(picked)
+            self.assertEqual(picked.id, "A")
+            self.assertEqual(pool.by_id("A").state, "available")
+            self.assertEqual(pool.by_id("C").state, "available")
 
     def test_apply_class_eligibility_not_quota(self):
         with tempfile.TemporaryDirectory() as td:

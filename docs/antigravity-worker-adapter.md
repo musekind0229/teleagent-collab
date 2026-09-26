@@ -16,11 +16,20 @@ be = get_execution_backend("antigravity.cli_v1")
 # 或 "antigravity" / "agy" / "agy.cli_v1"
 ```
 
+hello / agy 烟测要在 workspace 写出 `hello-from-worker.txt`。不带下面的环境变量时，权限通道 unsupported，产物空或缺失，finish 即使像 stop 也会假失败。这只给烟测打开 `--dangerously-skip-permissions`，不是全局默认。章程 `must_not: always-approve` 保持不变。
+
 ```bash
-python3 bin/run-job.py --backend antigravity jobs/examples/hello.charter.yaml
-python3 bin/run-job.py --backend agy jobs/examples/hello.charter.yaml
-COLLAB_EXECUTION_BACKEND=antigravity.cli_v1 python3 bin/run-job.py jobs/examples/hello.charter.yaml
+AGY_AUTO_APPROVE=1 python3 bin/run-job.py --backend antigravity jobs/examples/hello.charter.yaml
+AGY_AUTO_APPROVE=1 python3 bin/run-job.py --backend agy jobs/examples/hello.charter.yaml
+AGY_AUTO_APPROVE=1 COLLAB_EXECUTION_BACKEND=antigravity.cli_v1 python3 bin/run-job.py jobs/examples/hello.charter.yaml
 ```
+
+```powershell
+$env:AGY_AUTO_APPROVE = '1'
+python bin/run-job.py --backend agy jobs/examples/hello.charter.yaml
+```
+
+等价：`COLLAB_AGY_AUTO_APPROVE=1`，或章程 `agy_auto_approve: true`。依赖：`agy` 在 PATH 或 `AGY_BIN`；已登录；池 JSON 可选（见 [agy-account-pool.md](./agy-account-pool.md)，文件凭据靠子进程 `SSH_*`）；配了代理才走 `HTTP_PROXY` / `HTTPS_PROXY`。
 
 ## 登录前提
 
