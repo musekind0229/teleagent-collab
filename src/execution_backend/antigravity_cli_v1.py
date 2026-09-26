@@ -18,6 +18,11 @@ import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
+from execution_backend.agy_account_pool import (
+    ENV_POOL,
+    ENV_PROFILE,
+    clear_windows_antigravity_keyring,
+)
 from execution_backend.base import BackendError, BackendStatus, ExecutionBackendABC, unsupported
 
 BACKEND_ID = "antigravity.cli_v1"
@@ -339,6 +344,10 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         self._runs[handle] = rec
 
         try:
+            # Machine-wide slot: clear only for a pool-bound spawn, immediately before Popen.
+            spawn_env = self._env()
+            if str(spawn_env.get(ENV_POOL) or "").strip() or str(spawn_env.get(ENV_PROFILE) or "").strip():
+                clear_windows_antigravity_keyring()
             proc = subprocess.Popen(
                 cmd,
                 cwd=str(root),

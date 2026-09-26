@@ -24,14 +24,27 @@ python3 bin/run-job.py --backend antigravity \
 | 变量 | 值 |
 | --- | --- |
 | `HOME` | `<account.home>` |
+| `USERPROFILE` | 仅 Windows：与 `HOME` 相同 |
 | `GEMINI_FORCE_FILE_STORAGE` | `true` |
 | `AGY_PROFILE` | 池里的 `id`（CLI 不识别，只给编排元数据） |
+| `HTTP_PROXY` / `HTTPS_PROXY` | 仅当显式配置了代理 |
 
 保留已有 `AGY_BIN` / `AGY_MODEL` / `AGY_AUTO_APPROVE`。`--dangerously-skip-permissions` **默认仍关闭**。
 
+## Windows 串行换号
+
+`gemini:antigravity` 钥匙串是机器级单槽。换号顺序：
+
+1. `cmdkey /delete:gemini:antigravity`（槽不存在也继续；非 Windows 直接返回）
+2. `HOME` 与 `USERPROFILE` 设为该账号 `home`
+3. 配置了代理才注入 `HTTP_PROXY` / `HTTPS_PROXY`
+4. 再 spawn
+
+代理来源：账号上的 `http_proxy` / `https_proxy`，否则池 JSON 顶层同名字段，否则 `COLLAB_AGY_HTTP_PROXY` / `COLLAB_AGY_HTTPS_PROXY`。只配了 HTTP 时镜像到 `HTTPS_PROXY`。库内不写死代理地址。
+
 ## 池 JSON
 
-每条账号：`id`（或 `name`）、`home`（绝对路径）、`state`。可选 `email_mask` / `notes` / `cooldown_until`。
+每条账号：`id`（或 `name`）、`home`（绝对路径；Windows 需带盘符）、`state`。可选 `email_mask` / `notes` / `cooldown_until`，以及 `http_proxy` / `https_proxy`。池顶也可以放这两个代理字段。
 
 `state` ∈ `available` | `exhausted` | `cooldown` | `unavailable`。
 
@@ -70,3 +83,5 @@ python3 bin/run-job.py --backend antigravity \
 | `COLLAB_AGY_ACCOUNT_POOL` | 池 JSON 路径（CLI `--agy-account-pool` 优先） |
 | `COLLAB_AGY_POOL_PRECHECK=1` | 派工前对候选跑 live `agy models`（默认关；单测用 mock） |
 | `COLLAB_AGY_POOL_LIVE=1` | 打开可选 live 单测（默认 skip） |
+| `COLLAB_AGY_HTTP_PROXY` | 可选。写入 `HTTP_PROXY`；未另配 HTTPS 时镜像 |
+| `COLLAB_AGY_HTTPS_PROXY` | 可选。写入 `HTTPS_PROXY` |

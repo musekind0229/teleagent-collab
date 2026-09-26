@@ -7,6 +7,7 @@ import io
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -26,9 +27,16 @@ from execution_backend import (  # noqa: E402
     run_antigravity_charter,
 )
 from execution_backend.agy_account_pool import (  # noqa: E402
+    ENV_HTTP_PROXY,
+    ENV_HTTPS_PROXY,
     ENV_POOL,
     FORCE_FILE_STORAGE,
+    Account,
+    AccountPool,
+    AccountPoolError,
+    account_environ,
     apply_class_to_state,
+    clear_windows_antigravity_keyring,
     load_pool,
     mark_account,
     prepare_antigravity_environ_from_pool,
@@ -56,6 +64,7 @@ env_path = os.environ.get("AGY_FAKE_ENV", "")
 if env_path:
     keys = [
         "HOME",
+        "USERPROFILE",
         "AGY_PROFILE",
         "GEMINI_FORCE_FILE_STORAGE",
         "AGY_BIN",
@@ -63,6 +72,8 @@ if env_path:
         "AGY_AUTO_APPROVE",
         "COLLAB_AGY_AUTO_APPROVE",
         "COLLAB_AGY_ACCOUNT_POOL",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
     ]
     Path(env_path).write_text(json.dumps({k: os.environ.get(k) for k in keys}), encoding="utf-8")
 art = os.environ.get("AGY_FAKE_ARTIFACT", "")
@@ -86,10 +97,29 @@ raise SystemExit(int(os.environ.get("AGY_FAKE_EXIT", "0")))
 
 
 def _write_fake_agy(dirpath: str | Path) -> Path:
-    p = Path(dirpath) / "fake-agy"
+    root = Path(dirpath)
+    if os.name == "nt":
+        script = root / "fake-agy.py"
+        script.write_text(_FAKE_AGY, encoding="utf-8")
+        cmd = root / "fake-agy.cmd"
+        cmd.write_text(f'@"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
+        return cmd
+    p = root / "fake-agy"
     p.write_text(_FAKE_AGY, encoding="utf-8")
     p.chmod(p.stat().st_mode | stat.S_IEXEC)
     return p
+
+
+def _default_home_root() -> str:
+    # Windows Path.is_absolute() rejects a POSIX "/path/..." home.
+    if os.name == "nt":
+        return r"C:\path\to\profiles"
+    return "/path/to/profiles"
+
+
+def _account_home(name: str, home_root: str | None = None) -> str:
+    root = _default_home_root() if home_root is None else home_root
+    return str(Path(root) / name)
 
 
 def _pool_dict(
@@ -97,27 +127,27 @@ def _pool_dict(
     a_state: str = "available",
     b_state: str = "unavailable",
     c_state: str = "available",
-    home_root: str = "/path/to/profiles",
+    home_root: str | None = None,
 ) -> dict:
     return {
         "accounts": [
             {
                 "id": "A",
-                "home": f"{home_root}/homeA",
+                "home": _account_home("homeA", home_root),
                 "state": a_state,
                 "email_mask": "a***@example.com",
                 "notes": "fake primary",
             },
             {
                 "id": "B",
-                "home": f"{home_root}/homeB",
+                "home": _account_home("homeB", home_root),
                 "state": b_state,
                 "email_mask": "b***@example.com",
                 "notes": "eligibility_blocked",
             },
             {
                 "id": "C",
-                "home": f"{home_root}/homeC",
+                "home": _account_home("homeC", home_root),
                 "state": c_state,
                 "email_mask": "c***@example.com",
                 "notes": "fake standby",
@@ -147,6 +177,31 @@ def _clean_env(extra: dict | None = None) -> dict:
     if extra:
         env.update(extra)
     return env
+
+
+_REAL_SUBPROCESS_RUN = subprocess.run
+
+
+def _run_without_deleting_antigravity_keyring(args, *a, **kwargs):
+    """Unit tests must not delete the machine-wide gemini:antigravity credential."""
+    cmd = list(args) if isinstance(args, (list, tuple)) else [str(args)]
+    blob = " ".join(str(part) for part in cmd).lower()
+    if "cmdkey" in blob and "gemini:antigravity" in blob and "/delete" in blob:
+        class _Result:
+            returncode = 1
+            stdout = ""
+            stderr = "Element not found."
+
+        return _Result()
+    return _REAL_SUBPROCESS_RUN(args, *a, **kwargs)
+
+
+def setUpModule() -> None:
+    subprocess.run = _run_without_deleting_antigravity_keyring
+
+
+def tearDownModule() -> None:
+    subprocess.run = _REAL_SUBPROCESS_RUN
 
 
 def _load_run_job():
@@ -340,7 +395,9 @@ class TestFactoryAndRunJobPool(unittest.TestCase):
             )
             self.assertIsInstance(be, AntigravityCliExecutionBackend)
             injected = dict(be._env())
-            self.assertEqual(injected["HOME"], "/path/to/profiles/homeA")
+            self.assertEqual(injected["HOME"], _account_home("homeA"))
+            if os.name == "nt":
+                self.assertEqual(injected["USERPROFILE"], injected["HOME"])
             self.assertEqual(injected["AGY_PROFILE"], "A")
             self.assertEqual(injected[FORCE_FILE_STORAGE], "true")
             self.assertEqual(injected["AGY_BIN"], str(fake))
@@ -362,7 +419,9 @@ class TestFactoryAndRunJobPool(unittest.TestCase):
             argv = json.loads(Path(argv_path).read_text(encoding="utf-8"))
             self.assertNotIn(SKIP_PERMISSIONS_FLAG, argv)
             dumped = json.loads(Path(env_path).read_text(encoding="utf-8"))
-            self.assertEqual(dumped["HOME"], "/path/to/profiles/homeA")
+            self.assertEqual(dumped["HOME"], _account_home("homeA"))
+            if os.name == "nt":
+                self.assertEqual(dumped["USERPROFILE"], dumped["HOME"])
             self.assertEqual(dumped["AGY_PROFILE"], "A")
             self.assertEqual(dumped["GEMINI_FORCE_FILE_STORAGE"], "true")
 
@@ -410,7 +469,7 @@ class TestFactoryAndRunJobPool(unittest.TestCase):
                 persist=False,
             )
             env = prepared["environ"]
-            self.assertEqual(env["HOME"], "/path/to/profiles/homeA")
+            self.assertEqual(env["HOME"], _account_home("homeA"))
             self.assertEqual(env["AGY_PROFILE"], "A")
             self.assertEqual(env[FORCE_FILE_STORAGE], "true")
             self.assertEqual(env["AGY_BIN"], "/opt/agy")
@@ -468,7 +527,9 @@ class TestRunJobCliPool(unittest.TestCase):
             argv = json.loads(Path(argv_path).read_text(encoding="utf-8"))
             self.assertNotIn(SKIP_PERMISSIONS_FLAG, argv)
             dumped = json.loads(Path(env_path).read_text(encoding="utf-8"))
-            self.assertEqual(dumped["HOME"], "/path/to/profiles/homeA")
+            self.assertEqual(dumped["HOME"], _account_home("homeA"))
+            if os.name == "nt":
+                self.assertEqual(dumped["USERPROFILE"], dumped["HOME"])
             self.assertEqual(dumped["AGY_PROFILE"], "A")
             self.assertEqual(dumped["GEMINI_FORCE_FILE_STORAGE"], "true")
 
@@ -499,7 +560,9 @@ class TestRunJobCliPool(unittest.TestCase):
             )
             self.assertEqual(rc, 0, err + out)
             dumped = json.loads(Path(env_path).read_text(encoding="utf-8"))
-            self.assertEqual(dumped["HOME"], "/path/to/profiles/homeA")
+            self.assertEqual(dumped["HOME"], _account_home("homeA"))
+            if os.name == "nt":
+                self.assertEqual(dumped["USERPROFILE"], dumped["HOME"])
             self.assertEqual(dumped["AGY_PROFILE"], "A")
 
 
@@ -521,6 +584,242 @@ class TestNoTeleagentAdapterImportSideEffect(unittest.TestCase):
         src = Path(mod.__file__).read_text(encoding="utf-8")
         self.assertNotRegex(src, r"(?m)^\s*(import|from)\s+teleagent_adapter")
         self.assertNotIn("agy-multi-account-probe", src)
+
+
+class TestWindowsAccountSwitch(unittest.TestCase):
+    def _account(self, **extra: str) -> Account:
+        return Account(id="A", home=r"C:\profiles\homeA", extra=dict(extra))
+
+    def test_windows_userprofile_matches_home(self):
+        with patch("execution_backend.agy_account_pool.os.name", "nt"), patch(
+            "execution_backend.agy_account_pool.sys.platform", "win32"
+        ):
+            env = account_environ(
+                self._account(),
+                {
+                    "PATH": "x",
+                    "AGY_BIN": "agy",
+                    "AGY_MODEL": "gemini-x",
+                    "AGY_AUTO_APPROVE": "1",
+                },
+            )
+        self.assertEqual(env["USERPROFILE"], env["HOME"])
+        self.assertEqual(env["HOME"], r"C:\profiles\homeA")
+        self.assertEqual(env[FORCE_FILE_STORAGE], "true")
+        self.assertEqual(env["AGY_PROFILE"], "A")
+        self.assertEqual(env["AGY_BIN"], "agy")
+        self.assertEqual(env["AGY_MODEL"], "gemini-x")
+        self.assertEqual(env["AGY_AUTO_APPROVE"], "1")
+        self.assertNotIn("HTTP_PROXY", env)
+        self.assertNotIn("HTTPS_PROXY", env)
+
+    def test_non_windows_leaves_userprofile_unset(self):
+        acc = Account(id="A", home="/tmp/profiles/homeA")
+        with patch("execution_backend.agy_account_pool.os.name", "posix"), patch(
+            "execution_backend.agy_account_pool.sys.platform", "linux"
+        ):
+            env = account_environ(acc, {"PATH": "x"})
+        self.assertEqual(env["HOME"], "/tmp/profiles/homeA")
+        self.assertNotIn("USERPROFILE", env)
+
+    def test_proxy_absent_when_unconfigured(self):
+        env = account_environ(self._account(), {"PATH": "x"})
+        self.assertNotIn("HTTP_PROXY", env)
+        self.assertNotIn("HTTPS_PROXY", env)
+
+    def test_proxy_from_account_extra(self):
+        acc = self._account(
+            http_proxy="http://acct.example:8080",
+            https_proxy="http://acct.example:8443",
+        )
+        env = account_environ(acc, {"PATH": "x"})
+        self.assertEqual(env["HTTP_PROXY"], "http://acct.example:8080")
+        self.assertEqual(env["HTTPS_PROXY"], "http://acct.example:8443")
+
+    def test_proxy_from_pool_mirrors_http(self):
+        acc = self._account()
+        pool = AccountPool(accounts=[acc], extra={"http_proxy": "http://pool.example:8080"})
+        env = account_environ(acc, {"PATH": "x"}, pool=pool)
+        self.assertEqual(env["HTTP_PROXY"], "http://pool.example:8080")
+        self.assertEqual(env["HTTPS_PROXY"], "http://pool.example:8080")
+
+    def test_proxy_from_env_mirrors_http(self):
+        env = account_environ(
+            self._account(),
+            {"PATH": "x", ENV_HTTP_PROXY: "http://env.example:9"},
+        )
+        self.assertEqual(env["HTTP_PROXY"], "http://env.example:9")
+        self.assertEqual(env["HTTPS_PROXY"], "http://env.example:9")
+
+    def test_https_env_does_not_invent_http(self):
+        env = account_environ(
+            self._account(),
+            {"PATH": "x", ENV_HTTPS_PROXY: "http://env.example:10"},
+        )
+        self.assertNotIn("HTTP_PROXY", env)
+        self.assertEqual(env["HTTPS_PROXY"], "http://env.example:10")
+
+    def test_blank_proxy_is_unconfigured(self):
+        acc = self._account(http_proxy="  ", https_proxy="")
+        env = account_environ(acc, {"PATH": "x", ENV_HTTP_PROXY: "  "})
+        self.assertNotIn("HTTP_PROXY", env)
+        self.assertNotIn("HTTPS_PROXY", env)
+
+    def test_account_proxy_overrides_pool_and_env(self):
+        acc = self._account(http_proxy="http://acct.example:1")
+        pool = AccountPool(
+            accounts=[acc],
+            extra={
+                "http_proxy": "http://pool.example:2",
+                "https_proxy": "http://pool.example:3",
+            },
+        )
+        env = account_environ(
+            acc,
+            {
+                "PATH": "x",
+                ENV_HTTP_PROXY: "http://env.example:4",
+                ENV_HTTPS_PROXY: "http://env.example:5",
+            },
+            pool=pool,
+        )
+        self.assertEqual(env["HTTP_PROXY"], "http://acct.example:1")
+        self.assertEqual(env["HTTPS_PROXY"], "http://pool.example:3")
+
+    def test_prepare_injects_configured_proxy_and_userprofile(self):
+        payload = _pool_dict()
+        payload["https_proxy"] = "http://pool.example:9"
+        payload["accounts"][0]["http_proxy"] = "http://acct.example:8"
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_pool_file(td, payload)
+            with patch("execution_backend.agy_account_pool.os.name", "nt"), patch(
+                "execution_backend.agy_account_pool.sys.platform", "win32"
+            ):
+                prepared = prepare_antigravity_environ_from_pool(
+                    path,
+                    base_environ={"PATH": "x"},
+                    persist=False,
+                )
+        env = prepared["environ"]
+        self.assertEqual(env["HOME"], _account_home("homeA"))
+        self.assertEqual(env["USERPROFILE"], env["HOME"])
+        self.assertEqual(env["HTTP_PROXY"], "http://acct.example:8")
+        self.assertEqual(env["HTTPS_PROXY"], "http://pool.example:9")
+        self.assertEqual(env[FORCE_FILE_STORAGE], "true")
+        self.assertNotIn("AGY_AUTO_APPROVE", env)
+
+    def test_prepare_clears_keyring_after_select(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_pool_file(td)
+            with patch(
+                "execution_backend.agy_account_pool.clear_windows_antigravity_keyring"
+            ) as clear:
+                prepare_antigravity_environ_from_pool(
+                    path,
+                    base_environ={"PATH": "x"},
+                    persist=False,
+                )
+        clear.assert_called_once()
+
+    def test_prepare_skips_clear_when_nothing_available(self):
+        payload = _pool_dict(a_state="exhausted", b_state="unavailable", c_state="exhausted")
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_pool_file(td, payload)
+            with patch(
+                "execution_backend.agy_account_pool.clear_windows_antigravity_keyring"
+            ) as clear:
+                with self.assertRaises(AccountPoolError):
+                    prepare_antigravity_environ_from_pool(
+                        path,
+                        base_environ={"PATH": "x"},
+                        persist=False,
+                    )
+        clear.assert_not_called()
+
+    def test_clear_invokes_cmdkey_on_windows(self):
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+
+            class _Result:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            return _Result()
+
+        with patch("execution_backend.agy_account_pool.os.name", "nt"), patch(
+            "execution_backend.agy_account_pool.sys.platform", "win32"
+        ), patch("execution_backend.agy_account_pool.subprocess.run", fake_run):
+            clear_windows_antigravity_keyring()
+        self.assertEqual(calls, [["cmdkey", "/delete:gemini:antigravity"]])
+
+    def test_clear_non_windows_does_not_call_cmdkey(self):
+        with patch("execution_backend.agy_account_pool.os.name", "posix"), patch(
+            "execution_backend.agy_account_pool.sys.platform", "linux"
+        ), patch("execution_backend.agy_account_pool.subprocess.run") as run:
+            clear_windows_antigravity_keyring()
+        run.assert_not_called()
+
+    def test_missing_keyring_slot_is_nonfatal(self):
+        def fake_run(cmd, **kwargs):
+            class _Result:
+                returncode = 1
+                stdout = ""
+                stderr = "Element not found."
+
+            return _Result()
+
+        with patch("execution_backend.agy_account_pool.os.name", "nt"), patch(
+            "execution_backend.agy_account_pool.sys.platform", "win32"
+        ), patch("execution_backend.agy_account_pool.subprocess.run", fake_run):
+            clear_windows_antigravity_keyring()
+
+        def boom(cmd, **kwargs):
+            raise FileNotFoundError("cmdkey")
+
+        with patch("execution_backend.agy_account_pool.os.name", "nt"), patch(
+            "execution_backend.agy_account_pool.sys.platform", "win32"
+        ), patch("execution_backend.agy_account_pool.subprocess.run", boom):
+            clear_windows_antigravity_keyring()
+
+    def test_start_run_pool_clears_immediately_before_popen(self):
+        order: list[str] = []
+
+        def fake_clear():
+            order.append("clear")
+
+        def fake_popen(*args, **kwargs):
+            order.append("popen")
+            raise OSError("stop")
+
+        with tempfile.TemporaryDirectory() as td:
+            be = AntigravityCliExecutionBackend(
+                bin_path="agy",
+                environ={"PATH": "x", "AGY_PROFILE": "A"},
+            )
+            with patch(
+                "execution_backend.antigravity_cli_v1.clear_windows_antigravity_keyring",
+                fake_clear,
+            ), patch("execution_backend.antigravity_cli_v1.subprocess.Popen", fake_popen):
+                started = be.start_run(title="t", directory=td, instruction="hi")
+        self.assertFalse(started["ok"])
+        self.assertEqual(order, ["clear", "popen"])
+
+    def test_start_run_without_pool_does_not_clear(self):
+        def fake_popen(*args, **kwargs):
+            raise OSError("stop")
+
+        with tempfile.TemporaryDirectory() as td:
+            be = AntigravityCliExecutionBackend(bin_path="agy", environ={"PATH": "x"})
+            with patch(
+                "execution_backend.antigravity_cli_v1.clear_windows_antigravity_keyring"
+            ) as clear, patch(
+                "execution_backend.antigravity_cli_v1.subprocess.Popen", fake_popen
+            ):
+                be.start_run(title="t", directory=td, instruction="hi")
+        clear.assert_not_called()
 
 
 if __name__ == "__main__":

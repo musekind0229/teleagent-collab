@@ -2,6 +2,8 @@
 
 Does not touch teleagent_adapter or glue. One spawn = one HOME; no mid-run
 swap; no multi-account concurrency. Pool JSON must not contain tokens.
+Windows pool spawns clear the machine-wide ``gemini:antigravity`` keyring
+slot, then pin HOME and USERPROFILE to that account.
 """
 from __future__ import annotations
 
@@ -9,6 +11,8 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Mapping
@@ -31,7 +35,10 @@ from execution_backend.base import BackendError, BackendStatus
 ENV_POOL = "COLLAB_AGY_ACCOUNT_POOL"
 ENV_PRECHECK = "COLLAB_AGY_POOL_PRECHECK"
 ENV_PROFILE = "AGY_PROFILE"
+ENV_HTTP_PROXY = "COLLAB_AGY_HTTP_PROXY"
+ENV_HTTPS_PROXY = "COLLAB_AGY_HTTPS_PROXY"
 FORCE_FILE_STORAGE = "GEMINI_FORCE_FILE_STORAGE"
+KEYRING_TARGET = "gemini:antigravity"
 
 ACCOUNT_STATES = frozenset({"available", "exhausted", "cooldown", "unavailable"})
 DEFAULT_COOLDOWN_SEC = 300.0
@@ -357,20 +364,95 @@ def select_account(
     return None
 
 
+def _is_windows() -> bool:
+    return os.name == "nt" or str(sys.platform).startswith("win")
+
+
+def _proxy_text(raw: Any) -> str:
+    if not isinstance(raw, str):
+        return ""
+    return raw.strip()
+
+
+def _proxy_from(src: Mapping[str, Any] | None, key: str) -> str:
+    if not src:
+        return ""
+    return _proxy_text(src.get(key))
+
+
+def _configured_proxies(
+    account: Account,
+    env: Mapping[str, str],
+    pool: AccountPool | None,
+) -> tuple[str, str]:
+    """Account field, then pool-top, then COLLAB_AGY_*. HTTP-only mirrors to HTTPS."""
+    acct = account.extra or {}
+    top = pool.extra if pool is not None else None
+    http = (
+        _proxy_from(acct, "http_proxy")
+        or _proxy_from(top, "http_proxy")
+        or _proxy_text(env.get(ENV_HTTP_PROXY))
+    )
+    https = (
+        _proxy_from(acct, "https_proxy")
+        or _proxy_from(top, "https_proxy")
+        or _proxy_text(env.get(ENV_HTTPS_PROXY))
+    )
+    if http and not https:
+        https = http
+    return http, https
+
+
 def account_environ(
     account: Account,
     base: Mapping[str, str] | None = None,
+    *,
+    pool: AccountPool | None = None,
 ) -> dict[str, str]:
     """Environ for one spawn: HOME + file-storage + AGY_PROFILE.
 
+    On Windows, USERPROFILE is the same path as HOME. HTTP_PROXY / HTTPS_PROXY
+    are set only when the account, the pool, or COLLAB_AGY_* configures them.
     Preserves AGY_BIN / AGY_MODEL / AGY_AUTO_APPROVE from *base*.
     Does not set AGY_AUTO_APPROVE (skip-permissions stays off unless already on).
     """
     env = dict(os.environ if base is None else base)
-    env["HOME"] = str(account.home)
+    home = str(account.home)
+    env["HOME"] = home
+    if _is_windows():
+        env["USERPROFILE"] = home
     env[FORCE_FILE_STORAGE] = "true"
     env[ENV_PROFILE] = str(account.id)
+    http, https = _configured_proxies(account, env, pool)
+    if http:
+        env["HTTP_PROXY"] = http
+    if https:
+        env["HTTPS_PROXY"] = https
     return env
+
+
+def clear_windows_antigravity_keyring() -> None:
+    """Delete cmdkey target ``gemini:antigravity``. Non-Windows returns immediately.
+
+    A missing slot (non-zero exit, not found, or cmdkey itself missing) is non-fatal.
+    """
+    if not _is_windows():
+        return
+    kwargs: dict[str, Any] = {
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "check": False,
+        "timeout": 15,
+    }
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if flags:
+        kwargs["creationflags"] = flags
+    try:
+        subprocess.run(["cmdkey", f"/delete:{KEYRING_TARGET}"], **kwargs)
+    except (OSError, subprocess.SubprocessError):
+        return
 
 
 def live_agy_precheck(
@@ -378,14 +460,13 @@ def live_agy_precheck(
     *,
     environ: Mapping[str, str] | None = None,
     timeout: float = 20.0,
+    pool: AccountPool | None = None,
 ) -> str:
     """Optional live ``agy models`` under the account HOME. Never skip-permissions.
 
     Default tests must inject a mock instead of calling this.
     """
-    import subprocess
-
-    env = account_environ(account, environ)
+    env = account_environ(account, environ, pool=pool)
     bin_path = str(env.get("AGY_BIN") or "").strip() or shutil.which("agy") or "/home/box/.local/bin/agy"
     cmd = [bin_path, "models"]
     try:
@@ -419,13 +500,14 @@ def resolve_pool_path(
 def _precheck_from_env(
     explicit: PrecheckFn | None,
     environ: Mapping[str, str] | None,
+    pool: AccountPool | None = None,
 ) -> PrecheckFn | None:
     if explicit is not None:
         return explicit
     env = environ if environ is not None else os.environ
     raw = str(env.get(ENV_PRECHECK) or "").strip().lower()
     if raw in _TRUTHY:
-        return lambda acc: live_agy_precheck(acc, environ=env)
+        return lambda acc: live_agy_precheck(acc, environ=env, pool=pool)
     return None
 
 
@@ -441,12 +523,13 @@ def prepare_antigravity_environ_from_pool(
     Raises AccountPoolError if nothing is dispatchable.
     """
     pool = load_pool(pool_path)
-    chk = _precheck_from_env(precheck, base_environ)
+    chk = _precheck_from_env(precheck, base_environ, pool)
     acc = select_account(pool, precheck=chk, persist=persist)
     if acc is None:
         states = {a.id: a.state for a in pool.accounts}
         raise AccountPoolError(f"no available agy account in pool; states={states}")
-    env = account_environ(acc, base_environ)
+    clear_windows_antigravity_keyring()
+    env = account_environ(acc, base_environ, pool=pool)
     env[ENV_POOL] = str(Path(pool_path))
     return {"environ": env, "account": acc, "pool": pool, "agy_profile": acc.id}
 
@@ -504,12 +587,16 @@ __all__ = [
     "AccountPool",
     "AccountPoolError",
     "DEFAULT_COOLDOWN_SEC",
+    "ENV_HTTP_PROXY",
+    "ENV_HTTPS_PROXY",
     "ENV_POOL",
     "ENV_PRECHECK",
     "ENV_PROFILE",
     "FORCE_FILE_STORAGE",
+    "KEYRING_TARGET",
     "account_environ",
     "apply_class_to_state",
+    "clear_windows_antigravity_keyring",
     "apply_job_result_to_pool",
     "expire_cooldowns",
     "inject_agy_pool_into_backend_kwargs",
