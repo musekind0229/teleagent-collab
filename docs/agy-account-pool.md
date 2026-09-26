@@ -6,7 +6,7 @@
 
 ## 怎么配
 
-1. 每个账号准备一份 HOME（完整 home 或至少含 `.gemini/`），预先用 `agy` 登录，并走文件凭据：`GEMINI_FORCE_FILE_STORAGE=true`。
+1. 每个账号准备一份 HOME（完整 home 或至少含 `.gemini/`），预先用 `agy` 登录。文件凭据在 `<account.home>/.gemini/antigravity-cli/antigravity-oauth-token`（及 `.gemini/**`）。
 2. 复制示例 `jobs/examples/agy_account_pool.example.json` 到**不会进 git** 的路径（例如 `jobs/agy-account-pool.json`），把 `home` 改成绝对路径。
 3. 派工：
 
@@ -25,9 +25,16 @@ python3 bin/run-job.py --backend antigravity \
 | --- | --- |
 | `HOME` | `<account.home>` |
 | `USERPROFILE` | 仅 Windows：与 `HOME` 相同 |
-| `GEMINI_FORCE_FILE_STORAGE` | `true` |
+| `GEMINI_FORCE_FILE_STORAGE` | `true`（前向兼容；agy **1.2.11 不认**） |
+| `SSH_CONNECTION` | `203.0.113.1 50000 203.0.113.2 22`（RFC5737 TEST-NET 伪值） |
+| `SSH_CLIENT` | `203.0.113.1 50000 22` |
+| `SSH_TTY` | `windows-agy-pool` |
 | `AGY_PROFILE` | 池里的 `id`（CLI 不识别，只给编排元数据） |
 | `HTTP_PROXY` / `HTTPS_PROXY` | 仅当显式配置了代理 |
+
+Win 上 agy **1.2.11** 走文件凭据的真实触发是子进程里的伪 `SSH_*`（agy 打出 `Using file-based token storage because SSH session detected`）。这是社区「检测 SSH → 文件凭据」做法（oaustegard `agy_auth_broker` / auth-internals、agy-switcher LINUX.md），**不是**官方多账号 API。`SSH_*` **只注入本次 spawn 的子进程 environ**，不写 PowerShell profile、系统环境或 `.bashrc`。
+
+并发 `agy --print` 可能把 `antigravity-oauth-token` 写成尾部多余 `}`（google-antigravity/antigravity-cli#24）。本池换号保持**单次 spawn**，并清 `gemini:antigravity` 槽，避免钥匙串阴影。该 token 与 `.gemini/**` 已 gitignore；日志和异常禁止打印 token 内容。若二进制日后识别 `GEMINI_FORCE_ENCRYPTED_FILE_STORAGE` 可再评估；1.2.11 不依赖。
 
 保留已有 `AGY_BIN` / `AGY_MODEL` / `AGY_AUTO_APPROVE`。`--dangerously-skip-permissions` **默认仍关闭**。
 
@@ -36,7 +43,7 @@ python3 bin/run-job.py --backend antigravity \
 `gemini:antigravity` 钥匙串是机器级单槽。换号顺序：
 
 1. `cmdkey /delete:gemini:antigravity`（槽不存在也继续；非 Windows 直接返回）
-2. `HOME` 与 `USERPROFILE` 设为该账号 `home`
+2. `HOME` 与 `USERPROFILE` 设为该账号 `home`，并注入上表伪 `SSH_*`（只进子进程）
 3. 配置了代理才注入 `HTTP_PROXY` / `HTTPS_PROXY`
 4. 再 spawn
 
@@ -70,8 +77,8 @@ python3 bin/run-job.py --backend antigravity \
 ## 禁止事项
 
 - **API key ≠ Pro**。`GEMINI_API_KEY` + `modelProvider=gemini` 不是 Google AI Pro 订阅额度池。
-- **不要并发**打同一钥匙串 / 同一 HOME。本调度是串行的。
-- **不要提交 oauth**、access/id/refresh token、完整凭据、真实池状态（含真实 HOME 时）。
+- **不要并发**打同一钥匙串 / 同一 HOME。本调度是串行的；并发写 token 可能在文件尾多一个 `}`。
+- **不要提交 oauth**、access/id/refresh token、完整凭据、真实池状态（含真实 HOME 时）。token 在 `<account.home>/.gemini/antigravity-cli/antigravity-oauth-token`；日志和异常禁止打印其内容。
 - **不要 mid-run 换 HOME**。一次 `Popen` 钉死 `HOME`；换号只发生在下一次 spawn。
 - 不要默认打开 `--dangerously-skip-permissions`。`reply_permission` 仍 unsupported。
 - 不要把 `eligibility_blocked` 当成未登录或额度耗尽；地域/产品不合格时重登同一账号无意义。

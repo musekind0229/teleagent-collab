@@ -31,6 +31,9 @@ from execution_backend.agy_account_pool import (  # noqa: E402
     ENV_HTTPS_PROXY,
     ENV_POOL,
     FORCE_FILE_STORAGE,
+    SSH_CLIENT_PSEUDO,
+    SSH_CONNECTION_PSEUDO,
+    SSH_TTY_PSEUDO,
     Account,
     AccountPool,
     AccountPoolError,
@@ -67,6 +70,9 @@ if env_path:
         "USERPROFILE",
         "AGY_PROFILE",
         "GEMINI_FORCE_FILE_STORAGE",
+        "SSH_CONNECTION",
+        "SSH_CLIENT",
+        "SSH_TTY",
         "AGY_BIN",
         "AGY_MODEL",
         "AGY_AUTO_APPROVE",
@@ -94,6 +100,12 @@ sys.stdout.write("\n")
 sys.stderr.write(os.environ.get("AGY_FAKE_STDERR", ""))
 raise SystemExit(int(os.environ.get("AGY_FAKE_EXIT", "0")))
 '''
+
+
+def _assert_ssh_pseudos(case: unittest.TestCase, env: dict) -> None:
+    case.assertEqual(env["SSH_CONNECTION"], SSH_CONNECTION_PSEUDO)
+    case.assertEqual(env["SSH_CLIENT"], SSH_CLIENT_PSEUDO)
+    case.assertEqual(env["SSH_TTY"], SSH_TTY_PSEUDO)
 
 
 def _write_fake_agy(dirpath: str | Path) -> Path:
@@ -400,6 +412,7 @@ class TestFactoryAndRunJobPool(unittest.TestCase):
                 self.assertEqual(injected["USERPROFILE"], injected["HOME"])
             self.assertEqual(injected["AGY_PROFILE"], "A")
             self.assertEqual(injected[FORCE_FILE_STORAGE], "true")
+            _assert_ssh_pseudos(self, injected)
             self.assertEqual(injected["AGY_BIN"], str(fake))
             started = be.start_run(
                 title="hello",
@@ -424,6 +437,7 @@ class TestFactoryAndRunJobPool(unittest.TestCase):
                 self.assertEqual(dumped["USERPROFILE"], dumped["HOME"])
             self.assertEqual(dumped["AGY_PROFILE"], "A")
             self.assertEqual(dumped["GEMINI_FORCE_FILE_STORAGE"], "true")
+            _assert_ssh_pseudos(self, dumped)
 
     def test_run_antigravity_charter_uses_pool_and_skips_permissions(self):
         charter = load_charter(HELLO)
@@ -472,6 +486,7 @@ class TestFactoryAndRunJobPool(unittest.TestCase):
             self.assertEqual(env["HOME"], _account_home("homeA"))
             self.assertEqual(env["AGY_PROFILE"], "A")
             self.assertEqual(env[FORCE_FILE_STORAGE], "true")
+            _assert_ssh_pseudos(self, env)
             self.assertEqual(env["AGY_BIN"], "/opt/agy")
             self.assertEqual(env["AGY_MODEL"], "gemini-x")
             self.assertNotIn("AGY_AUTO_APPROVE", env)
@@ -532,6 +547,7 @@ class TestRunJobCliPool(unittest.TestCase):
                 self.assertEqual(dumped["USERPROFILE"], dumped["HOME"])
             self.assertEqual(dumped["AGY_PROFILE"], "A")
             self.assertEqual(dumped["GEMINI_FORCE_FILE_STORAGE"], "true")
+            _assert_ssh_pseudos(self, dumped)
 
     def test_env_collab_agy_account_pool(self):
         with tempfile.TemporaryDirectory() as td:
@@ -564,6 +580,7 @@ class TestRunJobCliPool(unittest.TestCase):
             if os.name == "nt":
                 self.assertEqual(dumped["USERPROFILE"], dumped["HOME"])
             self.assertEqual(dumped["AGY_PROFILE"], "A")
+            _assert_ssh_pseudos(self, dumped)
 
 
 @unittest.skipUnless(_pool_live_opt_in(), "set COLLAB_AGY_POOL_LIVE=1 for live pool precheck")
@@ -601,11 +618,13 @@ class TestWindowsAccountSwitch(unittest.TestCase):
                     "AGY_BIN": "agy",
                     "AGY_MODEL": "gemini-x",
                     "AGY_AUTO_APPROVE": "1",
+                    "SSH_CONNECTION": "192.0.2.9 1 192.0.2.10 22",
                 },
             )
         self.assertEqual(env["USERPROFILE"], env["HOME"])
         self.assertEqual(env["HOME"], r"C:\profiles\homeA")
         self.assertEqual(env[FORCE_FILE_STORAGE], "true")
+        _assert_ssh_pseudos(self, env)
         self.assertEqual(env["AGY_PROFILE"], "A")
         self.assertEqual(env["AGY_BIN"], "agy")
         self.assertEqual(env["AGY_MODEL"], "gemini-x")
@@ -621,6 +640,7 @@ class TestWindowsAccountSwitch(unittest.TestCase):
             env = account_environ(acc, {"PATH": "x"})
         self.assertEqual(env["HOME"], "/tmp/profiles/homeA")
         self.assertNotIn("USERPROFILE", env)
+        _assert_ssh_pseudos(self, env)
 
     def test_proxy_absent_when_unconfigured(self):
         env = account_environ(self._account(), {"PATH": "x"})
@@ -706,6 +726,7 @@ class TestWindowsAccountSwitch(unittest.TestCase):
         self.assertEqual(env["HTTP_PROXY"], "http://acct.example:8")
         self.assertEqual(env["HTTPS_PROXY"], "http://pool.example:9")
         self.assertEqual(env[FORCE_FILE_STORAGE], "true")
+        _assert_ssh_pseudos(self, env)
         self.assertNotIn("AGY_AUTO_APPROVE", env)
 
     def test_prepare_clears_keyring_after_select(self):

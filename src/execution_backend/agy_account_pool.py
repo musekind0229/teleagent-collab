@@ -3,7 +3,8 @@
 Does not touch teleagent_adapter or glue. One spawn = one HOME; no mid-run
 swap; no multi-account concurrency. Pool JSON must not contain tokens.
 Windows pool spawns clear the machine-wide ``gemini:antigravity`` keyring
-slot, then pin HOME and USERPROFILE to that account.
+slot, then pin HOME and USERPROFILE to that account. Child environ also
+sets SSH_* TEST-NET pseudos so agy 1.2.11 uses file token storage.
 """
 from __future__ import annotations
 
@@ -38,6 +39,10 @@ ENV_PROFILE = "AGY_PROFILE"
 ENV_HTTP_PROXY = "COLLAB_AGY_HTTP_PROXY"
 ENV_HTTPS_PROXY = "COLLAB_AGY_HTTPS_PROXY"
 FORCE_FILE_STORAGE = "GEMINI_FORCE_FILE_STORAGE"
+# Community SSH→file-creds trigger (agy detects SSH session). TEST-NET only.
+SSH_CONNECTION_PSEUDO = "203.0.113.1 50000 203.0.113.2 22"
+SSH_CLIENT_PSEUDO = "203.0.113.1 50000 22"
+SSH_TTY_PSEUDO = "windows-agy-pool"  # Windows pool marker; broker uses /dev/pts/0 on Linux
 KEYRING_TARGET = "gemini:antigravity"
 
 ACCOUNT_STATES = frozenset({"available", "exhausted", "cooldown", "unavailable"})
@@ -411,8 +416,12 @@ def account_environ(
 ) -> dict[str, str]:
     """Environ for one spawn: HOME + file-storage + AGY_PROFILE.
 
-    On Windows, USERPROFILE is the same path as HOME. HTTP_PROXY / HTTPS_PROXY
-    are set only when the account, the pool, or COLLAB_AGY_* configures them.
+    On Windows, USERPROFILE is the same path as HOME. SSH_CONNECTION /
+    SSH_CLIENT / SSH_TTY are fixed TEST-NET pseudo values (child environ
+    only) so agy 1.2.11 uses file token storage; it ignores
+    GEMINI_FORCE_FILE_STORAGE, which is still set for forward compatibility.
+    HTTP_PROXY / HTTPS_PROXY are set only when the account, the pool, or
+    COLLAB_AGY_* configures them.
     Preserves AGY_BIN / AGY_MODEL / AGY_AUTO_APPROVE from *base*.
     Does not set AGY_AUTO_APPROVE (skip-permissions stays off unless already on).
     """
@@ -422,6 +431,9 @@ def account_environ(
     if _is_windows():
         env["USERPROFILE"] = home
     env[FORCE_FILE_STORAGE] = "true"
+    env["SSH_CONNECTION"] = SSH_CONNECTION_PSEUDO
+    env["SSH_CLIENT"] = SSH_CLIENT_PSEUDO
+    env["SSH_TTY"] = SSH_TTY_PSEUDO
     env[ENV_PROFILE] = str(account.id)
     http, https = _configured_proxies(account, env, pool)
     if http:
@@ -594,6 +606,9 @@ __all__ = [
     "ENV_PROFILE",
     "FORCE_FILE_STORAGE",
     "KEYRING_TARGET",
+    "SSH_CLIENT_PSEUDO",
+    "SSH_CONNECTION_PSEUDO",
+    "SSH_TTY_PSEUDO",
     "account_environ",
     "apply_class_to_state",
     "clear_windows_antigravity_keyring",
