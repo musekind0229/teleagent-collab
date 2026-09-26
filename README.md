@@ -72,6 +72,8 @@ python bin/collab-service.py --persist .collab-app --port 8765 `
   --planner grok --backend teleagent-windows
 ```
 
+本机 TeleAgent GUI 与 Antigravity（agy）一起部署时，见 [Windows TeleAgent 与 Antigravity 部署](docs/WINDOWS-TELEAGENT-ANTIGRAVITY-DEPLOY.zh-CN.md)。
+
 普通权限与产物验收由 Grok 自动处理；Question、系统动作和组长失败会出现在 decision API。普通桌面路径已通过两步真实文件依赖任务，见 [2026-09-20 实机验收](docs/WINDOWS-LIVE-20260920.zh-CN.md)。
 
 `--teleagent-stdin-wrap` 仅诊断兼容：可建真实 session，但 GUI 模型授权复用仍会 `HTTP 401 / invalid token`，**未完成产物闭环，不是生产入口**。重新登录后发消息不是规定步骤，也不能修复该问题。
