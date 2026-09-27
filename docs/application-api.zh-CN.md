@@ -36,6 +36,29 @@ python bin/collab-service.py --persist .collab-app --port 8765
 python bin/collab-service.py --persist .collab-app --port 8765 --planner grok
 ```
 
+让 Antigravity（agy CLI）充当工人后端（复用 run-job 池 / 配额 / 503 短冷却；**不是** TeleAgent 监督通道）：
+
+```powershell
+# AGY_AUTO_APPROVE 只包住本次进程；用 try/finally，勿留在 shell
+$env:COLLAB_API_TOKEN = '换成一个本机随机值'
+$env:COLLAB_AGY_ACCOUNT_POOL = (Resolve-Path 'jobs/agy-account-pool.json').Path
+$prevApprove = $env:AGY_AUTO_APPROVE
+$env:AGY_AUTO_APPROVE = '1'
+try {
+  python bin/collab-service.py --persist .collab-app --port 8765 `
+    --planner deterministic --backend antigravity `
+    --agy-account-pool $env:COLLAB_AGY_ACCOUNT_POOL
+} finally {
+  if ($null -eq $prevApprove) { Remove-Item Env:AGY_AUTO_APPROVE -ErrorAction SilentlyContinue }
+  else { $env:AGY_AUTO_APPROVE = $prevApprove }
+}
+```
+
+边界（诚实）：
+- agy 运行句柄只在**本进程内存**；服务重启后对已绑定 `run_id` 的 observe 会失败，协调器把 Task 标失败（`backend resume failed`），**不会**静默重派。
+- `reply_permission` 固定 **501 unsupported**（与 inprocess 同形）。没有 TeleAgent 的 permission / question / system_action 逐条回传；hello 烟测靠 `AGY_AUTO_APPROVE` 打开 `--dangerously-skip-permissions`，不是把 skip 映射成 once/approve。
+- 账号池在**服务启动时**选一次 HOME，钉死本进程生命周期；换号 / 配额冷却后的再选要重启 service（或另批 per-dispatch 选号）。
+
 ## 推荐入口（桌面 GUI）
 
 生产与日常联调只走**已登录的桌面 TeleAgent**。先探活，再开服务；**不要**加 `--teleagent-stdin-wrap`。

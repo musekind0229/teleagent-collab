@@ -37,7 +37,13 @@ def _planner(name: str, persist: Path):
     raise ValueError(f"unknown planner {name!r}")
 
 
-def _backend(name: str, persist: Path, *, teleagent_stdin_wrap: bool = False):
+def _backend(
+    name: str,
+    persist: Path,
+    *,
+    teleagent_stdin_wrap: bool = False,
+    agy_account_pool: str | None = None,
+):
     if name == "inprocess":
         return None
     if name == "teleagent-windows":
@@ -47,6 +53,23 @@ def _backend(name: str, persist: Path, *, teleagent_stdin_wrap: bool = False):
             state_dir=persist / "windows-controller",
             stdin_wrap=teleagent_stdin_wrap,
         )
+    if name in ("antigravity", "agy"):
+        # Reuse run-job pool inject (quota / 503 cooldown / mutex). Account is
+        # selected once at service start and pinned for this process lifetime.
+        # In-memory agy run handles are NOT recoverable across restart — the
+        # coordinator fails the Task with backend resume failed, never silent
+        # redispatch. reply_permission stays 501 (no TA permission channel).
+        from execution_backend import get_execution_backend
+        from execution_backend.agy_account_pool import AccountPoolError
+
+        kw: dict = {}
+        pool = (agy_account_pool or "").strip()
+        if pool:
+            kw["account_pool_path"] = pool
+        try:
+            return get_execution_backend("antigravity", **kw)
+        except AccountPoolError as e:
+            raise ValueError(f"antigravity account pool unavailable: {e}") from e
     raise ValueError(f"unknown backend {name!r}")
 
 
@@ -58,7 +81,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--planner", choices=("deterministic", "grok"), default="deterministic")
-    parser.add_argument("--backend", choices=("inprocess", "teleagent-windows"), default="inprocess")
+    parser.add_argument(
+        "--backend",
+        choices=("inprocess", "teleagent-windows", "antigravity", "agy"),
+        default="inprocess",
+        help=(
+            "Worker backend. antigravity/agy reuses run-job pool + CLI worker; "
+            "in-memory run handles are not recoverable after service restart; "
+            "reply_permission is 501 (unlike teleagent-windows supervision)."
+        ),
+    )
+    parser.add_argument(
+        "--agy-account-pool",
+        default="",
+        help=(
+            "Optional path to agy account pool JSON (else COLLAB_AGY_ACCOUNT_POOL). "
+            "Selected at process start; one HOME pinned for this service lifetime."
+        ),
+    )
     parser.add_argument(
         "--teleagent-stdin-wrap",
         action="store_true",
@@ -132,7 +172,12 @@ def main(argv: list[str] | None = None) -> int:
 
     persist = Path(args.persist).resolve()
     planner = _planner(args.planner, persist)
-    backend = _backend(args.backend, persist, teleagent_stdin_wrap=args.teleagent_stdin_wrap)
+    backend = _backend(
+        args.backend,
+        persist,
+        teleagent_stdin_wrap=args.teleagent_stdin_wrap,
+        agy_account_pool=args.agy_account_pool or None,
+    )
     app = CollabApplication(persist, planner=planner, backend=backend)
     if args.once:
         try:

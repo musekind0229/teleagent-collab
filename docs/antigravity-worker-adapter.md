@@ -31,6 +31,24 @@ python bin/run-job.py --backend agy jobs/examples/hello.charter.yaml
 
 等价：`COLLAB_AGY_AUTO_APPROVE=1`，或章程 `agy_auto_approve: true`。依赖：`agy` 在 PATH 或 `AGY_BIN`；已登录；池 JSON 可选（见 [agy-account-pool.md](./agy-account-pool.md)，文件凭据靠子进程 `SSH_*`）；配了代理才走 `HTTP_PROXY` / `HTTPS_PROXY`。
 
+
+## collab-service
+
+```powershell
+$prevApprove = $env:AGY_AUTO_APPROVE
+$env:AGY_AUTO_APPROVE = '1'
+try {
+  python bin/collab-service.py --persist .collab-app --port 8765 `
+    --planner deterministic --backend antigravity `
+    --agy-account-pool jobs/agy-account-pool.json
+} finally {
+  if ($null -eq $prevApprove) { Remove-Item Env:AGY_AUTO_APPROVE -ErrorAction SilentlyContinue }
+  else { $env:AGY_AUTO_APPROVE = $prevApprove }
+}
+```
+
+服务路径与 `run-job --backend antigravity` 共用 `antigravity.cli_v1` + 账号池。差异见 [application-api](application-api.zh-CN.md) 与 [部署短清单](WINDOWS-TELEAGENT-ANTIGRAVITY-DEPLOY.zh-CN.md)：内存句柄不可恢复；`reply_permission=501`。
+
 ## 登录前提
 
 箱子上要有 **agy**（PATH 或 `AGY_BIN`），并且 **已经登录**。本适配只 spawn CLI，不负责 `agy login`、不代管凭据。

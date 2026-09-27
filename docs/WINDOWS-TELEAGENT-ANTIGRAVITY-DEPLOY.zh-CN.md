@@ -110,3 +110,49 @@ cmd /c "set AGY_AUTO_APPROVE=1&& python bin/run-job.py --backend antigravity job
 ## 11. 不要贴 token
 
 禁止粘贴、打印或提交 access / id / refresh token、oauth JSON 和真实池文件。日志和异常同样不要带 token 正文。
+
+## collab-service 路径（`--backend antigravity`）
+
+经应用 Goal API 派工，而不是只跑 `bin/run-job.py`。成功标准：终态 + report；失败须清晰（need_human / error），勿静默。
+
+```powershell
+$env:COLLAB_API_TOKEN = '换成一个本机随机值'
+$env:COLLAB_AGY_ACCOUNT_POOL = (Resolve-Path 'jobs/agy-account-pool.json').Path
+$prevApprove = $env:AGY_AUTO_APPROVE
+$env:AGY_AUTO_APPROVE = '1'
+try {
+  python bin/collab-service.py --persist .collab-app --port 8765 `
+    --planner deterministic --backend antigravity `
+    --agy-account-pool $env:COLLAB_AGY_ACCOUNT_POOL
+} finally {
+  if ($null -eq $prevApprove) { Remove-Item Env:AGY_AUTO_APPROVE -ErrorAction SilentlyContinue }
+  else { $env:AGY_AUTO_APPROVE = $prevApprove }
+}
+```
+
+另开终端交最小 hello（Bearer 同 token）：
+
+```powershell
+$headers = @{ Authorization = "Bearer $env:COLLAB_API_TOKEN"; 'Content-Type' = 'application/json' }
+$body = @{
+  idempotency_key = "agy-service-hello-001"
+  client_id = "smoke"
+  title = "agy service hello"
+  goal = "In the assigned collab workspace only, create hello-from-worker.txt with exactly one short greeting line, then stop."
+  boundaries = @{
+    must = @("Stay inside the assigned workspace", "Create hello-from-worker.txt")
+    must_not = @("Do not access credentials", "Do not use the network")
+  }
+  acceptance = @{ artifacts = @("hello-from-worker.txt"); text = "one greeting line" }
+  budget = @{ wall_sec = 240; max_reworks = 0 }
+} | ConvertTo-Json -Depth 6
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8765/v1/requests -Headers $headers -Body $body
+# 轮询 GET /v1/requests/{id} 与 /v1/requests/{id}/report 直到终态
+```
+
+与 `teleagent-windows` 合同差异（摘要）：
+- **权限**：agy `reply_permission=501`；TA 有 session 级 ask / decision 回传。
+- **句柄**：agy 内存句柄，服务重启不可恢复；TA / win_collab 控制器可持久观察。
+- **AUTO_APPROVE**：只影响 agy 是否带 `--dangerously-skip-permissions`；必须 try/finally，勿写进 profile。
+- **池**：启动时选号钉 HOME；配额/503 短冷却写回池 JSON，但本进程不会自动换到下一号（需重启 service 再选）。
+
