@@ -1,5 +1,7 @@
 # teleagent-collab
 
+Antigravity 接入审查（2026-09-27，基线 `d9deeab`）：[问题、建议与离线复现证据](docs/ANTIGRAVITY-REVIEW-20260927.zh-CN.md)。
+
 > Windows 有两条互补路径：通用框架使用 `src/teleagent_adapter/windows_local_v1.py`，已实机验证的监督控制器使用 `windows/collab.ps1` / `python -m win_collab`。整合状态与边界见 [Windows 整合说明](docs/WINDOWS-UNIFIED.zh-CN.md)，操作见 [Windows 预览说明](windows/README.zh-CN.md)。面向外部调用方的本机 Goal API 见 [应用入口 API](docs/application-api.zh-CN.md)。
 
 把天翼星辰 **TeleAgent** 当成编排里的便宜工人：用本地 HTTP（`:4399`）下单、等完结、接权限弹窗；**组长/门禁可插拔**（烟测默认 Grok Build），不焊死某一家。
