@@ -333,7 +333,13 @@ def run_antigravity_charter(
     if profile and pool_path:
         try:
             pool_obj = load_pool(pool_path)
-            apply_job_result_to_pool(pool_obj, pool_obj.by_id(profile), result)
+            apply_job_result_to_pool(
+                pool_obj,
+                pool_obj.by_id(profile),
+                result,
+                persist=True,
+                environ=env_map,
+            )
         except Exception:  # noqa: BLE001 — pool update must not flip job ok
             pass
     result.setdefault("notes", [])

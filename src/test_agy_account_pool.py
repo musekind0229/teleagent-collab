@@ -13,6 +13,7 @@ import tempfile
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -27,6 +28,8 @@ from execution_backend import (  # noqa: E402
     run_antigravity_charter,
 )
 from execution_backend.agy_account_pool import (  # noqa: E402
+    ENV_COOLDOWN_MODE,
+    ENV_COOLDOWN_SEC,
     ENV_HTTP_PROXY,
     ENV_HTTPS_PROXY,
     ENV_POOL,
@@ -39,7 +42,9 @@ from execution_backend.agy_account_pool import (  # noqa: E402
     AccountPoolError,
     account_environ,
     apply_class_to_state,
+    apply_job_result_to_pool,
     clear_windows_antigravity_keyring,
+    expire_cooldowns,
     load_pool,
     mark_account,
     prepare_antigravity_environ_from_pool,
@@ -184,6 +189,8 @@ def _clean_env(extra: dict | None = None) -> dict:
         "COLLAB_AGY_POOL_LIVE",
         "COLLAB_EXECUTION_BACKEND",
         "AGY_PROFILE",
+        ENV_COOLDOWN_SEC,
+        ENV_COOLDOWN_MODE,
     ):
         env.pop(k, None)
     if extra:
@@ -286,6 +293,8 @@ class TestPoolSelectHandoff(unittest.TestCase):
             ],
         )
         self.assertEqual(obj["accounts"][1]["state"], "unavailable")
+        self.assertEqual(obj["cooldown_sec"], 300)
+        self.assertEqual(obj["cooldown_mode"], "duration")
 
     def test_load_save_atomic_roundtrip(self):
         with tempfile.TemporaryDirectory() as td:
@@ -374,10 +383,12 @@ class TestPoolSelectHandoff(unittest.TestCase):
                     return "rate_limit"
                 return "ok"
 
-            picked = select_account(pool, precheck=precheck)
+            picked = select_account(pool, precheck=precheck, environ={})
             self.assertEqual(picked.id, "C")
-            self.assertEqual(pool.by_id("A").state, "exhausted")
+            self.assertEqual(pool.by_id("A").state, "cooldown")
+            self.assertTrue(pool.by_id("A").cooldown_until)
             self.assertEqual(pool.by_id("B").state, "cooldown")
+            self.assertTrue(pool.by_id("B").cooldown_until)
 
     def test_precheck_models_list_rc0_selects_available(self):
         """Plain ``agy models`` stdout (rc 0, no JSON status) must select."""
@@ -404,9 +415,266 @@ class TestPoolSelectHandoff(unittest.TestCase):
             acc = pool.by_id("A")
             apply_class_to_state(acc, "eligibility_blocked")
             self.assertEqual(acc.state, "unavailable")
+            self.assertIsNone(acc.cooldown_until)
+            apply_class_to_state(acc, "auth_invalid")
+            self.assertEqual(acc.state, "unavailable")
             acc2 = pool.by_id("C")
-            apply_class_to_state(acc2, "quota_exhausted")
-            self.assertEqual(acc2.state, "exhausted")
+            apply_class_to_state(acc2, "quota_exhausted", now=1_800_000_000.0, cooldown_sec=300)
+            self.assertEqual(acc2.state, "cooldown")
+            self.assertNotEqual(acc2.state, "unavailable")
+            until = datetime.fromisoformat(acc2.cooldown_until).timestamp()
+            self.assertAlmostEqual(until, 1_800_000_000.0 + 300, delta=0.001)
+            apply_class_to_state(acc2, "ordinary_task_failure")
+            self.assertEqual(acc2.state, "cooldown")
+            apply_class_to_state(acc2, "ok")
+            self.assertEqual(acc2.state, "cooldown")
+            self.assertAlmostEqual(
+                datetime.fromisoformat(acc2.cooldown_until).timestamp(),
+                1_800_000_000.0 + 300,
+                delta=0.001,
+            )
+
+
+def _iso_ts(raw: str) -> float:
+    dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _next_local_midnight(now: float) -> datetime:
+    local = datetime.fromtimestamp(now).astimezone()
+    midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight + timedelta(days=1)
+
+
+_QUOTA_RESULT = {
+    "ok": False,
+    "error": "API error: UNAVAILABLE (code 503): No capacity available for model gemini-3.8-flash-low",
+    "stdout": "",
+    "stderr": "MODEL_CAPACITY_EXHAUSTED RESOURCE_EXHAUSTED",
+    "returncode": 1,
+}
+
+
+class TestQuotaRotation(unittest.TestCase):
+    def test_quota_failure_switches_account_and_persists(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_pool_file(
+                td,
+                _pool_dict(a_state="available", b_state="unavailable", c_state="available"),
+            )
+            pool = load_pool(path)
+            cls = apply_job_result_to_pool(
+                pool,
+                pool.by_id("A"),
+                _QUOTA_RESULT,
+                persist=True,
+                environ={},
+            )
+            self.assertEqual(cls, "quota_exhausted")
+            self.assertEqual(pool.by_id("A").state, "cooldown")
+            self.assertTrue(pool.by_id("A").cooldown_until)
+            self.assertGreater(_iso_ts(pool.by_id("A").cooldown_until), time.time())
+            self.assertEqual(pool.by_id("B").state, "unavailable")
+            picked = select_account(pool, environ={})
+            self.assertIsNotNone(picked)
+            self.assertEqual(picked.id, "C")
+            self.assertNotEqual(picked.id, "B")
+
+            again = load_pool(path)
+            self.assertEqual(again.by_id("A").state, "cooldown")
+            self.assertTrue(again.by_id("A").cooldown_until)
+            self.assertEqual(again.by_id("B").state, "unavailable")
+            picked2 = select_account(again, environ={})
+            self.assertEqual(picked2.id, "C")
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            self.assertNotIn("token", json.dumps(raw))
+            self.assertNotIn("oauth", json.dumps(raw).lower())
+
+    def test_cooldown_expired_is_selectable_again(self):
+        past = datetime.fromtimestamp(time.time() - 120, tz=timezone.utc).isoformat()
+        with tempfile.TemporaryDirectory() as td:
+            payload = _pool_dict(a_state="cooldown", b_state="unavailable", c_state="available")
+            payload["accounts"][0]["cooldown_until"] = past
+            path = _write_pool_file(td, payload)
+
+            loaded = load_pool(path)
+            self.assertEqual(loaded.by_id("A").state, "available")
+            self.assertIsNone(loaded.by_id("A").cooldown_until)
+            self.assertEqual(select_account(loaded, environ={}).id, "A")
+
+            loaded.by_id("A").state = "cooldown"
+            loaded.by_id("A").cooldown_until = past
+            self.assertTrue(expire_cooldowns(loaded))
+            self.assertEqual(loaded.by_id("A").state, "available")
+            self.assertIsNone(loaded.by_id("A").cooldown_until)
+
+            mark_account(loaded, "A", "cooldown", cooldown_until=past, persist=True)
+            self.assertEqual(loaded.by_id("A").state, "cooldown")
+            picked = select_account(loaded, environ={})
+            self.assertEqual(picked.id, "A")
+            self.assertEqual(loaded.by_id("A").state, "available")
+            disk = json.loads(path.read_text(encoding="utf-8"))
+            states = {row["id"]: row["state"] for row in disk["accounts"]}
+            self.assertEqual(states["A"], "available")
+            self.assertNotIn("cooldown_until", disk["accounts"][0])
+
+    def test_day_boundary_cooldown_restores_after_local_midnight(self):
+        local_tz = datetime.now().astimezone().tzinfo
+        now_local = datetime(2026, 6, 15, 10, 0, 0, tzinfo=local_tz)
+        now = now_local.timestamp()
+        midnight = datetime(2026, 6, 16, 0, 0, 0, tzinfo=local_tz)
+        with tempfile.TemporaryDirectory() as td:
+            payload = _pool_dict(a_state="available", b_state="unavailable", c_state="available")
+            payload["cooldown_mode"] = "day_boundary"
+            payload["cooldown_sec"] = 10
+            path = _write_pool_file(td, payload)
+            pool = load_pool(path)
+            cls = apply_job_result_to_pool(
+                pool,
+                pool.by_id("A"),
+                _QUOTA_RESULT,
+                persist=True,
+                now=now,
+                environ={},
+            )
+            self.assertEqual(cls, "quota_exhausted")
+            self.assertEqual(pool.by_id("A").state, "cooldown")
+            until = _iso_ts(pool.by_id("A").cooldown_until)
+            self.assertAlmostEqual(until, midnight.timestamp(), delta=0.001)
+            self.assertGreaterEqual(until, _next_local_midnight(now).timestamp() - 0.001)
+            self.assertFalse(expire_cooldowns(pool, now=now))
+            self.assertEqual(pool.by_id("A").state, "cooldown")
+            self.assertTrue(expire_cooldowns(pool, now=midnight.timestamp()))
+            self.assertEqual(pool.by_id("A").state, "available")
+            self.assertIsNone(pool.by_id("A").cooldown_until)
+            self.assertEqual(select_account(pool, now=midnight.timestamp(), environ={}).id, "A")
+
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["cooldown_mode"], "day_boundary")
+            self.assertEqual(saved["cooldown_sec"], 10)
+
+    def test_env_cooldown_overrides_pool_extra(self):
+        now = 1_800_000_000.0
+        with tempfile.TemporaryDirectory() as td:
+            payload = _pool_dict()
+            payload["cooldown_sec"] = 10
+            payload["cooldown_mode"] = "duration"
+            pool = load_pool(_write_pool_file(td, payload))
+            apply_job_result_to_pool(
+                pool,
+                pool.by_id("A"),
+                _QUOTA_RESULT,
+                persist=False,
+                now=now,
+                environ={ENV_COOLDOWN_SEC: "60", ENV_COOLDOWN_MODE: "duration"},
+            )
+            self.assertAlmostEqual(_iso_ts(pool.by_id("A").cooldown_until), now + 60, delta=0.001)
+
+            pool.by_id("C").state = "available"
+            apply_job_result_to_pool(
+                pool,
+                pool.by_id("C"),
+                _QUOTA_RESULT,
+                persist=False,
+                now=now,
+                environ={ENV_COOLDOWN_MODE: "day_boundary"},
+            )
+            self.assertEqual(pool.by_id("C").state, "cooldown")
+            self.assertAlmostEqual(
+                _iso_ts(pool.by_id("C").cooldown_until),
+                _next_local_midnight(now).timestamp(),
+                delta=0.001,
+            )
+
+    def test_collect_result_quota_rotates_to_next_profile(self):
+        with tempfile.TemporaryDirectory() as td:
+            pool_path = _write_pool_file(
+                td,
+                _pool_dict(a_state="available", b_state="unavailable", c_state="available"),
+            )
+            fake = _write_fake_agy(td)
+            ws = Path(td) / "ws"
+            ws.mkdir()
+            base = _clean_env(
+                {
+                    "AGY_BIN": str(fake),
+                    "AGY_FAKE_STATUS": "ERROR",
+                    "AGY_FAKE_EXIT": "1",
+                    "AGY_FAKE_RESPONSE": (
+                        "UNAVAILABLE (code 503): No capacity available for model "
+                        "gemini-3.8-flash-low"
+                    ),
+                    "AGY_FAKE_STDERR": "MODEL_CAPACITY_EXHAUSTED",
+                    "PATH": os.environ.get("PATH", ""),
+                }
+            )
+            be = get_execution_backend(
+                "antigravity",
+                account_pool_path=str(pool_path),
+                environ=base,
+            )
+            started = be.start_run(
+                title="quota",
+                directory=str(ws),
+                instruction="fail quota",
+                artifacts=[],
+            )
+            self.assertTrue(started.get("ok"), started.get("error"))
+            self.assertEqual(started.get("agy_profile"), "A")
+            deadline = time.time() + 5
+            while be.observe_run(started["run_id"]).get("busy") and time.time() < deadline:
+                time.sleep(0.05)
+            collected = be.collect_result(started["run_id"])
+            self.assertFalse(collected["ok"])
+            self.assertEqual(collected.get("agy_err_class"), "quota_exhausted")
+            self.assertIn("MODEL_CAPACITY_EXHAUSTED", collected.get("stderr") or "")
+            self.assertEqual(collected.get("returncode"), 1)
+            pool = load_pool(pool_path)
+            self.assertEqual(pool.by_id("A").state, "cooldown")
+            self.assertTrue(pool.by_id("A").cooldown_until)
+            self.assertEqual(pool.by_id("B").state, "unavailable")
+            nxt = prepare_antigravity_environ_from_pool(
+                pool_path,
+                base_environ=base,
+                persist=False,
+            )
+            self.assertEqual(nxt["agy_profile"], "C")
+
+    def test_collect_result_swallows_pool_io_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake = _write_fake_agy(td)
+            ws = Path(td) / "ws"
+            ws.mkdir()
+            missing = str(Path(td) / "no-such-pool.json")
+            base = _clean_env(
+                {
+                    "AGY_BIN": str(fake),
+                    "AGY_FAKE_ARTIFACT": "hello-from-worker.txt",
+                    ENV_POOL: missing,
+                    "AGY_PROFILE": "A",
+                    "PATH": os.environ.get("PATH", ""),
+                }
+            )
+            be = AntigravityCliExecutionBackend(bin_path=str(fake), environ=base)
+            started = be.start_run(
+                title="hello",
+                directory=str(ws),
+                instruction="write the hello file",
+                artifacts=["hello-from-worker.txt"],
+            )
+            deadline = time.time() + 5
+            while be.observe_run(started["run_id"]).get("busy") and time.time() < deadline:
+                time.sleep(0.05)
+            with self.assertLogs("execution_backend.antigravity_cli_v1", level="WARNING") as logs:
+                collected = be.collect_result(started["run_id"])
+            self.assertTrue(collected["ok"])
+            self.assertNotIn("agy_err_class", collected)
+            self.assertTrue(any("pool update failed" in line for line in logs.output))
+            blob = "\n".join(logs.output)
+            self.assertNotIn("access_token", blob)
+            self.assertNotIn("refresh_token", blob)
 
 
 class TestFactoryAndRunJobPool(unittest.TestCase):

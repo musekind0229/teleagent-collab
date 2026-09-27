@@ -3,8 +3,11 @@
     "Example only. Fake HOME paths — do not point this file at a real oauth store.",
     "Copy to a gitignored path (e.g. jobs/agy-account-pool.json) and fill in real profile HOMEs locally.",
     "Never put access/id/refresh tokens, oauth JSON, or GEMINI_API_KEY in the pool file.",
-    "GEMINI_API_KEY mode is not Google AI Pro quota. Serial dispatch only; one HOME per spawn."
+    "GEMINI_API_KEY mode is not Google AI Pro quota. Serial dispatch only; one HOME per spawn.",
+    "cooldown_sec is seconds for cooldown_mode=duration (default 300). day_boundary waits until the next machine-local midnight. Quota and rate-limit use cooldown, not exhausted."
   ],
+  "cooldown_sec": 300,
+  "cooldown_mode": "duration",
   "accounts": [
     {
       "id": "A",
@@ -25,7 +28,7 @@
       "home": "/path/to/profiles/homeC",
       "state": "available",
       "email_mask": "c***@example.com",
-      "notes": "example standby; selected after A is exhausted"
+      "notes": "example standby; selected after A is cooldown"
     }
   ]
 }

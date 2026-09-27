@@ -8,6 +8,7 @@ explicitly sets agy_auto_approve=true.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -21,9 +22,13 @@ from typing import Any, Mapping
 from execution_backend.agy_account_pool import (
     ENV_POOL,
     ENV_PROFILE,
+    apply_job_result_to_pool,
     clear_windows_antigravity_keyring,
+    load_pool,
 )
 from execution_backend.base import BackendError, BackendStatus, ExecutionBackendABC, unsupported
+
+_LOG = logging.getLogger(__name__)
 
 BACKEND_ID = "antigravity.cli_v1"
 DEFAULT_AGY_MODEL = "gemini-3.8-flash-low"
@@ -635,7 +640,46 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         profile = self._agy_profile()
         if profile:
             out["agy_profile"] = profile
+        self._attach_spawn_output(out, rec)
+        self._persist_pool_after_collect(out)
         return out
+
+    def _attach_spawn_output(self, out: dict[str, Any], rec: dict[str, Any]) -> None:
+        """Copy harvested streams onto the collect payload when absent.
+
+        ``assistant_error`` is truncated. Classify needs the raw streams.
+        """
+        if "stdout" not in out:
+            out["stdout"] = rec.get("stdout") or ""
+        if "stderr" not in out:
+            out["stderr"] = rec.get("stderr") or ""
+        if "returncode" not in out:
+            out["returncode"] = rec.get("returncode")
+
+    def _persist_pool_after_collect(self, out: dict[str, Any]) -> None:
+        """Quota / rate-limit / auth classes update the selected account.
+
+        Runs only when this spawn was bound to a pool (``COLLAB_AGY_ACCOUNT_POOL``
+        and ``AGY_PROFILE``). Pool I/O failures are logged by exception type
+        and swallowed. Never logs stdout, stderr, or token material.
+        """
+        env = self._env()
+        pool_path = str(env.get(ENV_POOL) or "").strip()
+        profile = str(env.get(ENV_PROFILE) or "").strip()
+        if not pool_path or not profile:
+            return
+        try:
+            pool = load_pool(pool_path)
+            cls = apply_job_result_to_pool(
+                pool,
+                pool.by_id(profile),
+                out,
+                persist=True,
+                environ=env,
+            )
+            out["agy_err_class"] = cls
+        except Exception as exc:  # noqa: BLE001 — pool I/O must not fail collect
+            _LOG.warning("agy account pool update failed (%s)", type(exc).__name__)
 
     def list_pending_actions(self, *, session_id: str | None = None) -> tuple[int, list]:
         # agy print is one-shot. No permission channel — same as inprocess.

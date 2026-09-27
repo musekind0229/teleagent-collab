@@ -38,6 +38,37 @@ git pull
 
 真实池（如 `jobs/agy-account-pool.json`）保存为 **UTF-8、无 BOM**，并且 gitignore。从 `jobs/examples/agy_account_pool.example.json` 复制，再填本机 `home`。文件里不要放 token。
 
+## 配额轮换
+
+`collect_result` 在本次 spawn 的环境里同时有 `COLLAB_AGY_ACCOUNT_POOL` 和 `AGY_PROFILE` 时，把该次结果分类写回池 JSON，并用临时文件 + `os.replace` 原子保存。池读写失败只记异常类型、不让任务采集失败，日志里不出现 token。
+
+| 分类（看 stderr / error / stdout） | 账号 |
+| --- | --- |
+| `eligibility_blocked` / `auth_invalid` | `unavailable`。例如 `0001` 这种资格不合格，之后一直跳过 |
+| `quota_exhausted` | `state=cooldown`，并写 `cooldown_until`。不是资格问题，也不是 `ordinary_task_failure`，所以不会继续打同一个号 |
+| `rate_limit` | 同样 `cooldown` |
+| `ok` / `ordinary_task_failure` | 不改账号状态 |
+
+`exhausted` 还留在状态集里，只给手工标记。分类器遇到配额走 `cooldown`，到期后 `expire_cooldowns`（在 `load_pool` / `select_account`）把它提回 `available`。
+
+池顶字段（保存在 JSON 里，不是账号条目）：
+
+- `cooldown_sec`：秒，默认 300。`cooldown_mode` 为 `duration` 时，`cooldown_until = now + cooldown_sec`（UTC ISO）。
+- `cooldown_mode`：`duration`（默认）或 `day_boundary`。`day_boundary` 的截止点是**本机本地时区**的下一个日历零点（这台 Windows 是中国标准时间，相当于 Asia/Shanghai），存成 UTC。过了该时刻才能再被选中。
+
+环境变量可盖过池文件：`COLLAB_AGY_COOLDOWN_SEC`、`COLLAB_AGY_COOLDOWN_MODE`。
+
+两个处于 `available` 的号会轮换。`musekind0003` 被标成配额冷却后，下一次 `select_account` 或带 `--agy-account-pool` 的 spawn 应把 `AGY_PROFILE` 设成 `musekind0003-alt`。`unavailable`（含 `0001` / eligibility）不参与。
+
+探测（不必烧掉真实额度）：
+
+- 配额：`MODEL_CAPACITY_EXHAUSTED`、`RESOURCE_EXHAUSTED`、`No capacity`、`503 UNAVAILABLE`、`fetchQuotaStatus`、credits。
+- 限流：`429` / overloaded / try again later。
+- 轮换：标记之后再选一次，`AGY_PROFILE` 应换成另一个 `available` 号。
+- 本刀用模拟的配额结果验证了轮换，没有对线上 agy 打出真实配额错误。
+
+不要把 token 贴进日志、池文件或文档。
+
 ## 8. 每日 `--ready` 与 tip
 
 ```powershell

@@ -18,7 +18,7 @@ import tempfile
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +38,8 @@ ENV_PRECHECK = "COLLAB_AGY_POOL_PRECHECK"
 ENV_PROFILE = "AGY_PROFILE"
 ENV_HTTP_PROXY = "COLLAB_AGY_HTTP_PROXY"
 ENV_HTTPS_PROXY = "COLLAB_AGY_HTTPS_PROXY"
+ENV_COOLDOWN_SEC = "COLLAB_AGY_COOLDOWN_SEC"
+ENV_COOLDOWN_MODE = "COLLAB_AGY_COOLDOWN_MODE"
 FORCE_FILE_STORAGE = "GEMINI_FORCE_FILE_STORAGE"
 # Community SSH→file-creds trigger (agy detects SSH session). TEST-NET only.
 SSH_CONNECTION_PSEUDO = "203.0.113.1 50000 203.0.113.2 22"
@@ -47,6 +49,9 @@ KEYRING_TARGET = "gemini:antigravity"
 
 ACCOUNT_STATES = frozenset({"available", "exhausted", "cooldown", "unavailable"})
 DEFAULT_COOLDOWN_SEC = 300.0
+COOLDOWN_MODE_DURATION = "duration"
+COOLDOWN_MODE_DAY_BOUNDARY = "day_boundary"
+_COOLDOWN_MODES = frozenset({COOLDOWN_MODE_DURATION, COOLDOWN_MODE_DAY_BOUNDARY})
 
 _KNOWN_ACCOUNT_KEYS = frozenset(
     {"id", "name", "home", "state", "email_mask", "notes", "cooldown_until"}
@@ -254,24 +259,101 @@ def save_pool(path: str | Path, pool: AccountPool) -> None:
     pool.path = p
 
 
+def _coerce_cooldown_sec(raw: Any, default: float) -> float:
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if val < 0:
+        return default
+    return val
+
+
+def _coerce_cooldown_mode(raw: Any, default: str = COOLDOWN_MODE_DURATION) -> str:
+    text = str(raw or "").strip().lower()
+    if text in _COOLDOWN_MODES:
+        return text
+    return default
+
+
+def resolve_cooldown_settings(
+    pool: AccountPool | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+    cooldown_sec: float | None = None,
+    cooldown_mode: str | None = None,
+) -> tuple[float, str]:
+    """Resolve ``(cooldown_sec, cooldown_mode)``.
+
+    Precedence: explicit args, then ``COLLAB_AGY_COOLDOWN_SEC`` /
+    ``COLLAB_AGY_COOLDOWN_MODE``, then ``pool.extra``, then
+    ``DEFAULT_COOLDOWN_SEC`` / ``duration``.
+    """
+    sec = DEFAULT_COOLDOWN_SEC
+    mode = COOLDOWN_MODE_DURATION
+    extra = pool.extra if pool is not None else None
+    if isinstance(extra, Mapping):
+        if "cooldown_sec" in extra:
+            sec = _coerce_cooldown_sec(extra.get("cooldown_sec"), sec)
+        if extra.get("cooldown_mode") not in (None, ""):
+            mode = _coerce_cooldown_mode(extra.get("cooldown_mode"), mode)
+    env = os.environ if environ is None else environ
+    if str(env.get(ENV_COOLDOWN_SEC) or "").strip():
+        sec = _coerce_cooldown_sec(env.get(ENV_COOLDOWN_SEC), sec)
+    if str(env.get(ENV_COOLDOWN_MODE) or "").strip():
+        mode = _coerce_cooldown_mode(env.get(ENV_COOLDOWN_MODE), mode)
+    if cooldown_sec is not None:
+        sec = _coerce_cooldown_sec(cooldown_sec, sec)
+    if cooldown_mode is not None and str(cooldown_mode).strip():
+        mode = _coerce_cooldown_mode(cooldown_mode, mode)
+    return sec, mode
+
+
+def cooldown_until_iso(
+    now: float,
+    *,
+    cooldown_sec: float = DEFAULT_COOLDOWN_SEC,
+    cooldown_mode: str = COOLDOWN_MODE_DURATION,
+) -> str:
+    """UTC ISO instant when a cooldown ends.
+
+    ``duration``: ``now + cooldown_sec``.
+    ``day_boundary``: the next calendar midnight in the machine local
+    timezone (on this Windows deploy, China Standard Time / Asia/Shanghai).
+    The value is stored in UTC so ``expire_cooldowns`` can compare epochs.
+    """
+    mode = _coerce_cooldown_mode(cooldown_mode)
+    if mode == COOLDOWN_MODE_DAY_BOUNDARY:
+        local = datetime.fromtimestamp(float(now)).astimezone()
+        midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+        nxt = midnight + timedelta(days=1)
+        return nxt.astimezone(timezone.utc).isoformat()
+    until = datetime.fromtimestamp(float(now) + float(cooldown_sec), tz=timezone.utc)
+    return until.isoformat()
+
+
 def apply_class_to_state(
     account: Account,
     err_class: str,
     *,
     now: float | None = None,
     cooldown_sec: float = DEFAULT_COOLDOWN_SEC,
+    cooldown_mode: str = COOLDOWN_MODE_DURATION,
 ) -> bool:
     """Map classifier output onto pool state. Returns True if state changed.
 
     eligibility_blocked / auth_invalid -> unavailable (do not dispatch)
-    quota_exhausted -> exhausted (NOT eligibility)
+    quota_exhausted -> cooldown (set cooldown_until; NOT eligibility, NOT exhausted)
     rate_limit -> cooldown
     ok / ordinary_task_failure -> no account-state change
+
+    ``exhausted`` stays in ACCOUNT_STATES for manual marks. The classifier
+    path for quota does not use it, so expiry can restore the account.
     """
     mapping = {
         CLASS_ELIGIBILITY_BLOCKED: "unavailable",
         CLASS_AUTH_INVALID: "unavailable",
-        CLASS_QUOTA_EXHAUSTED: "exhausted",
+        CLASS_QUOTA_EXHAUSTED: "cooldown",
         CLASS_RATE_LIMIT: "cooldown",
     }
     new_state = mapping.get(str(err_class or "").strip())
@@ -281,13 +363,15 @@ def apply_class_to_state(
     account.state = new_state
     if new_state == "cooldown":
         t = time.time() if now is None else float(now)
-        until = datetime.fromtimestamp(t + float(cooldown_sec), tz=timezone.utc)
-        account.cooldown_until = until.isoformat()
+        account.cooldown_until = cooldown_until_iso(
+            t,
+            cooldown_sec=float(cooldown_sec),
+            cooldown_mode=cooldown_mode,
+        )
         changed = True
-    elif new_state != "cooldown":
-        if account.cooldown_until:
-            account.cooldown_until = None
-            changed = True
+    elif account.cooldown_until:
+        account.cooldown_until = None
+        changed = True
     return changed
 
 
@@ -338,35 +422,47 @@ def select_account(
     *,
     precheck: PrecheckFn | None = None,
     persist: bool = True,
+    now: float | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> Account | None:
     """Pick the first *available* account. Optional precheck runs per candidate.
 
     Precheck classes:
       eligibility_blocked / auth_invalid -> unavailable, skip, try next
-      quota_exhausted -> exhausted, try next
+      quota_exhausted -> cooldown, try next
       rate_limit -> cooldown, try next
       ok -> selected
     Non-matching classes skip this candidate without changing state.
+    Cooldown length comes from pool.extra / COLLAB_AGY_COOLDOWN_* (see
+    resolve_cooldown_settings).
 
     Does not swap HOME mid-run; the caller binds one account per spawn.
     """
-    expire_cooldowns(pool)
+    expired = expire_cooldowns(pool, now=now)
+    sec, mode = resolve_cooldown_settings(pool, environ=environ)
     mutated = False
+    chosen: Account | None = None
     for acc in pool.accounts:
         if acc.state != "available":
             continue
         if precheck is None:
-            return acc
+            chosen = acc
+            break
         cls = _normalize_precheck(precheck(acc))
-        if apply_class_to_state(acc, cls):
+        if apply_class_to_state(
+            acc,
+            cls,
+            now=now,
+            cooldown_sec=sec,
+            cooldown_mode=mode,
+        ):
             mutated = True
         if cls == CLASS_OK:
-            if persist and mutated and pool.path is not None:
-                save_pool(pool.path, pool)
-            return acc
-    if persist and mutated and pool.path is not None:
+            chosen = acc
+            break
+    if persist and (mutated or expired) and pool.path is not None:
         save_pool(pool.path, pool)
-    return None
+    return chosen
 
 
 def _is_windows() -> bool:
@@ -536,7 +632,12 @@ def prepare_antigravity_environ_from_pool(
     """
     pool = load_pool(pool_path)
     chk = _precheck_from_env(precheck, base_environ, pool)
-    acc = select_account(pool, precheck=chk, persist=persist)
+    acc = select_account(
+        pool,
+        precheck=chk,
+        persist=persist,
+        environ=base_environ,
+    )
     if acc is None:
         states = {a.id: a.state for a in pool.accounts}
         raise AccountPoolError(f"no available agy account in pool; states={states}")
@@ -576,13 +677,35 @@ def apply_job_result_to_pool(
     result: Mapping[str, Any] | None,
     *,
     persist: bool = True,
+    now: float | None = None,
+    environ: Mapping[str, str] | None = None,
+    cooldown_sec: float | None = None,
+    cooldown_mode: str | None = None,
 ) -> str:
     """After a finished spawn, classify the result and update pool state.
 
-    ordinary_task_failure / ok do not mark the account bad. Never swaps HOME.
+    ordinary_task_failure / ok do not mark the account bad. Quota and
+    rate-limit land on cooldown (pool.extra / COLLAB_AGY_COOLDOWN_*).
+    Never swaps HOME. ``account`` must be the object inside ``pool``.
     """
+    sec, mode = resolve_cooldown_settings(
+        pool,
+        environ=environ,
+        cooldown_sec=cooldown_sec,
+        cooldown_mode=cooldown_mode,
+    )
     cls = classify_result(dict(result) if result is not None else None)
-    if apply_class_to_state(account, cls) and persist and pool.path is not None:
+    if (
+        apply_class_to_state(
+            account,
+            cls,
+            now=now,
+            cooldown_sec=sec,
+            cooldown_mode=mode,
+        )
+        and persist
+        and pool.path is not None
+    ):
         save_pool(pool.path, pool)
     return cls
 
@@ -598,7 +721,11 @@ __all__ = [
     "Account",
     "AccountPool",
     "AccountPoolError",
+    "COOLDOWN_MODE_DAY_BOUNDARY",
+    "COOLDOWN_MODE_DURATION",
     "DEFAULT_COOLDOWN_SEC",
+    "ENV_COOLDOWN_MODE",
+    "ENV_COOLDOWN_SEC",
     "ENV_HTTP_PROXY",
     "ENV_HTTPS_PROXY",
     "ENV_POOL",
@@ -613,12 +740,14 @@ __all__ = [
     "apply_class_to_state",
     "clear_windows_antigravity_keyring",
     "apply_job_result_to_pool",
+    "cooldown_until_iso",
     "expire_cooldowns",
     "inject_agy_pool_into_backend_kwargs",
     "live_agy_precheck",
     "load_pool",
     "mark_account",
     "prepare_antigravity_environ_from_pool",
+    "resolve_cooldown_settings",
     "resolve_pool_path",
     "save_pool",
     "select_account",

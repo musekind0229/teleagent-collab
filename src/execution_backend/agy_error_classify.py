@@ -19,7 +19,10 @@ Classes (first match wins):
 
 eligibility_blocked is not auth_invalid and not quota_exhausted: oauth may
 already be on disk; the account is simply not eligible in this location.
-Scheduler mapping: eligibility_blocked -> unavailable (do not dispatch).
+Scheduler mapping (agy_account_pool.apply_class_to_state):
+  eligibility_blocked / auth_invalid -> unavailable (do not dispatch)
+  quota_exhausted / rate_limit -> cooldown (recoverable; not a permanent exhausted mark)
+  ok / ordinary_task_failure -> no account-state change
 
 Model ``UNAVAILABLE (code 503): No capacity…`` is quota/capacity, not
 eligibility — do not mark the HOME unavailable for geo/product block.
