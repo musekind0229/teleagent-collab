@@ -23,7 +23,11 @@ AGY_AUTO_APPROVE=1 python3 bin/run-job.py --backend antigravity \
 
 ```powershell
 $env:AGY_AUTO_APPROVE = '1'
-python bin/run-job.py --backend antigravity --agy-account-pool jobs/agy-account-pool.json jobs/examples/hello.charter.yaml
+try {
+  python bin/run-job.py --backend antigravity --agy-account-pool jobs/agy-account-pool.json jobs/examples/hello.charter.yaml
+} finally {
+  Remove-Item Env:AGY_AUTO_APPROVE -ErrorAction SilentlyContinue
+}
 ```
 
 等价开关：`COLLAB_AGY_AUTO_APPROVE=1`，或章程 `agy_auto_approve: true`。依赖：`agy` 在 PATH（或 `AGY_BIN`）；池 JSON 可选；配了代理才注入；文件凭据靠下方子进程 `SSH_*`。
@@ -64,10 +68,11 @@ Win 上 agy **1.2.11** 走文件凭据的真实触发是子进程里的伪 `SSH_
 
 池顶（写入 `pool.extra`，随原子保存一起落盘）：
 
-- `cooldown_sec`：数字，默认 `300`。`cooldown_mode=duration` 时 `cooldown_until = now + cooldown_sec`（UTC ISO）。
-- `cooldown_mode`：`duration`（默认）或 `day_boundary`。`day_boundary` 把 `cooldown_until` 设为本机本地时区的下一个日历零点（这台 Windows 是中国标准时间，相当于 Asia/Shanghai），再存成 UTC。
+- `cooldown_sec`：数字，默认 `300`。`cooldown_mode=duration` 时 `cooldown_until = now + cooldown_sec`（UTC ISO）。**只作用于** `quota_exhausted`。
+- `cooldown_mode`：`duration`（默认）或 `day_boundary`。`day_boundary` 把 `cooldown_until` 设为本机本地时区的下一个日历零点（这台 Windows 是中国标准时间，相当于 Asia/Shanghai），再存成 UTC。**只作用于**真配额。
+- `temp_cooldown_sec`：数字，默认 `60`。给 `temporary_no_capacity`（503 / No capacity）与 `rate_limit`；**始终** `duration`，不继承 `day_boundary`。
 
-`state` ∈ `available` | `exhausted` | `cooldown` | `unavailable`。`exhausted` 只留给手工标记；配额分类不再写入它。
+`state` ∈ `available` | `exhausted` | `cooldown` | `unavailable`。`exhausted` 只留给手工标记；配额 / 503 / 限流分类都写 `cooldown`，不写永久 `exhausted`。
 
 示例里的 `/path/to/profiles/homeA` 是假路径，**不要**指向真实 oauth。
 
@@ -79,14 +84,15 @@ Win 上 agy **1.2.11** 走文件凭据的真实触发是子进程里的伪 `SSH_
 | --- | --- |
 | `eligibility_blocked` | `unavailable`，**不派**，试下一个 |
 | `auth_invalid` | `unavailable`，不派，试下一个 |
-| `quota_exhausted`（含模型 `503` / `No capacity`） | `cooldown`（写 `cooldown_until`；≠ eligibility，≠ `ordinary_task_failure`） |
-| `rate_limit` | `cooldown`（到期可回到 available） |
+| `quota_exhausted` | 真配额（`MODEL_CAPACITY_EXHAUSTED` 等）→ `cooldown`（`cooldown_sec` / `cooldown_mode`，可 `day_boundary`；≠ eligibility，≠ 永久 `exhausted`） |
+| `temporary_no_capacity` | 可重试 `503` / `No capacity` → **短** `duration` 冷却（`temp_cooldown_sec`）；到期恢复，不跟零点 |
+| `rate_limit` | 同样短 `duration` 冷却（`temp_cooldown_sec`） |
 | `ok` | 选中。含 JSON `SUCCESS`/`OK`/`COMPLETED`/`STOP`/`DONE`，以及 `agy models` 成功时的纯文本模型列表（rc 为 0 或未给、输出非空、未命中上面几类、也不是 FAIL status）。不改账号状态 |
 | `ordinary_task_failure` | 非 0 退出或 JSON `ERROR`/`FAILED`/`FAIL`。不把账号标坏，也不选中 |
 
-剧本：A 可派 → 配额或限流把 A 标 `cooldown` → 下一单选 C。手工 `exhausted` 同样会被跳过。B 因 eligibility 为 `unavailable`，**永不被选**。
+剧本：A 可派 → 配额 / 503 / 限流把 A 标 `cooldown` → 下一单选 C。手工 `exhausted` 同样会被跳过。B 因 eligibility 为 `unavailable`，**永不被选**。
 
-`cooldown_until` 过期后，`load_pool` / `select_account` 里的 `expire_cooldowns` 把该号提回 `available`。`day_boundary` 要等到本机本地零点之后。
+`cooldown_until` 过期后，`load_pool` / `select_account` 里的 `expire_cooldowns` 把该号提回 `available`。真配额的 `day_boundary` 要等到本机本地零点之后；503 / 限流只等 `temp_cooldown_sec`。
 
 一次 spawn 结束后，`AntigravityCliExecutionBackend.collect_result` 在环境里同时有 `COLLAB_AGY_ACCOUNT_POOL` 和 `AGY_PROFILE` 时分类该结果并 `save_pool`（原子替换）。配额因此不会被当成普通任务失败、反复打在同一个账号上。池 I/O 失败只记异常类型，不抛出，也不打印 token。
 
@@ -108,5 +114,6 @@ Win 上 agy **1.2.11** 走文件凭据的真实触发是子进程里的伪 `SSH_
 | `COLLAB_AGY_POOL_LIVE=1` | 打开可选 live 单测（默认 skip） |
 | `COLLAB_AGY_HTTP_PROXY` | 可选。写入 `HTTP_PROXY`；未另配 HTTPS 时镜像 |
 | `COLLAB_AGY_HTTPS_PROXY` | 可选。写入 `HTTPS_PROXY` |
-| `COLLAB_AGY_COOLDOWN_SEC` | 可选。覆盖池顶 `cooldown_sec` |
-| `COLLAB_AGY_COOLDOWN_MODE` | 可选。`duration` 或 `day_boundary`，覆盖池顶 `cooldown_mode` |
+| `COLLAB_AGY_COOLDOWN_SEC` | 可选。覆盖池顶 `cooldown_sec`（真配额） |
+| `COLLAB_AGY_COOLDOWN_MODE` | 可选。`duration` 或 `day_boundary`，覆盖池顶 `cooldown_mode`（真配额） |
+| `COLLAB_AGY_TEMP_COOLDOWN_SEC` | 可选。覆盖池顶 `temp_cooldown_sec`（503 / rate_limit 短冷却） |

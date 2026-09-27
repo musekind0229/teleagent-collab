@@ -28,11 +28,13 @@ from execution_backend import (  # noqa: E402
     run_antigravity_charter,
 )
 from execution_backend.agy_account_pool import (  # noqa: E402
+    DEFAULT_TEMP_COOLDOWN_SEC,
     ENV_COOLDOWN_MODE,
     ENV_COOLDOWN_SEC,
     ENV_HTTP_PROXY,
     ENV_HTTPS_PROXY,
     ENV_POOL,
+    ENV_TEMP_COOLDOWN_SEC,
     FORCE_FILE_STORAGE,
     SSH_CLIENT_PSEUDO,
     SSH_CONNECTION_PSEUDO,
@@ -268,15 +270,22 @@ class TestClassifierFixture(unittest.TestCase):
         self.assertEqual(classify("", "", 0), "empty_failure")
         self.assertEqual(classify(text, "", 1), "ordinary_task_failure")
 
-    def test_model_503_no_capacity_is_quota_not_eligibility(self):
+    def test_model_503_no_capacity_is_temp_not_quota_or_eligibility(self):
         blob = (
             '{"status":"ERROR","error":"API error (attempt 3): '
             'UNAVAILABLE (code 503): No capacity available for model '
             'gemini-3.8-flash-low on the server"}'
         )
         got = classify(blob, "")
-        self.assertEqual(got, "quota_exhausted")
+        self.assertEqual(got, "temporary_no_capacity")
+        self.assertNotEqual(got, "quota_exhausted")
         self.assertNotEqual(got, "eligibility_blocked")
+        # True quota still wins when MODEL_CAPACITY_EXHAUSTED is also present.
+        both = classify(
+            blob,
+            "MODEL_CAPACITY_EXHAUSTED RESOURCE_EXHAUSTED",
+        )
+        self.assertEqual(both, "quota_exhausted")
 
 
 class TestPoolSelectHandoff(unittest.TestCase):
@@ -296,6 +305,7 @@ class TestPoolSelectHandoff(unittest.TestCase):
         self.assertEqual(obj["accounts"][1]["state"], "unavailable")
         self.assertEqual(obj["cooldown_sec"], 300)
         self.assertEqual(obj["cooldown_mode"], "duration")
+        self.assertEqual(obj["temp_cooldown_sec"], 60)
 
     def test_load_save_atomic_roundtrip(self):
         with tempfile.TemporaryDirectory() as td:
@@ -589,7 +599,97 @@ class TestQuotaRotation(unittest.TestCase):
                 delta=0.001,
             )
 
+    def test_503_alone_short_cooldown_ignores_day_boundary(self):
+        """Pure 503/No capacity must not wait until local midnight."""
+        now = 1_800_000_000.0  # fixed epoch
+        pure_503 = {
+            "ok": False,
+            "error": (
+                "API error: UNAVAILABLE (code 503): No capacity available "
+                "for model gemini-3.8-flash-low"
+            ),
+            "stdout": "",
+            "stderr": "",
+            "returncode": 1,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            payload = _pool_dict(a_state="available", b_state="unavailable", c_state="available")
+            payload["cooldown_mode"] = "day_boundary"
+            payload["cooldown_sec"] = 10
+            payload["temp_cooldown_sec"] = 45
+            path = _write_pool_file(td, payload)
+            pool = load_pool(path)
+            cls = apply_job_result_to_pool(
+                pool,
+                pool.by_id("A"),
+                pure_503,
+                persist=True,
+                now=now,
+                environ={},
+            )
+            self.assertEqual(cls, "temporary_no_capacity")
+            self.assertEqual(pool.by_id("A").state, "cooldown")
+            self.assertNotEqual(pool.by_id("A").state, "exhausted")
+            until = _iso_ts(pool.by_id("A").cooldown_until)
+            self.assertAlmostEqual(until, now + 45, delta=0.001)
+            # Must NOT be day_boundary midnight.
+            self.assertNotAlmostEqual(
+                until,
+                _next_local_midnight(now).timestamp(),
+                delta=1.0,
+            )
+            # Expires after short cooldown — selectable again.
+            self.assertTrue(expire_cooldowns(pool, now=now + 46))
+            self.assertEqual(pool.by_id("A").state, "available")
+            self.assertIsNone(pool.by_id("A").cooldown_until)
+
+    def test_rate_limit_also_uses_short_temp_cooldown(self):
+        now = 1_800_000_000.0
+        rate = {
+            "ok": False,
+            "error": "rate limit exceeded (HTTP 429). Try again later.",
+            "stdout": "",
+            "stderr": "Error: rate limit exceeded (HTTP 429).",
+            "returncode": 1,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            payload = _pool_dict()
+            payload["cooldown_mode"] = "day_boundary"
+            payload["cooldown_sec"] = 9999
+            path = _write_pool_file(td, payload)
+            pool = load_pool(path)
+            cls = apply_job_result_to_pool(
+                pool,
+                pool.by_id("A"),
+                rate,
+                persist=False,
+                now=now,
+                environ={ENV_TEMP_COOLDOWN_SEC: "30"},
+            )
+            self.assertEqual(cls, "rate_limit")
+            self.assertEqual(pool.by_id("A").state, "cooldown")
+            self.assertAlmostEqual(_iso_ts(pool.by_id("A").cooldown_until), now + 30, delta=0.001)
+
+    def test_apply_class_temp_defaults_to_60s_duration(self):
+        with tempfile.TemporaryDirectory() as td:
+            pool = load_pool(_write_pool_file(td))
+            acc = pool.by_id("A")
+            apply_class_to_state(
+                acc,
+                "temporary_no_capacity",
+                now=1_800_000_000.0,
+                cooldown_sec=300,
+                cooldown_mode="day_boundary",
+            )
+            self.assertEqual(acc.state, "cooldown")
+            self.assertAlmostEqual(
+                datetime.fromisoformat(acc.cooldown_until).timestamp(),
+                1_800_000_000.0 + DEFAULT_TEMP_COOLDOWN_SEC,
+                delta=0.001,
+            )
+
     def test_collect_result_quota_rotates_to_next_profile(self):
+
         with tempfile.TemporaryDirectory() as td:
             pool_path = _write_pool_file(
                 td,

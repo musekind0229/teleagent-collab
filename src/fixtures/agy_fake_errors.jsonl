@@ -2,7 +2,7 @@
 {"id":"auth_models_1","source":"simulated","stderr":"Error: Please sign in to view available models. Launch the CLI without arguments to sign in.\n","stdout":"","expect":"auth_invalid"}
 {"id":"quota_capacity_1","source":"binary_string_sim","stderr":"","stdout":"{\"status\":\"ERROR\",\"error\":\"MODEL_CAPACITY_EXHAUSTED: model capacity exhausted for this account\"}","expect":"quota_exhausted"}
 {"id":"quota_resource_1","source":"binary_string_sim","stderr":"RESOURCE_EXHAUSTED: Quota exceeded","stdout":"{\"status\":\"ERROR\",\"error\":\"RESOURCE_EXHAUSTED\"}","expect":"quota_exhausted"}
-{"id":"quota_503_capacity_1","source":"live_homeA","stderr":"","stdout":"{\"status\":\"ERROR\",\"error\":\"API error (attempt 3): UNAVAILABLE (code 503): No capacity available for model gemini-3.8-flash-low on the server\"}","expect":"quota_exhausted"}
+{"id":"temp_503_capacity_1","source":"live_homeA","stderr":"","stdout":"{\"status\":\"ERROR\",\"error\":\"API error (attempt 3): UNAVAILABLE (code 503): No capacity available for model gemini-3.8-flash-low on the server\"}","expect":"temporary_no_capacity"}
 {"id":"rate_429_1","source":"binary_string_sim","stderr":"Error: rate limit exceeded (HTTP 429). Try again later.","stdout":"{\"status\":\"ERROR\",\"error\":\"rate limit\"}","expect":"rate_limit"}
 {"id":"rate_overloaded_1","source":"binary_string_sim","stderr":"The model API is currently overloaded and may experience intermittent errors.","stdout":"{\"status\":\"ERROR\",\"error\":\"overloaded\"}","expect":"rate_limit"}
 {"id":"ordinary_1","source":"simulated","stderr":"","stdout":"{\"status\":\"ERROR\",\"error\":\"tool failed: file not found\"}","expect":"ordinary_task_failure"}

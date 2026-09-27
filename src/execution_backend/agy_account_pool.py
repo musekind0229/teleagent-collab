@@ -28,6 +28,7 @@ from execution_backend.agy_error_classify import (
     CLASS_OK,
     CLASS_QUOTA_EXHAUSTED,
     CLASS_RATE_LIMIT,
+    CLASS_TEMPORARY_NO_CAPACITY,
     classify,
     classify_result,
 )
@@ -40,6 +41,7 @@ ENV_HTTP_PROXY = "COLLAB_AGY_HTTP_PROXY"
 ENV_HTTPS_PROXY = "COLLAB_AGY_HTTPS_PROXY"
 ENV_COOLDOWN_SEC = "COLLAB_AGY_COOLDOWN_SEC"
 ENV_COOLDOWN_MODE = "COLLAB_AGY_COOLDOWN_MODE"
+ENV_TEMP_COOLDOWN_SEC = "COLLAB_AGY_TEMP_COOLDOWN_SEC"
 FORCE_FILE_STORAGE = "GEMINI_FORCE_FILE_STORAGE"
 # Community SSH→file-creds trigger (agy detects SSH session). TEST-NET only.
 SSH_CONNECTION_PSEUDO = "203.0.113.1 50000 203.0.113.2 22"
@@ -49,9 +51,13 @@ KEYRING_TARGET = "gemini:antigravity"
 
 ACCOUNT_STATES = frozenset({"available", "busy", "exhausted", "cooldown", "unavailable"})
 DEFAULT_COOLDOWN_SEC = 300.0
+# Short cooldown for transient 503 / rate_limit (always duration; never day_boundary).
+DEFAULT_TEMP_COOLDOWN_SEC = 60.0
 COOLDOWN_MODE_DURATION = "duration"
 COOLDOWN_MODE_DAY_BOUNDARY = "day_boundary"
 _COOLDOWN_MODES = frozenset({COOLDOWN_MODE_DURATION, COOLDOWN_MODE_DAY_BOUNDARY})
+# Classes that must never inherit day_boundary / long quota cooldown.
+_SHORT_COOLDOWN_CLASSES = frozenset({CLASS_TEMPORARY_NO_CAPACITY, CLASS_RATE_LIMIT})
 
 _KNOWN_ACCOUNT_KEYS = frozenset(
     {"id", "name", "home", "state", "email_mask", "notes", "cooldown_until", "lease_pid", "lease_until"}
@@ -329,6 +335,31 @@ def resolve_cooldown_settings(
     return sec, mode
 
 
+
+def resolve_temp_cooldown_sec(
+    pool: AccountPool | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+    temp_cooldown_sec: float | None = None,
+) -> float:
+    """Seconds for temporary_no_capacity / rate_limit (always duration mode).
+
+    Precedence: explicit arg, then ``COLLAB_AGY_TEMP_COOLDOWN_SEC``, then
+    ``pool.extra["temp_cooldown_sec"]``, then ``DEFAULT_TEMP_COOLDOWN_SEC``.
+    """
+    sec = DEFAULT_TEMP_COOLDOWN_SEC
+    if pool is not None:
+        extra = pool.extra or {}
+        if "temp_cooldown_sec" in extra:
+            sec = _coerce_cooldown_sec(extra.get("temp_cooldown_sec"), sec)
+    env = environ or {}
+    if str(env.get(ENV_TEMP_COOLDOWN_SEC) or "").strip():
+        sec = _coerce_cooldown_sec(env.get(ENV_TEMP_COOLDOWN_SEC), sec)
+    if temp_cooldown_sec is not None:
+        sec = _coerce_cooldown_sec(temp_cooldown_sec, sec)
+    return float(sec)
+
+
 def cooldown_until_iso(
     now: float,
     *,
@@ -359,34 +390,45 @@ def apply_class_to_state(
     now: float | None = None,
     cooldown_sec: float = DEFAULT_COOLDOWN_SEC,
     cooldown_mode: str = COOLDOWN_MODE_DURATION,
+    temp_cooldown_sec: float = DEFAULT_TEMP_COOLDOWN_SEC,
 ) -> bool:
     """Map classifier output onto pool state. Returns True if state changed.
 
     eligibility_blocked / auth_invalid -> unavailable (do not dispatch)
-    quota_exhausted -> cooldown (set cooldown_until; NOT eligibility, NOT exhausted)
-    rate_limit -> cooldown
+    quota_exhausted -> cooldown (pool cooldown_sec / mode; NOT eligibility,
+        NOT permanent exhausted — expiry restores via expire_cooldowns)
+    temporary_no_capacity / rate_limit -> short duration cooldown
+        (temp_cooldown_sec; always duration — never day_boundary)
     ok / ordinary_task_failure -> no account-state change
 
     ``exhausted`` stays in ACCOUNT_STATES for manual marks. The classifier
-    path for quota does not use it, so expiry can restore the account.
+    path for quota / 503 does not use it, so expiry can restore the account.
     """
     mapping = {
         CLASS_ELIGIBILITY_BLOCKED: "unavailable",
         CLASS_AUTH_INVALID: "unavailable",
         CLASS_QUOTA_EXHAUSTED: "cooldown",
+        CLASS_TEMPORARY_NO_CAPACITY: "cooldown",
         CLASS_RATE_LIMIT: "cooldown",
     }
-    new_state = mapping.get(str(err_class or "").strip())
+    cls = str(err_class or "").strip()
+    new_state = mapping.get(cls)
     if not new_state:
         return False
     changed = account.state != new_state
     account.state = new_state
     if new_state == "cooldown":
         t = time.time() if now is None else float(now)
+        if cls in _SHORT_COOLDOWN_CLASSES:
+            use_sec = float(temp_cooldown_sec)
+            use_mode = COOLDOWN_MODE_DURATION
+        else:
+            use_sec = float(cooldown_sec)
+            use_mode = cooldown_mode
         account.cooldown_until = cooldown_until_iso(
             t,
-            cooldown_sec=float(cooldown_sec),
-            cooldown_mode=cooldown_mode,
+            cooldown_sec=use_sec,
+            cooldown_mode=use_mode,
         )
         changed = True
     elif account.cooldown_until:
@@ -627,12 +669,12 @@ def select_account(
 
     Precheck classes:
       eligibility_blocked / auth_invalid -> unavailable, skip, try next
-      quota_exhausted -> cooldown, try next
-      rate_limit -> cooldown, try next
+      quota_exhausted -> cooldown (pool cooldown_*), try next
+      temporary_no_capacity / rate_limit -> short duration cooldown, try next
       ok -> selected
     Non-matching classes skip this candidate without changing state.
-    Cooldown length comes from pool.extra / COLLAB_AGY_COOLDOWN_* (see
-    resolve_cooldown_settings).
+    Quota cooldown: pool.extra / COLLAB_AGY_COOLDOWN_* (resolve_cooldown_settings).
+    Transient 503 / rate_limit: temp_cooldown_sec / COLLAB_AGY_TEMP_COOLDOWN_SEC.
 
     Does not swap HOME mid-run; the caller binds one account per spawn.
     """
@@ -640,6 +682,7 @@ def select_account(
     expired_busy = expire_busy_leases(pool, now=now)
     expired = expired or expired_busy
     sec, mode = resolve_cooldown_settings(pool, environ=environ)
+    temp_sec = resolve_temp_cooldown_sec(pool, environ=environ)
     mutated = False
     chosen: Account | None = None
     for acc in pool.accounts:
@@ -655,6 +698,7 @@ def select_account(
             now=now,
             cooldown_sec=sec,
             cooldown_mode=mode,
+            temp_cooldown_sec=temp_sec,
         ):
             mutated = True
         if cls == CLASS_OK:
@@ -942,11 +986,13 @@ def apply_job_result_to_pool(
     environ: Mapping[str, str] | None = None,
     cooldown_sec: float | None = None,
     cooldown_mode: str | None = None,
+    temp_cooldown_sec: float | None = None,
 ) -> str:
     """After a finished spawn, classify the result and update pool state.
 
-    ordinary_task_failure / ok do not mark the account bad. Quota and
-    rate-limit land on cooldown (pool.extra / COLLAB_AGY_COOLDOWN_*).
+    ordinary_task_failure / ok do not mark the account bad. True quota uses
+    pool.extra / COLLAB_AGY_COOLDOWN_*. Transient 503 / rate_limit use
+    temp_cooldown_sec / COLLAB_AGY_TEMP_COOLDOWN_SEC (always duration).
     Never swaps HOME. ``account`` must be the object inside ``pool``.
     """
     sec, mode = resolve_cooldown_settings(
@@ -955,6 +1001,11 @@ def apply_job_result_to_pool(
         cooldown_sec=cooldown_sec,
         cooldown_mode=cooldown_mode,
     )
+    temp_sec = resolve_temp_cooldown_sec(
+        pool,
+        environ=environ,
+        temp_cooldown_sec=temp_cooldown_sec,
+    )
     cls = classify_result(dict(result) if result is not None else None)
     changed = apply_class_to_state(
         account,
@@ -962,6 +1013,7 @@ def apply_job_result_to_pool(
         now=now,
         cooldown_sec=sec,
         cooldown_mode=mode,
+        temp_cooldown_sec=temp_sec,
     )
     # Drop busy lease after the spawn finishes (unless classify moved it).
     _drop_held_home_lease(account.home)
@@ -993,8 +1045,10 @@ __all__ = [
     "COOLDOWN_MODE_DAY_BOUNDARY",
     "COOLDOWN_MODE_DURATION",
     "DEFAULT_COOLDOWN_SEC",
+    "DEFAULT_TEMP_COOLDOWN_SEC",
     "ENV_COOLDOWN_MODE",
     "ENV_COOLDOWN_SEC",
+    "ENV_TEMP_COOLDOWN_SEC",
     "ENV_HTTP_PROXY",
     "ENV_HTTPS_PROXY",
     "ENV_POOL",
@@ -1023,6 +1077,7 @@ __all__ = [
     "release_account_lease",
     "reserve_account",
     "resolve_cooldown_settings",
+    "resolve_temp_cooldown_sec",
     "resolve_pool_path",
     "save_pool",
     "select_account",

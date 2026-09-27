@@ -7,7 +7,9 @@ Classes (first match wins):
   eligibility_blocked   -- signed in but Antigravity not available (location/account)
   auth_invalid          -- not signed in / authentication required or failed
   quota_exhausted       -- MODEL_CAPACITY_EXHAUSTED / RESOURCE_EXHAUSTED / credits
-                           / model 503 No capacity (NOT eligibility)
+                           (true quota; may use day_boundary cooldown)
+  temporary_no_capacity -- model 503 / No capacity (transient; short duration
+                           cooldown — NOT permanent exhausted, NOT eligibility)
   rate_limit            -- 429 / overloaded / try again later
   ok                    -- JSON status SUCCESS/OK/COMPLETED/STOP/DONE, or rc in
                            (None, 0) with non-empty output that matched none of
@@ -21,11 +23,15 @@ eligibility_blocked is not auth_invalid and not quota_exhausted: oauth may
 already be on disk; the account is simply not eligible in this location.
 Scheduler mapping (agy_account_pool.apply_class_to_state):
   eligibility_blocked / auth_invalid -> unavailable (do not dispatch)
-  quota_exhausted / rate_limit -> cooldown (recoverable; not a permanent exhausted mark)
+  quota_exhausted -> cooldown (pool cooldown_sec / cooldown_mode; recoverable)
+  temporary_no_capacity / rate_limit -> short duration cooldown
+      (temp_cooldown_sec; always duration — never day_boundary / never
+       permanent exhausted; expires like cooldown, not like exhausted)
   ok / ordinary_task_failure -> no account-state change
 
-Model ``UNAVAILABLE (code 503): No capacity…`` is quota/capacity, not
-eligibility — do not mark the HOME unavailable for geo/product block.
+Model ``UNAVAILABLE (code 503): No capacity…`` is *temporary* capacity,
+not daily quota and not eligibility — do not mark the HOME unavailable for
+geo/product block, and do not wait until local midnight.
 """
 from __future__ import annotations
 
@@ -44,6 +50,7 @@ AUTH = re.compile(
     r"not signed in|unauthenticated|unauthorized|login",
     re.I,
 )
+# True account/model quota — may justify day_boundary. Do NOT include bare 503.
 QUOTA = re.compile(
     r"MODEL_CAPACITY_EXHAUSTED|"
     r"capacity.?exhausted|"
@@ -51,7 +58,12 @@ QUOTA = re.compile(
     r"quota.?exceed|"
     r"out of credits|"
     r"no credits|"
-    r"fetchQuotaStatus|"
+    r"fetchQuotaStatus",
+    re.I,
+)
+# Transient server capacity — short cooldown only (checked after QUOTA so a
+# blob that also says MODEL_CAPACITY_EXHAUSTED still counts as true quota).
+TEMP_NO_CAPACITY = re.compile(
     r"no capacity|"
     r"UNAVAILABLE\s*\(code\s*503\)|"
     r"\(code\s*503\)",
@@ -68,6 +80,7 @@ _FAIL_STATUS = frozenset({"ERROR", "FAILED", "FAIL"})
 CLASS_ELIGIBILITY_BLOCKED = "eligibility_blocked"
 CLASS_AUTH_INVALID = "auth_invalid"
 CLASS_QUOTA_EXHAUSTED = "quota_exhausted"
+CLASS_TEMPORARY_NO_CAPACITY = "temporary_no_capacity"
 CLASS_RATE_LIMIT = "rate_limit"
 CLASS_OK = "ok"
 CLASS_EMPTY_FAILURE = "empty_failure"
@@ -93,6 +106,8 @@ def classify(stdout: str = "", stderr: str = "", rc: int | None = None) -> str:
         return CLASS_AUTH_INVALID
     if QUOTA.search(blob):
         return CLASS_QUOTA_EXHAUSTED
+    if TEMP_NO_CAPACITY.search(blob):
+        return CLASS_TEMPORARY_NO_CAPACITY
     if RATE.search(blob):
         return CLASS_RATE_LIMIT
     if status and status.upper() in _OK_STATUS:
@@ -141,6 +156,7 @@ __all__ = [
     "CLASS_ORDINARY",
     "CLASS_QUOTA_EXHAUSTED",
     "CLASS_RATE_LIMIT",
+    "CLASS_TEMPORARY_NO_CAPACITY",
     "classify",
     "classify_agy_error",
     "classify_result",

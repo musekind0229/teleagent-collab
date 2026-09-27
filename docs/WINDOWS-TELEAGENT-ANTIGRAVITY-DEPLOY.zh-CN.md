@@ -45,24 +45,27 @@ git pull
 | 分类（看 stderr / error / stdout） | 账号 |
 | --- | --- |
 | `eligibility_blocked` / `auth_invalid` | `unavailable`。例如 `0001` 这种资格不合格，之后一直跳过 |
-| `quota_exhausted` | `state=cooldown`，并写 `cooldown_until`。不是资格问题，也不是 `ordinary_task_failure`，所以不会继续打同一个号 |
-| `rate_limit` | 同样 `cooldown` |
+| `quota_exhausted` | `state=cooldown`，并写 `cooldown_until`（可用 `day_boundary`）。真配额：`MODEL_CAPACITY_EXHAUSTED` / `RESOURCE_EXHAUSTED` / credits / `fetchQuotaStatus`。不是资格问题，也不是永久 `exhausted` |
+| `temporary_no_capacity` | 可重试的 `503` / `No capacity`。**短** `duration` 冷却（`temp_cooldown_sec`，默认 60s），**不会**跟 `day_boundary` 等到次日零点，也不是永久耗尽 |
+| `rate_limit` | 同样短 `duration` 冷却（与 `temporary_no_capacity` 共用 `temp_cooldown_sec`） |
 | `ok` / `ordinary_task_failure` | 不改账号状态 |
 
-`exhausted` 还留在状态集里，只给手工标记。分类器遇到配额走 `cooldown`，到期后 `expire_cooldowns`（在 `load_pool` / `select_account`）把它提回 `available`。
+`exhausted` 还留在状态集里，只给手工标记。分类器遇到配额 / 503 / 限流都走 `cooldown`（不是永久耗尽），到期后 `expire_cooldowns`（在 `load_pool` / `select_account`）把它提回 `available`。
 
 池顶字段（保存在 JSON 里，不是账号条目）：
 
-- `cooldown_sec`：秒，默认 300。`cooldown_mode` 为 `duration` 时，`cooldown_until = now + cooldown_sec`（UTC ISO）。
-- `cooldown_mode`：`duration`（默认）或 `day_boundary`。`day_boundary` 的截止点是**本机本地时区**的下一个日历零点（这台 Windows 是中国标准时间，相当于 Asia/Shanghai），存成 UTC。过了该时刻才能再被选中。
+- `cooldown_sec`：秒，默认 300。`cooldown_mode` 为 `duration` 时，`cooldown_until = now + cooldown_sec`（UTC ISO）。**只作用于** `quota_exhausted`。
+- `cooldown_mode`：`duration`（默认）或 `day_boundary`。`day_boundary` 的截止点是**本机本地时区**的下一个日历零点（这台 Windows 是中国标准时间，相当于 Asia/Shanghai），存成 UTC。过了该时刻才能再被选中。**只作用于**真配额。
+- `temp_cooldown_sec`：秒，默认 60。给 `temporary_no_capacity` / `rate_limit`；**始终** `duration`，忽略 `day_boundary`。
 
-环境变量可盖过池文件：`COLLAB_AGY_COOLDOWN_SEC`、`COLLAB_AGY_COOLDOWN_MODE`。
+环境变量可盖过池文件：`COLLAB_AGY_COOLDOWN_SEC`、`COLLAB_AGY_COOLDOWN_MODE`、`COLLAB_AGY_TEMP_COOLDOWN_SEC`。
 
 两个处于 `available` 的号会轮换。`musekind0003` 被标成配额冷却后，下一次 `select_account` 或带 `--agy-account-pool` 的 spawn 应把 `AGY_PROFILE` 设成 `musekind0003-alt`。`unavailable`（含 `0001` / eligibility）不参与。
 
 探测（不必烧掉真实额度）：
 
-- 配额：`MODEL_CAPACITY_EXHAUSTED`、`RESOURCE_EXHAUSTED`、`No capacity`、`503 UNAVAILABLE`、`fetchQuotaStatus`、credits。
+- 真配额：`MODEL_CAPACITY_EXHAUSTED`、`RESOURCE_EXHAUSTED`、`fetchQuotaStatus`、credits。
+- 临时无容量：`No capacity`、`503 UNAVAILABLE`（无真配额关键词时）。
 - 限流：`429` / overloaded / try again later。
 - 轮换：标记之后再选一次，`AGY_PROFILE` 应换成另一个 `available` 号。
 - 本刀用模拟的配额结果验证了轮换，没有对线上 agy 打出真实配额错误。
@@ -79,12 +82,26 @@ python bin/collab-service.py --ready
 
 ## 9. hello 烟测才开 auto-approve
 
+只给**本次**烟测进程打开 skip-permissions。推荐用 `try/finally` 清环境，避免污染后续同壳进程；或把变量只放进子进程环境。
+
 ```powershell
+# 推荐：try/finally 清掉，避免后续手工 agy / 别的工单继承
 $env:AGY_AUTO_APPROVE = '1'
-python bin/run-job.py --backend antigravity jobs/examples/hello.charter.yaml
+try {
+  python bin/run-job.py --backend antigravity jobs/examples/hello.charter.yaml
+} finally {
+  Remove-Item Env:AGY_AUTO_APPROVE -ErrorAction SilentlyContinue
+  Remove-Item Env:COLLAB_AGY_AUTO_APPROVE -ErrorAction SilentlyContinue
+}
 ```
 
-等价：`COLLAB_AGY_AUTO_APPROVE=1`，或章程 `agy_auto_approve: true`。这只给这次烟测加上 `--dangerously-skip-permissions`，工人才能写出产物。不设时权限通道 unsupported，产物为空，finish 像 stop 也会假失败。不要把 skip-permissions 做成所有工单的默认。
+```powershell
+# 等价：只给子进程，不改当前壳
+$env:COLLAB_AGY_ACCOUNT_POOL = 'jobs/agy-account-pool.json'  # 若用池
+cmd /c "set AGY_AUTO_APPROVE=1&& python bin/run-job.py --backend antigravity jobs/examples/hello.charter.yaml"
+```
+
+等价：`COLLAB_AGY_AUTO_APPROVE=1`，或章程 `agy_auto_approve: true`。这只给这次烟测加上 `--dangerously-skip-permissions`，工人才能写出产物。不设时权限通道 unsupported，产物为空，finish 像 stop 也会假失败。不要把 skip-permissions 做成所有工单的默认，也不要把 `AGY_AUTO_APPROVE` 留在 PowerShell profile / 机器环境里。
 
 ## 10. 不要动别的机器
 

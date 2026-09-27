@@ -4,7 +4,7 @@
     "Copy to a gitignored path (e.g. jobs/agy-account-pool.json) and fill in real profile HOMEs locally.",
     "Never put access/id/refresh tokens, oauth JSON, or GEMINI_API_KEY in the pool file.",
     "GEMINI_API_KEY mode is not Google AI Pro quota. Serial dispatch only; one HOME per spawn.",
-    "cooldown_sec is seconds for cooldown_mode=duration (default 300). day_boundary waits until the next machine-local midnight. Quota and rate-limit use cooldown, not exhausted."
+    "cooldown_sec is seconds for quota cooldown_mode=duration (default 300). day_boundary waits until the next machine-local midnight (quota only). temp_cooldown_sec (default 60) is for temporary_no_capacity (503) / rate_limit; always duration. Quota and transient capacity use cooldown, not exhausted."
   ],
   "cooldown_sec": 300,
   "cooldown_mode": "duration",
@@ -30,5 +30,6 @@
       "email_mask": "c***@example.com",
       "notes": "example standby; selected after A is cooldown"
     }
-  ]
+  ],
+  "temp_cooldown_sec": 60
 }
