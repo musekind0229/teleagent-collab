@@ -14,6 +14,8 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -376,6 +378,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
 
         rec["proc"] = proc
         rec["pid"] = proc.pid
+        self._start_pipe_drainers(rec, proc)
         return self._start_payload(rec, ok=True)
 
     def _start_payload(self, rec: dict[str, Any], *, ok: bool) -> dict[str, Any]:
@@ -462,6 +465,68 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             return proc.poll() is not None
         return proc.poll() is not None
 
+    @staticmethod
+    def _drain_stream(stream: Any, chunks: list[str], done: threading.Event) -> None:
+        """Continuously read one PIPE so the child cannot block on a full buffer."""
+        try:
+            while True:
+                try:
+                    piece = stream.read(65536)
+                except (ValueError, OSError):
+                    break
+                if not piece:
+                    break
+                chunks.append(piece)
+        finally:
+            done.set()
+
+    def _start_pipe_drainers(self, rec: dict[str, Any], proc: subprocess.Popen) -> None:
+        out_chunks: list[str] = []
+        err_chunks: list[str] = []
+        out_done = threading.Event()
+        err_done = threading.Event()
+        rec["stdout_chunks"] = out_chunks
+        rec["stderr_chunks"] = err_chunks
+        rec["stdout_done"] = out_done
+        rec["stderr_done"] = err_done
+        threads: list[threading.Thread] = []
+        if proc.stdout is not None:
+            t = threading.Thread(
+                target=self._drain_stream,
+                args=(proc.stdout, out_chunks, out_done),
+                name=f"agy-stdout-{rec.get('run_id')}",
+                daemon=True,
+            )
+            t.start()
+            threads.append(t)
+        else:
+            out_done.set()
+        if proc.stderr is not None:
+            t = threading.Thread(
+                target=self._drain_stream,
+                args=(proc.stderr, err_chunks, err_done),
+                name=f"agy-stderr-{rec.get('run_id')}",
+                daemon=True,
+            )
+            t.start()
+            threads.append(t)
+        else:
+            err_done.set()
+        rec["drain_threads"] = threads
+
+    def _join_drainers(self, rec: dict[str, Any], *, timeout: float = 5.0) -> None:
+        threads = list(rec.get("drain_threads") or [])
+        deadline = time.time() + float(timeout)
+        for t in threads:
+            remaining = max(0.0, deadline - time.time())
+            t.join(timeout=remaining)
+        out_done = rec.get("stdout_done")
+        err_done = rec.get("stderr_done")
+        if isinstance(out_done, threading.Event):
+            out_done.wait(timeout=max(0.0, deadline - time.time()))
+        if isinstance(err_done, threading.Event):
+            err_done.wait(timeout=max(0.0, deadline - time.time()))
+
     def _harvest(self, rec: dict[str, Any]) -> None:
         if rec.get("harvested"):
             return
@@ -475,10 +540,28 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             return
         if proc.poll() is None:
             return
+        # Child has exited; finish draining (already streaming, no communicate deadlock).
+        self._join_drainers(rec, timeout=5.0)
         try:
-            stdout, stderr = proc.communicate(timeout=5)
-        except Exception as e:  # noqa: BLE001 — harvest must not raise to callers
-            stdout, stderr = rec.get("stdout") or "", f"{rec.get('stderr') or ''}{e}"
+            # Reap without reading pipes again (drainers already consumed them).
+            if proc.returncode is None:
+                proc.wait(timeout=1)
+        except Exception:  # noqa: BLE001 — harvest must not raise to callers
+            pass
+        for stream_name in ("stdout", "stderr"):
+            stream = getattr(proc, stream_name, None)
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+        stdout = "".join(rec.get("stdout_chunks") or [])
+        stderr = "".join(rec.get("stderr_chunks") or [])
+        # Prefer live chunks; fall back to any prior partials.
+        if not stdout and rec.get("stdout"):
+            stdout = str(rec.get("stdout") or "")
+        if not stderr and rec.get("stderr"):
+            stderr = str(rec.get("stderr") or "")
         rec["stdout"] = stdout or ""
         rec["stderr"] = stderr or ""
         rec["returncode"] = proc.returncode
@@ -530,8 +613,34 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             rec["finish"] = "cancelled"
             return
         if proc is not None and proc.poll() is None:
+            # Enforce wall deadline for observe-only callers (not only collect/wait).
+            timeout = rec.get("timeout_sec")
+            started = rec.get("started_at")
+            if (
+                timeout is not None
+                and started is not None
+                and not rec.get("cancelled")
+                and not rec.get("timed_out")
+            ):
+                try:
+                    wall = float(timeout)
+                except (TypeError, ValueError):
+                    wall = None
+                if wall is not None and wall >= 0 and (time.time() - float(started)) >= wall:
+                    rec["timed_out"] = True
+                    rec["assistant_error"] = rec.get("assistant_error") or "timeout"
+                    self._kill_proc(proc)
+                    self._harvest(rec)
+                    return
             rec["activity"] = "busy"
             rec["state"] = rec.get("state") or "running"
+            # Keep snapshot of drained text so large output never waits on poll.
+            chunks_out = rec.get("stdout_chunks")
+            chunks_err = rec.get("stderr_chunks")
+            if isinstance(chunks_out, list):
+                rec["stdout"] = "".join(chunks_out)
+            if isinstance(chunks_err, list):
+                rec["stderr"] = "".join(chunks_err)
             return
         self._harvest(rec)
 
@@ -719,6 +828,142 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         return 200, {"ok": True, "run_id": rec["run_id"], "state": "cancelled"}
 
 
+
+_EXACT_CONTENT_RE = re.compile(
+    r"(?P<path>\S+)\s+must\s+contain\s+exactly\s+(?P<body>.+)$",
+    re.IGNORECASE,
+)
+
+
+def _charter_requests_lead_review(charter: dict | None) -> bool:
+    if not isinstance(charter, dict):
+        return False
+    if bool(charter.get("force_lead_review")):
+        return True
+    acc = charter.get("acceptance")
+    if isinstance(acc, str) and acc.strip():
+        return True
+    if isinstance(acc, dict) and acc:
+        # done_when-style artifact lists alone are presence checks, not lead review.
+        keys = {str(k).lower() for k in acc.keys()}
+        if keys - {"artifacts", "files", "outputs"}:
+            return True
+    return False
+
+
+def _check_exact_content_acceptance(workdir: Path, acceptance: str) -> tuple[bool, str]:
+    """Validate "path must contain exactly BODY" acceptance strings."""
+    m = _EXACT_CONTENT_RE.match(str(acceptance or "").strip())
+    if not m:
+        return True, ""
+    rel = m.group("path").strip().strip("\"'")
+    body = m.group("body").strip()
+    path = Path(rel)
+    if not path.is_absolute():
+        path = workdir / rel
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        return False, f"acceptance_failed: cannot read {rel}: {e}"
+    # Compare stripped single-line body by default; keep exact match when body has newlines.
+    if "\n" in body or "\r" in body:
+        ok = text == body
+    else:
+        ok = text.strip() == body.strip()
+    if ok:
+        return True, ""
+    return False, (
+        f"acceptance_failed: {rel} must contain exactly {body!r}; "
+        f"got {text.strip()[:200]!r}"
+    )
+
+
+def apply_agy_acceptance_gate(
+    *,
+    charter: dict | None,
+    workdir: str | Path,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Enforce force_lead_review / acceptance on the agy path.
+
+    Presence-only artifact checks already happen in collect_result. When the
+    charter asks for lead review or an exact-content acceptance string, either
+    validate the content or fail closed — never report ok=true for WRONG output.
+    """
+    if not isinstance(charter, dict):
+        return result
+    need = _charter_requests_lead_review(charter)
+    acceptance = charter.get("acceptance")
+    result["force_lead_review"] = bool(charter.get("force_lead_review"))
+    if not need:
+        return result
+    root = Path(workdir)
+    notes = result.setdefault("notes", [])
+    if not isinstance(notes, list):
+        notes = []
+        result["notes"] = notes
+
+    # Exact-content string criteria (offline review probe / charter text).
+    if isinstance(acceptance, str) and acceptance.strip():
+        ok_acc, reason = _check_exact_content_acceptance(root, acceptance)
+        if not ok_acc:
+            result["ok"] = False
+            result["state"] = "fail"
+            result["error"] = reason
+            result["acceptance_failed"] = True
+            notes.append(reason)
+            return result
+        notes.append("agy acceptance: exact-content criteria passed")
+
+    # force_lead_review without a checkable acceptance string: refuse the contract
+    # rather than silently claiming review passed (no Hermes/lead channel on agy).
+    if bool(charter.get("force_lead_review")) and not (
+        isinstance(acceptance, str) and _EXACT_CONTENT_RE.match(acceptance.strip())
+    ):
+        # Still run local artifact_review when available for presence/hello rules.
+        try:
+            from execution_backend.closed_loop import artifact_review
+
+            review = artifact_review(
+                charter=charter,
+                workdir=root,
+                collect=result,
+                run_id=str(result.get("run_id") or ""),
+                job_name_s=str(charter.get("name") or ""),
+            )
+            result["artifact_review"] = {
+                "verdict": review.get("verdict"),
+                "reason": review.get("reason"),
+                "error_class": review.get("error_class"),
+            }
+            if str(review.get("verdict") or "").lower() != "pass":
+                result["ok"] = False
+                result["state"] = "fail"
+                reason = str(
+                    review.get("reason")
+                    or review.get("error_class")
+                    or "acceptance_failed"
+                )
+                result["error"] = reason
+                result["acceptance_failed"] = True
+                notes.append(f"agy artifact_review failed: {reason}")
+                return result
+            notes.append("agy artifact_review: pass")
+            return result
+        except Exception as e:  # noqa: BLE001 — fail closed on review wiring errors
+            result["ok"] = False
+            result["state"] = "fail"
+            reason = (
+                "force_lead_review unsupported on antigravity.cli_v1 without "
+                f"checkable acceptance ({type(e).__name__})"
+            )
+            result["error"] = reason
+            result["acceptance_failed"] = True
+            notes.append(reason)
+            return result
+    return result
+
+
 def run_antigravity_job_via_public_api(
     *,
     workdir: str | Path,
@@ -791,6 +1036,7 @@ def run_antigravity_job_via_public_api(
     result["backend"] = be.backend_id
     result["path"] = be.backend_id
     result["skip_permissions"] = bool(started.get("skip_permissions"))
+    result = apply_agy_acceptance_gate(charter=charter, workdir=root, result=result)
     return result
 
 
@@ -800,6 +1046,7 @@ __all__ = [
     "SKIP_PERMISSIONS_FLAG",
     "AntigravityCliExecutionBackend",
     "agy_auto_approve_enabled",
+    "apply_agy_acceptance_gate",
     "artifacts_from_charter",
     "build_agy_argv",
     "build_agy_prompt",

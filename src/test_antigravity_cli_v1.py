@@ -465,5 +465,126 @@ class TestLiveAgySmoke(unittest.TestCase):
             self.assertIn(collected.get("finish"), ("stop", "error", "cancelled"))
 
 
+
+class TestP1PipeAcceptanceTimeout(unittest.TestCase):
+    """Codex P1: pipe drain, force_lead_review acceptance, observe timeout."""
+
+    def test_large_stdout_does_not_deadlock(self):
+        real_popen = __import__("subprocess").Popen
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("AGY_", "COLLAB_AGY_"))}
+
+        def factory(code):
+            def spawn(argv, **kwargs):
+                return real_popen([sys.executable, "-c", code], **kwargs)
+
+            return spawn
+
+        with tempfile.TemporaryDirectory() as td:
+            be = AntigravityCliExecutionBackend(environ=env, timeout_sec=8, poll_sec=0.05)
+            code = "import json; print(json.dumps({'status':'ok','response':'x'*200000}))"
+            with patch("execution_backend.antigravity_cli_v1.subprocess.Popen", factory(code)):
+                run = be.start_run(title="large", directory=td)
+            deadline = time.time() + 5
+            obs = be.observe_run(run["run_id"])
+            while obs.get("busy") and time.time() < deadline:
+                time.sleep(0.05)
+                obs = be.observe_run(run["run_id"])
+            self.assertFalse(obs.get("busy"), obs)
+            collected = be.collect_result(run["run_id"])
+            self.assertTrue(collected.get("ok"), collected)
+            self.assertGreaterEqual(len(collected.get("response") or ""), 200000)
+
+    def test_observe_enforces_timeout_sec(self):
+        real_popen = __import__("subprocess").Popen
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("AGY_", "COLLAB_AGY_"))}
+
+        def factory(code):
+            def spawn(argv, **kwargs):
+                return real_popen([sys.executable, "-c", code], **kwargs)
+
+            return spawn
+
+        with tempfile.TemporaryDirectory() as td:
+            be = AntigravityCliExecutionBackend(environ=env, timeout_sec=0.1, poll_sec=0.05)
+            with patch(
+                "execution_backend.antigravity_cli_v1.subprocess.Popen",
+                factory("import time; time.sleep(30)"),
+            ):
+                run = be.start_run(title="deadline", directory=td)
+            time.sleep(0.35)
+            obs = be.observe_run(run["run_id"])
+            self.assertFalse(obs.get("busy"), obs)
+            self.assertTrue(obs.get("errored") or not obs.get("finish_successful"), obs)
+            collected = be.collect_result(run["run_id"])
+            self.assertFalse(collected.get("ok"))
+            self.assertIn("timeout", (collected.get("error") or "").lower())
+
+    def test_force_lead_review_wrong_content_not_ok(self):
+        real_popen = __import__("subprocess").Popen
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("AGY_", "COLLAB_AGY_"))}
+
+        def factory(code):
+            def spawn(argv, **kwargs):
+                return real_popen([sys.executable, "-c", code], **kwargs)
+
+            return spawn
+
+        code = (
+            "from pathlib import Path; import json; "
+            "Path('answer.txt').write_text('WRONG'); "
+            "print(json.dumps({'status':'ok','response':'done'}))"
+        )
+        charter = {
+            "name": "review-probe",
+            "goal": "Write answer.txt",
+            "done_when": {"artifacts": ["answer.txt"]},
+            "acceptance": "answer.txt must contain exactly RIGHT",
+            "force_lead_review": True,
+            "timeout_sec": 5,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with patch("execution_backend.antigravity_cli_v1.subprocess.Popen", factory(code)):
+                result = run_antigravity_charter(charter=charter, workdir=root, environ=env)
+            self.assertEqual((root / "answer.txt").read_text(encoding="utf-8"), "WRONG")
+            self.assertFalse(result.get("ok"), result)
+            self.assertNotEqual(result.get("state"), "ok")
+            self.assertTrue(
+                result.get("acceptance_failed")
+                or "acceptance" in str(result.get("error") or "").lower(),
+                result,
+            )
+
+    def test_exact_acceptance_right_content_ok(self):
+        real_popen = __import__("subprocess").Popen
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("AGY_", "COLLAB_AGY_"))}
+
+        def factory(code):
+            def spawn(argv, **kwargs):
+                return real_popen([sys.executable, "-c", code], **kwargs)
+
+            return spawn
+
+        code = (
+            "from pathlib import Path; import json; "
+            "Path('answer.txt').write_text('RIGHT'); "
+            "print(json.dumps({'status':'ok','response':'done'}))"
+        )
+        charter = {
+            "name": "review-probe-ok",
+            "goal": "Write answer.txt",
+            "done_when": {"artifacts": ["answer.txt"]},
+            "acceptance": "answer.txt must contain exactly RIGHT",
+            "force_lead_review": True,
+            "timeout_sec": 5,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with patch("execution_backend.antigravity_cli_v1.subprocess.Popen", factory(code)):
+                result = run_antigravity_charter(charter=charter, workdir=root, environ=env)
+            self.assertTrue(result.get("ok"), result)
+
+
+
 if __name__ == "__main__":
     unittest.main()

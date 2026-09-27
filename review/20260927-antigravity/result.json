@@ -1,23 +1,28 @@
 {
   "pipe_deadlock": {
-    "busy_before_drain": true,
-    "bytes_after_manual_drain": 200033,
-    "exit_after_drain": 0
+    "busy_after_observe": false,
+    "ok": true,
+    "response_bytes": 200000,
+    "improved": true
   },
   "observe_timeout": {
     "timeout_sec": 0.1,
-    "elapsed_sec": 0.3,
-    "busy": true
+    "elapsed_sec": 0.35,
+    "busy": false,
+    "improved": true
   },
   "review_ignored": {
     "force_lead_review": true,
     "actual_content": "WRONG",
-    "ok": true,
-    "state": "ok"
+    "ok": false,
+    "state": "fail",
+    "improved": true
   },
   "no_account_reservation": {
     "first": "A",
-    "second": "A",
-    "pool_state": "available"
+    "second": null,
+    "second_error": "no available agy account in pool; states={'A': 'busy'}",
+    "pool_state_after_first": "busy",
+    "improved": true
   }
 }

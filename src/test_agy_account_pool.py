@@ -48,6 +48,7 @@ from execution_backend.agy_account_pool import (  # noqa: E402
     load_pool,
     mark_account,
     prepare_antigravity_environ_from_pool,
+    release_account_lease,
     save_pool,
     select_account,
 )
@@ -1137,6 +1138,45 @@ class TestWindowsAccountSwitch(unittest.TestCase):
             ):
                 be.start_run(title="t", directory=td, instruction="hi")
         clear.assert_not_called()
+
+
+
+class TestP1AccountMutex(unittest.TestCase):
+    """Codex P1: cross-entrance mutex / busy lease prevents double HOME select."""
+
+    def test_second_prepare_cannot_take_same_home(self):
+        with tempfile.TemporaryDirectory() as td:
+            home_root = str(Path(td) / "homes")
+            Path(home_root, "homeA").mkdir(parents=True)
+            payload = {
+                "accounts": [
+                    {
+                        "id": "A",
+                        "home": str(Path(home_root) / "homeA"),
+                        "state": "available",
+                    }
+                ]
+            }
+            pool_path = Path(td) / "pool.json"
+            pool_path.write_text(json.dumps(payload), encoding="utf-8")
+            env = {"PATH": os.environ.get("PATH", ""), "COLLAB_AGY_LOCK_DIR": str(Path(td) / "locks")}
+            with patch("execution_backend.agy_account_pool.clear_windows_antigravity_keyring"):
+                first = prepare_antigravity_environ_from_pool(
+                    pool_path, base_environ=env, persist=True
+                )
+                self.assertEqual(first["agy_profile"], "A")
+                loaded = load_pool(pool_path)
+                self.assertEqual(loaded.by_id("A").state, "busy")
+                with self.assertRaises(AccountPoolError):
+                    prepare_antigravity_environ_from_pool(
+                        pool_path, base_environ=env, persist=True
+                    )
+                release_account_lease(load_pool(pool_path), "A", persist=True)
+                again = prepare_antigravity_environ_from_pool(
+                    pool_path, base_environ=env, persist=True
+                )
+                self.assertEqual(again["agy_profile"], "A")
+                release_account_lease(load_pool(pool_path), "A", persist=True)
 
 
 if __name__ == "__main__":
