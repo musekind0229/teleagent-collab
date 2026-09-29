@@ -22,9 +22,57 @@ python bin/hermes-collab-request.py report <request_id>
 python bin/hermes-collab-request.py wait <request_id> [--timeout 600] [--interval 2]
 ```
 
-- 始终向 **stdout** 打一行 JSON；失败/超时时 JSON 仍打出，**exit ≠ 0**。
-- `wait`：轮询至 `completed` / `failed` / `cancelled`。`completed` → 0；终态失败/取消 → 2；墙钟超时 → 3。
+- 始终向 **stdout** 打一行 JSON；失败、超时、待决策时 JSON 仍打出，**exit ≠ 0**。
 - `{id}` 会做 percent-encoding（含中文 Goal id）。
+
+### `wait` 退出码
+
+轮询 `GET /v1/requests/{id}`。终态（`completed` / `failed` / `cancelled`）优先；遇到待人工决策**立即返回**，不再睡到超时。
+
+| 退出码 | 含义 |
+| --- | --- |
+| 0 | `state=completed` |
+| 1 | HTTP / 传输 / 非法 JSON，或响应 `ok=false` |
+| 2 | `state=failed` 或 `cancelled` |
+| 3 | 墙钟超时（服务端仍可能在跑） |
+| 4 | 需要人拍板（`need_human`），立即返回 |
+
+exit 4 在原 status 上追加字段（`ok` 保持服务端原值）：
+
+```json
+{
+  "ok": true,
+  "code": "need_human",
+  "need_human": true,
+  "state": "blocked",
+  "wait": {
+    "terminal": false,
+    "need_human": true,
+    "timed_out": false,
+    "reason": "pending_decisions",
+    "state": "blocked",
+    "decision_ids": ["dec-1"],
+    "decisions": [
+      {
+        "decision_id": "dec-1",
+        "kind": "system_action_approval",
+        "title": "需要批准安装",
+        "task_id": "task-1",
+        "status": "pending",
+        "summary": "需要批准安装"
+      }
+    ]
+  }
+}
+```
+
+`wait.reason` 只有三种：
+
+- `pending_decisions`：status 的 `pending_decisions` 非空；
+- `awaiting_decision`：`awaiting_decision` 为真，或 `pending_decision_count>0`（行可能还没挂在 status 上，会再 GET 一次 `/decisions` 补 `decision_ids`；这次失败则 `decisions` 为 `[]`）；
+- `task_awaiting_decision`：某个 `tasks[].status=="awaiting_decision"`。没有决策行时 `decisions` 为 `[]`，并带 `wait.task_ids`。
+
+`decisions[].summary`：依次取 `title`、`details.summary` / `message` / `reason` / `question`、`lead_error.message` 里第一条非空文本，压成单行并截断到 200 字；都没有则用 `kind`。
 
 ### 一行示例
 

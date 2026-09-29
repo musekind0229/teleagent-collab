@@ -9,8 +9,14 @@ Env:
   COLLAB_API_TOKEN  optional; sent as Authorization: Bearer …
 
 Subcommands: open | status | report | wait
-Stdout: one JSON object. Non-zero exit = HTTP/transport failure or wait timeout
-(or wait ended in failed/cancelled).
+Stdout: one JSON object.
+
+Exit codes:
+  0  EXIT_OK         success (wait: state completed)
+  1  EXIT_ERROR      HTTP/transport/API error, or payload ok=false
+  2  EXIT_FAILED     wait ended in failed or cancelled
+  3  EXIT_TIMEOUT    wait hit the wall-clock deadline
+  4  EXIT_NEED_HUMAN wait stopped immediately: a human decision is required
 """
 from __future__ import annotations
 
@@ -27,12 +33,18 @@ from typing import Any
 DEFAULT_BASE = "http://127.0.0.1:8765"
 TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
 SUCCESS_STATES = frozenset({"completed"})
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_FAILED = 2
+EXIT_TIMEOUT = 3
+EXIT_NEED_HUMAN = 4
+_SUMMARY_LIMIT = 200
 
 
 class ClientError(Exception):
     """Transport or API failure with a JSON-serializable payload."""
 
-    def __init__(self, payload: dict[str, Any], *, exit_code: int = 1) -> None:
+    def __init__(self, payload: dict[str, Any], *, exit_code: int = EXIT_ERROR) -> None:
         super().__init__(str(payload.get("error") or payload.get("code") or "error"))
         self.payload = payload
         self.exit_code = exit_code
@@ -88,7 +100,7 @@ def request_json(
             payload = {"ok": False, "error": "non-object error body", "code": "http_error"}
         payload.setdefault("ok", False)
         payload.setdefault("http_status", int(e.code))
-        raise ClientError(payload, exit_code=1) from e
+        raise ClientError(payload, exit_code=EXIT_ERROR) from e
     except urllib.error.URLError as e:
         raise ClientError(
             {
@@ -96,12 +108,12 @@ def request_json(
                 "code": "transport_error",
                 "error": str(getattr(e, "reason", e)),
             },
-            exit_code=1,
+            exit_code=EXIT_ERROR,
         ) from e
     except TimeoutError as e:
         raise ClientError(
             {"ok": False, "code": "timeout", "error": "HTTP request timed out"},
-            exit_code=1,
+            exit_code=EXIT_ERROR,
         ) from e
 
     if not raw.strip():
@@ -116,7 +128,7 @@ def request_json(
                 "error": f"response is not JSON: {e}",
                 "http_status": status,
             },
-            exit_code=1,
+            exit_code=EXIT_ERROR,
         ) from e
     if not isinstance(payload, dict):
         raise ClientError(
@@ -126,7 +138,7 @@ def request_json(
                 "error": "response JSON must be an object",
                 "http_status": status,
             },
-            exit_code=1,
+            exit_code=EXIT_ERROR,
         )
     payload.setdefault("http_status", status)
     return payload
@@ -176,6 +188,105 @@ def cmd_report(args: argparse.Namespace) -> dict[str, Any]:
     return request_json("GET", f"/v1/requests/{rid}/report", timeout=float(args.http_timeout))
 
 
+def _nonempty_str(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+def _one_line(text: str, limit: int = _SUMMARY_LIMIT) -> str:
+    return " ".join(text.split())[:limit]
+
+
+def _decision_summary(row: dict[str, Any]) -> str:
+    """First non-empty of title, details fields, lead_error.message; else kind."""
+    candidates: list[Any] = [row.get("title")]
+    details = row.get("details")
+    if isinstance(details, dict):
+        for key in ("summary", "message", "reason", "question"):
+            candidates.append(details.get(key))
+    lead_error = row.get("lead_error")
+    if isinstance(lead_error, dict):
+        candidates.append(lead_error.get("message"))
+    for value in candidates:
+        text = _nonempty_str(value)
+        if text is not None:
+            return _one_line(text)
+    return _one_line(str(row.get("kind") or ""))
+
+
+def _decision_brief(row: dict[str, Any]) -> dict[str, Any]:
+    def _text(value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value)
+
+    return {
+        "decision_id": _text(row.get("decision_id")),
+        "kind": _text(row.get("kind")),
+        "title": _text(row.get("title")),
+        "task_id": _text(row.get("task_id")),
+        "status": _text(row.get("status")),
+        "summary": _decision_summary(row),
+    }
+
+
+def _decision_briefs(rows: Any) -> list[dict[str, Any]]:
+    if not isinstance(rows, list):
+        return []
+    return [_decision_brief(row) for row in rows if isinstance(row, dict)]
+
+
+def need_human_view(status: dict[str, Any]) -> dict[str, Any] | None:
+    """Human-decision snapshot, or None when wait should keep polling.
+
+    Terminal states win: completed / failed / cancelled return None even if
+    decision rows are still present. Otherwise the first matching signal is
+    pending_decisions, then awaiting_decision / pending_decision_count, then
+    a task whose status is awaiting_decision.
+    """
+    if not isinstance(status, dict):
+        return None
+    state = str(status.get("state") or "")
+    if state in TERMINAL_STATES:
+        return None
+
+    raw_pending = status.get("pending_decisions")
+    pending_nonempty = isinstance(raw_pending, list) and len(raw_pending) > 0
+    task_ids: list[str] | None = None
+    if pending_nonempty:
+        reason = "pending_decisions"
+    else:
+        try:
+            count_n = int(status.get("pending_decision_count") or 0)
+        except (TypeError, ValueError):
+            count_n = 0
+        if status.get("awaiting_decision") or count_n > 0:
+            reason = "awaiting_decision"
+        else:
+            tasks = status.get("tasks")
+            ids: list[str] = []
+            if isinstance(tasks, list):
+                for task in tasks:
+                    if isinstance(task, dict) and str(task.get("status") or "") == "awaiting_decision":
+                        ids.append("" if task.get("task_id") is None else str(task.get("task_id")))
+            if not ids:
+                return None
+            reason = "task_awaiting_decision"
+            task_ids = ids
+
+    decisions = _decision_briefs(raw_pending)
+    view: dict[str, Any] = {
+        "reason": reason,
+        "state": state,
+        "decision_ids": [item["decision_id"] for item in decisions],
+        "decisions": decisions,
+    }
+    if task_ids is not None:
+        view["task_ids"] = task_ids
+    return view
+
+
 def cmd_wait(args: argparse.Namespace) -> dict[str, Any]:
     rid = _encode_id(args.request_id)
     deadline = time.monotonic() + float(args.timeout)
@@ -187,8 +298,43 @@ def cmd_wait(args: argparse.Namespace) -> dict[str, Any]:
         if state in TERMINAL_STATES:
             last["wait"] = {"terminal": True, "state": state}
             if state not in SUCCESS_STATES:
-                raise ClientError(last, exit_code=2)
+                raise ClientError(last, exit_code=EXIT_FAILED)
             return last
+        view = need_human_view(last)
+        if view is not None:
+            decisions = list(view.get("decisions") or [])
+            decision_ids = list(view.get("decision_ids") or [])
+            reason = str(view.get("reason") or "")
+            # Status can flag awaiting_decision before rows are copied onto it.
+            if not decisions and reason != "pending_decisions":
+                try:
+                    extra = request_json(
+                        "GET",
+                        f"/v1/requests/{rid}/decisions",
+                        timeout=float(args.http_timeout),
+                    )
+                except ClientError:
+                    extra = None
+                if isinstance(extra, dict):
+                    filled = _decision_briefs(extra.get("pending_decisions"))
+                    if filled:
+                        decisions = filled
+                        decision_ids = [item["decision_id"] for item in filled]
+            last["code"] = "need_human"
+            last["need_human"] = True
+            wait_info: dict[str, Any] = {
+                "terminal": False,
+                "need_human": True,
+                "timed_out": False,
+                "reason": reason,
+                "state": view.get("state", state),
+                "decision_ids": decision_ids,
+                "decisions": decisions,
+            }
+            if "task_ids" in view:
+                wait_info["task_ids"] = list(view["task_ids"])
+            last["wait"] = wait_info
+            raise ClientError(last, exit_code=EXIT_NEED_HUMAN)
         if time.monotonic() >= deadline:
             last["wait"] = {
                 "terminal": False,
@@ -196,7 +342,7 @@ def cmd_wait(args: argparse.Namespace) -> dict[str, Any]:
                 "state": state,
                 "timeout_sec": float(args.timeout),
             }
-            raise ClientError(last, exit_code=3)
+            raise ClientError(last, exit_code=EXIT_TIMEOUT)
         time.sleep(interval)
 
 
@@ -256,7 +402,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_rep.add_argument("request_id", help="request_id / goal_id")
     p_rep.set_defaults(func=cmd_report)
 
-    p_wait = sub.add_parser("wait", help="poll status until terminal or timeout")
+    p_wait = sub.add_parser(
+        "wait",
+        help="poll status until terminal, human decision, or timeout",
+    )
     p_wait.add_argument("request_id", help="request_id / goal_id")
     p_wait.add_argument(
         "--timeout",
@@ -288,8 +437,8 @@ def main(argv: list[str] | None = None) -> int:
         return 130
     _emit(payload)
     if isinstance(payload, dict) and payload.get("ok") is False:
-        return 1
-    return 0
+        return EXIT_ERROR
+    return EXIT_OK
 
 
 if __name__ == "__main__":

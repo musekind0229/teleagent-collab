@@ -1,7 +1,7 @@
 ---
 name: teleagent-collab
 description: "Delegate work to local collab-service workers (agy/antigravity pool) via bin/hermes-collab-request.py: open, wait, report. Use when the user asks to have 'the worker'/'collab'/'agy' do a task or produce a file."
-version: 0.1.0
+version: 0.2.0
 author: teleagent-collab
 license: MIT
 platforms: [windows, linux, macos]
@@ -64,8 +64,8 @@ collab-service 是本机常驻的派工服务（Application API，默认 `http:/
    ```powershell
    python bin/hermes-collab-request.py wait <request_id> --timeout 600 --interval 5
    ```
-   退出码：`0` = completed；`2` = failed / cancelled；`3` = 墙钟超时（服务端仍可能在跑）；`1` = HTTP/传输错误。
-   如果终端工具自身有超时，可以改为循环调用 `status <request_id>`（每 5–10 秒），直到 `state` 为 `completed` / `failed` / `cancelled`。
+   退出码：`0` = completed；`2` = failed / cancelled；`3` = 墙钟超时（服务端仍可能在跑）；`1` = HTTP/传输错误；`4` = 需要人拍板（立即返回，不再等超时）。
+   如果终端工具自身有超时，可以改为循环调用 `status <request_id>`（每 5–10 秒），直到 `state` 为 `completed` / `failed` / `cancelled`，或出现待决策（`pending_decisions` 非空 / `awaiting_decision` / 任务 `status=awaiting_decision`）。后几种按下面「停下问用户」处理，不要干等到超时。
 4. 取报告：
    ```powershell
    python bin/hermes-collab-request.py report <request_id>
@@ -79,9 +79,10 @@ collab-service 是本机常驻的派工服务（Application API，默认 `http:/
 - `state=failed` 或 `cancelled`；
 - 任何层级出现 `need_human: true`（顶层、`failure`、`tasks[].result`），或 `error` 以 `need_human:` 开头；
 - `pending_decisions` 非空（服务在等人拍板）；
+- `wait` 退出码 `4`：已经停在等人拍板。把 `request_id`、`wait.reason`（`pending_decisions` / `awaiting_decision` / `task_awaiting_decision`）、`decision_ids`、每条 `decisions[].summary` 转述给用户。禁止自己批准或拒绝决策（不要代答 `POST …/decisions/…`）；
 - `wait` 退出码 3 超时，或 401/403/transport_error。
 
-禁止：自行 `POST /v1/requests/{id}/retry`、重新 open 同一目标“再试一次”、换号、改账号池、重启服务、设置 `AGY_AUTO_APPROVE`。
+禁止：自行 `POST /v1/requests/{id}/retry`、重新 open 同一目标“再试一次”、换号、改账号池、重启服务、设置 `AGY_AUTO_APPROVE`、自己批准或拒绝决策。
 
 ## Pitfalls
 
