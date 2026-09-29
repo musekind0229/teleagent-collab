@@ -57,7 +57,7 @@ try {
 边界（诚实）：
 - agy 运行句柄只在**本进程内存**；服务重启后对已绑定 `run_id` 的 observe 会失败，协调器把 Task 标失败（`backend resume failed`），**不会**静默重派。
 - `reply_permission` 固定 **501 unsupported**（与 inprocess 同形）。没有 TeleAgent 的 permission / question / system_action 逐条回传；hello 烟测靠 `AGY_AUTO_APPROVE` 打开 `--dangerously-skip-permissions`，不是把 skip 映射成 once/approve。
-- 账号池在**服务启动时**选一次 HOME，钉死本进程生命周期；换号 / 配额冷却后的再选要重启 service（或另批 per-dispatch 选号）。
+- 账号池在每次 `start_run`（**per-dispatch**）选号+租约；`collect_result` 写回配额/503/冷却并释放 lease。同进程下一 Goal 可换号。一次 Popen 仍钉死该次 HOME（不 mid-run 换）。跨入口切号文件锁强化可另批。
 
 Hermes / 终端调用方可用薄客户端 [hermes-collab-min-client.zh-CN.md](hermes-collab-min-client.zh-CN.md)（`bin/hermes-collab-request.py`：open / status / report / wait）。后端仍由本服务启动参数决定。
 

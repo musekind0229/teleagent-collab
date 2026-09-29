@@ -131,6 +131,37 @@ class CollabServiceAntigravityBackendTests(unittest.TestCase):
             self.assertEqual(be_factory.call_args.args[0], "antigravity")
             be.close.assert_called()
 
+    def test_backend_with_pool_defers_home_pin_until_start_run(self):
+        """Service wiring must not reserve/pin HOME; start_run does per-dispatch."""
+        mod = _load_collab_service()
+        with tempfile.TemporaryDirectory() as td:
+            pool = Path(td) / "pool.json"
+            home_a = Path(td) / "homeA"
+            home_c = Path(td) / "homeC"
+            home_a.mkdir()
+            home_c.mkdir()
+            pool.write_text(
+                json.dumps(
+                    {
+                        "accounts": [
+                            {"id": "A", "home": str(home_a), "state": "available"},
+                            {"id": "C", "home": str(home_c), "state": "available"},
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            be = mod._backend("antigravity", Path(td), agy_account_pool=str(pool))
+            self.assertEqual(be.backend_id, "antigravity.cli_v1")
+            self.assertEqual(be._account_pool_path, str(pool))
+            # Not pinned at construction.
+            self.assertNotEqual(str(dict(be._env()).get("HOME") or ""), str(home_a))
+            self.assertNotEqual(dict(be._env()).get("AGY_PROFILE"), "A")
+            src = (BIN / "collab-service.py").read_text(encoding="utf-8")
+            self.assertIn("per-dispatch", src)
+            self.assertNotIn("one HOME pinned for this service lifetime", src)
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())

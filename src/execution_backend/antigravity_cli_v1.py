@@ -24,9 +24,12 @@ from typing import Any, Mapping
 from execution_backend.agy_account_pool import (
     ENV_POOL,
     ENV_PROFILE,
+    AccountPoolError,
     apply_job_result_to_pool,
     clear_windows_antigravity_keyring,
     load_pool,
+    prepare_antigravity_environ_from_pool,
+    release_account_lease,
 )
 from execution_backend.base import BackendError, BackendStatus, ExecutionBackendABC, unsupported
 
@@ -258,19 +261,75 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         timeout_sec: float | None = None,
         environ: Mapping[str, str] | None = None,
         poll_sec: float = 0.1,
+        account_pool_path: str | None = None,
+        persist_pool: bool = True,
+        precheck: Any | None = None,
     ) -> None:
+        # Base environ (no account pin). Per-dispatch HOME lives on each run rec.
+        # Only an explicit account_pool_path (from inject / factory) enables
+        # per-dispatch select. ENV_POOL alone in environ is for pre-bound spawns
+        # (collect writeback) and must not trigger prepare on start_run.
+        self._base_environ = dict(environ) if environ is not None else None
         self._environ = dict(environ) if environ is not None else None
-        self.bin_path = resolve_agy_bin(explicit=bin_path, environ=self._env())
-        self.model = resolve_agy_model(explicit=model, environ=self._env())
+        self._account_pool_path = (str(account_pool_path).strip() if account_pool_path else "") or None
+        self._persist_pool = bool(persist_pool)
+        self._precheck = precheck
+        self.bin_path = resolve_agy_bin(explicit=bin_path, environ=self._base_env())
+        self.model = resolve_agy_model(explicit=model, environ=self._base_env())
         self.timeout_sec = 300.0 if timeout_sec is None else float(timeout_sec)
         self.poll_sec = float(poll_sec)
         self._runs: dict[str, dict[str, Any]] = {}
 
+    def _base_env(self) -> Mapping[str, str]:
+        return self._base_environ if self._base_environ is not None else os.environ
+
     def _env(self) -> Mapping[str, str]:
+        # Last dispatch environ (serial collab-service); prefer rec["spawn_environ"].
         return self._environ if self._environ is not None else os.environ
 
-    def _agy_profile(self) -> str:
-        return str(self._env().get("AGY_PROFILE") or "").strip()
+    def _agy_profile(self, rec: Mapping[str, Any] | None = None) -> str:
+        if rec is not None:
+            profile = str(rec.get("agy_profile") or "").strip()
+            if profile:
+                return profile
+            spawn = rec.get("spawn_environ")
+            if isinstance(spawn, Mapping):
+                return str(spawn.get(ENV_PROFILE) or "").strip()
+        return str(self._env().get(ENV_PROFILE) or "").strip()
+
+    def _bind_pool_environ_for_dispatch(self) -> dict[str, str]:
+        """Select+reserve one account for this start_run (per-dispatch).
+
+        When no explicit account_pool_path was wired, return the base environ
+        unchanged (pre-bound AGY_PROFILE / ENV_POOL for tests and one-offs).
+        """
+        base = dict(self._base_env())
+        pool_path = self._account_pool_path
+        if not pool_path:
+            return base
+        prepared = prepare_antigravity_environ_from_pool(
+            pool_path,
+            base_environ=base,
+            precheck=self._precheck,
+            persist=self._persist_pool,
+        )
+        env = dict(prepared["environ"])
+        self._environ = env
+        return env
+
+    def _release_pool_after_failed_spawn(self, spawn_env: Mapping[str, str] | None) -> None:
+        """Drop lease when Popen fails after a successful prepare."""
+        if not spawn_env:
+            return
+        pool_path = str(spawn_env.get(ENV_POOL) or "").strip()
+        profile = str(spawn_env.get(ENV_PROFILE) or "").strip()
+        if not pool_path or not profile:
+            return
+        try:
+            pool = load_pool(pool_path)
+            release_account_lease(pool, profile, persist=self._persist_pool)
+        except Exception as exc:  # noqa: BLE001 — spawn-fail path must stay local
+            _LOG.warning("agy account lease release after spawn fail (%s)", type(exc).__name__)
 
     def start_run(
         self,
@@ -294,8 +353,14 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             if cleaned:
                 arts.append(cleaned)
 
-        skip = agy_auto_approve_enabled(charter, self._env())
-        model = resolve_agy_model(explicit=self.model, environ=self._env(), charter=charter)
+        # Per-dispatch pool select+reserve before building argv / Popen.
+        try:
+            spawn_env = self._bind_pool_environ_for_dispatch()
+        except AccountPoolError:
+            raise
+
+        skip = agy_auto_approve_enabled(charter, spawn_env)
+        model = resolve_agy_model(explicit=self.model, environ=spawn_env, charter=charter)
         prompt = build_agy_prompt(
             title=title,
             instruction=instruction,
@@ -317,6 +382,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
 
         run_id = f"agy_{uuid.uuid4().hex[:12]}"
         handle = f"agy_native_{run_id}"
+        profile = str(spawn_env.get(ENV_PROFILE) or "").strip()
         rec: dict[str, Any] = {
             "run_id": run_id,
             "native_handle": handle,
@@ -346,14 +412,17 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             "usage": None,
             "response": "",
             "path_errors": errors,
+            "spawn_environ": dict(spawn_env),
+            "agy_profile": profile,
         }
         self._runs[run_id] = rec
         self._runs[handle] = rec
 
         try:
             # Machine-wide slot: clear only for a pool-bound spawn, immediately before Popen.
-            spawn_env = self._env()
-            if str(spawn_env.get(ENV_POOL) or "").strip() or str(spawn_env.get(ENV_PROFILE) or "").strip():
+            # prepare_antigravity_environ_from_pool already cleared; clear again right
+            # before Popen so a concurrent entrance cannot leave a keyring shadow.
+            if str(spawn_env.get(ENV_POOL) or "").strip() or profile:
                 clear_windows_antigravity_keyring()
             proc = subprocess.Popen(
                 cmd,
@@ -365,9 +434,10 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
                 encoding="utf-8",
                 errors="replace",
                 start_new_session=True,
-                env=dict(self._env()),
+                env=dict(spawn_env),
             )
         except OSError as e:
+            self._release_pool_after_failed_spawn(spawn_env)
             rec["state"] = "failed"
             rec["activity"] = "idle"
             rec["finish"] = "error"
@@ -394,7 +464,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             "argv_flags": list(rec.get("argv_flags") or []),
             "contract_version": "contract.v0.1-draft",
         }
-        profile = self._agy_profile()
+        profile = self._agy_profile(rec)
         if profile:
             payload["agy_profile"] = profile
         return payload
@@ -694,7 +764,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             "skip_permissions": bool(rec.get("skip_permissions")),
             "usage": rec.get("usage"),
         }
-        profile = self._agy_profile()
+        profile = self._agy_profile(rec)
         if profile:
             out["agy_profile"] = profile
         return out
@@ -746,11 +816,11 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
                 for k in ("activity", "finish_successful", "cancelled", "errored", "busy")
             },
         }
-        profile = self._agy_profile()
+        profile = self._agy_profile(rec)
         if profile:
             out["agy_profile"] = profile
         self._attach_spawn_output(out, rec)
-        self._persist_pool_after_collect(out)
+        self._persist_pool_after_collect(out, rec)
         return out
 
     def _attach_spawn_output(self, out: dict[str, Any], rec: dict[str, Any]) -> None:
@@ -765,16 +835,22 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         if "returncode" not in out:
             out["returncode"] = rec.get("returncode")
 
-    def _persist_pool_after_collect(self, out: dict[str, Any]) -> None:
+    def _persist_pool_after_collect(self, out: dict[str, Any], rec: dict[str, Any]) -> None:
         """Quota / rate-limit / auth classes update the selected account.
 
         Runs only when this spawn was bound to a pool (``COLLAB_AGY_ACCOUNT_POOL``
-        and ``AGY_PROFILE``). Pool I/O failures are logged by exception type
-        and swallowed. Never logs stdout, stderr, or token material.
+        and ``AGY_PROFILE``). Releases the busy lease so the next start_run in
+        this process can select a different account. Pool I/O failures are logged
+        by exception type and swallowed. Never logs stdout, stderr, or token material.
         """
-        env = self._env()
+        spawn = rec.get("spawn_environ")
+        env: Mapping[str, str]
+        if isinstance(spawn, Mapping) and spawn:
+            env = spawn
+        else:
+            env = self._env()
         pool_path = str(env.get(ENV_POOL) or "").strip()
-        profile = str(env.get(ENV_PROFILE) or "").strip()
+        profile = str(rec.get("agy_profile") or env.get(ENV_PROFILE) or "").strip()
         if not pool_path or not profile:
             return
         try:
@@ -783,7 +859,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
                 pool,
                 pool.by_id(profile),
                 out,
-                persist=True,
+                persist=self._persist_pool,
                 environ=env,
             )
             out["agy_err_class"] = cls

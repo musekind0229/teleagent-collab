@@ -154,5 +154,5 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8765/v1/requests -Headers $
 - **权限**：agy `reply_permission=501`；TA 有 session 级 ask / decision 回传。
 - **句柄**：agy 内存句柄，服务重启不可恢复；TA / win_collab 控制器可持久观察。
 - **AUTO_APPROVE**：只影响 agy 是否带 `--dangerously-skip-permissions`；必须 try/finally，勿写进 profile。
-- **池**：启动时选号钉 HOME；配额/503 短冷却写回池 JSON，但本进程不会自动换到下一号（需重启 service 再选）。
+- **池**：每次 `start_run` per-dispatch 选号+租约；配额/503 短冷却写回池 JSON 并释放 lease 后，同进程下一派可换号。一次 Popen 仍钉死该次 HOME。
 

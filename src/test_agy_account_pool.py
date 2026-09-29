@@ -743,6 +743,79 @@ class TestQuotaRotation(unittest.TestCase):
             )
             self.assertEqual(nxt["agy_profile"], "C")
 
+    def test_same_backend_second_start_run_reselects_after_cooldown(self):
+        """collab-service long-lived backend: per-dispatch switch after pool writeback."""
+
+        with tempfile.TemporaryDirectory() as td:
+            pool_path = _write_pool_file(
+                td,
+                _pool_dict(a_state="available", b_state="unavailable", c_state="available"),
+            )
+            fake = _write_fake_agy(td)
+            ws1 = Path(td) / "ws1"
+            ws2 = Path(td) / "ws2"
+            ws1.mkdir()
+            ws2.mkdir()
+            base = _clean_env(
+                {
+                    "AGY_BIN": str(fake),
+                    "AGY_FAKE_STATUS": "ERROR",
+                    "AGY_FAKE_EXIT": "1",
+                    "AGY_FAKE_RESPONSE": (
+                        "UNAVAILABLE (code 503): No capacity available for model "
+                        "gemini-3.8-flash-low"
+                    ),
+                    "AGY_FAKE_STDERR": "MODEL_CAPACITY_EXHAUSTED",
+                    "PATH": os.environ.get("PATH", ""),
+                    "COLLAB_AGY_LOCK_DIR": str(Path(td) / "locks"),
+                }
+            )
+            be = get_execution_backend(
+                "antigravity",
+                account_pool_path=str(pool_path),
+                environ=base,
+            )
+            # Construction must not pin HOME / reserve.
+            self.assertNotEqual(dict(be._env()).get("AGY_PROFILE"), "A")
+            started1 = be.start_run(
+                title="quota-1",
+                directory=str(ws1),
+                instruction="fail quota",
+                artifacts=[],
+            )
+            self.assertTrue(started1.get("ok"), started1)
+            self.assertEqual(started1.get("agy_profile"), "A")
+            home1 = dict(be._env()).get("HOME")
+            deadline = time.time() + 5
+            while be.observe_run(started1["run_id"]).get("busy") and time.time() < deadline:
+                time.sleep(0.05)
+            collected1 = be.collect_result(started1["run_id"])
+            self.assertEqual(collected1.get("agy_err_class"), "quota_exhausted")
+            self.assertEqual(collected1.get("agy_profile"), "A")
+            pool = load_pool(pool_path)
+            self.assertEqual(pool.by_id("A").state, "cooldown")
+
+            # Same backend instance: second dispatch must re-select (C), new HOME.
+            started2 = be.start_run(
+                title="quota-2",
+                directory=str(ws2),
+                instruction="fail quota again",
+                artifacts=[],
+            )
+            self.assertTrue(started2.get("ok"), started2)
+            self.assertEqual(started2.get("agy_profile"), "C")
+            home2 = dict(be._env()).get("HOME")
+            self.assertNotEqual(home1, home2)
+            self.assertEqual(home2, _account_home("homeC"))
+            deadline = time.time() + 5
+            while be.observe_run(started2["run_id"]).get("busy") and time.time() < deadline:
+                time.sleep(0.05)
+            collected2 = be.collect_result(started2["run_id"])
+            self.assertEqual(collected2.get("agy_profile"), "C")
+            self.assertEqual(collected2.get("agy_err_class"), "quota_exhausted")
+            pool2 = load_pool(pool_path)
+            self.assertEqual(pool2.by_id("C").state, "cooldown")
+
     def test_collect_result_swallows_pool_io_failure(self):
         with tempfile.TemporaryDirectory() as td:
             fake = _write_fake_agy(td)
@@ -803,14 +876,12 @@ class TestFactoryAndRunJobPool(unittest.TestCase):
                 persist_pool=False,
             )
             self.assertIsInstance(be, AntigravityCliExecutionBackend)
-            injected = dict(be._env())
-            self.assertEqual(injected["HOME"], _account_home("homeA"))
-            if os.name == "nt":
-                self.assertEqual(injected["USERPROFILE"], injected["HOME"])
-            self.assertEqual(injected["AGY_PROFILE"], "A")
-            self.assertEqual(injected[FORCE_FILE_STORAGE], "true")
-            _assert_ssh_pseudos(self, injected)
-            self.assertEqual(injected["AGY_BIN"], str(fake))
+            # Construction only resolves the pool path; HOME is not pinned yet.
+            self.assertEqual(be._account_pool_path, str(pool_path))
+            pre = dict(be._env())
+            self.assertNotEqual(pre.get("AGY_PROFILE"), "A")
+            self.assertNotEqual(pre.get("HOME"), _account_home("homeA"))
+            self.assertEqual(pre.get("AGY_BIN"), str(fake))
             started = be.start_run(
                 title="hello",
                 directory=str(ws),
@@ -819,6 +890,14 @@ class TestFactoryAndRunJobPool(unittest.TestCase):
             )
             self.assertFalse(started.get("skip_permissions"), started)
             self.assertEqual(started.get("agy_profile"), "A")
+            injected = dict(be._env())
+            self.assertEqual(injected["HOME"], _account_home("homeA"))
+            if os.name == "nt":
+                self.assertEqual(injected["USERPROFILE"], injected["HOME"])
+            self.assertEqual(injected["AGY_PROFILE"], "A")
+            self.assertEqual(injected[FORCE_FILE_STORAGE], "true")
+            _assert_ssh_pseudos(self, injected)
+            self.assertEqual(injected["AGY_BIN"], str(fake))
             deadline = time.time() + 5
             while be.observe_run(started["run_id"]).get("busy") and time.time() < deadline:
                 time.sleep(0.05)

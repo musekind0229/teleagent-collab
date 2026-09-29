@@ -272,7 +272,7 @@ def run_antigravity_charter(
     Does not go through the inprocess closed-loop / workdir-claim knives.
 
     Optional peripheral account pool (COLLAB_AGY_ACCOUNT_POOL / account_pool_path):
-    select one available HOME, inject environ, never swap HOME mid-run.
+    start_run selects+reserves one available HOME per dispatch; never swap HOME mid-run.
     """
     from execution_backend.agy_account_pool import (
         AccountPoolError,
@@ -286,7 +286,6 @@ def run_antigravity_charter(
         run_antigravity_job_via_public_api,
     )
 
-    selected_env: Mapping[str, str] | None = None
     if backend is None:
         kw: dict[str, Any] = {"timeout_sec": timeout_sec, "environ": environ}
         if account_pool_path:
@@ -307,11 +306,9 @@ def run_antigravity_charter(
                 "artifacts": [],
                 "notes": [f"agy account pool: {e}"],
             }
-        selected_env = kw.get("environ")
         be = AntigravityCliExecutionBackend(**kw)
     else:
         be = backend
-        selected_env = getattr(be, "_environ", None)
 
     result = run_antigravity_job_via_public_api(
         workdir=workdir,
@@ -321,6 +318,8 @@ def run_antigravity_charter(
         timeout_sec=timeout_sec,
         backend=be,
     )
+    # Per-dispatch environ lives on the backend after start_run / collect.
+    selected_env = getattr(be, "_environ", None)
     env_map = selected_env if isinstance(selected_env, Mapping) else None
     profile = selected_profile_from_environ(env_map) or str(result.get("agy_profile") or "").strip()
     if profile:
@@ -328,8 +327,12 @@ def run_antigravity_charter(
     pool_path = None
     if env_map is not None:
         pool_path = env_map.get("COLLAB_AGY_ACCOUNT_POOL")
-    if not pool_path and account_pool_path:
-        pool_path = str(account_pool_path)
+    if not pool_path:
+        pool_path = str(
+            (kw.get("account_pool_path") if backend is None else None)
+            or account_pool_path
+            or ""
+        ).strip() or None
     if profile and pool_path:
         try:
             pool_obj = load_pool(pool_path)

@@ -71,8 +71,8 @@ _TRUTHY = frozenset({"1", "true", "yes", "on", "live"})
 PrecheckFn = Callable[[Any], Any]
 
 # Cross-process / cross-entrance home leases held until release_account_lease.
-# Keyed by absolute HOME path. Kept here so inject_agy_pool_into_backend_kwargs
-# can drop the return dict without releasing the lock early.
+# Keyed by absolute HOME path. Retained across prepare() return so per-dispatch
+# start_run can drop the prepared dict without releasing the lock early.
 _HELD_HOME_LEASES: dict[str, Any] = {}
 
 
@@ -953,7 +953,16 @@ def prepare_antigravity_environ_from_pool(
 
 
 def inject_agy_pool_into_backend_kwargs(kwargs: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Pop pool kwargs and, if a pool is configured, inject HOME/AGY_PROFILE environ.
+    """Resolve pool path for the backend; do **not** pin HOME at construction.
+
+    Long-lived collab-service and one-shot run-job both select+reserve inside
+    ``AntigravityCliExecutionBackend.start_run`` (per-dispatch). This helper
+    only:
+      1. resolves ``account_pool_path`` / ``COLLAB_AGY_ACCOUNT_POOL``
+      2. fail-closed probes that at least one account is currently dispatchable
+         (no reserve / no busy mark)
+      3. forwards ``account_pool_path`` / ``persist_pool`` / ``precheck`` to the
+         backend kwargs
 
     Unknown keys must not be forwarded to AntigravityCliExecutionBackend.
     """
@@ -966,13 +975,17 @@ def inject_agy_pool_into_backend_kwargs(kwargs: Mapping[str, Any] | None) -> dic
     path = resolve_pool_path(explicit=pool_path, environ=env_map)
     if not path:
         return kw
-    prepared = prepare_antigravity_environ_from_pool(
-        path,
-        base_environ=env_map,
-        precheck=precheck,
-        persist=bool(persist),
-    )
-    kw["environ"] = prepared["environ"]
+    # Fail-closed at wiring: pool must load and have a currently available id.
+    # Selection + reserve happen later in start_run (per-dispatch).
+    pool = load_pool(path)
+    probe = select_account(pool, precheck=None, persist=False, environ=env_map)
+    if probe is None:
+        states = {a.id: a.state for a in pool.accounts}
+        raise AccountPoolError(f"no available agy account in pool; states={states}")
+    kw["account_pool_path"] = path
+    kw["persist_pool"] = bool(persist)
+    if precheck is not None:
+        kw["precheck"] = precheck
     return kw
 
 

@@ -54,8 +54,9 @@ def _backend(
             stdin_wrap=teleagent_stdin_wrap,
         )
     if name in ("antigravity", "agy"):
-        # Reuse run-job pool inject (quota / 503 cooldown / mutex). Account is
-        # selected once at service start and pinned for this process lifetime.
+        # Reuse run-job pool path (quota / 503 cooldown / mutex). Account is
+        # selected+reserved per start_run (per-dispatch); collect_result applies
+        # pool state and releases the lease so the next Goal can switch accounts.
         # In-memory agy run handles are NOT recoverable across restart — the
         # coordinator fails the Task with backend resume failed, never silent
         # redispatch. reply_permission stays 501 (no TA permission channel).
@@ -96,7 +97,8 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help=(
             "Optional path to agy account pool JSON (else COLLAB_AGY_ACCOUNT_POOL). "
-            "Selected at process start; one HOME pinned for this service lifetime."
+            "Each start_run selects+reserves one HOME (per-dispatch); not pinned "
+            "for the whole service lifetime."
         ),
     )
     parser.add_argument(

@@ -78,6 +78,6 @@ python -m test_hermes_collab_request
 
 ## 非目标（本刀不做）
 
-- per-dispatch 换号 / 账号池逻辑（另刀）
+- （已交付另刀）collab-service per-dispatch 换号见 [agy-account-pool.md](agy-account-pool.md)
 - 观察切面大改、把 Hermes 做成状态库
 - 把 `AGY_AUTO_APPROVE` 写进用户 profile

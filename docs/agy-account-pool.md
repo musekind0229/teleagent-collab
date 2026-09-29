@@ -30,6 +30,8 @@ try {
 }
 ```
 
+长寿命 `collab-service --backend antigravity` 与 one-shot `run-job` 一样走 **per-dispatch** 选号：每次 `start_run` 调用 `prepare_antigravity_environ_from_pool`（select+reserve、清 Windows keyring），`collect_result` 里 `apply_job_result_to_pool` + 释放 lease。配额/503/冷却写回后，**同进程下一派可换号**。构造 backend / 服务启动只做池可达性探测，**不再**把 HOME 钉死在进程生命周期。跨入口切号文件锁仍可另批加强。
+
 等价开关：`COLLAB_AGY_AUTO_APPROVE=1`，或章程 `agy_auto_approve: true`。依赖：`agy` 在 PATH（或 `AGY_BIN`）；池 JSON 可选；配了代理才注入；文件凭据靠下方子进程 `SSH_*`。
 
 选中账号后注入的环境（一次 spawn 固定）：
