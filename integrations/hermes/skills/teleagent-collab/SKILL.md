@@ -1,7 +1,7 @@
 ---
 name: teleagent-collab
 description: "Delegate work to local collab-service workers (agy/antigravity pool) via bin/hermes-collab-request.py: open, wait, report. Use when the user asks to have 'the worker'/'collab'/'agy' do a task or produce a file."
-version: 0.2.0
+version: 0.2.1
 author: teleagent-collab
 license: MIT
 platforms: [windows, linux, macos]
@@ -36,13 +36,18 @@ collab-service 是本机常驻的派工服务（Application API，默认 `http:/
 
 ## 连接配置（不要写明文 token）
 
+脚本只读 `COLLAB_API_BASE` 和 `COLLAB_API_TOKEN`，不把 `.env` 里其它变量注入环境。查找顺序：进程环境 > `COLLAB_ENV_FILE` > `HERMES_HOME/.env` > Windows `%LOCALAPPDATA%\hermes\.env` / 其它系统 `~/.hermes/.env`。
+
+脚本自己会读 Hermes `.env`，终端里不需要 `export`。Hermes 进程启动时也会把同一份 `.env` 载入环境。
+
 | 变量 | 来源 | 默认 |
 | --- | --- | --- |
-| `COLLAB_API_BASE` | 进程环境变量，或 Hermes 的 `.env`（Windows: `%LOCALAPPDATA%\hermes\.env`） | `http://127.0.0.1:8765` |
-| `COLLAB_API_TOKEN` | 同上；仅当服务启用了 bearer token 才需要 | 空 |
+| `COLLAB_API_BASE` | 进程环境 > `COLLAB_ENV_FILE` > `HERMES_HOME/.env` > Win `%LOCALAPPDATA%\hermes\.env` / 其它 `~/.hermes/.env` | `http://127.0.0.1:8765` |
+| `COLLAB_API_TOKEN` | 同上；仅服务启用 bearer 时需要。脚本自己读 `.env`，不必 `export` | 空 |
 
 - 从不在回复、命令行参数、日志里回显 `COLLAB_API_TOKEN` 的值；不要 `echo` / `Get-ChildItem env:` 打印它。
-- 不要把 token 写进 skill、仓库、memory 或 profile。缺 token 导致 401 时停下问用户。
+- 不要把 token 写进 skill、仓库、memory 或 profile。
+- 401/403 时把 stdout JSON 的 `auth.token_source`（`env` / `dotenv` / `none`）告诉用户，不要回显 token，也不要提它的长度或前缀。
 
 ## Procedure
 
@@ -80,7 +85,7 @@ collab-service 是本机常驻的派工服务（Application API，默认 `http:/
 - 任何层级出现 `need_human: true`（顶层、`failure`、`tasks[].result`），或 `error` 以 `need_human:` 开头；
 - `pending_decisions` 非空（服务在等人拍板）；
 - `wait` 退出码 `4`：已经停在等人拍板。把 `request_id`、`wait.reason`（`pending_decisions` / `awaiting_decision` / `task_awaiting_decision`）、`decision_ids`、每条 `decisions[].summary` 转述给用户。禁止自己批准或拒绝决策（不要代答 `POST …/decisions/…`）；
-- `wait` 退出码 3 超时，或 401/403/transport_error。
+- `wait` 退出码 3 超时，或 401/403/transport_error。401/403 只转告 `auth.token_source`，不要回显 token。
 
 禁止：自行 `POST /v1/requests/{id}/retry`、重新 open 同一目标“再试一次”、换号、改账号池、重启服务、设置 `AGY_AUTO_APPROVE`、自己批准或拒绝决策。
 

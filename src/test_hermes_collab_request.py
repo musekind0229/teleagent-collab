@@ -4,7 +4,9 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -45,15 +47,25 @@ class _FakeResp:
 
 class HermesCollabRequestTests(unittest.TestCase):
     def setUp(self) -> None:
+        # Point dotenv at a missing file so an empty token never opens a real
+        # Hermes .env (tests that need a file override COLLAB_ENV_FILE).
+        self._tmp = tempfile.TemporaryDirectory()
+        missing = str(Path(self._tmp.name) / "missing.env")
         self._env = mock.patch.dict(
-            "os.environ",
-            {"COLLAB_API_BASE": "http://127.0.0.1:8765", "COLLAB_API_TOKEN": "test-token"},
+            os.environ,
+            {
+                "COLLAB_API_BASE": "http://127.0.0.1:8765",
+                "COLLAB_API_TOKEN": "test-token",
+                "COLLAB_ENV_FILE": missing,
+            },
             clear=False,
         )
         self._env.start()
+        os.environ.pop("HERMES_HOME", None)
 
     def tearDown(self) -> None:
         self._env.stop()
+        self._tmp.cleanup()
 
     def test_open_posts_bearer_and_body(self) -> None:
         captured: dict = {}
@@ -538,6 +550,228 @@ class HermesCollabRequestTests(unittest.TestCase):
                 }
             )
         )
+
+    def test_collab_env_file_supplies_bearer(self) -> None:
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout=30):
+            captured["auth"] = req.headers.get("Authorization")
+            return _FakeResp({"ok": True, "request_id": "g1", "state": "running"})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text('COLLAB_API_TOKEN="dotenv-tok"\n', encoding="utf-8")
+            with mock.patch.dict(os.environ, {"COLLAB_ENV_FILE": str(env_file)}, clear=False):
+                os.environ.pop("COLLAB_API_TOKEN", None)
+                os.environ.pop("HERMES_HOME", None)
+                with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                    HCR.request_json("GET", "/v1/requests/g1")
+        self.assertTrue(
+            captured.get("auth") == "Bearer dotenv-tok",
+            "expected Bearer token from COLLAB_ENV_FILE",
+        )
+
+    def test_hermes_home_dotenv_supplies_bearer(self) -> None:
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout=30):
+            captured["auth"] = req.headers.get("Authorization")
+            return _FakeResp({"ok": True})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".env").write_text("COLLAB_API_TOKEN=home-tok\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"HERMES_HOME": str(home)}, clear=False):
+                os.environ.pop("COLLAB_API_TOKEN", None)
+                os.environ.pop("COLLAB_ENV_FILE", None)
+                with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                    HCR.request_json("GET", "/v1/requests/g1")
+        self.assertTrue(
+            captured.get("auth") == "Bearer home-tok",
+            "expected Bearer token from HERMES_HOME/.env",
+        )
+
+    def test_process_env_overrides_dotenv(self) -> None:
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout=30):
+            captured["auth"] = req.headers.get("Authorization")
+            return _FakeResp({"ok": True})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text('COLLAB_API_TOKEN="dotenv-tok"\n', encoding="utf-8")
+            with mock.patch.dict(
+                os.environ,
+                {"COLLAB_API_TOKEN": "env-tok", "COLLAB_ENV_FILE": str(env_file)},
+                clear=False,
+            ):
+                os.environ.pop("HERMES_HOME", None)
+                with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                    HCR.request_json("GET", "/v1/requests/g1")
+        self.assertTrue(
+            captured.get("auth") == "Bearer env-tok",
+            "process environment should beat dotenv",
+        )
+
+    def test_dotenv_api_base_used(self) -> None:
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout=30):
+            captured["url"] = req.full_url
+            return _FakeResp({"ok": True})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text(
+                "COLLAB_API_BASE=http://127.0.0.1:9999\nOTHER_FROM_DOTENV=nope\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"COLLAB_ENV_FILE": str(env_file)}, clear=False):
+                os.environ.pop("COLLAB_API_BASE", None)
+                os.environ.pop("HERMES_HOME", None)
+                os.environ.pop("OTHER_FROM_DOTENV", None)
+                with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                    HCR.request_json("GET", "/v1/requests/g1")
+                self.assertNotIn("OTHER_FROM_DOTENV", os.environ)
+        self.assertEqual(captured["url"], "http://127.0.0.1:9999/v1/requests/g1")
+
+    def test_read_dotenv_comments_quotes_export_bom(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".env"
+            body = (
+                "# comment only\n"
+                "# COLLAB_API_TOKEN=not-this\n"
+                "\n"
+                "   \n"
+                "  # indented comment\n"
+                "export COLLAB_API_BASE='http://127.0.0.1:9999'\n"
+                "UNQUOTED=hello # inline comment\n"
+                'DOUBLE="keep # inside"\n'
+                "SINGLE='a b'\n"
+                "NO_EQUALS this line\n"
+                "export TRAIL=tail # gone\n"
+                "DOLLAR=$COLLAB_API_TOKEN\n"
+            )
+            path.write_bytes(b'\xef\xbb\xbfCOLLAB_API_TOKEN="dotenv-tok"\n' + body.encode("utf-8"))
+            data = HCR._read_dotenv(path)
+            self.assertEqual(HCR._read_dotenv(Path(tmp) / "absent.env"), {})
+        self.assertEqual(data["COLLAB_API_TOKEN"], "dotenv-tok")
+        self.assertNotIn("\ufeffCOLLAB_API_TOKEN", data)
+        self.assertEqual(data["COLLAB_API_BASE"], "http://127.0.0.1:9999")
+        self.assertEqual(data["UNQUOTED"], "hello")
+        self.assertEqual(data["DOUBLE"], "keep # inside")
+        self.assertEqual(data["SINGLE"], "a b")
+        self.assertEqual(data["TRAIL"], "tail")
+        self.assertEqual(data["DOLLAR"], "$COLLAB_API_TOKEN")
+        self.assertNotIn("NO_EQUALS", data)
+        self.assertNotIn("not-this", list(data.values()))
+        self.assertNotIn("\ufeff", "".join(data))
+
+    def test_missing_dotenv_omits_authorization(self) -> None:
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout=30):
+            captured["headers"] = dict(req.headers)
+            return _FakeResp({"ok": True})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = str(Path(tmp) / "nope.env")
+            with mock.patch.dict(os.environ, {"COLLAB_ENV_FILE": missing}, clear=False):
+                os.environ.pop("COLLAB_API_TOKEN", None)
+                os.environ.pop("HERMES_HOME", None)
+                with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                    out = HCR.request_json("GET", "/v1/requests/g1")
+        self.assertTrue(out["ok"])
+        auth_keys = [k for k in captured["headers"] if k.lower() == "authorization"]
+        self.assertEqual(auth_keys, [])
+
+    def test_401_dotenv_source_hides_token(self) -> None:
+        token = "dotenv-tok"
+        seen: dict = {}
+
+        def fake_urlopen(req, timeout=30):
+            seen["auth"] = req.headers.get("Authorization")
+            err_body = json.dumps(
+                {"ok": False, "code": "unauthorized", "error": "unauthorized"}
+            ).encode()
+            raise HTTPError(
+                req.full_url,
+                401,
+                "Unauthorized",
+                hdrs=None,  # type: ignore[arg-type]
+                fp=io.BytesIO(err_body),
+            )
+
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / ".env"
+            env_file.write_text(f'COLLAB_API_TOKEN="{token}"\n', encoding="utf-8")
+            with mock.patch.dict(os.environ, {"COLLAB_ENV_FILE": str(env_file)}, clear=False):
+                os.environ.pop("COLLAB_API_TOKEN", None)
+                os.environ.pop("HERMES_HOME", None)
+                with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                    with mock.patch("sys.stdout", buf):
+                        code = HCR.main(["status", "g1"])
+        text = buf.getvalue()
+        self.assertEqual(code, 1)
+        self.assertNotIn(token, text)
+        self.assertTrue(seen.get("auth") == f"Bearer {token}", "401 request missing dotenv bearer")
+        payload = json.loads(text)
+        self.assertEqual(payload["auth"]["token_source"], "dotenv")
+        self.assertEqual(set(payload["auth"]), {"token_source", "env_file"})
+
+    def test_401_without_token_source_is_none(self) -> None:
+        def fake_urlopen(req, timeout=30):
+            auth_keys = [k for k in req.headers if k.lower() == "authorization"]
+            if auth_keys:
+                raise AssertionError("Authorization header present without a token")
+            raise HTTPError(
+                req.full_url,
+                401,
+                "Unauthorized",
+                hdrs=None,  # type: ignore[arg-type]
+                fp=io.BytesIO(b'{"ok": false, "code": "unauthorized", "error": "unauthorized"}'),
+            )
+
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = str(Path(tmp) / "missing.env")
+            with mock.patch.dict(os.environ, {"COLLAB_ENV_FILE": missing}, clear=False):
+                os.environ.pop("COLLAB_API_TOKEN", None)
+                os.environ.pop("HERMES_HOME", None)
+                with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                    with mock.patch("sys.stdout", buf):
+                        code = HCR.main(["status", "g1"])
+        text = buf.getvalue()
+        self.assertEqual(code, 1)
+        self.assertNotIn("test-token", text)
+        payload = json.loads(text)
+        self.assertEqual(payload["auth"]["token_source"], "none")
+        self.assertEqual(payload["auth"]["env_file"], missing)
+
+    def test_dotenv_path_windows_localappdata(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"LOCALAPPDATA": r"C:\Users\Admin\AppData\Local"},
+            clear=False,
+        ):
+            os.environ.pop("COLLAB_ENV_FILE", None)
+            os.environ.pop("HERMES_HOME", None)
+            with mock.patch.object(HCR.os, "name", "nt"):
+                got = HCR._dotenv_path()
+        self.assertEqual(
+            got,
+            Path(r"C:\Users\Admin\AppData\Local") / "hermes" / ".env",
+        )
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("COLLAB_ENV_FILE", None)
+            os.environ.pop("HERMES_HOME", None)
+            os.environ.pop("LOCALAPPDATA", None)
+            with mock.patch.object(HCR.os, "name", "nt"):
+                missing = HCR._dotenv_path()
+        self.assertIsNone(missing)
 
 
 if __name__ == "__main__":

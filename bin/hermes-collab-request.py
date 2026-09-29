@@ -4,9 +4,18 @@
 Thin HTTP wrapper over collab-service loopback API. Does NOT own account
 pools, agy subprocesses, or Hermes ledger state.
 
-Env:
+Env (first non-empty wins). Only these two keys are read from dotenv;
+other dotenv entries are not injected into the process environment:
   COLLAB_API_BASE   default http://127.0.0.1:8765
   COLLAB_API_TOKEN  optional; sent as Authorization: Bearer …
+
+Lookup order:
+  1. process environment (stripped; empty does not count)
+  2. COLLAB_ENV_FILE, when set and non-empty
+  3. HERMES_HOME/.env, when HERMES_HOME is set and non-empty
+  4. Windows: %LOCALAPPDATA%\\hermes\\.env
+     (skipped when LOCALAPPDATA is missing)
+     other OS: ~/.hermes/.env
 
 Subcommands: open | status | report | wait
 Stdout: one JSON object.
@@ -28,7 +37,13 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path, PosixPath, WindowsPath
 from typing import Any
+
+# pathlib.Path re-reads os.name and cannot construct WindowsPath on POSIX
+# (or PosixPath on Windows). Bind the flavour at import so tests can patch
+# os.name and still receive a Path.
+_Path = WindowsPath if os.name == "nt" else PosixPath
 
 DEFAULT_BASE = "http://127.0.0.1:8765"
 TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
@@ -50,12 +65,85 @@ class ClientError(Exception):
         self.exit_code = exit_code
 
 
+_DOTENV_KEYS = frozenset({"COLLAB_API_BASE", "COLLAB_API_TOKEN"})
+
+
+def _dotenv_path() -> Path | None:
+    """Dotenv file to consult, or None when the Windows default is unset."""
+    explicit = (os.environ.get("COLLAB_ENV_FILE") or "").strip()
+    if explicit:
+        return _Path(explicit)
+    hermes_home = (os.environ.get("HERMES_HOME") or "").strip()
+    if hermes_home:
+        return _Path(hermes_home) / ".env"
+    if os.name == "nt":
+        local_app = (os.environ.get("LOCALAPPDATA") or "").strip()
+        if not local_app:
+            return None
+        return _Path(local_app) / "hermes" / ".env"
+    home = _Path.home()
+    return home.joinpath(".hermes", ".env")
+
+
+def _read_dotenv(path: Path) -> dict[str, str]:
+    """Parse KEY=VALUE lines. Missing or unreadable files yield {}."""
+    try:
+        text = Path(path).read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return {}
+    parsed: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line.removeprefix("export ").strip()
+            if not line or line.startswith("#"):
+                continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        else:
+            comment_at = value.find(" #")
+            if comment_at != -1:
+                value = value[:comment_at].rstrip()
+        parsed[key] = value
+    return parsed
+
+
+def _setting(name: str) -> tuple[str, str]:
+    """Return (value, source) where source is env, dotenv, or none.
+
+    Reads the dotenv file on every call. Does not write os.environ.
+    """
+    env_val = (os.environ.get(name) or "").strip()
+    if env_val:
+        return env_val, "env"
+    if name not in _DOTENV_KEYS:
+        return "", "none"
+    path = _dotenv_path()
+    if path is None:
+        return "", "none"
+    file_val = _read_dotenv(path).get(name, "")
+    if file_val.strip():
+        return file_val, "dotenv"
+    return "", "none"
+
+
 def _base_url() -> str:
-    return (os.environ.get("COLLAB_API_BASE") or DEFAULT_BASE).rstrip("/")
+    value, _source = _setting("COLLAB_API_BASE")
+    return (value or DEFAULT_BASE).rstrip("/")
 
 
 def _token() -> str:
-    return (os.environ.get("COLLAB_API_TOKEN") or "").strip()
+    value, _source = _setting("COLLAB_API_TOKEN")
+    return value
 
 
 def _emit(payload: dict[str, Any]) -> None:
@@ -100,6 +188,12 @@ def request_json(
             payload = {"ok": False, "error": "non-object error body", "code": "http_error"}
         payload.setdefault("ok", False)
         payload.setdefault("http_status", int(e.code))
+        if int(e.code) in (401, 403):
+            env_path = _dotenv_path()
+            payload["auth"] = {
+                "token_source": _setting("COLLAB_API_TOKEN")[1],
+                "env_file": None if env_path is None else str(env_path),
+            }
         raise ClientError(payload, exit_code=EXIT_ERROR) from e
     except urllib.error.URLError as e:
         raise ClientError(
@@ -351,7 +445,10 @@ def build_parser() -> argparse.ArgumentParser:
         prog="hermes-collab-request.py",
         description=(
             "Minimal collab Application API client (Hermes-friendly). "
-            "Reads COLLAB_API_BASE / COLLAB_API_TOKEN."
+            "COLLAB_API_BASE and COLLAB_API_TOKEN: first non-empty of process "
+            "environment, COLLAB_ENV_FILE, HERMES_HOME/.env, then "
+            "%LOCALAPPDATA%\\hermes\\.env on Windows or ~/.hermes/.env "
+            "elsewhere. Only those two keys are read from dotenv."
         ),
     )
     p.add_argument(

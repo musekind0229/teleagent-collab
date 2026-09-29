@@ -6,12 +6,18 @@
 
 ## 环境变量
 
+`COLLAB_API_BASE` 与 `COLLAB_API_TOKEN` 只认这两个 key，不会把 `.env` 里其它变量注入进程环境。取第一个非空值（进程环境先 strip）：
+
+进程环境 > `COLLAB_ENV_FILE`（指向 dotenv 文件）> `HERMES_HOME/.env` > Windows `%LOCALAPPDATA%\hermes\.env`（没有 `LOCALAPPDATA` 则跳过）/ 其它系统 `~/.hermes/.env`。
+
+终端里直接跑脚本不必先 `export`：token 写在上述 `.env` 即可。Hermes 进程启动时也会把 `.env` 载入环境。
+
 | 变量 | 含义 | 默认 |
 | --- | --- | --- |
 | `COLLAB_API_BASE` | 服务根 URL | `http://127.0.0.1:8765` |
 | `COLLAB_API_TOKEN` | 有则发 `Authorization: Bearer …` | 空（无 Bearer） |
 
-密钥只进环境变量，不要写进仓库、profile 或本文件示例的真实值。
+HTTP 401/403 的 stdout JSON 带 `auth.token_source`（`env` / `dotenv` / `none`）和 `auth.env_file`（路径或 `null`），不含 token。排查看 `auth.token_source`，不要回显 token。密钥不要写进仓库、profile 或本文件示例。
 
 ## 子命令
 
