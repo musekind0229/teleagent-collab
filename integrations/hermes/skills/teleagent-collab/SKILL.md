@@ -1,7 +1,7 @@
 ---
 name: teleagent-collab
 description: "Delegate work to local collab-service workers (agy/antigravity pool) via bin/hermes-collab-request.py: open, wait, report. Use when the user asks to have 'the worker'/'collab'/'agy' do a task or produce a file."
-version: 0.2.2
+version: 0.2.3
 author: teleagent-collab
 license: MIT
 platforms: [windows, linux, macos]
@@ -95,6 +95,7 @@ collab-service 是本机常驻的派工服务（Application API，默认 `http:/
 - `wait` 超时不代表失败：服务端可能仍在跑，用 `status` 再看，并告诉用户。
 - 中文 goal id 已由脚本做 percent-encoding，直接传原值即可。
 - PowerShell 下 JSON 可用 `| ConvertFrom-Json` 取字段。
+- 输出默认 ASCII 转义（中文为 `\uXXXX`）。读中文字段用 `ConvertFrom-Json` / `json.loads` 解析，不要对原始 JSON 文本匹配中文。不要自己加 `--unicode`，除非确认终端是 UTF-8。
 
 ## Verification
 

@@ -18,7 +18,16 @@ Lookup order:
      other OS: ~/.hermes/.env
 
 Subcommands: open | status | report | wait
-Stdout: one JSON object.
+Stdout: one JSON object (single line). Default is pure ASCII
+(ensure_ascii=True); non-ASCII becomes \\uXXXX so PowerShell 5.1 pipes
+(any code page) and Hermes UTF-8 decoding both keep the text.
+ConvertFrom-Json / json.loads restore the original characters.
+--unicode (before the subcommand, same level as --http-timeout) or
+COLLAB_JSON_UNICODE=1|true|yes|on emits raw UTF-8 and reconfigures
+stdout to utf-8 when the stream has reconfigure. main() also sets
+stdout/stderr errors=backslashreplace (encoding unchanged) when
+reconfigure exists, so a mismatched code page does not raise
+UnicodeEncodeError.
 
 Exit codes:
   0  EXIT_OK         success (wait: state completed)
@@ -146,8 +155,44 @@ def _token() -> str:
     return value
 
 
-def _emit(payload: dict[str, Any]) -> None:
-    print(json.dumps(payload, ensure_ascii=False, default=str))
+_JSON_UNICODE_ON = frozenset({"1", "true", "yes", "on"})
+
+
+def _reconfigure(stream: Any, **kwargs: Any) -> None:
+    """Call stream.reconfigure(**kwargs) when present. Ignore failures."""
+    reconfigure = getattr(stream, "reconfigure", None)
+    if not callable(reconfigure):
+        return
+    try:
+        reconfigure(**kwargs)
+    except Exception:
+        return
+
+
+def _json_unicode_enabled(flag: bool = False) -> bool:
+    """True for --unicode or COLLAB_JSON_UNICODE=1|true|yes|on."""
+    if flag:
+        return True
+    raw = (os.environ.get("COLLAB_JSON_UNICODE") or "").strip().lower()
+    return raw in _JSON_UNICODE_ON
+
+
+def _emit(
+    payload: dict[str, Any],
+    *,
+    unicode: bool = False,
+    stream: Any = None,
+) -> None:
+    """Print one JSON line.
+
+    Default (unicode=False) is ASCII-only (\\uXXXX escapes). unicode=True
+    reconfigures sys.stdout to utf-8 when possible and writes raw characters.
+    """
+    use_unicode = bool(unicode)
+    if use_unicode:
+        _reconfigure(sys.stdout, encoding="utf-8")
+    text = json.dumps(payload, ensure_ascii=not use_unicode, default=str)
+    print(text, file=sys.stdout if stream is None else stream)
 
 
 def _headers(*, with_body: bool = False) -> dict[str, str]:
@@ -461,7 +506,9 @@ def build_parser() -> argparse.ArgumentParser:
             "COLLAB_API_BASE and COLLAB_API_TOKEN: first non-empty of process "
             "environment, COLLAB_ENV_FILE, HERMES_HOME/.env, then "
             "%LOCALAPPDATA%\\hermes\\.env on Windows or ~/.hermes/.env "
-            "elsewhere. Only those two keys are read from dotenv."
+            "elsewhere. Only those two keys are read from dotenv. "
+            "Stdout is one ASCII JSON line by default (non-ASCII as \\uXXXX); "
+            "--unicode emits raw UTF-8."
         ),
     )
     p.add_argument(
@@ -469,6 +516,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=30.0,
         help="per-request HTTP timeout seconds (default 30)",
+    )
+    p.add_argument(
+        "--unicode",
+        action="store_true",
+        help=(
+            "emit UTF-8 JSON with raw non-ASCII characters "
+            "(default: one-line ASCII JSON, non-ASCII as \\uXXXX). "
+            "Also enabled by COLLAB_JSON_UNICODE=1|true|yes|on. "
+            "Reconfigures stdout to utf-8 when supported."
+        ),
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -535,17 +592,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Do not change encoding here. backslashreplace only stops
+    # UnicodeEncodeError when the console code page cannot hold a character.
+    _reconfigure(sys.stdout, errors="backslashreplace")
+    _reconfigure(sys.stderr, errors="backslashreplace")
     parser = build_parser()
     args = parser.parse_args(argv)
+    as_unicode = _json_unicode_enabled(bool(getattr(args, "unicode", False)))
     try:
         payload = args.func(args)
     except ClientError as e:
-        _emit(e.payload)
+        _emit(e.payload, unicode=as_unicode)
         return int(e.exit_code)
     except KeyboardInterrupt:
-        _emit({"ok": False, "code": "interrupted", "error": "KeyboardInterrupt"})
+        _emit(
+            {"ok": False, "code": "interrupted", "error": "KeyboardInterrupt"},
+            unicode=as_unicode,
+        )
         return 130
-    _emit(payload)
+    _emit(payload, unicode=as_unicode)
     if isinstance(payload, dict) and payload.get("ok") is False:
         return EXIT_ERROR
     return EXIT_OK

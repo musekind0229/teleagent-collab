@@ -28,7 +28,7 @@ python bin/hermes-collab-request.py report <request_id>
 python bin/hermes-collab-request.py wait <request_id> [--timeout 600] [--interval 2]
 ```
 
-- 始终向 **stdout** 打一行 JSON；失败、超时、待决策时 JSON 仍打出，**exit ≠ 0**。
+- 始终向 **stdout** 打一行 JSON（默认纯 ASCII，`\uXXXX`；见「输出编码 / PowerShell」）；失败、超时、待决策时 JSON 仍打出，**exit ≠ 0**。
 - `{id}` 会做 percent-encoding（含中文 Goal id）。
 
 ### `wait` 退出码
@@ -87,6 +87,28 @@ exit 4 在原 status 上追加字段（`ok` 保持服务端原值）：
 $env:COLLAB_API_BASE = 'http://127.0.0.1:8765'
 # $env:COLLAB_API_TOKEN = '本机随机值'   # 若服务启用了 token
 python bin/hermes-collab-request.py open --goal '在工作区写 delivery.md' --artifact delivery.md --backend antigravity
+```
+
+## 输出编码 / PowerShell
+
+默认一行**纯 ASCII JSON**：中文等非 ASCII 写成 `\uXXXX`。Windows PowerShell 5.1 里，直接赋值按 `[Console]::OutputEncoding` 解码，管道 / `Out-File` 则经 `$OutputEncoding`（默认 us-ascii）转码。纯 ASCII 在任意代码页、任意管道下都不会把中文变成 `?` 或乱码；Hermes 按 UTF-8 读子进程输出时也安全。
+
+`ConvertFrom-Json` / `json.loads` 之后字段是正常中文。不要对原始 JSON 文本做字符串匹配中文。
+
+```powershell
+$r = python bin/hermes-collab-request.py status <id> | ConvertFrom-Json
+# 或
+$x = python bin/hermes-collab-request.py status <id>
+$x | ConvertFrom-Json
+```
+
+想在终端里直接看中文，加全局参数 `--unicode`（放在子命令前，与 `--http-timeout` 同级），或设 `COLLAB_JSON_UNICODE=1`（`true` / `yes` / `on` 也可以）。Windows PowerShell 5.1 需先把输出改成 UTF-8，否则控制台会把 UTF-8 当 GBK 解成乱码：
+
+```powershell
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+# 管道或 Out-File 时还要：
+$OutputEncoding = [Text.Encoding]::UTF8
+python bin/hermes-collab-request.py --unicode status <id>
 ```
 
 ## 本机 Hermes 怎么调

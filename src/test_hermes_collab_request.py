@@ -57,6 +57,9 @@ class HermesCollabRequestTests(unittest.TestCase):
                 "COLLAB_API_BASE": "http://127.0.0.1:8765",
                 "COLLAB_API_TOKEN": "test-token",
                 "COLLAB_ENV_FILE": missing,
+                # Empty keeps the default ASCII JSON even if the developer shell
+                # exported COLLAB_JSON_UNICODE. patch.dict restores the original.
+                "COLLAB_JSON_UNICODE": "",
             },
             clear=False,
         )
@@ -836,6 +839,202 @@ class HermesCollabRequestTests(unittest.TestCase):
             with mock.patch.object(HCR.os, "name", "nt"):
                 missing = HCR._dotenv_path()
         self.assertIsNone(missing)
+
+    def _run_main(self, argv: list[str], urlopen, env: dict | None = None):
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, env or {}, clear=False):
+            with mock.patch("urllib.request.urlopen", side_effect=urlopen):
+                with mock.patch("sys.stdout", buf):
+                    code = HCR.main(argv)
+        return code, buf.getvalue()
+
+    def test_status_default_stdout_is_ascii_json(self) -> None:
+        outcome = "在工作区写 hello.txt"
+
+        def fake_urlopen(req, timeout=30):
+            return _FakeResp(
+                {"ok": True, "state": "running", "goal": {"desired_outcome": outcome}}
+            )
+
+        code, text = self._run_main(["status", "ID"], fake_urlopen)
+        self.assertEqual(code, 0)
+        self.assertTrue(text.isascii())
+        self.assertIn("\\u5728", text)
+        self.assertNotIn(outcome, text)
+        self.assertEqual(json.loads(text)["goal"]["desired_outcome"], outcome)
+
+    def test_http_404_chinese_error_stdout_is_ascii(self) -> None:
+        message = "找不到该请求"
+
+        def fake_urlopen(req, timeout=30):
+            body = json.dumps(
+                {"ok": False, "code": "not_found", "error": message}
+            ).encode("utf-8")
+            raise HTTPError(
+                req.full_url,
+                404,
+                "Not Found",
+                hdrs=None,  # type: ignore[arg-type]
+                fp=io.BytesIO(body),
+            )
+
+        code, text = self._run_main(["status", "missing"], fake_urlopen)
+        self.assertEqual(code, 1)
+        self.assertTrue(text.isascii())
+        self.assertNotIn(message, text)
+        payload = json.loads(text)
+        self.assertEqual(payload["error"], message)
+        self.assertEqual(payload["http_status"], 404)
+
+    def test_unicode_flag_and_env_emit_raw_chinese(self) -> None:
+        outcome = "在工作区写 hello.txt"
+
+        def fake_urlopen(req, timeout=30):
+            return _FakeResp({"ok": True, "goal": {"desired_outcome": outcome}})
+
+        for argv, env in (
+            (["--unicode", "status", "ID"], None),
+            (["--unicode", "status", "ID"], {"COLLAB_JSON_UNICODE": "0"}),
+            (["status", "ID"], {"COLLAB_JSON_UNICODE": "1"}),
+            (["status", "ID"], {"COLLAB_JSON_UNICODE": "true"}),
+            (["status", "ID"], {"COLLAB_JSON_UNICODE": "yes"}),
+            (["status", "ID"], {"COLLAB_JSON_UNICODE": "on"}),
+            (["status", "ID"], {"COLLAB_JSON_UNICODE": "YES"}),
+        ):
+            code, text = self._run_main(argv, fake_urlopen, env)
+            self.assertEqual(code, 0, msg=f"argv={argv} env={env}")
+            self.assertIn(outcome, text)
+            self.assertEqual(json.loads(text)["goal"]["desired_outcome"], outcome)
+
+        for env in ({"COLLAB_JSON_UNICODE": "0"}, {"COLLAB_JSON_UNICODE": ""}):
+            code, text = self._run_main(["status", "ID"], fake_urlopen, env)
+            self.assertEqual(code, 0, msg=repr(env))
+            self.assertTrue(text.isascii(), msg=repr(env))
+            self.assertIn("\\u5728", text)
+            self.assertNotIn(outcome, text)
+            self.assertEqual(json.loads(text)["goal"]["desired_outcome"], outcome)
+
+    def test_emit_default_cp936_and_ascii_streams(self) -> None:
+        payload = {"goal": {"desired_outcome": "在工作区写 hello.txt"}}
+        raw = io.BytesIO()
+        cp936 = io.TextIOWrapper(raw, encoding="cp936")
+        HCR._emit(payload, stream=cp936)
+        cp936.flush()
+        text = raw.getvalue().decode("ascii")
+        self.assertTrue(text.isascii())
+        self.assertIn("\\u5728", text)
+        loaded = json.loads(text)
+        self.assertEqual(loaded["goal"]["desired_outcome"], "在工作区写 hello.txt")
+
+        raw_ascii = io.BytesIO()
+        ascii_stream = io.TextIOWrapper(raw_ascii, encoding="ascii")
+        HCR._emit(payload, stream=ascii_stream)
+        ascii_stream.flush()
+        ascii_text = raw_ascii.getvalue().decode("ascii")
+        self.assertEqual(
+            json.loads(ascii_text)["goal"]["desired_outcome"],
+            payload["goal"]["desired_outcome"],
+        )
+
+        odd = io.StringIO()
+
+        class _Odd:
+            def __str__(self) -> str:
+                return "odd-value"
+
+        HCR._emit({"x": _Odd()}, stream=odd)
+        self.assertEqual(json.loads(odd.getvalue())["x"], "odd-value")
+
+    def test_main_stringio_without_reconfigure(self) -> None:
+        def fake_urlopen(req, timeout=30):
+            return _FakeResp({"ok": True, "state": "queued", "request_id": "g1"})
+
+        out = io.StringIO()
+        err = io.StringIO()
+        self.assertFalse(hasattr(out, "reconfigure"))
+        self.assertFalse(hasattr(err, "reconfigure"))
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+                code = HCR.main(["status", "g1"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue())["request_id"], "g1")
+
+    def test_reconfigure_failure_is_ignored(self) -> None:
+        class _Boom(io.StringIO):
+            def reconfigure(self, **kwargs):
+                raise OSError("cannot reconfigure")
+
+        out, err = _Boom(), _Boom()
+        outcome = "在工作区写 hello.txt"
+
+        def fake_urlopen(req, timeout=30):
+            return _FakeResp({"ok": True, "goal": {"desired_outcome": outcome}})
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+                code = HCR.main(["--unicode", "status", "ID"])
+        self.assertEqual(code, 0)
+        self.assertIn(outcome, out.getvalue())
+
+    def test_main_reconfigure_errors_then_optional_utf8(self) -> None:
+        class _Rec(io.StringIO):
+            def __init__(self) -> None:
+                super().__init__()
+                self.calls: list[dict] = []
+
+            def reconfigure(self, **kwargs):
+                self.calls.append(dict(kwargs))
+
+        def fake_urlopen(req, timeout=30):
+            return _FakeResp(
+                {"ok": True, "goal": {"desired_outcome": "在工作区写 hello.txt"}}
+            )
+
+        out, err = _Rec(), _Rec()
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+                code = HCR.main(["status", "ID"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out.calls, [{"errors": "backslashreplace"}])
+        self.assertEqual(err.calls, [{"errors": "backslashreplace"}])
+        self.assertTrue(out.getvalue().isascii())
+
+        out_u, err_u = _Rec(), _Rec()
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with mock.patch("sys.stdout", out_u), mock.patch("sys.stderr", err_u):
+                code = HCR.main(["--unicode", "status", "ID"])
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            out_u.calls,
+            [{"errors": "backslashreplace"}, {"encoding": "utf-8"}],
+        )
+        self.assertEqual(err_u.calls, [{"errors": "backslashreplace"}])
+        self.assertIn("在工作区写 hello.txt", out_u.getvalue())
+
+    def test_keyboard_interrupt_emits_json(self) -> None:
+        def fake_urlopen(req, timeout=30):
+            raise KeyboardInterrupt
+
+        code, text = self._run_main(["status", "ID"], fake_urlopen)
+        self.assertEqual(code, 130)
+        self.assertTrue(text.isascii())
+        self.assertEqual(json.loads(text)["code"], "interrupted")
+
+        buf = io.StringIO()
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with mock.patch.object(HCR, "_emit", wraps=HCR._emit) as emit:
+                with mock.patch("sys.stdout", buf):
+                    code = HCR.main(["--unicode", "status", "ID"])
+        self.assertEqual(code, 130)
+        self.assertIs(emit.call_args.kwargs.get("unicode"), True)
+        self.assertEqual(json.loads(buf.getvalue())["error"], "KeyboardInterrupt")
+
+    def test_help_mentions_ascii_default_and_unicode(self) -> None:
+        help_text = HCR.build_parser().format_help()
+        self.assertIn("--unicode", help_text)
+        self.assertIn("ASCII", help_text)
+        self.assertIn("\\uXXXX", help_text)
+        self.assertIn("COLLAB_JSON_UNICODE", help_text)
 
 
 if __name__ == "__main__":
