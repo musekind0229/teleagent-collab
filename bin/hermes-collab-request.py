@@ -337,23 +337,176 @@ def _one_line(text: str, limit: int = _SUMMARY_LIMIT) -> str:
     return " ".join(text.split())[:limit]
 
 
+_NATIVE_DECISION_KINDS = frozenset({"permission", "question", "review", "system_action"})
+
+
+def _stripped(value: Any) -> str | None:
+    text = _nonempty_str(value)
+    if text is None:
+        return None
+    return text.strip()
+
+
+def _review_payload_summary(payload: dict[str, Any]) -> str | None:
+    """review: artifacts name(bytesB), ...; tools a,b; finish=...; violations=N.
+
+    Skip any part that is missing or the wrong shape. Artifact previews and
+    tool inputs/outputs are never included (previews may carry watermarks
+    or zero-width characters).
+    """
+    parts: list[str] = []
+    artifacts = payload.get("artifacts")
+    if isinstance(artifacts, dict):
+        rendered: list[str] = []
+        for name, meta in artifacts.items():
+            label = _stripped(name)
+            if label is None:
+                continue
+            if isinstance(meta, dict):
+                nbytes = meta.get("bytes")
+                if isinstance(nbytes, int) and not isinstance(nbytes, bool):
+                    label = f"{label}({nbytes}B)"
+            rendered.append(label)
+        if rendered:
+            parts.append("artifacts " + ", ".join(rendered))
+    tools = payload.get("tools")
+    if isinstance(tools, list):
+        names: list[str] = []
+        for item in tools:
+            if not isinstance(item, dict):
+                continue
+            tool = _stripped(item.get("tool"))
+            if tool is not None:
+                names.append(tool)
+        if names:
+            parts.append("tools " + ",".join(names))
+    finish = _stripped(payload.get("finish"))
+    if finish is not None:
+        parts.append("finish=" + finish)
+    violations = payload.get("policy_violations")
+    if isinstance(violations, list):
+        parts.append(f"violations={len(violations)}")
+    if not parts:
+        return None
+    return "review: " + "; ".join(parts)
+
+
+def _permission_payload_summary(payload: dict[str, Any]) -> str | None:
+    """permission: <permission> <comma-joined patterns>. Ignores other keys."""
+    perm = _stripped(payload.get("permission"))
+    patterns = payload.get("patterns")
+    names: list[str] = []
+    if isinstance(patterns, list):
+        for item in patterns:
+            text = _stripped(item)
+            if text is not None:
+                names.append(text)
+    if perm is None and not names:
+        return None
+    body: list[str] = []
+    if perm is not None:
+        body.append(perm)
+    if names:
+        body.append(", ".join(names))
+    return "permission: " + " ".join(body)
+
+
+def _question_payload_summary(payload: dict[str, Any]) -> str | None:
+    """question: first questions[0].question, else its header, else payload.question."""
+    text: str | None = None
+    questions = payload.get("questions")
+    if isinstance(questions, list) and questions:
+        first = questions[0]
+        if isinstance(first, dict):
+            text = _stripped(first.get("question")) or _stripped(first.get("header"))
+    if text is None:
+        text = _stripped(payload.get("question"))
+    if text is None:
+        return None
+    return "question: " + text
+
+
+def _system_action_fields(obj: Any) -> tuple[str | None, str | None]:
+    if not isinstance(obj, dict):
+        return None, None
+    typ = _stripped(obj.get("type"))
+    filename: str | None = None
+    package = obj.get("package")
+    if isinstance(package, dict):
+        filename = _stripped(package.get("filename"))
+    return typ, filename
+
+
+def _system_action_payload_summary(payload: dict[str, Any]) -> str | None:
+    """system_action: <type> <package.filename> from the payload or its proposal."""
+    typ, filename = _system_action_fields(payload)
+    ptyp, pfilename = _system_action_fields(payload.get("proposal"))
+    bits = [bit for bit in (typ or ptyp, filename or pfilename) if bit]
+    if not bits:
+        return None
+    return "system_action: " + " ".join(bits)
+
+
+def _native_payload_summary(backend_kind: str, payload: dict[str, Any]) -> str | None:
+    """One-line summary from a TeleAgent-native worker payload, or None.
+
+    Odd shapes return None instead of raising so the caller keeps the
+    previous candidate order.
+    """
+    builders = {
+        "review": _review_payload_summary,
+        "permission": _permission_payload_summary,
+        "question": _question_payload_summary,
+        "system_action": _system_action_payload_summary,
+    }
+    builder = builders.get(backend_kind)
+    if builder is None:
+        return None
+    try:
+        text = builder(payload)
+    except (TypeError, ValueError, AttributeError, KeyError, IndexError):
+        return None
+    if _stripped(text) is None:
+        return None
+    return text
+
+
 def _decision_summary(row: dict[str, Any]) -> str:
     """One-line summary, truncated to 200.
 
     Skip title when it is empty or equal to kind (escalate stores the kind
-    slug in title). Then details, the row reason, lead_error.message, title,
-    and finally kind.
+    slug in title). Then details.summary/message/reason/question. When
+    details.backend_kind is permission/question/review/system_action and
+    details.payload is a dict, a payload summary comes next and beats the
+    generic title ``TeleAgent <kind>`` and the row reason. Then the row
+    reason, lead_error.message, title, and finally kind.
     """
     title = row.get("title")
     kind = row.get("kind")
     candidates: list[Any] = []
+    details = row.get("details")
+    payload_summary: str | None = None
+    generic_title = ""
+    if isinstance(details, dict):
+        backend_kind = details.get("backend_kind")
+        payload = details.get("payload")
+        if (
+            isinstance(backend_kind, str)
+            and backend_kind in _NATIVE_DECISION_KINDS
+            and isinstance(payload, dict)
+        ):
+            payload_summary = _native_payload_summary(backend_kind, payload)
+            if payload_summary:
+                generic_title = f"TeleAgent {backend_kind}"
     title_text = _nonempty_str(title)
     if title_text is not None and title_text.strip() != str(kind or "").strip():
-        candidates.append(title_text)
-    details = row.get("details")
+        if not generic_title or title_text.strip() != generic_title:
+            candidates.append(title_text)
     if isinstance(details, dict):
         for key in ("summary", "message", "reason", "question"):
             candidates.append(details.get(key))
+    if payload_summary:
+        candidates.append(payload_summary)
     candidates.append(row.get("reason"))
     lead_error = row.get("lead_error")
     if isinstance(lead_error, dict):

@@ -618,6 +618,241 @@ class HermesCollabRequestTests(unittest.TestCase):
         self.assertEqual(view["decisions"][0]["kind"], kind)
         self.assertEqual(view["decisions"][0]["title"], kind)
 
+    def test_native_review_summary_from_payload(self) -> None:
+        preview = "hello\u200b「AI生成」watermark-preview"
+        tool_secret = "TOOL_INPUT_SECRET_DO_NOT_LEAK"
+        row = {
+            "decision_id": "d-review",
+            "kind": "artifact_review",
+            "title": "TeleAgent review",
+            "status": "pending",
+            "reason": "TeleAgent worker requires a bounded decision",
+            "details": {
+                "backend_kind": "review",
+                "backend_request_id": "req-review",
+                "context_hash": "abc",
+                "payload": {
+                    "artifacts": {
+                        "hello.txt": {
+                            "sha256": "deadbeef",
+                            "bytes": 10777,
+                            "preview": preview,
+                            "truncated": False,
+                        }
+                    },
+                    "tools": [
+                        {
+                            "tool": "write",
+                            "status": "completed",
+                            "input": {"content": tool_secret},
+                            "output": preview,
+                        },
+                        {"tool": "read", "status": "completed", "input": {"path": "hello.txt"}},
+                        {"tool": "report_final_files", "status": "completed", "input": {}},
+                    ],
+                    "policy_violations": [],
+                    "approved_permissions": 0,
+                    "finish": "stop",
+                },
+            },
+        }
+        summary = HCR._decision_summary(row)
+        self.assertEqual(
+            summary,
+            "review: artifacts hello.txt(10777B); tools write,read,report_final_files; finish=stop; violations=0",
+        )
+        self.assertNotIn(preview, summary)
+        self.assertNotIn("\u200b", summary)
+        self.assertNotIn("AI", summary)
+        self.assertNotIn(tool_secret, summary)
+        self.assertNotIn("sha256", summary)
+        self.assertNotIn("deadbeef", summary)
+
+        with_details = {
+            **row,
+            "details": {**row["details"], "summary": "细节里的摘要"},
+        }
+        self.assertEqual(HCR._decision_summary(with_details), "细节里的摘要")
+        meaningful_title = {**row, "title": "请复核 hello.txt"}
+        self.assertEqual(HCR._decision_summary(meaningful_title), "请复核 hello.txt")
+
+    def test_native_permission_summary_from_payload(self) -> None:
+        row = {
+            "kind": "action_approval",
+            "title": "TeleAgent permission",
+            "reason": "TeleAgent worker requires a bounded decision",
+            "details": {
+                "backend_kind": "permission",
+                "payload": {
+                    "id": "perm-1",
+                    "permission": "external_directory",
+                    "patterns": ["*.md", 3, None, "src/*.py"],
+                    "metadata": {"token": "do-not-include"},
+                    "always": ["*"],
+                    "input": {"command": "secret-cmd"},
+                },
+            },
+        }
+        summary = HCR._decision_summary(row)
+        self.assertEqual(summary, "permission: external_directory *.md, src/*.py")
+        self.assertNotIn("do-not-include", summary)
+        self.assertNotIn("secret-cmd", summary)
+        self.assertNotIn("perm-1", summary)
+
+        no_patterns = {
+            "kind": "action_approval",
+            "title": "TeleAgent permission",
+            "reason": "TeleAgent worker requires a bounded decision",
+            "details": {
+                "backend_kind": "permission",
+                "payload": {"permission": "edit", "metadata": {"k": "v"}},
+            },
+        }
+        self.assertEqual(HCR._decision_summary(no_patterns), "permission: edit")
+
+    def test_native_question_summary_from_payload(self) -> None:
+        row = {
+            "kind": "question",
+            "title": "TeleAgent question",
+            "reason": "TeleAgent worker requires a bounded decision",
+            "details": {
+                "backend_kind": "question",
+                "payload": {
+                    "id": "q1",
+                    "questions": [
+                        {
+                            "question": "Which file?\nhello or notes",
+                            "header": "which?",
+                            "options": ["a", "b"],
+                        },
+                        {"question": "second should not win"},
+                    ],
+                },
+            },
+        }
+        self.assertEqual(
+            HCR._decision_summary(row),
+            "question: Which file? hello or notes",
+        )
+
+        header_only = {
+            "kind": "question",
+            "title": "TeleAgent question",
+            "reason": "TeleAgent worker requires a bounded decision",
+            "details": {
+                "backend_kind": "question",
+                "payload": {"questions": [{"header": "continue?", "options": ["yes"]}]},
+            },
+        }
+        self.assertEqual(HCR._decision_summary(header_only), "question: continue?")
+
+        flat = {
+            "kind": "question",
+            "title": "TeleAgent question",
+            "reason": "TeleAgent worker requires a bounded decision",
+            "details": {"backend_kind": "question", "payload": {"question": "Proceed with install?"}},
+        }
+        self.assertEqual(HCR._decision_summary(flat), "question: Proceed with install?")
+
+    def test_native_system_action_summary_from_payload(self) -> None:
+        row = {
+            "kind": "system_action_approval",
+            "title": "TeleAgent system_action",
+            "reason": "TeleAgent worker requires a bounded decision",
+            "details": {
+                "backend_kind": "system_action",
+                "payload": {
+                    "proposal": {
+                        "type": "msi_install",
+                        "elevation": "runas",
+                        "package": {"filename": "test-package.msi", "sha256": "abc"},
+                        "arguments": ["/qn"],
+                    },
+                    "proposal_sha256": "zzz",
+                    "preapproval_tools": [{"tool": "write", "input": {"secret": "NOPE"}}],
+                },
+            },
+        }
+        summary = HCR._decision_summary(row)
+        self.assertEqual(summary, "system_action: msi_install test-package.msi")
+        self.assertNotIn("NOPE", summary)
+        self.assertNotIn("/qn", summary)
+        self.assertNotIn("runas", summary)
+
+        flat = {
+            "kind": "system_action_approval",
+            "title": "TeleAgent system_action",
+            "reason": "TeleAgent worker requires a bounded decision",
+            "details": {
+                "backend_kind": "system_action",
+                "payload": {
+                    "type": "msi_install",
+                    "package": {"filename": "setup.msi", "sha256": "ff"},
+                    "arguments": ["/qn"],
+                },
+            },
+        }
+        self.assertEqual(HCR._decision_summary(flat), "system_action: msi_install setup.msi")
+
+    def test_native_malformed_payload_falls_back(self) -> None:
+        generic_title = "TeleAgent review"
+        generic_reason = "TeleAgent worker requires a bounded decision"
+        payloads = [
+            ["not", "a", "dict"],
+            "review-blob",
+            None,
+            {
+                "artifacts": "hello.txt",
+                "tools": 5,
+                "policy_violations": "nope",
+                "finish": {"no": "dict"},
+            },
+            {"artifacts": None, "tools": None, "policy_violations": None, "finish": None},
+            {},
+        ]
+        for payload in payloads:
+            row = {
+                "kind": "artifact_review",
+                "title": generic_title,
+                "reason": generic_reason,
+                "details": {"backend_kind": "review", "payload": payload},
+            }
+            self.assertEqual(HCR._decision_summary(row), generic_title)
+
+        odd_question = {
+            "kind": "question",
+            "title": "TeleAgent question",
+            "reason": generic_reason,
+            "details": {
+                "backend_kind": "question",
+                "payload": {"questions": [1, "nope"], "question": {"nested": True}},
+            },
+        }
+        self.assertEqual(HCR._decision_summary(odd_question), "TeleAgent question")
+
+        odd_permission = {
+            "kind": "action_approval",
+            "title": "TeleAgent permission",
+            "reason": generic_reason,
+            "details": {
+                "backend_kind": "permission",
+                "payload": {"permission": ["edit"], "patterns": {"a": 1}},
+            },
+        }
+        self.assertEqual(HCR._decision_summary(odd_permission), "TeleAgent permission")
+
+        # Non-native rows keep the previous candidate order.
+        non_native = {
+            "kind": "escalate_over_budget",
+            "title": "escalate_over_budget",
+            "reason": "预算用尽",
+            "details": {
+                "backend_kind": "antigravity",
+                "payload": {"permission": "edit", "patterns": ["*"]},
+            },
+        }
+        self.assertEqual(HCR._decision_summary(non_native), "预算用尽")
+
     def test_collab_env_file_supplies_bearer(self) -> None:
         captured: dict = {}
 
