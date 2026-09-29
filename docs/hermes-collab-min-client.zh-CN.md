@@ -36,7 +36,7 @@ python bin/hermes-collab-request.py open --goal '在工作区写 delivery.md' --
 
 ## 本机 Hermes 怎么调
 
-事实（Win）：`C:\Users\Admin\AppData\Local\hermes\bin\hermes.exe`（约 v0.21.3）。Hermes **没有**专用 collab skill；靠 **terminal / code_execution** 跑本脚本即可。
+事实（Win）：`C:\Users\Admin\AppData\Local\hermes\bin\hermes.exe`（约 v0.21.3）。Hermes 通过 **terminal / code_execution** 跑本脚本。已提供 Hermes skill：[`integrations/hermes/skills/teleagent-collab/SKILL.md`](../integrations/hermes/skills/teleagent-collab/SKILL.md)，安装与加载依据见 [integrations/hermes/README.zh-CN.md](../integrations/hermes/README.zh-CN.md)。
 
 推荐：
 
