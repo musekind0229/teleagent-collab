@@ -1,7 +1,7 @@
 ---
 name: teleagent-collab
 description: "Delegate work to local collab-service workers (agy/antigravity pool) via bin/hermes-collab-request.py: open, wait, report. Use when the user asks to have 'the worker'/'collab'/'agy' do a task or produce a file."
-version: 0.2.5
+version: 0.2.6
 author: teleagent-collab
 license: MIT
 platforms: [windows, linux, macos]
@@ -64,7 +64,7 @@ collab-service 是本机常驻的派工服务（Application API，默认 `http:/
    ```powershell
    python bin/hermes-collab-request.py open --goal "在工作区写 hello.txt，内容为 hello" --artifact hello.txt --title "hello"
    ```
-   记下返回 JSON 里的 `request_id`（也叫 goal id）。
+   记下返回 JSON 里的 `request_id`（也叫 goal id）。工人若要读工作区以外的文件，开单加可重复的 `--external-input PATH`（解析为绝对路径并附上 SHA-256）；未钉住的外部路径会被静默拒绝，到不了 permission 决策。
 3. 等待终态（阻塞轮询；按任务规模设 `--timeout`，hello 类 600 秒足够）：
    ```powershell
    python bin/hermes-collab-request.py wait <request_id> --timeout 600 --interval 5

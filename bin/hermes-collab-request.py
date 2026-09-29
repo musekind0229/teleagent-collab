@@ -39,6 +39,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -287,6 +288,48 @@ def _encode_id(request_id: str) -> str:
     return urllib.parse.quote(str(request_id), safe="")
 
 
+def _external_input_record(raw: str) -> dict[str, str]:
+    """Absolute path plus sha256. Missing files are a client error, not HTTP."""
+    text = str(raw or "").strip()
+    if not text:
+        raise ClientError(
+            {"ok": False, "code": "bad_external_input", "error": "external input path is empty"},
+            exit_code=EXIT_ERROR,
+        )
+    try:
+        resolved = Path(text).expanduser().resolve()
+    except OSError as e:
+        raise ClientError(
+            {
+                "ok": False,
+                "code": "bad_external_input",
+                "error": f"external input path cannot be resolved: {text}",
+            },
+            exit_code=EXIT_ERROR,
+        ) from e
+    if not resolved.is_file():
+        raise ClientError(
+            {
+                "ok": False,
+                "code": "bad_external_input",
+                "error": f"external input file does not exist: {text}",
+            },
+            exit_code=EXIT_ERROR,
+        )
+    try:
+        digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
+    except OSError as e:
+        raise ClientError(
+            {
+                "ok": False,
+                "code": "bad_external_input",
+                "error": f"external input file cannot be read: {text}",
+            },
+            exit_code=EXIT_ERROR,
+        ) from e
+    return {"path": str(resolved), "sha256": digest}
+
+
 def cmd_open(args: argparse.Namespace) -> dict[str, Any]:
     artifacts = list(args.artifact or [])
     if not artifacts:
@@ -314,6 +357,9 @@ def cmd_open(args: argparse.Namespace) -> dict[str, Any]:
     # caller annotation only (server ignores unknown fields today).
     if args.backend:
         body["caller_backend_hint"] = args.backend
+    pins = [_external_input_record(item) for item in (getattr(args, "external_input", None) or [])]
+    if pins:
+        body["external_inputs"] = pins
     return request_json("POST", "/v1/requests", body=body, timeout=float(args.http_timeout))
 
 
@@ -765,6 +811,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "optional caller annotation only; worker backend is chosen at "
             "collab-service start (teleagent-windows | antigravity | …)"
+        ),
+    )
+    p_open.add_argument(
+        "--external-input",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help=(
+            "pin a file the worker may read outside the task workspace "
+            "(repeatable; sends absolute path and sha256). "
+            "A missing file exits 1 with code bad_external_input"
         ),
     )
     p_open.set_defaults(func=cmd_open)

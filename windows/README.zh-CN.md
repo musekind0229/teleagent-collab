@@ -61,6 +61,18 @@ Windows 适配器从已验证的 TeleAgent runtime Node 进程环境中只选取
 - `min_approved_permissions` 可要求通过前至少观察到指定次数的真实 `once` 批准，防止用零审批运行冒充审批闭环。
 - `external_directory` 请求只允许本工单精确工作区，或元数据精确指向仍满足路径与哈希约束的 `external_inputs` 文件；其余请求自动拒绝。父级 `workspaces/*`、兄弟工单和仅靠宽泛 pattern 命中的文件均不能由组长覆盖放行。
 
+### TeleAgent 有效权限（桌面 2.6.0）
+
+创建 session 时控制器提交 `[{"permission":"*","pattern":"*","action":"ask"}]`，服务器会原样回显。回显只表示这条会话策略被承认，**生效的是 agent 级规则**。`GET /config` 里 `agent.opencowork-default.permission` 实测为：`powershell=allow`、`question=allow`、`bash=deny`，`external_directory` 为 `{"*":"ask", ...}`。没有启用 yolo / auto-allow（日志里没有 `[permission] auto-allow`）。
+
+因此：
+
+- 工作区内的读、写、编辑和 PowerShell 执行不会产生 permission 请求。
+- 仍会询问的只有 `external_directory`（访问工作区以外的路径）。
+- 没有写进章程 `external_inputs` 的外部路径由 `hard_reject()` 直接拒绝，事件是 `hard_reject`，不会进入待决队列。Application API 以前不能传 `external_inputs`，所以经这套 API 产不出 permission 决策。
+- 要得到可回传的 permission 决策，在 Goal 上钉住该文件：`external_inputs` 最多 8 项，每项只能是 `{"path": <绝对路径>, "sha256": <64 位十六进制>}`。客户端写法是 `python bin/hermes-collab-request.py open --external-input PATH`（可重复）。客户端解析绝对路径并计算 SHA-256；文件不存在则退出码 1，`code` 为 `bad_external_input`。文件是否在仓库内、哈希是否一致、是否为链接、是否超过 512 KiB，仍由 Windows `validate_charter` 把关。antigravity 与 inprocess 忽略该字段。
+- agent 规则 `question=allow` 下，question 工具产生的是 `question` 决策，不是 permission 请求。
+
 ### Windows 系统安装两阶段门禁
 
 `task_kind=system_install` 使用单独的动作状态机，目前只支持哈希固定的 MSI：

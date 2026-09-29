@@ -667,6 +667,7 @@ def _default_goal_body(
         "context_refs",
         "source_charter_path",
         "forbidden_tools",
+        "external_inputs",
     ):
         if extra_key in src:
             body[extra_key] = src[extra_key]

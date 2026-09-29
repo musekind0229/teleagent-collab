@@ -162,6 +162,27 @@
         "type": "string",
         "minLength": 1
       }
+    },
+    "external_inputs": {
+      "type": "array",
+      "description": "Optional pins so a Windows external_directory request can become a permission decision. At most 8 objects, each exactly an absolute path and a 64-hex SHA-256. Repo, hash, link, and size checks stay in the Windows charter validator. Absent means no pins. Backends that do not supervise external_directory ignore this field.",
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "sha256"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-fA-F]{64}$"
+          }
+        }
+      }
     }
   }
 }

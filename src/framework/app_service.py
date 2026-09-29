@@ -78,6 +78,8 @@ def _task_id(goal_id: str, key: str) -> str:
 GOAL_HTTP_TERMINAL = frozenset({"completed", "failed", "cancelled"})
 TASK_HTTP_TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
 MAX_FORBIDDEN_TOOLS = 32
+MAX_EXTERNAL_INPUTS = 8
+_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 def project_forbidden_tools(
@@ -110,6 +112,64 @@ def project_forbidden_tools(
             code="invalid_forbidden_tools",
         )
     return found
+
+
+def project_external_inputs(payload: Mapping[str, Any] | None = None) -> list[dict[str, str]]:
+    """Return Goal.external_inputs after shape validation.
+
+    Absent or null means no pins. Each item must be exactly an absolute
+    ``path`` and a 64-hex ``sha256``, at most eight. File-inside-repo, hash
+    match, link, and size checks stay in ``win_collab.validate_charter``.
+    """
+    src = payload if isinstance(payload, Mapping) else {}
+    if "external_inputs" not in src or src.get("external_inputs") is None:
+        return []
+    raw = src.get("external_inputs")
+    if not isinstance(raw, list):
+        raise AppError(
+            "external_inputs must be a list of pinned files",
+            code="invalid_external_inputs",
+        )
+    if len(raw) > MAX_EXTERNAL_INPUTS:
+        raise AppError(
+            f"external_inputs must have at most {MAX_EXTERNAL_INPUTS} entries",
+            code="invalid_external_inputs",
+        )
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, Mapping) or set(item) != {"path", "sha256"}:
+            raise AppError(
+                "each external input requires only path and sha256",
+                code="invalid_external_inputs",
+            )
+        path = item.get("path")
+        digest = item.get("sha256")
+        if not isinstance(path, str) or not isinstance(digest, str):
+            raise AppError(
+                "external input path and sha256 must be strings",
+                code="invalid_external_inputs",
+            )
+        path = path.strip()
+        digest = digest.strip()
+        if not path or not Path(path).is_absolute():
+            raise AppError(
+                "external input path must be absolute",
+                code="invalid_external_inputs",
+            )
+        if _SHA256_RE.fullmatch(digest) is None:
+            raise AppError(
+                "external input sha256 must be 64 hex characters",
+                code="invalid_external_inputs",
+            )
+        if path in seen:
+            raise AppError(
+                "external_inputs paths must be unique",
+                code="invalid_external_inputs",
+            )
+        seen.add(path)
+        out.append({"path": path, "sha256": digest})
+    return out
 
 
 def allows_aigc_marks(
@@ -154,6 +214,18 @@ def worker_charter_for_task(
         forbidden = [str(x).strip() for x in raw_forbidden if str(x).strip()]
         if forbidden:
             charter["forbidden_tools"] = forbidden
+    raw_external = goal_obj.get("external_inputs")
+    if isinstance(raw_external, list) and raw_external:
+        pinned: list[dict[str, str]] = []
+        for item in raw_external:
+            if not isinstance(item, Mapping):
+                continue
+            path = item.get("path")
+            digest = item.get("sha256")
+            if isinstance(path, str) and path.strip() and isinstance(digest, str) and digest.strip():
+                pinned.append({"path": path.strip(), "sha256": digest.strip()})
+        if pinned:
+            charter["external_inputs"] = pinned
     if allows_aigc_marks(goal_obj, task):
         charter["allow_aigc_marks"] = True
     raw_inputs = (task.get("inputs") or {}).get("input_files") if isinstance(task.get("inputs"), Mapping) else None
@@ -1629,6 +1701,7 @@ class CollabApplication:
         client_id = str(payload.get("client_id") or "local-api").strip() or "local-api"
         title = str(payload.get("title") or goal_text[:80]).strip()
         forbidden_tools = project_forbidden_tools(payload=payload)
+        external_inputs = project_external_inputs(payload)
         goal = {
             "title": title,
             "desired_outcome": goal_text,
@@ -1640,6 +1713,8 @@ class CollabApplication:
         }
         if forbidden_tools:
             goal["forbidden_tools"] = forbidden_tools
+        if external_inputs:
+            goal["external_inputs"] = external_inputs
         result = self.layer.submit_goal(
             submit_key=submit_key,
             title=title,
@@ -2200,6 +2275,7 @@ __all__ = [
     "build_planning_request",
     "planning_response_schema",
     "project_forbidden_tools",
+    "project_external_inputs",
     "validate_plan",
     "worker_charter_for_task",
     "allows_aigc_marks",

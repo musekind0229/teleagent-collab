@@ -1,6 +1,7 @@
 """Mock-HTTP unit tests for bin/hermes-collab-request.py (no live service)."""
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import io
 import json
@@ -1319,6 +1320,72 @@ class HermesCollabRequestTests(unittest.TestCase):
         self.assertEqual(code, 130)
         self.assertIs(emit.call_args.kwargs.get("unicode"), True)
         self.assertEqual(json.loads(buf.getvalue())["error"], "KeyboardInterrupt")
+
+    def test_open_external_input_sends_resolved_path_and_sha256(self) -> None:
+        payload = b"pinned-bytes\n"
+        second = b"other"
+        src_dir = Path(self._tmp.name)
+        src = src_dir / "pin.txt"
+        other = src_dir / "other.txt"
+        src.write_bytes(payload)
+        other.write_bytes(second)
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout=30):
+            captured["body"] = json.loads(req.data.decode("utf-8"))
+            return _FakeResp({"ok": True, "request_id": "g1", "state": "queued"})
+
+        prev = os.getcwd()
+        try:
+            os.chdir(src_dir)
+            code, text = self._run_main(
+                [
+                    "open",
+                    "--goal",
+                    "read pins",
+                    "--external-input",
+                    "pin.txt",
+                    "--external-input",
+                    str(other),
+                ],
+                fake_urlopen,
+            )
+        finally:
+            os.chdir(prev)
+        self.assertEqual(code, 0)
+        self.assertTrue(text.isascii())
+        pins = captured["body"]["external_inputs"]
+        self.assertEqual(
+            pins,
+            [
+                {"path": str(src.resolve()), "sha256": hashlib.sha256(payload).hexdigest()},
+                {"path": str(other.resolve()), "sha256": hashlib.sha256(second).hexdigest()},
+            ],
+        )
+        self.assertTrue(all(Path(item["path"]).is_absolute() for item in pins))
+
+        captured.clear()
+        code, text = self._run_main(["open", "--goal", "no pin"], fake_urlopen)
+        self.assertEqual(code, 0)
+        self.assertNotIn("external_inputs", captured["body"])
+        self.assertTrue(text.isascii())
+
+    def test_open_missing_external_input_exits_bad_external_input(self) -> None:
+        missing = str(Path(self._tmp.name) / "no-such-file.txt")
+
+        def fail_urlopen(req, timeout=30):
+            raise AssertionError("open must not send when the external input is missing")
+
+        code, text = self._run_main(
+            ["open", "--goal", "read pin", "--external-input", missing],
+            fail_urlopen,
+        )
+        self.assertEqual(code, 1)
+        self.assertTrue(text.isascii())
+        payload = json.loads(text)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["code"], "bad_external_input")
+        self.assertIn("no-such-file.txt", payload["error"])
 
     def test_help_mentions_ascii_default_and_unicode(self) -> None:
         help_text = HCR.build_parser().format_help()

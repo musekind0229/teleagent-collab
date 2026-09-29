@@ -29,6 +29,7 @@ from framework.app_service import (
     allows_aigc_marks,
     gate_collected_artifacts,
     lead_error_retryable,
+    project_external_inputs,
     project_forbidden_tools,
     review_contamination_summary,
     split_task_musts,
@@ -849,6 +850,97 @@ class AppServiceTests(unittest.TestCase):
         too_many = dict(goal)
         too_many["forbidden_tools"] = [f"tool-{i}" for i in range(33)]
         self.assertTrue(list(validator.iter_errors(too_many)))
+
+    def test_external_inputs_reach_charter_and_absent_has_no_key(self):
+        digest = "ab" * 32
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = str((root / "not-created.bin").resolve())
+            pin = {"path": path, "sha256": digest}
+            self.assertFalse(Path(path).exists())
+            backend = _RecordingBackend()
+            app = CollabApplication(root / "rec", backend=backend)
+            body = _request()
+            body["external_inputs"] = [dict(pin)]
+            opened = app.submit(body)
+            goal = app.status(opened["goal_id"])["goal"]
+            self.assertEqual(goal.get("external_inputs"), [pin])
+            Draft202012Validator(GOAL_SCHEMA).validate(goal)
+            first = app.coordinator.process_goal(opened["goal_id"])
+            self.assertEqual(first["action"], "task_finished", first)
+            self.assertEqual(backend.starts[0]["charter"]["external_inputs"], [pin])
+            charter = worker_charter_for_task(
+                goal=goal,
+                task={
+                    "title": "t",
+                    "inputs": {"instruction": "read the pin"},
+                    "done_when": {"artifacts": ["delivery.txt"]},
+                },
+            )
+            self.assertEqual(charter["external_inputs"], [pin])
+            passed = WindowsSupervisedExecutionBackend._charter(
+                title="t",
+                instruction="read the pin",
+                artifacts=["delivery.txt"],
+                charter=charter,
+            )
+            self.assertEqual(passed["external_inputs"], [pin])
+
+            plain = _request()
+            plain["idempotency_key"] = "pilot-absent"
+            opened_plain = app.submit(plain)
+            goal_plain = app.status(opened_plain["goal_id"])["goal"]
+            self.assertNotIn("external_inputs", goal_plain)
+            charter_plain = worker_charter_for_task(
+                goal=goal_plain,
+                task={"title": "t", "inputs": {"instruction": "x"}, "done_when": {}},
+            )
+            self.assertNotIn("external_inputs", charter_plain)
+            self.assertEqual(project_external_inputs({}), [])
+            self.assertEqual(project_external_inputs({"external_inputs": None}), [])
+
+            empty = _request()
+            empty["idempotency_key"] = "pilot-empty-pins"
+            empty["external_inputs"] = []
+            opened_empty = app.submit(empty)
+            self.assertNotIn("external_inputs", app.status(opened_empty["goal_id"])["goal"])
+
+            inproc = CollabApplication(root / "inproc")
+            in_body = _request()
+            in_body["idempotency_key"] = "pilot-inproc"
+            in_body["external_inputs"] = [dict(pin)]
+            opened_in = inproc.submit(in_body)
+            tick = inproc.coordinator.process_goal(opened_in["goal_id"])
+            self.assertEqual(tick.get("action"), "task_finished", tick)
+            self.assertEqual(inproc.status(opened_in["goal_id"])["state"], "completed")
+
+    def test_submit_rejects_invalid_external_inputs(self):
+        digest = "cd" * 32
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = str((root / "pinned.bin").resolve())
+            app = CollabApplication(root / "app")
+            cases = [
+                [{"path": "relative.txt", "sha256": digest}],
+                [{"path": path, "sha256": digest, "note": "extra"}],
+                {"path": path, "sha256": digest},
+                [{"path": path, "sha256": "abcd"}],
+                [{"path": path, "sha256": digest}] * 9,
+                [{"path": path, "sha256": digest}, {"path": path, "sha256": "ef" * 32}],
+                [{"path": "", "sha256": digest}],
+            ]
+            for index, bad in enumerate(cases):
+                body = _request()
+                body["idempotency_key"] = f"pilot-bad-{index}"
+                body["external_inputs"] = bad
+                with self.assertRaises(AppError) as cm:
+                    app.submit(body)
+                self.assertEqual(cm.exception.code, "invalid_external_inputs", bad)
+            self.assertEqual(app.list_requests()["requests"], [])
+            schema = GOAL_SCHEMA["properties"]["external_inputs"]
+            self.assertEqual(schema["maxItems"], 8)
+            self.assertTrue(schema["items"]["additionalProperties"] is False)
+            self.assertEqual(set(schema["items"]["required"]), {"path", "sha256"})
 
     def test_successor_reads_direct_dep_artifact(self):
         with tempfile.TemporaryDirectory() as td:

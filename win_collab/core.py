@@ -867,7 +867,7 @@ class Engine:
                         # look like an ambiguous POST /session.
                         if not self._desktop_blocked(job, jobs):
                             self.start_journal(job, {'stage':'creating', 'run_id':job['run_id']})
-                            # This is session-local policy, not global auto-approval.
+                            # The server acknowledges this session ask list, but agent-level allow rules take precedence.
                             created = self.api(job, 'POST', '/session', {'title': 'codex-collab-' + job['id'][:8],
                                   'directory': job['workspace'],
                                   'permission': [{'permission': '*', 'pattern': '*', 'action': 'ask'}]})
