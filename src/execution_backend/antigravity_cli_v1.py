@@ -18,18 +18,19 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Mapping
 
 from execution_backend.agy_account_pool import (
+    ENV_LEASE_ID,
     ENV_POOL,
     ENV_PROFILE,
     AccountPoolError,
-    apply_job_result_to_pool,
+    account_switch_lock,
     clear_windows_antigravity_keyring,
-    load_pool,
+    finish_account_lease,
     prepare_antigravity_environ_from_pool,
-    release_account_lease,
 )
 from execution_backend.base import BackendError, BackendStatus, ExecutionBackendABC, unsupported
 
@@ -326,8 +327,14 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         if not pool_path or not profile:
             return
         try:
-            pool = load_pool(pool_path)
-            release_account_lease(pool, profile, persist=self._persist_pool)
+            finish_account_lease(
+                pool_path,
+                profile,
+                lease_id=str(spawn_env.get(ENV_LEASE_ID) or "").strip() or None,
+                persist=self._persist_pool,
+                environ=spawn_env,
+                classify_result_state=False,
+            )
         except Exception as exc:  # noqa: BLE001 — spawn-fail path must stay local
             _LOG.warning("agy account lease release after spawn fail (%s)", type(exc).__name__)
 
@@ -353,11 +360,38 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             if cleaned:
                 arts.append(cleaned)
 
-        # Per-dispatch pool select+reserve before building argv / Popen.
-        try:
-            spawn_env = self._bind_pool_environ_for_dispatch()
-        except AccountPoolError:
-            raise
+        # Account switch critical section (pool-global cross-process lock):
+        # select+reserve → keyring clear → HOME/USERPROFILE env → Popen.
+        # Released once the child has its env and is started; the agy run
+        # itself is protected by the per-account busy lease + HOME lock.
+        base_env = self._base_env()
+        lock_pool = self._account_pool_path or str(base_env.get(ENV_POOL) or "").strip()
+        with (account_switch_lock(lock_pool, environ=base_env) if lock_pool else nullcontext()):
+            rec, failed = self._start_run_locked(
+                title=title, root=root, instruction=instruction,
+                arts=arts, errors=errors, charter=charter,
+            )
+        if failed is not None:
+            return failed
+        proc = rec["proc"]
+        rec["pid"] = proc.pid
+        self._start_pipe_drainers(rec, proc)
+        return self._start_payload(rec, ok=True)
+
+    def _start_run_locked(
+        self,
+        *,
+        title: str,
+        root: Path,
+        instruction: str,
+        arts: list[str],
+        errors: list[str],
+        charter: dict | None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Bind env + clear keyring + Popen (caller holds the switch lock).
+
+        Returns ``(rec, failure_payload)``; failure_payload is None on spawn."""
+        spawn_env = self._bind_pool_environ_for_dispatch()
 
         skip = agy_auto_approve_enabled(charter, spawn_env)
         model = resolve_agy_model(explicit=self.model, environ=spawn_env, charter=charter)
@@ -444,12 +478,9 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             rec["assistant_error"] = f"agy spawn failed: {e}"
             rec["harvested"] = True
             rec["path_errors"] = errors + [rec["assistant_error"]]
-            return self._start_payload(rec, ok=False)
-
+            return rec, self._start_payload(rec, ok=False)
         rec["proc"] = proc
-        rec["pid"] = proc.pid
-        self._start_pipe_drainers(rec, proc)
-        return self._start_payload(rec, ok=True)
+        return rec, None
 
     def _start_payload(self, rec: dict[str, Any], *, ok: bool) -> dict[str, Any]:
         payload = {
@@ -854,11 +885,11 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         if not pool_path or not profile:
             return
         try:
-            pool = load_pool(pool_path)
-            cls = apply_job_result_to_pool(
-                pool,
-                pool.by_id(profile),
+            cls = finish_account_lease(
+                pool_path,
+                profile,
                 out,
+                lease_id=str(env.get(ENV_LEASE_ID) or "").strip() or None,
                 persist=self._persist_pool,
                 environ=env,
             )

@@ -275,10 +275,10 @@ def run_antigravity_charter(
     start_run selects+reserves one available HOME per dispatch; never swap HOME mid-run.
     """
     from execution_backend.agy_account_pool import (
+        ENV_LEASE_ID,
         AccountPoolError,
-        apply_job_result_to_pool,
+        finish_account_lease,
         inject_agy_pool_into_backend_kwargs,
-        load_pool,
         selected_profile_from_environ,
     )
     from execution_backend.antigravity_cli_v1 import (
@@ -335,11 +335,13 @@ def run_antigravity_charter(
         ).strip() or None
     if profile and pool_path:
         try:
-            pool_obj = load_pool(pool_path)
-            apply_job_result_to_pool(
-                pool_obj,
-                pool_obj.by_id(profile),
+            # Locked + lease-owner checked: a late writeback cannot free a HOME
+            # that another entrance reserved after collect released ours.
+            finish_account_lease(
+                pool_path,
+                profile,
                 result,
+                lease_id=str((env_map or {}).get(ENV_LEASE_ID) or "").strip() or None,
                 persist=True,
                 environ=env_map,
             )

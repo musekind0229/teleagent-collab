@@ -1,7 +1,13 @@
-"""Peripheral agy account-pool scheduler (HOME isolation, serial).
+"""Peripheral agy account-pool scheduler (HOME isolation).
 
 Does not touch teleagent_adapter or glue. One spawn = one HOME; no mid-run
-swap; no multi-account concurrency. Pool JSON must not contain tokens.
+swap. Pool JSON must not contain tokens.
+
+Account switch lock (``account_switch_lock``, the pool-global flock /
+LockFileEx file): select+reserve, keyring clear, HOME/USERPROFILE env build
+and the agy Popen run serialized across processes; lease release / result
+writeback also take it. The agy run itself is NOT under the global lock:
+per-account busy lease (lease_id) + per-HOME lock keep two runs off one HOME.
 Windows pool spawns clear the machine-wide ``gemini:antigravity`` keyring
 slot, then pin HOME and USERPROFILE to that account. Child environ also
 sets SSH_* TEST-NET pseudos so agy 1.2.11 uses file token storage.
@@ -15,8 +21,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from collections.abc import Callable, Mapping
+import uuid
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -60,7 +69,18 @@ _COOLDOWN_MODES = frozenset({COOLDOWN_MODE_DURATION, COOLDOWN_MODE_DAY_BOUNDARY}
 _SHORT_COOLDOWN_CLASSES = frozenset({CLASS_TEMPORARY_NO_CAPACITY, CLASS_RATE_LIMIT})
 
 _KNOWN_ACCOUNT_KEYS = frozenset(
-    {"id", "name", "home", "state", "email_mask", "notes", "cooldown_until", "lease_pid", "lease_until"}
+    {
+        "id",
+        "name",
+        "home",
+        "state",
+        "email_mask",
+        "notes",
+        "cooldown_until",
+        "lease_pid",
+        "lease_until",
+        "lease_id",
+    }
 )
 _SECRET_KEY_RE = re.compile(
     r"token|secret|password|oauth|refresh|credential|cookie|id_token",
@@ -93,6 +113,7 @@ class Account:
     cooldown_until: str | None = None
     lease_pid: int | None = None
     lease_until: str | None = None
+    lease_id: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -115,6 +136,8 @@ class Account:
             d["lease_pid"] = self.lease_pid
         if self.lease_until:
             d["lease_until"] = self.lease_until
+        if self.lease_id:
+            d["lease_id"] = self.lease_id
         for k, v in self.extra.items():
             if k in d or k in _KNOWN_ACCOUNT_KEYS:
                 continue
@@ -219,6 +242,7 @@ def _account_from_obj(raw: Mapping[str, Any]) -> Account:
     }
     until = raw.get("cooldown_until")
     lease_until = raw.get("lease_until")
+    lease_id = raw.get("lease_id")
     lease_pid_raw = raw.get("lease_pid")
     lease_pid: int | None
     try:
@@ -234,6 +258,7 @@ def _account_from_obj(raw: Mapping[str, Any]) -> Account:
         cooldown_until=None if until in (None, "") else str(until),
         lease_pid=lease_pid,
         lease_until=None if lease_until in (None, "") else str(lease_until),
+        lease_id=None if lease_id in (None, "") else str(lease_id),
         extra=extra,
     )
 
@@ -483,6 +508,7 @@ def _normalize_precheck(result: Any) -> str:
 DEFAULT_BUSY_LEASE_SEC = 3600.0
 ENV_BUSY_LEASE_SEC = "COLLAB_AGY_BUSY_LEASE_SEC"
 ENV_LOCK_DIR = "COLLAB_AGY_LOCK_DIR"
+ENV_LEASE_ID = "COLLAB_AGY_LEASE_ID"
 
 
 def _iso_now(ts: float | None = None) -> str:
@@ -502,12 +528,42 @@ def _parse_iso(raw: str | None) -> float | None:
         return None
 
 
+def _pid_alive_windows(pid: int) -> bool:
+    """OpenProcess + GetExitCodeProcess. Never os.kill on Windows (sig 0 is
+    CTRL_C_EVENT / TerminateProcess territory). Unknown → assume alive."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        k32.GetExitCodeProcess.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = k32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            # ERROR_INVALID_PARAMETER: no such pid. Access denied etc → alive.
+            return ctypes.get_last_error() != 87
+        try:
+            code = wintypes.DWORD(0)
+            if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            return int(code.value) == 259  # STILL_ACTIVE
+        finally:
+            k32.CloseHandle(handle)
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def _pid_alive(pid: int | None) -> bool:
-    """Best-effort liveness. On Windows, os.kill(pid, 0) is unreliable — callers
-    must also honor lease_until. Unknown/unsupported → assume alive.
+    """Best-effort liveness on this host. Unknown/unsupported → assume alive.
+    Callers must also honor lease_until.
     """
     if pid is None or int(pid) <= 0:
         return False
+    if _is_windows():
+        return _pid_alive_windows(int(pid))
     try:
         os.kill(int(pid), 0)
         return True
@@ -573,11 +629,56 @@ def expire_busy_leases(pool: AccountPool, *, now: float | None = None) -> bool:
             stale = not _pid_alive(acc.lease_pid)
         if stale:
             acc.state = "available"
-            acc.lease_pid = None
-            acc.lease_until = None
+            _clear_lease_fields(acc)
             _drop_held_home_lease(acc.home)
             changed = True
     return changed
+
+
+def _clear_lease_fields(acc: Account) -> None:
+    acc.lease_pid = None
+    acc.lease_until = None
+    acc.lease_id = None
+
+
+def _home_lock_free(home: str | Path, *, environ: Mapping[str, str] | None = None) -> bool | None:
+    """True if nobody holds the per-HOME lock (probe acquire+release).
+    None when the lock backend is unavailable (unknown)."""
+    try:
+        from platform_services import get_file_lock
+
+        held = get_file_lock().acquire(home_lease_lock_path(home, environ=environ), blocking=False)
+    except BlockingIOError:
+        return False
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        held.unlock_and_close()
+    except Exception:  # noqa: BLE001
+        pass
+    return True
+
+
+def reclaim_dead_leases(pool: AccountPool, *, environ: Mapping[str, str] | None = None) -> list[str]:
+    """Take over busy leases whose holder died before lease_until.
+
+    Conservative: requires BOTH a dead ``lease_pid`` on this host AND a free
+    per-HOME lock (the kernel drops flock / LockFileEx when a holder exits).
+    Call under ``account_switch_lock``. Returns reclaimed account ids.
+    """
+    out: list[str] = []
+    me = os.getpid()
+    for acc in pool.accounts:
+        if acc.state != "busy" or acc.lease_pid is None or int(acc.lease_pid) == me:
+            continue
+        if _pid_alive(acc.lease_pid):
+            continue
+        if _home_lock_free(acc.home, environ=environ) is not True:
+            continue
+        acc.state = "available"
+        _clear_lease_fields(acc)
+        out.append(acc.id)
+    return out
 
 
 def _home_key(home: str | Path) -> str:
@@ -622,6 +723,14 @@ def reserve_account(
     account.state = "busy"
     account.lease_pid = int(os.getpid() if pid is None else pid)
     account.lease_until = _iso_now(t + max(1.0, sec))
+    account.lease_id = uuid.uuid4().hex
+
+
+def _owns_lease(acc: Account, lease_id: str | None) -> bool:
+    """Is the caller the lease holder? lease_id wins; else same pid / no pid."""
+    if lease_id and acc.lease_id:
+        return str(lease_id) == str(acc.lease_id)
+    return acc.lease_pid is None or int(acc.lease_pid) == os.getpid()
 
 
 def release_account_lease(
@@ -630,31 +739,144 @@ def release_account_lease(
     *,
     persist: bool = True,
     force: bool = False,
+    lease_id: str | None = None,
 ) -> Account:
-    """Clear busy lease → available (unless already cooldown/exhausted/unavailable)."""
+    """Clear busy lease → available (unless already cooldown/exhausted/unavailable).
+
+    A lease held by someone else (different ``lease_id`` / live other pid) is
+    left untouched unless ``force``: a late release must not free a HOME that
+    another entrance has since reserved.
+    """
     acc = pool.by_id(account) if isinstance(account, str) else account
+    if not force and not _owns_lease(acc, lease_id):
+        return acc
     _drop_held_home_lease(acc.home)
-    if acc.state == "busy" or force:
-        if acc.state in ("cooldown", "exhausted", "unavailable") and not force:
-            acc.lease_pid = None
-            acc.lease_until = None
-        else:
-            acc.state = "available"
-            acc.lease_pid = None
-            acc.lease_until = None
-    else:
-        acc.lease_pid = None
-        acc.lease_until = None
+    if force or acc.state == "busy":
+        acc.state = "available"
+    _clear_lease_fields(acc)
     if persist and pool.path is not None:
         save_pool(pool.path, pool)
     return acc
 
 
-def _acquire_pool_lock(pool_path: str | Path, *, environ: Mapping[str, str] | None = None, blocking: bool = True):
-    from platform_services import get_file_lock
+ENV_SWITCH_LOCK_TIMEOUT_SEC = "COLLAB_AGY_SWITCH_LOCK_TIMEOUT_SEC"
+DEFAULT_SWITCH_LOCK_TIMEOUT_SEC = 120.0
+_SWITCH_LOCK_POLL_SEC = 0.05
+# Per-thread re-entrancy for the pool-global switch lock (keyed by lock path).
+_SWITCH_TLS = threading.local()
 
+
+class AccountSwitchLockTimeout(AccountPoolError):
+    """Pool-global account switch lock not acquired within the timeout."""
+
+
+def switch_lock_timeout_sec(environ: Mapping[str, str] | None = None) -> float:
+    env = environ if environ is not None else os.environ
+    raw = str(env.get(ENV_SWITCH_LOCK_TIMEOUT_SEC) or "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    return DEFAULT_SWITCH_LOCK_TIMEOUT_SEC
+
+
+def _holder_path(lock_path: Path) -> Path:
+    return lock_path.with_name(lock_path.name + ".holder.json")
+
+
+def _read_holder(lock_path: Path) -> str:
+    try:
+        return _holder_path(lock_path).read_text(encoding="utf-8").strip()[:200]
+    except OSError:
+        return "unknown"
+
+
+def _held_depths() -> dict[str, int]:
+    d = getattr(_SWITCH_TLS, "depths", None)
+    if d is None:
+        d = {}
+        _SWITCH_TLS.depths = d
+    return d
+
+
+def switch_lock_held(pool_path: str | Path, *, environ: Mapping[str, str] | None = None) -> bool:
+    """True when the current thread holds the switch lock for *pool_path*."""
+    key = str(pool_global_lock_path(pool_path, environ=environ))
+    return _held_depths().get(key, 0) > 0
+
+
+@contextmanager
+def account_switch_lock(
+    pool_path: str | Path,
+    *,
+    environ: Mapping[str, str] | None = None,
+    timeout_sec: float | None = None,
+) -> Iterator[Path]:
+    """Pool-global cross-process mutex around one account switch.
+
+    Same lock file as the 2e99a62 pool mutex (flock / LockFileEx via
+    ``platform_services``). Re-entrant per thread. Acquire polls a
+    non-blocking lock until ``timeout_sec`` (default
+    ``COLLAB_AGY_SWITCH_LOCK_TIMEOUT_SEC`` / 120s) and then raises
+    ``AccountSwitchLockTimeout`` naming the lock path and last holder. A dead
+    holder cannot wedge it: the kernel drops the lock on process exit.
+    """
     lock_path = pool_global_lock_path(pool_path, environ=environ)
-    return get_file_lock().acquire(lock_path, blocking=blocking)
+    key = str(lock_path)
+    depths = _held_depths()
+    if depths.get(key, 0) > 0:
+        depths[key] += 1
+        try:
+            yield lock_path
+        finally:
+            depths[key] -= 1
+        return
+    try:
+        from platform_services import get_file_lock
+
+        backend = get_file_lock()
+    except Exception as e:  # noqa: BLE001
+        raise AccountPoolError(
+            f"cannot acquire agy pool lock: {type(e).__name__}: {e}",
+            status=BackendStatus.UNAVAILABLE,
+        ) from e
+    limit = switch_lock_timeout_sec(environ) if timeout_sec is None else max(0.0, float(timeout_sec))
+    deadline = time.monotonic() + limit
+    held = None
+    while held is None:
+        try:
+            held = backend.acquire(lock_path, blocking=False)
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise AccountSwitchLockTimeout(
+                    f"agy account switch lock busy for >{limit:g}s: lock={lock_path} "
+                    f"holder={_read_holder(lock_path)} (raise {ENV_SWITCH_LOCK_TIMEOUT_SEC} "
+                    "or stop the stuck entrance)",
+                    status=BackendStatus.UNAVAILABLE,
+                ) from None
+            time.sleep(_SWITCH_LOCK_POLL_SEC)
+        except Exception as e:  # noqa: BLE001
+            raise AccountPoolError(
+                f"cannot acquire agy pool lock: {type(e).__name__}: {e}",
+                status=BackendStatus.UNAVAILABLE,
+            ) from e
+    try:
+        _holder_path(lock_path).write_text(
+            json.dumps({"pid": os.getpid(), "thread": threading.get_ident(), "since": _iso_now()}),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+    depths[key] = 1
+    try:
+        yield lock_path
+    finally:
+        depths.pop(key, None)
+        try:
+            held.unlock_and_close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def select_account(
@@ -664,8 +886,9 @@ def select_account(
     persist: bool = True,
     now: float | None = None,
     environ: Mapping[str, str] | None = None,
+    exclude: set[str] | frozenset[str] | None = None,
 ) -> Account | None:
-    """Pick the first *available* account. Optional precheck runs per candidate.
+    """Pick the first *available* account (ids in *exclude* are skipped). Optional precheck runs per candidate.
 
     Precheck classes:
       eligibility_blocked / auth_invalid -> unavailable, skip, try next
@@ -685,8 +908,9 @@ def select_account(
     temp_sec = resolve_temp_cooldown_sec(pool, environ=environ)
     mutated = False
     chosen: Account | None = None
+    skip_ids = exclude or ()
     for acc in pool.accounts:
-        if acc.state != "available":
+        if acc.state != "available" or acc.id in skip_ids:
             continue
         if precheck is None:
             chosen = acc
@@ -869,54 +1093,62 @@ def prepare_antigravity_environ_from_pool(
     base_environ: Mapping[str, str] | None = None,
     precheck: PrecheckFn | None = None,
     persist: bool = True,
+    lock_timeout_sec: float | None = None,
 ) -> dict[str, Any]:
-    """Load pool, select one available account under a cross-process mutex.
+    """Select + reserve one account under the pool-global switch lock.
 
-    Acquires a pool-global exclusive lock, picks an available account, marks it
-    ``busy`` with a lease (pid + lease_until), optionally holds a per-HOME lock,
-    then releases the global lock. Two entrances cannot reserve the same HOME.
-    Caller should ``release_account_lease`` when the spawn finishes (also done
-    from apply_job_result_to_pool / run_antigravity_charter).
+    Inside ``account_switch_lock`` (cross-process, re-entrant): load pool,
+    expire cooldowns / stale busy leases, reclaim leases of dead holders,
+    pick an available account whose per-HOME lock is free (a held HOME is
+    skipped, not fatal, while another account is available), mark it ``busy``
+    (pid + lease_until + lease_id), persist, clear the machine-wide
+    ``gemini:antigravity`` keyring slot and build the child environ.
 
-    Raises AccountPoolError if nothing is dispatchable.
+    ``start_run`` wraps this *and* its Popen in the same lock so nothing can
+    clear the keyring between prepare and spawn. Callers release via
+    ``finish_account_lease`` / ``release_account_lease``.
+
+    Raises AccountPoolError if nothing is dispatchable,
+    AccountSwitchLockTimeout if the lock is not acquired in time.
     """
-    held_global = None
-    held_home = None
-    try:
-        held_global = _acquire_pool_lock(pool_path, environ=base_environ, blocking=True)
-    except Exception as e:  # noqa: BLE001
-        raise AccountPoolError(
-            f"cannot acquire agy pool lock: {type(e).__name__}: {e}",
-            status=BackendStatus.UNAVAILABLE,
-        ) from e
-    try:
+    with account_switch_lock(pool_path, environ=base_environ, timeout_sec=lock_timeout_sec) as lock_path:
         pool = load_pool(pool_path)
+        reclaimed = reclaim_dead_leases(pool, environ=base_environ)
         chk = _precheck_from_env(precheck, base_environ, pool)
-        acc = select_account(
-            pool,
-            precheck=chk,
-            persist=False,
-            environ=base_environ,
-        )
-        if acc is None:
-            states = {a.id: a.state for a in pool.accounts}
-            raise AccountPoolError(f"no available agy account in pool; states={states}")
-        # Minimal per-HOME lease: non-blocking exclusive lock on a lockfile.
-        try:
-            from platform_services import get_file_lock
-
-            home_lock = home_lease_lock_path(acc.home, environ=base_environ)
+        held_home = None
+        leased: set[str] = set()
+        acc: Account | None = None
+        while True:
+            acc = select_account(
+                pool,
+                precheck=chk,
+                persist=False,
+                environ=base_environ,
+                exclude=leased,
+            )
+            if acc is None:
+                break
             try:
+                from platform_services import get_file_lock
+
+                home_lock = home_lease_lock_path(acc.home, environ=base_environ)
                 held_home = get_file_lock().acquire(home_lock, blocking=False)
-            except BlockingIOError as e:
+            except BlockingIOError:
+                leased.add(acc.id)
+                continue
+            except Exception:  # noqa: BLE001
+                held_home = None  # JSON busy mark still serializes; home lock best-effort
+            break
+        if acc is None:
+            if persist and pool.path is not None and reclaimed:
+                save_pool(pool.path, pool)
+            states = {a.id: a.state for a in pool.accounts}
+            if leased:
                 raise AccountPoolError(
-                    f"agy home already leased: account={acc.id!r} home={acc.home!r}",
+                    f"agy home already leased: accounts={sorted(leased)}; states={states}",
                     status=BackendStatus.UNAVAILABLE,
-                ) from e
-        except AccountPoolError:
-            raise
-        except Exception:
-            held_home = None  # JSON busy mark still serializes; home lock is best-effort
+                )
+            raise AccountPoolError(f"no available agy account in pool; states={states}")
         reserve_account(
             acc,
             lease_sec=busy_lease_sec(base_environ),
@@ -936,20 +1168,44 @@ def prepare_antigravity_environ_from_pool(
         clear_windows_antigravity_keyring()
         env = account_environ(acc, base_environ, pool=pool)
         env[ENV_POOL] = str(Path(pool_path))
+        if acc.lease_id:
+            env[ENV_LEASE_ID] = acc.lease_id
         return {
             "environ": env,
             "account": acc,
             "pool": pool,
             "agy_profile": acc.id,
+            "lease_id": acc.lease_id,
             "home_lease": held_home,
-            "pool_lock_path": str(pool_global_lock_path(pool_path, environ=base_environ)),
+            "pool_lock_path": str(lock_path),
+            "reclaimed": reclaimed,
         }
-    finally:
-        if held_global is not None:
-            try:
-                held_global.unlock_and_close()
-            except Exception:
-                pass
+
+
+def finish_account_lease(
+    pool_path: str | Path,
+    profile: str,
+    result: Mapping[str, Any] | None = None,
+    *,
+    lease_id: str | None = None,
+    persist: bool = True,
+    environ: Mapping[str, str] | None = None,
+    classify_result_state: bool = True,
+    lock_timeout_sec: float | None = None,
+) -> str:
+    """Locked load → apply result / release → save (no lost pool updates).
+
+    Returns the error class (``ok`` when only releasing).
+    """
+    with account_switch_lock(pool_path, environ=environ, timeout_sec=lock_timeout_sec):
+        pool = load_pool(pool_path)
+        acc = pool.by_id(profile)
+        if classify_result_state:
+            return apply_job_result_to_pool(
+                pool, acc, result, persist=persist, environ=environ, lease_id=lease_id
+            )
+        release_account_lease(pool, acc, persist=persist, lease_id=lease_id)
+        return CLASS_OK
 
 
 def inject_agy_pool_into_backend_kwargs(kwargs: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -1000,8 +1256,12 @@ def apply_job_result_to_pool(
     cooldown_sec: float | None = None,
     cooldown_mode: str | None = None,
     temp_cooldown_sec: float | None = None,
+    lease_id: str | None = None,
 ) -> str:
     """After a finished spawn, classify the result and update pool state.
+
+    If the account is now busy under another holder's lease (a late second
+    writeback after someone else reserved it), nothing is changed.
 
     ordinary_task_failure / ok do not mark the account bad. True quota uses
     pool.extra / COLLAB_AGY_COOLDOWN_*. Transient 503 / rate_limit use
@@ -1020,6 +1280,8 @@ def apply_job_result_to_pool(
         temp_cooldown_sec=temp_cooldown_sec,
     )
     cls = classify_result(dict(result) if result is not None else None)
+    if account.state == "busy" and not _owns_lease(account, lease_id):
+        return cls
     changed = apply_class_to_state(
         account,
         cls,
@@ -1032,12 +1294,10 @@ def apply_job_result_to_pool(
     _drop_held_home_lease(account.home)
     if account.state == "busy":
         account.state = "available"
-        account.lease_pid = None
-        account.lease_until = None
+        _clear_lease_fields(account)
         changed = True
-    elif account.lease_pid is not None or account.lease_until:
-        account.lease_pid = None
-        account.lease_until = None
+    elif account.lease_pid is not None or account.lease_until or account.lease_id:
+        _clear_lease_fields(account)
         changed = True
     if changed and persist and pool.path is not None:
         save_pool(pool.path, pool)
@@ -1053,6 +1313,14 @@ def selected_profile_from_environ(environ: Mapping[str, str] | None) -> str:
 __all__ = [
     "ACCOUNT_STATES",
     "Account",
+    "AccountSwitchLockTimeout",
+    "ENV_LEASE_ID",
+    "ENV_SWITCH_LOCK_TIMEOUT_SEC",
+    "account_switch_lock",
+    "finish_account_lease",
+    "reclaim_dead_leases",
+    "switch_lock_held",
+    "switch_lock_timeout_sec",
     "AccountPool",
     "AccountPoolError",
     "COOLDOWN_MODE_DAY_BOUNDARY",
