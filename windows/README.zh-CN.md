@@ -53,7 +53,8 @@ Windows 适配器从已验证的 TeleAgent runtime Node 进程环境中只选取
 ```
 
 - 权限：`once | reject | deny_job`；不接受 `always`。
-- 验收：`pass | fail`；必须全部产物存在，hash 未变化，工人 idle。缺证据时应 fail 并给具体返工要求。
+- 验收：`pass | fail`；必须全部产物存在，hash 未变化，工人 idle，且内容没有 AIGC 水印或不可见字符。缺证据时应 fail 并给具体返工要求。`fail` 返工不看这条内容检查。
+- 内容检查：`AI生成`（可含空白）、`人工智能生成`，以及 U+200B、U+200C、U+200D、U+2060、U+FEFF（文件头单独一个 BOM 除外）、U+180E、U+2061–U+2064，会使 `pass` 失败，错误以 `Artifact content contaminated` 开头。章程 `allow_aigc_marks: true` 关闭检查。解不开的二进制不扫描。
 - 问题：`answer | deny_job`；answer 另带 `answers: [["第一题回答"], ["第二题回答"]]`。
 - 当前控制器不支持凭据白名单。普通外部输入只能通过 `external_inputs` 声明：最多 8 个仓库内普通文件，每个都固定绝对路径和 SHA-256，单文件不超过 512 KiB；文件变化、路径不一致、符号链接/目录联接和凭据类名称都会拒绝。
 - `forbidden_tools` 可列出章程禁止使用的工具；工具即使被 TeleAgent 自动执行，带有已完成违规工具的工单也不能通过验收。

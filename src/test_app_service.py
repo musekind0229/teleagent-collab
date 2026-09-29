@@ -26,8 +26,11 @@ from framework.app_service import (
     GOAL_HTTP_TERMINAL,
     LeadAdapterPlanner,
     TASK_HTTP_TERMINAL,
+    allows_aigc_marks,
+    gate_collected_artifacts,
     lead_error_retryable,
     project_forbidden_tools,
+    review_contamination_summary,
     split_task_musts,
     task_acceptance_criteria,
     worker_charter_for_task,
@@ -349,6 +352,95 @@ class _TeleAgentClient:
             self.status[path.split("/")[2]] = {"type": "idle"}
             return True
         raise AssertionError((method, path))
+
+
+class _ContentBackend:
+    """collect_result writes one text file and reports ok. The service gate scans it."""
+
+    backend_id = "fake.content_v1"
+
+    def __init__(self, content: str) -> None:
+        self.content = content
+        self.directory = Path(".")
+        self.artifacts: list[str] = []
+
+    def start_run(self, *, title, directory, instruction="", artifacts=None, charter=None):
+        self.directory = Path(directory)
+        self.artifacts = [str(x) for x in (artifacts or [])]
+        return {
+            "ok": True,
+            "backend": self.backend_id,
+            "run_id": "content-run-1",
+            "native_handle": "content-run-1",
+        }
+
+    def observe_run(self, run_id, **kwargs):
+        return {"busy": False, "finish_successful": True}
+
+    def collect_result(self, run_id):
+        written = []
+        for rel in self.artifacts:
+            path = self.directory / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(self.content, encoding="utf-8")
+            written.append(str(path))
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "artifacts": written,
+            "workspace": str(self.directory),
+        }
+
+    def list_pending_actions(self, *, session_id=None):
+        return 200, []
+
+    def cancel(self, run_id):
+        return 200, {"ok": True, "run_id": run_id, "state": "cancelled"}
+
+
+class _ContaminatedReviewBackend:
+    backend_id = "fake.review_contam_v1"
+
+    def start_run(self, *, title, directory, instruction="", artifacts=None, charter=None):
+        return {"ok": True, "backend": self.backend_id, "run_id": "rev-contam", "native_handle": "rev-contam"}
+
+    def observe_run(self, run_id, **kwargs):
+        return {"busy": True}
+
+    def list_pending_actions(self, *, session_id=None):
+        return 200, [
+            {
+                "request_id": "req-contam-1",
+                "kind": "review",
+                "context_hash": "abc",
+                "payload": {
+                    "artifacts": {
+                        "hello.txt": {
+                            "bytes": 20,
+                            "contamination": {
+                                "contaminated": True,
+                                "encoding": "utf-8",
+                                "invisible": {"U+200B": 4, "U+200D": 4},
+                                "aigc_marks": {"AI生成": 1},
+                                "first_offset": 0,
+                                "scanned": True,
+                            },
+                        }
+                    },
+                    "finish": "stop",
+                    "policy_violations": [],
+                },
+            }
+        ]
+
+    def collect_result(self, run_id):
+        return {"ok": False, "run_id": run_id, "error": "still in review"}
+
+    def cancel(self, run_id):
+        return 200, {"ok": True, "run_id": run_id, "state": "cancelled"}
+
+
+_DIRTY_ARTIFACT = "hello decision\n\nAI生成\n" + ("\u200b\u200d" * 3)
 
 
 class _PendingCancelBackend(_AsyncBackend):
@@ -1170,6 +1262,123 @@ class AppServiceTests(unittest.TestCase):
             self.assertEqual(second["action"], "decision_required", second)
             self.assertEqual(lead.review_calls, 1)
             self.assertEqual(len(app.status(opened["goal_id"])["pending_decisions"]), 1)
+
+    def test_contaminated_artifact_fails_successful_collect(self):
+        with tempfile.TemporaryDirectory() as td:
+            app = CollabApplication(td, backend=_ContentBackend(_DIRTY_ARTIFACT))
+            opened = app.submit(_request())
+            tick = app.coordinator.process_goal(opened["goal_id"])
+            self.assertEqual(tick.get("action"), "task_finished", tick)
+            status = app.status(opened["goal_id"])
+            self.assertEqual(status["state"], "failed")
+            task = status["tasks"][0]
+            self.assertEqual(task["status"], "failed")
+            error = task["result"]["error"]
+            self.assertTrue(error.startswith("artifact_contaminated:"), error)
+            self.assertIn("AI生成x1", error)
+            self.assertIn("U+200Bx3", error)
+            self.assertIn("delivery.txt", task["result"]["artifact_contamination"])
+
+    def test_clean_artifact_collect_still_succeeds(self):
+        with tempfile.TemporaryDirectory() as td:
+            app = CollabApplication(td, backend=_ContentBackend("hello\n"))
+            opened = app.submit(_request())
+            tick = app.coordinator.process_goal(opened["goal_id"])
+            self.assertEqual(tick.get("action"), "task_finished", tick)
+            status = app.status(opened["goal_id"])
+            self.assertEqual(status["state"], "completed")
+            self.assertEqual(status["tasks"][0]["status"], "succeeded")
+            self.assertNotIn("artifact_contamination", status["tasks"][0]["result"])
+
+    def test_allow_aigc_marks_on_goal_acceptance_opts_out(self):
+        with tempfile.TemporaryDirectory() as td:
+            app = CollabApplication(td, backend=_ContentBackend(_DIRTY_ARTIFACT))
+            body = _request()
+            body["acceptance"]["allow_aigc_marks"] = True
+            opened = app.submit(body)
+            tick = app.coordinator.process_goal(opened["goal_id"])
+            self.assertEqual(tick.get("action"), "task_finished", tick)
+            status = app.status(opened["goal_id"])
+            self.assertEqual(status["state"], "completed", status.get("tasks"))
+            self.assertEqual(status["tasks"][0]["status"], "succeeded")
+
+    def test_content_gate_opt_out_inputs_relative_path_and_charter_passthrough(self):
+        self.assertFalse(allows_aigc_marks({"acceptance": {"allow_aigc_marks": "true"}}, {}))
+        self.assertTrue(allows_aigc_marks({}, {"inputs": {"allow_aigc_marks": True}}))
+        charter = worker_charter_for_task(
+            goal={
+                "desired_outcome": "x",
+                "boundaries": {"must": [], "must_not": []},
+                "acceptance": {"artifacts": ["a.txt"], "allow_aigc_marks": True},
+            },
+            task={
+                "title": "t",
+                "inputs": {"instruction": "do"},
+                "done_when": {"artifacts": ["a.txt"]},
+            },
+        )
+        self.assertIs(charter["allow_aigc_marks"], True)
+        passed = WindowsSupervisedExecutionBackend._charter(
+            title="t",
+            instruction="i",
+            artifacts=["a.txt"],
+            charter={"allow_aigc_marks": True, "forbidden_tools": ["write"]},
+        )
+        self.assertIs(passed["allow_aigc_marks"], True)
+        self.assertEqual(passed["forbidden_tools"], ["write"])
+        absent = WindowsSupervisedExecutionBackend._charter(
+            title="t",
+            instruction="i",
+            artifacts=["a.txt"],
+            charter={},
+        )
+        self.assertNotIn("allow_aigc_marks", absent)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "hello.txt").write_text("AI 生成\n", encoding="utf-8")
+            blocked = gate_collected_artifacts(
+                {"ok": True, "artifacts": ["hello.txt", "missing.txt"], "workspace": str(root)}
+            )
+            self.assertFalse(blocked["ok"])
+            self.assertTrue(blocked["error"].startswith("artifact_contaminated:"))
+            self.assertIn("hello.txt", blocked["artifact_contamination"])
+            self.assertNotIn("missing.txt", blocked["artifact_contamination"])
+            allowed = gate_collected_artifacts(
+                {"ok": True, "artifacts": ["hello.txt"], "workspace": str(root)},
+                allow_aigc_marks=True,
+            )
+            self.assertTrue(allowed["ok"])
+            self.assertNotIn("error", allowed)
+        summary = review_contamination_summary(
+            {
+                "artifacts": {
+                    "hello.txt": {
+                        "contamination": {
+                            "contaminated": True,
+                            "aigc_marks": {"AI生成": 1},
+                            "invisible": {"U+200B": 2},
+                        }
+                    }
+                }
+            }
+        )
+        self.assertEqual(summary, "CONTAMINATED hello.txt: AI生成x1, U+200Bx2")
+
+    def test_review_decision_title_marks_contamination(self):
+        with tempfile.TemporaryDirectory() as td:
+            app = CollabApplication(td, backend=_ContaminatedReviewBackend())
+            opened = app.submit(_request())
+            first = app.coordinator.process_goal(opened["goal_id"])
+            self.assertEqual(first.get("action"), "worker_running", first)
+            second = app.coordinator.process_goal(opened["goal_id"])
+            self.assertEqual(second.get("action"), "decision_required", second)
+            pending = app.status(opened["goal_id"])["pending_decisions"]
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0]["title"], "TeleAgent review (CONTAMINATED)")
+            self.assertEqual(
+                pending[0]["details"]["summary"],
+                "CONTAMINATED hello.txt: AI生成x1, U+200Bx4, U+200Dx4",
+            )
 
 
 if __name__ == "__main__":

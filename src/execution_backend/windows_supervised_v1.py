@@ -121,7 +121,7 @@ class WindowsSupervisedExecutionBackend(ExecutionBackendABC):
             ("agent", "TELEAGENT_AGENT", "opencowork-default"),
         ):
             body[key] = str(src.get(key) or os.environ.get(env_name) or default)
-        for key in ("forbidden_tools", "external_inputs", "min_approved_permissions"):
+        for key in ("forbidden_tools", "external_inputs", "min_approved_permissions", "allow_aigc_marks"):
             if key in src:
                 body[key] = src[key]
         raw_inputs = src.get("input_files")

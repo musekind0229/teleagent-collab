@@ -117,6 +117,27 @@ $opened
 
 返回的 `request_id` 同时是当前版本的 `goal_id`。后台协调循环会自动规划和推进任务，无需调用方手动联系任何 agent。
 
+## 产物内容检查（AIGC 水印 / 不可见字符）
+
+验收不只看文件在不在。协调器在 `collect_result` 返回成功之后、`finish_task` 把任务记成成功之前，会扫描 `result.artifacts` 里每个已经存在的文件（绝对路径，或相对 `result.workspace` 的路径）。这条门禁不看后端：in-process、Antigravity、Windows TeleAgent 都走这里。Windows 控制器在 `review` 的 `pass` 上还有同一套检查；`fail` 返工不受阻挡，工人可以改掉水印再交。
+
+判为污染的内容：
+
+- 文本标记 `AI生成`（`AI` 和 `生成` 之间可以有空白，所以 `AI 生成` 也算）和 `人工智能生成`。不把英文 `AI generated` 当水印，避免英文正文误报。
+- 不可见字符：U+200B、U+200C、U+200D、U+2060、U+FEFF（见下）、U+180E、U+2061–U+2064。
+
+编码：只有文件第 0 字节是 UTF-16 BOM（`FF FE` 或 `FE FF`）时才按 UTF-16 解码；否则严格 UTF-8，允许开头的 UTF-8 BOM（`EF BB BF`）。解不开的当作二进制，不扫描，不算污染。
+
+BOM：解码后**第一个字符**如果是那一个来自文件头 BOM 的 U+FEFF，是合法编码标记，不算污染。出现在其它位置的 U+FEFF，或第二个 U+FEFF，算污染。
+
+大于 2 MiB 的文件只扫描开头 2 MiB，扫描结果带 `truncated: true`。
+
+命中且未关闭检查时，任务失败：`result.ok` 变为 false，`error` 以 `artifact_contaminated:` 开头（后面是一行计数，例如 `CONTAMINATED hello.txt: AI生成x1, U+200Bx1926, U+200Dx1658`），并带上 `artifact_contamination`。
+
+关闭检查：在 Goal 的 `acceptance` 里放布尔值 `allow_aigc_marks: true`，或写在该 Task 的 `inputs.allow_aigc_marks`。只有布尔 `true` 生效；字符串 `"true"` 不会关闭检查。服务会把这个选择抄进工人章程。Windows 章程上的同名布尔字段同样放行 `pass`（缺省即检查）。
+
+TeleAgent `review` 若产物自带 `contamination.contaminated`，投影出的决策标题是 `TeleAgent review (CONTAMINATED)`，`details.summary` 是上面那行计数。
+
 ## 查询和控制
 
 | 方法 | 路径 | 用途 |

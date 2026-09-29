@@ -46,6 +46,8 @@ COLLAB_WALL_S_CEILING = 7 * 24 * 3600
 COLLAB_STEPS_CEILING = 100_000
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_HOME = REPO / '.collab-state'
+_SCAN_BYTES = None
+_SUMMARIZE = None
 SYSTEM_EFFECTS = {'install_files', 'service_change', 'firewall_change', 'shortcuts'}
 USER_GATED_EFFECTS = {'service_change', 'firewall_change'}
 
@@ -327,6 +329,29 @@ def validate_system_action(data):
         raise ValueError('Sensitive system effects require explicit user_authorized_effects')
 
 
+def _contamination_api():
+    """Canonical scanner in ``src/framework``. No second copy of the rules.
+
+    Works for ``python -m win_collab`` from the repo root (``src`` is not on
+    ``sys.path``) and for tests that already put ``src`` on ``sys.path``.
+    """
+    global _SCAN_BYTES, _SUMMARIZE
+    if _SCAN_BYTES is not None and _SUMMARIZE is not None:
+        return _SCAN_BYTES, _SUMMARIZE
+    import importlib
+    import sys
+    try:
+        module = importlib.import_module('framework.artifact_contamination')
+    except ImportError:
+        src = str(REPO / 'src')
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        module = importlib.import_module('framework.artifact_contamination')
+    _SCAN_BYTES = module.scan_bytes
+    _SUMMARIZE = module.summarize
+    return _SCAN_BYTES, _SUMMARIZE
+
+
 def contained(root, relative):
     """Reject drive paths, ADS, traversal and links before accessing any artifact."""
     if not isinstance(relative, str) or not relative or ':' in relative or '\\' in relative:
@@ -367,6 +392,10 @@ def validate_charter(data):
             len(forbidden) != len(set(forbidden)) or
             not all(isinstance(x, str) and x.strip() for x in forbidden)):
         raise ValueError('forbidden_tools must be a unique list of non-empty tool names')
+    # Optional. True disables the AIGC / invisible-character acceptance gate.
+    # Absent means the check stays on. Non-booleans are rejected.
+    if 'allow_aigc_marks' in data and type(data.get('allow_aigc_marks')) is not bool:
+        raise ValueError('allow_aigc_marks must be a boolean')
     minimum = data.get('min_approved_permissions', 0)
     if type(minimum) is not int or not 0 <= minimum <= data.get('max_lead_requests', 12):
         raise ValueError('Invalid min_approved_permissions')
@@ -407,9 +436,11 @@ def snapshot(workspace, artifacts):
         if p.stat().st_size > 512 * 1024:
             raise ValueError(f'Artifact too large for review: {name}')
         raw = p.read_bytes()
+        scan_bytes, _summarize = _contamination_api()
         result[name] = {'sha256': hashlib.sha256(raw).hexdigest(), 'bytes': len(raw),
                         'preview': raw[:12000].decode('utf-8', errors='replace'),
-                        'truncated': len(raw) > 12000}
+                        'truncated': len(raw) > 12000,
+                        'contamination': scan_bytes(raw)}
     return result
 
 
@@ -1197,6 +1228,20 @@ class Engine:
                         raise ValueError('Artifacts changed or incomplete; cannot accept stale review')
                     if packet['payload'].get('policy_violations'):
                         raise ValueError('Policy violations prevent acceptance')
+                    # fail/redo does not enter this branch, so a worker can still
+                    # replace a watermarked artifact. Opt out per charter only.
+                    if job['charter'].get('allow_aigc_marks') is not True:
+                        summarize = _contamination_api()[1]
+                        findings = {}
+                        for name, meta in current.items():
+                            scan = meta.get('contamination') if isinstance(meta, dict) else None
+                            if isinstance(scan, dict):
+                                findings[name] = scan
+                        line = summarize(findings)
+                        if line:
+                            raise ValueError(
+                                'Artifact content contaminated (AIGC mark / invisible chars): ' + line
+                            )
                     if (job['charter'].get('task_kind', 'file_task') == 'system_install' and
                             (not job.get('action_dispatched') or
                              packet['payload'].get('approved_system_action_hash') !=

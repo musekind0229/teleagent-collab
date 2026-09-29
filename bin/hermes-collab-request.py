@@ -347,12 +347,58 @@ def _stripped(value: Any) -> str | None:
     return text.strip()
 
 
+def _contamination_bits(scan: dict[str, Any]) -> str:
+    """``AI生成x1, U+200Bx3`` from an already-scanned contamination object."""
+    parts: list[str] = []
+    marks = scan.get("aigc_marks")
+    if isinstance(marks, dict):
+        for key, count in marks.items():
+            label = _stripped(key)
+            if label is None:
+                continue
+            if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+                parts.append(f"{label}x{count}")
+    invisible = scan.get("invisible")
+    if isinstance(invisible, dict):
+        for key, count in invisible.items():
+            label = _stripped(str(key)) if not isinstance(key, str) else _stripped(key)
+            if label is None:
+                continue
+            if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+                parts.append(f"{label}x{count}")
+    return ", ".join(parts)
+
+
+def _contamination_prefix(artifacts: dict[str, Any]) -> str:
+    """``CONTAMINATED name: counts; `` for each contaminated artifact, or ``""``."""
+    chunks: list[str] = []
+    for name, meta in artifacts.items():
+        if not isinstance(meta, dict):
+            continue
+        scan = meta.get("contamination")
+        if not isinstance(scan, dict) or scan.get("contaminated") is not True:
+            continue
+        label = _stripped(name)
+        if label is None:
+            continue
+        bits = _contamination_bits(scan)
+        if bits:
+            chunks.append(f"CONTAMINATED {label}: {bits}")
+        else:
+            chunks.append(f"CONTAMINATED {label}")
+    if not chunks:
+        return ""
+    return "; ".join(chunks) + "; "
+
+
 def _review_payload_summary(payload: dict[str, Any]) -> str | None:
     """review: artifacts name(bytesB), ...; tools a,b; finish=...; violations=N.
 
     Skip any part that is missing or the wrong shape. Artifact previews and
     tool inputs/outputs are never included (previews may carry watermarks
-    or zero-width characters).
+    or zero-width characters). When an artifact's ``contamination.contaminated``
+    is true, the line is prefixed with ``CONTAMINATED <name>: <counts>; ``
+    and then truncated to 200 characters so the prefix stays first.
     """
     parts: list[str] = []
     artifacts = payload.get("artifacts")
@@ -386,9 +432,14 @@ def _review_payload_summary(payload: dict[str, Any]) -> str | None:
     violations = payload.get("policy_violations")
     if isinstance(violations, list):
         parts.append(f"violations={len(violations)}")
-    if not parts:
+    prefix = _contamination_prefix(artifacts) if isinstance(artifacts, dict) else ""
+    if not parts and not prefix:
         return None
-    return "review: " + "; ".join(parts)
+    body = ("review: " + "; ".join(parts)) if parts else ""
+    text = prefix + body if body else prefix.rstrip("; ").rstrip()
+    if prefix:
+        return _one_line(text)
+    return text
 
 
 def _permission_payload_summary(payload: dict[str, Any]) -> str | None:
@@ -478,8 +529,10 @@ def _decision_summary(row: dict[str, Any]) -> str:
     slug in title). Then details.summary/message/reason/question. When
     details.backend_kind is permission/question/review/system_action and
     details.payload is a dict, a payload summary comes next and beats the
-    generic title ``TeleAgent <kind>`` and the row reason. Then the row
-    reason, lead_error.message, title, and finally kind.
+    generic title ``TeleAgent <kind>`` and the row reason. A review summary
+    that starts with ``CONTAMINATED`` is returned before the title so a
+    watermark is not hidden by ``TeleAgent review (CONTAMINATED)``. Then the
+    row reason, lead_error.message, title, and finally kind.
     """
     title = row.get("title")
     kind = row.get("kind")
@@ -498,6 +551,8 @@ def _decision_summary(row: dict[str, Any]) -> str:
             payload_summary = _native_payload_summary(backend_kind, payload)
             if payload_summary:
                 generic_title = f"TeleAgent {backend_kind}"
+                if payload_summary.startswith("CONTAMINATED"):
+                    return _one_line(payload_summary)
     title_text = _nonempty_str(title)
     if title_text is not None and title_text.strip() != str(kind or "").strip():
         if not generic_title or title_text.strip() != generic_title:

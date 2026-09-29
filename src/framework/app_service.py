@@ -25,6 +25,7 @@ from urllib.parse import unquote, urlparse
 
 from execution_backend.base import ExecutionBackend
 from execution_backend.inprocess_v1 import InProcessExecutionBackend
+from framework.artifact_contamination import scan_file, summarize
 from framework.artifact_handoff import HandoffError, handoff_direct_dependency_artifacts
 from framework.need_human import goal_need_human_view, sanitize_reason
 from framework.durable_api import DurableLayer
@@ -111,6 +112,25 @@ def project_forbidden_tools(
     return found
 
 
+def allows_aigc_marks(
+    goal: Mapping[str, Any] | None,
+    task: Mapping[str, Any] | None = None,
+) -> bool:
+    """True only for a boolean opt-out of the artifact content check.
+
+    The check stays on unless ``allow_aigc_marks`` is the boolean ``True`` on
+    ``goal["acceptance"]`` or ``task["inputs"]``. The string ``"true"`` and
+    other truthy values do not opt out. ``task_acceptance_criteria`` stays the
+    artifact/text view of ``done_when``; this flag is not inferred from it.
+    The scanner module does not read this switch.
+    """
+    goal_obj = goal if isinstance(goal, Mapping) else {}
+    task_obj = task if isinstance(task, Mapping) else {}
+    acceptance = goal_obj.get("acceptance") if isinstance(goal_obj.get("acceptance"), Mapping) else {}
+    inputs = task_obj.get("inputs") if isinstance(task_obj.get("inputs"), Mapping) else {}
+    return acceptance.get("allow_aigc_marks") is True or inputs.get("allow_aigc_marks") is True
+
+
 def worker_charter_for_task(
     *,
     goal: Mapping[str, Any] | None,
@@ -134,6 +154,8 @@ def worker_charter_for_task(
         forbidden = [str(x).strip() for x in raw_forbidden if str(x).strip()]
         if forbidden:
             charter["forbidden_tools"] = forbidden
+    if allows_aigc_marks(goal_obj, task):
+        charter["allow_aigc_marks"] = True
     raw_inputs = (task.get("inputs") or {}).get("input_files") if isinstance(task.get("inputs"), Mapping) else None
     if isinstance(raw_inputs, list) and raw_inputs:
         names: list[str] = []
@@ -177,6 +199,87 @@ TASK_REVIEW_HINT = (
     "artifacts are unfinished. Still fail if this task violated prohibitions or "
     "did not produce its own artifacts."
 )
+
+
+def review_contamination_summary(payload: Any) -> str:
+    """``summarize`` of contamination dicts carried on a review payload.
+
+    Windows ``snapshot`` stores each artifact as a dict with a ``contamination``
+    object from ``scan_bytes``. Empty when nothing is contaminated.
+    """
+    if not isinstance(payload, Mapping):
+        return ""
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, Mapping):
+        return ""
+    findings: dict[str, Any] = {}
+    for name, meta in artifacts.items():
+        if not isinstance(meta, Mapping):
+            continue
+        scan = meta.get("contamination")
+        if isinstance(scan, Mapping):
+            findings[str(name)] = dict(scan)
+    return summarize(findings)
+
+
+def _artifact_label(item: str, root: Path | None, resolved: Path) -> str:
+    raw = Path(item)
+    if not raw.is_absolute():
+        return raw.as_posix()
+    if root is not None:
+        try:
+            return resolved.resolve().relative_to(root.resolve()).as_posix()
+        except (OSError, ValueError):
+            pass
+    return resolved.name
+
+
+def gate_collected_artifacts(result: Any, *, allow_aigc_marks: bool = False) -> Any:
+    """Fail an otherwise successful backend result whose artifacts are contaminated.
+
+    Runs only when ``result["ok"]`` is true and ``allow_aigc_marks`` is false.
+    Artifact entries may be absolute paths or paths relative to
+    ``result["workspace"]``. Missing paths are skipped. On a hit, sets
+    ``ok`` false, ``error`` to ``artifact_contaminated: <summarize()>``, and
+    ``artifact_contamination`` to the per-artifact scan dicts. Opt-out returns
+    the result unchanged. The scanner itself stays free of this policy.
+    """
+    if allow_aigc_marks or not isinstance(result, dict) or not result.get("ok"):
+        return result
+    artifacts = result.get("artifacts")
+    if not isinstance(artifacts, list):
+        return result
+    workspace = result.get("workspace")
+    root = Path(workspace) if isinstance(workspace, str) and workspace.strip() else None
+    findings: dict[str, Any] = {}
+    for item in artifacts:
+        if not isinstance(item, str) or not item.strip():
+            continue
+        candidate = Path(item)
+        if not candidate.is_absolute():
+            if root is None:
+                continue
+            candidate = root / item
+        if not candidate.is_file():
+            continue
+        try:
+            scan = scan_file(candidate)
+        except OSError:
+            continue
+        findings[_artifact_label(item, root, candidate)] = scan
+    line = summarize(findings)
+    if not line:
+        return result
+    failed = dict(result)
+    failed["ok"] = False
+    failed["error"] = f"artifact_contaminated: {line}"
+    failed["artifact_contamination"] = findings
+    return failed
+
+
+def _gate_backend_result(snap: Mapping[str, Any], task: Mapping[str, Any], result: Any) -> Any:
+    goal = snap.get("goal") if isinstance(snap.get("goal"), Mapping) else {}
+    return gate_collected_artifacts(result, allow_aigc_marks=allows_aigc_marks(goal, task))
 
 
 def task_acceptance_criteria(task: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -703,6 +806,18 @@ class AppCoordinator:
                     "system_action": "system_action_approval",
                 }[backend_kind]
                 decision_id = f"dec_{hashlib.sha256(request_id.encode('utf-8')).hexdigest()[:12]}"
+                decision_title = f"TeleAgent {backend_kind}"
+                decision_details: dict[str, Any] = {
+                    "backend_kind": backend_kind,
+                    "backend_request_id": request_id,
+                    "context_hash": action.get("context_hash"),
+                    "payload": action.get("payload"),
+                }
+                if backend_kind == "review":
+                    contamination_summary = review_contamination_summary(action.get("payload"))
+                    if contamination_summary:
+                        decision_title = "TeleAgent review (CONTAMINATED)"
+                        decision_details["summary"] = contamination_summary
                 opened = self.layer.open_decision(
                     goal_id,
                     kind=public_kind,
@@ -711,14 +826,9 @@ class AppCoordinator:
                     decision_id=decision_id,
                     request_id=request_id,
                     actions=[{"request_id": request_id, "kind": backend_kind}],
-                    title=f"TeleAgent {backend_kind}",
+                    title=decision_title,
                     return_to_upper=False,
-                    details={
-                        "backend_kind": backend_kind,
-                        "backend_request_id": request_id,
-                        "context_hash": action.get("context_hash"),
-                        "payload": action.get("payload"),
-                    },
+                    details=decision_details,
                     reason="TeleAgent worker requires a bounded decision",
                 )
                 if opened.get("ok"):
@@ -741,6 +851,7 @@ class AppCoordinator:
                     "run_id": run_id,
                     "error": f"backend resume failed: {type(e).__name__}",
                 }
+            result = _gate_backend_result(snap, task, result)
             finished = self.layer.finish_task(
                 goal_id,
                 str(task["task_id"]),
@@ -818,6 +929,7 @@ class AppCoordinator:
                     "run_id": run_id,
                     "error": f"backend observation failed: {type(e).__name__}",
                 }
+            result = _gate_backend_result(snap, task, result)
             finished = self.layer.finish_task(
                 goal_id,
                 str(task["task_id"]),
@@ -2090,6 +2202,9 @@ __all__ = [
     "project_forbidden_tools",
     "validate_plan",
     "worker_charter_for_task",
+    "allows_aigc_marks",
+    "gate_collected_artifacts",
+    "review_contamination_summary",
     "task_acceptance_criteria",
     "split_task_musts",
     "lead_error_retryable",

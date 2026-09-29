@@ -47,4 +47,14 @@ Copy-Item integrations\hermes\skills\teleagent-collab\SKILL.md $dst -Force
 - 0.2.3 时 `summary` 只有 “TeleAgent review”；0.2.4 起从 worker payload 生成，例如
   `review: artifacts hello2.txt(18B); tools write,read,powershell,read,report_final_files; finish=stop; violations=0`。
 - 提交方 `POST /v1/requests/{id}/decisions/{dec}` `{"verdict":"pass"}` 后任务 succeeded、goal completed。
-- 坑：TeleAgent 的 `write` 工具会给文本追加 “AI生成” 标识和大量零宽字符（14 字节内容 → 10777 字节）；验收只看文件存在时会放行，审阅时注意字节数。
+- 坑（当时）：TeleAgent 的 `write` 工具会给文本追加 “AI生成” 标识和大量零宽字符（14 字节内容 → 10777 字节）。只看文件存在的验收会放行。
+
+## 产物内容检查（skill 0.2.5）
+
+服务和 Windows 控制器现在按内容拒绝这种水印，不再只看文件在不在。
+
+- 命中 `AI生成`（允许中间空白）、`人工智能生成`，或 U+200B / U+200C / U+200D / U+2060 / U+FEFF / U+180E / U+2061–U+2064 时，任务失败。`error` 以 `artifact_contaminated:` 开头。
+- 英文 `AI generated` 不当水印。
+- BOM：文件头单独一个 U+FEFF（UTF-8 `EF BB BF`，或 UTF-16 `FF FE` / `FE FF`）是合法编码标记，不算污染；后面再出现的 U+FEFF 算污染。解不开的二进制不扫描。
+- 关闭检查：Goal `acceptance.allow_aigc_marks: true`，或该 Task 的 `inputs.allow_aigc_marks: true`（必须是布尔值）。Windows 章程同名字段同样放行。
+- `review` 决策若带上污染，标题为 `TeleAgent review (CONTAMINATED)`，摘要以 `CONTAMINATED` 开头。客户端应把这段原文告诉用户，不要批准。

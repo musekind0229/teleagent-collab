@@ -1,7 +1,7 @@
 ---
 name: teleagent-collab
 description: "Delegate work to local collab-service workers (agy/antigravity pool) via bin/hermes-collab-request.py: open, wait, report. Use when the user asks to have 'the worker'/'collab'/'agy' do a task or produce a file."
-version: 0.2.4
+version: 0.2.5
 author: teleagent-collab
 license: MIT
 platforms: [windows, linux, macos]
@@ -82,6 +82,7 @@ collab-service 是本机常驻的派工服务（Application API，默认 `http:/
 出现以下任一情况，**立即停止**，把 `request_id`、`state`、`failure` / `failure_reason` / `need_human` 原因原样（去掉任何密钥）告诉用户，等用户决定：
 
 - `state=failed` 或 `cancelled`；
+- 决策 `summary` 以 `CONTAMINATED` 开头，或失败结果的 `error` 以 `artifact_contaminated` 开头：这是失败/不安全的产物（AIGC 水印或不可见字符）。把这段原文告诉用户，不要批准。
 - 任何层级出现 `need_human: true`（顶层、`failure`、`tasks[].result`），或 `error` 以 `need_human:` 开头；
 - `pending_decisions` 非空（服务在等人拍板）；
 - `wait` 退出码 `4`：已经停在等人拍板。把 `request_id`、`wait.reason`（`pending_decisions` / `awaiting_decision` / `task_awaiting_decision`）、`decision_ids`、每条 `decisions[].summary` 转述给用户。禁止自己批准或拒绝决策（不要代答 `POST …/decisions/…`）；

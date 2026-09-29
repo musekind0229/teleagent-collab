@@ -676,6 +676,62 @@ class HermesCollabRequestTests(unittest.TestCase):
         meaningful_title = {**row, "title": "请复核 hello.txt"}
         self.assertEqual(HCR._decision_summary(meaningful_title), "请复核 hello.txt")
 
+    def test_review_summary_prefixes_contamination(self) -> None:
+        scan = {
+            "contaminated": True,
+            "aigc_marks": {"AI生成": 1},
+            "invisible": {"U+200B": 1926, "U+200D": 1658},
+        }
+        payload = {
+            "artifacts": {
+                "hello.txt": {
+                    "bytes": 10777,
+                    "preview": "hello\u200b「AI生成」",
+                    "contamination": scan,
+                }
+            },
+            "tools": [
+                {"tool": "write", "status": "completed", "input": {"content": "secret"}},
+                {"tool": "read", "status": "completed"},
+            ],
+            "finish": "stop",
+            "policy_violations": [],
+        }
+        direct = HCR._review_payload_summary(payload)
+        self.assertEqual(
+            direct,
+            "CONTAMINATED hello.txt: AI生成x1, U+200Bx1926, U+200Dx1658; "
+            "review: artifacts hello.txt(10777B); tools write,read; finish=stop; violations=0",
+        )
+        assert direct is not None
+        self.assertLessEqual(len(direct), 200)
+        self.assertNotIn("\u200b", direct)
+        self.assertNotIn("secret", direct)
+        row = {
+            "kind": "artifact_review",
+            "title": "TeleAgent review (CONTAMINATED)",
+            "reason": "TeleAgent worker requires a bounded decision",
+            "details": {
+                "backend_kind": "review",
+                "summary": "细节不该盖过污染前缀",
+                "payload": payload,
+            },
+        }
+        summary = HCR._decision_summary(row)
+        self.assertTrue(summary.startswith("CONTAMINATED hello.txt: AI生成x1, U+200Bx1926, U+200Dx1658; "))
+        self.assertLess(summary.find("CONTAMINATED"), summary.find("review:"))
+        self.assertLessEqual(len(summary), 200)
+        long_payload = {
+            "artifacts": payload["artifacts"],
+            "tools": [{"tool": f"toolname{i:02d}", "status": "completed"} for i in range(40)],
+            "finish": "stop",
+            "policy_violations": [],
+        }
+        truncated = HCR._review_payload_summary(long_payload)
+        assert truncated is not None
+        self.assertTrue(truncated.startswith("CONTAMINATED hello.txt:"))
+        self.assertLessEqual(len(truncated), 200)
+
     def test_native_permission_summary_from_payload(self) -> None:
         row = {
             "kind": "action_approval",

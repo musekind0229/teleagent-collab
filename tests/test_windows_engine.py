@@ -441,6 +441,67 @@ class Tests(unittest.TestCase):
         self.assertEqual(self.store.get(j['id'])['state'],'failed')
         self.assertFalse((Path(j['workspace'])/'test-package.msi').exists())
 
+    def test_snapshot_contamination_blocks_pass_until_opt_out(self):
+        j=self.start()
+        dirty='hello decision\n\nAI生成\n'+('\u200b\u200d'*3)
+        (Path(j['workspace'])/'a.txt').write_text(dirty, encoding='utf-8')
+        (Path(j['workspace'])/'b.txt').write_text('verified\n', encoding='utf-8')
+        self.client.status[j['session_id']]={'type':'idle'}
+        self.client.messages[j['session_id']].append(
+            {'info':{'role':'assistant','finish':'stop'},'parts':[]})
+        self.rescan(j)
+        p=self.store.inbox()[0]
+        dirty_scan=p['payload']['artifacts']['a.txt']['contamination']
+        clean_scan=p['payload']['artifacts']['b.txt']['contamination']
+        self.assertTrue(dirty_scan['contaminated'])
+        self.assertEqual(dirty_scan['aigc_marks']['AI生成'], 1)
+        self.assertEqual(dirty_scan['invisible']['U+200B'], 3)
+        self.assertEqual(dirty_scan['invisible']['U+200D'], 3)
+        self.assertFalse(clean_scan['contaminated'])
+        self.assertEqual(clean_scan['encoding'], 'utf-8')
+        with self.assertRaisesRegex(ValueError, 'Artifact content contaminated'):
+            self.answer(p, 'pass')
+        self.assertEqual(self.store.get(j['id'])['state'], 'awaiting_review')
+        self.answer(p, 'fail')
+        redone=self.store.get(j['id'])
+        self.assertEqual(redone['state'], 'running')
+        self.assertEqual(redone['redos'], 1)
+
+    def test_allow_aigc_marks_permits_contaminated_pass(self):
+        c=charter(); c['allow_aigc_marks']=True
+        j=self.engine.submit(c); self.engine.tick(); j=self.store.get(j['id'])
+        dirty='AI 生成\n'+'\u200b'
+        for name in ('a.txt', 'b.txt'):
+            (Path(j['workspace'])/name).write_text(dirty, encoding='utf-8')
+        self.client.status[j['session_id']]={'type':'idle'}
+        self.client.messages[j['session_id']].append(
+            {'info':{'role':'assistant','finish':'stop'},'parts':[]})
+        self.rescan(j)
+        p=self.store.inbox()[0]
+        self.assertTrue(p['payload']['artifacts']['a.txt']['contamination']['contaminated'])
+        self.answer(p, 'pass')
+        self.assertEqual(self.store.get(j['id'])['state'], 'passed')
+
+    def test_allow_aigc_marks_must_be_boolean(self):
+        c=charter(); c['allow_aigc_marks']='true'
+        with self.assertRaisesRegex(ValueError, 'allow_aigc_marks'):
+            validate_charter(c)
+        c['allow_aigc_marks']=True
+        self.assertIs(validate_charter(c)['allow_aigc_marks'], True)
+        bom=self.start()
+        payload=b'\xef\xbb\xbfverified\n'
+        for name in ('a.txt', 'b.txt'):
+            (Path(bom['workspace'])/name).write_bytes(payload)
+        self.client.status[bom['session_id']]={'type':'idle'}
+        self.client.messages[bom['session_id']].append(
+            {'info':{'role':'assistant','finish':'stop'},'parts':[]})
+        self.rescan(bom)
+        review=self.store.inbox()[0]
+        self.assertFalse(review['payload']['artifacts']['a.txt']['contamination']['contaminated'])
+        self.assertEqual(review['payload']['artifacts']['a.txt']['contamination']['encoding'], 'utf-8-bom')
+        self.answer(review, 'pass')
+        self.assertEqual(self.store.get(bom['id'])['state'], 'passed')
+
     def test_system_install_requires_explicit_sensitive_effect_authorization(self):
         source=Path(self.tmp.name)/'source.msi';source.write_bytes(b'fixed-msi-fixture')
         c=install_charter(source);c['user_authorized_effects']=[]
