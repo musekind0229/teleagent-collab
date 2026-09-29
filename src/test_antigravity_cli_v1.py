@@ -234,6 +234,51 @@ class TestSimulatedBackend(unittest.TestCase):
             self.assertNotIn(SKIP_PERMISSIONS_FLAG, argv)
             self.assertEqual(result.get("conversation_id"), "conv_hello")
 
+    def _run_rel_workspace(self, charter: dict, fake_art: str):
+        with tempfile.TemporaryDirectory() as td:
+            fake = _write_fake_agy(td)
+            be = self._backend(fake, {"AGY_FAKE_ARTIFACT": fake_art})
+            old_cwd = os.getcwd()
+            os.chdir(td)
+            try:
+                rel_ws = Path("rel-app") / "ws"
+                rel_ws.mkdir(parents=True)
+                result = run_antigravity_charter(
+                    charter=charter,
+                    workdir=rel_ws,
+                    instruction="write the file",
+                    name="rel",
+                    timeout_sec=10,
+                    backend=be,
+                )
+                exists = (Path(td) / "rel-app" / "ws" / fake_art).is_file()
+            finally:
+                os.chdir(old_cwd)
+            return result, exists
+
+    def test_relative_workspace_reports_present_artifact(self):
+        """Regression: relative --workspace used to double-prefix -> artifacts=[]."""
+        result, exists = self._run_rel_workspace(
+            {"name": "rel", "goal": "g", "done_when": {"artifacts": ["hello-from-worker.txt"]}},
+            "hello-from-worker.txt",
+        )
+        self.assertTrue(exists)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result.get("missing"), [], result)
+        self.assertEqual(len(result["artifacts"]), 1, result)
+        self.assertTrue(result["artifacts"][0].endswith("hello-from-worker.txt"))
+
+    def test_subdir_artifact_keeps_relative_path(self):
+        """Regression: Path.name dropped subdirs (out/x.md -> x.md)."""
+        result, exists = self._run_rel_workspace(
+            {"name": "rel", "goal": "g", "done_when": {"artifacts": ["out/x.md"]}},
+            "out/x.md",
+        )
+        self.assertTrue(exists)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result.get("missing"), [], result)
+        self.assertTrue(Path(result["artifacts"][0]).as_posix().endswith("out/x.md"), result)
+
     def test_live_json_status_success_uppercase(self):
         """agy print JSON uses status=SUCCESS (verified live)."""
         with tempfile.TemporaryDirectory() as td:

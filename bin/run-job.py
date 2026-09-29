@@ -75,6 +75,7 @@ def write_reports(out_dir: Path, charter: dict, result: dict, instruction: str) 
         "run_id",
         "finish",
         "artifact_records",
+        "missing",
         "job_end_contract",
         "lead_advisory",
         "rework_used_new_run",

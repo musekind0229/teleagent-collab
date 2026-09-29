@@ -1091,9 +1091,13 @@ def run_antigravity_job_via_public_api(
     root = Path(workdir)
     root.mkdir(parents=True, exist_ok=True)
     job = name or (job_name(charter) if callable(job_name) else str(charter.get("name") or "job"))
+    # Keep charter artifacts workspace-relative. Resolving against ``root`` and
+    # then passing the result back as a relative artifact double-prefixed a
+    # relative --workspace (``ws/ws/x``) and ``Path.name`` dropped subdirs, so
+    # collect_result reported artifacts=[] while the file existed. Absolute
+    # charter paths are still mapped under root by start_run's sanitizer.
     try:
-        arts = resolve_arts(charter, workspace=root)
-        arts = [Path(a).name if Path(a).is_absolute() else a for a in arts]
+        arts = resolve_arts(charter, workspace=None)
     except Exception:
         arts = artifacts_from_charter(charter)
 
