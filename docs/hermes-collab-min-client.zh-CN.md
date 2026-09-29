@@ -65,6 +65,7 @@ exit 4 在原 status 上追加字段（`ok` 保持服务端原值）：
         "title": "需要批准安装",
         "task_id": "task-1",
         "status": "pending",
+        "reason": "",
         "summary": "需要批准安装"
       }
     ]
@@ -78,7 +79,7 @@ exit 4 在原 status 上追加字段（`ok` 保持服务端原值）：
 - `awaiting_decision`：`awaiting_decision` 为真，或 `pending_decision_count>0`（行可能还没挂在 status 上，会再 GET 一次 `/decisions` 补 `decision_ids`；这次失败则 `decisions` 为 `[]`）；
 - `task_awaiting_decision`：某个 `tasks[].status=="awaiting_decision"`。没有决策行时 `decisions` 为 `[]`，并带 `wait.task_ids`。
 
-`decisions[].summary`：依次取 `title`、`details.summary` / `message` / `reason` / `question`、`lead_error.message` 里第一条非空文本，压成单行并截断到 200 字；都没有则用 `kind`。
+`decisions[].summary`：依次取第一条非空文本——`title`（仅当非空且不等于 `kind`）、`details.summary`、`details.message`、`details.reason`、`details.question`、决策行 `reason`、`lead_error.message`、`title`、最后是 `kind`。压成单行并截断到 200 字。`decisions[].reason` 是决策行上的 `reason`（没有则为 `""`）。
 
 ### 一行示例
 

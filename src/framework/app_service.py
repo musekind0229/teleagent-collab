@@ -1452,6 +1452,7 @@ def public_pending_decisions(rows: Any) -> list[dict[str, Any]]:
             "request_id": str(row.get("request_id") or ""),
             "kind": str(row.get("kind") or ""),
             "title": str(row.get("title") or ""),
+            "reason": str(row.get("reason") or ""),
             "task_id": str(row.get("task_id") or ""),
             "run_id": str(row.get("run_id") or ""),
             "status": str(row.get("status") or ""),

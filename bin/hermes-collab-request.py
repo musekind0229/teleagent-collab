@@ -293,20 +293,32 @@ def _one_line(text: str, limit: int = _SUMMARY_LIMIT) -> str:
 
 
 def _decision_summary(row: dict[str, Any]) -> str:
-    """First non-empty of title, details fields, lead_error.message; else kind."""
-    candidates: list[Any] = [row.get("title")]
+    """One-line summary, truncated to 200.
+
+    Skip title when it is empty or equal to kind (escalate stores the kind
+    slug in title). Then details, the row reason, lead_error.message, title,
+    and finally kind.
+    """
+    title = row.get("title")
+    kind = row.get("kind")
+    candidates: list[Any] = []
+    title_text = _nonempty_str(title)
+    if title_text is not None and title_text.strip() != str(kind or "").strip():
+        candidates.append(title_text)
     details = row.get("details")
     if isinstance(details, dict):
         for key in ("summary", "message", "reason", "question"):
             candidates.append(details.get(key))
+    candidates.append(row.get("reason"))
     lead_error = row.get("lead_error")
     if isinstance(lead_error, dict):
         candidates.append(lead_error.get("message"))
+    candidates.append(title)
     for value in candidates:
         text = _nonempty_str(value)
         if text is not None:
             return _one_line(text)
-    return _one_line(str(row.get("kind") or ""))
+    return _one_line(str(kind or ""))
 
 
 def _decision_brief(row: dict[str, Any]) -> dict[str, Any]:
@@ -321,6 +333,7 @@ def _decision_brief(row: dict[str, Any]) -> dict[str, Any]:
         "title": _text(row.get("title")),
         "task_id": _text(row.get("task_id")),
         "status": _text(row.get("status")),
+        "reason": _text(row.get("reason")),
         "summary": _decision_summary(row),
     }
 

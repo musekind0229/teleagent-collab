@@ -283,6 +283,7 @@ class HermesCollabRequestTests(unittest.TestCase):
         self.assertFalse(wait["timed_out"])
         self.assertEqual(wait["decision_ids"], ["dec-1"])
         self.assertEqual(wait["decisions"][0]["summary"], "需要批准安装")
+        self.assertEqual(wait["decisions"][0]["reason"], "")
         self.assertEqual(wait["decisions"][0]["decision_id"], "dec-1")
         self.assertEqual(wait["decisions"][0]["kind"], "system_action_approval")
         self.assertEqual(wait["decisions"][0]["task_id"], "task-1")
@@ -540,6 +541,7 @@ class HermesCollabRequestTests(unittest.TestCase):
         assert fallback is not None
         self.assertEqual(fallback["reason"], "pending_decisions")
         self.assertEqual(fallback["decisions"][0]["summary"], "system_action_approval")
+        self.assertEqual(fallback["decisions"][0]["reason"], "")
         self.assertIsNone(
             HCR.need_human_view(
                 {
@@ -550,6 +552,68 @@ class HermesCollabRequestTests(unittest.TestCase):
                 }
             )
         )
+
+    def test_decision_summary_skips_kind_title(self) -> None:
+        kind = "escalate_over_budget"
+        with_reason = {
+            "decision_id": "d-reason",
+            "kind": kind,
+            "title": kind,
+            "task_id": "T",
+            "status": "pending",
+            "reason": "预算用尽\n需要加人",
+        }
+        self.assertEqual(HCR._decision_summary(with_reason), "预算用尽 需要加人")
+        brief = HCR._decision_brief(with_reason)
+        self.assertEqual(brief["summary"], "预算用尽 需要加人")
+        self.assertEqual(brief["reason"], "预算用尽\n需要加人")
+        self.assertIn("reason", brief)
+
+        with_details = {
+            "decision_id": "d-details",
+            "kind": kind,
+            "title": kind,
+            "reason": "row reason 不该盖过 details.summary",
+            "details": {"summary": "细节里的摘要", "message": "也不该赢"},
+            "lead_error": {"message": "lead 更不该赢"},
+        }
+        self.assertEqual(HCR._decision_summary(with_details), "细节里的摘要")
+        self.assertEqual(
+            HCR._decision_brief(with_details)["reason"],
+            "row reason 不该盖过 details.summary",
+        )
+
+        meaningful = {
+            "kind": "system_action_approval",
+            "title": "需要批准安装",
+            "reason": "不应盖过有意义的 title",
+            "details": {"summary": "也不应盖过 title"},
+        }
+        self.assertEqual(HCR._decision_summary(meaningful), "需要批准安装")
+
+        only_kind = {"kind": kind}
+        only_brief = HCR._decision_brief(only_kind)
+        self.assertEqual(only_brief["summary"], kind)
+        self.assertEqual(only_brief["reason"], "")
+
+        same_title = {
+            "kind": kind,
+            "title": kind,
+            "reason": "",
+            "details": {"summary": "  ", "message": "", "reason": None, "question": ""},
+            "lead_error": {"message": "   "},
+        }
+        self.assertEqual(HCR._decision_summary(same_title), kind)
+
+        view = HCR.need_human_view(
+            {"state": "blocked", "pending_decisions": [with_reason]}
+        )
+        self.assertIsNotNone(view)
+        assert view is not None
+        self.assertEqual(view["decisions"][0]["summary"], "预算用尽 需要加人")
+        self.assertEqual(view["decisions"][0]["reason"], "预算用尽\n需要加人")
+        self.assertEqual(view["decisions"][0]["kind"], kind)
+        self.assertEqual(view["decisions"][0]["title"], kind)
 
     def test_collab_env_file_supplies_bearer(self) -> None:
         captured: dict = {}
