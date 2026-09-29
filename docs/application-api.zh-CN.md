@@ -59,6 +59,8 @@ try {
 - `reply_permission` 固定 **501 unsupported**（与 inprocess 同形）。没有 TeleAgent 的 permission / question / system_action 逐条回传；hello 烟测靠 `AGY_AUTO_APPROVE` 打开 `--dangerously-skip-permissions`，不是把 skip 映射成 once/approve。
 - 账号池在**服务启动时**选一次 HOME，钉死本进程生命周期；换号 / 配额冷却后的再选要重启 service（或另批 per-dispatch 选号）。
 
+Hermes / 终端调用方可用薄客户端 [hermes-collab-min-client.zh-CN.md](hermes-collab-min-client.zh-CN.md)（`bin/hermes-collab-request.py`：open / status / report / wait）。后端仍由本服务启动参数决定。
+
 ## 推荐入口（桌面 GUI）
 
 生产与日常联调只走**已登录的桌面 TeleAgent**。先探活，再开服务；**不要**加 `--teleagent-stdin-wrap`。
