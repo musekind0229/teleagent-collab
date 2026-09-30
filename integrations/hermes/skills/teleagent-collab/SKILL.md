@@ -1,7 +1,7 @@
 ---
 name: teleagent-collab
 description: "Delegate work to local collab-service workers (agy/antigravity pool) via bin/hermes-collab-request.py: open, wait, report. Use when the user asks to have 'the worker'/'collab'/'agy' do a task or produce a file."
-version: 0.2.6
+version: 0.2.7
 author: teleagent-collab
 license: MIT
 platforms: [windows, linux, macos]
@@ -90,6 +90,8 @@ collab-service 是本机常驻的派工服务（Application API，默认 `http:/
 - `wait` 退出码 3 超时，或 401/403/transport_error。401/403 只转告 `auth.token_source`，不要回显 token。
 
 禁止：自行 `POST /v1/requests/{id}/retry`、重新 open 同一目标“再试一次”、换号、改账号池、重启服务、设置 `AGY_AUTO_APPROVE`、自己批准或拒绝决策。
+
+`decide <request_id> <decision_id> --verdict <原话>` 只给人类提交者/操作者用；Hermes 仍禁止自行调用。仅当用户明确说出要提交的 verdict 时，才可按该原话执行 `decide`；若被拒绝（`code` 为 `artifact_contaminated` 或 `worker_decision_rejected`），把 `code` 和 `error` 原样转告。
 
 ## Pitfalls
 

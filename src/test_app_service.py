@@ -43,8 +43,9 @@ from framework.artifact_handoff import (
     safe_relative_name,
     stage_handoff_files,
 )
+from execution_backend.base import BackendError, BackendStatus
 from execution_backend.windows_supervised_v1 import WindowsSupervisedExecutionBackend
-from win_collab.core import Store
+from win_collab.core import ArtifactContaminatedError, Store
 
 GOAL_SCHEMA = json.loads(
     (Path(__file__).resolve().parent.parent / "contracts" / "goal.schema.json").read_text(encoding="utf-8")
@@ -454,6 +455,39 @@ class _PendingCancelBackend(_AsyncBackend):
         if self.cancel_calls == 1:
             return 200, {"ok": False, "run_id": run_id, "state": "stopping", "pending": True}
         return 200, {"ok": True, "run_id": run_id, "state": "cancelled"}
+
+
+def _decision_goal(decision_id: str = "d1", backend_request_id: str = "backend-req") -> dict:
+    return {
+        "ok": True,
+        "submitter_id": "api:test",
+        "goal": {
+            "state": "running",
+            "pending_decisions": [
+                {
+                    "decision_id": decision_id,
+                    "kind": "artifact_review",
+                    "return_to_upper": False,
+                    "details": {
+                        "backend_request_id": backend_request_id,
+                        "backend_kind": "review",
+                    },
+                }
+            ],
+            "resolved_decisions": [],
+        },
+    }
+
+
+class _RaisingBackend:
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+        self.backend_id = "test.raise"
+        self.calls: list = []
+
+    def resolve_decision(self, request_id, *, verdict, reason, answers=None):
+        self.calls.append((request_id, verdict, reason, answers))
+        raise self._exc
 
 
 class AppServiceTests(unittest.TestCase):
@@ -1471,6 +1505,194 @@ class AppServiceTests(unittest.TestCase):
                 pending[0]["details"]["summary"],
                 "CONTAMINATED hello.txt: AI生成x1, U+200Bx4, U+200Dx4",
             )
+
+    def _raising_app(self, td: str, exc: BaseException) -> tuple[CollabApplication, _RaisingBackend]:
+        backend = _RaisingBackend(exc)
+        app = CollabApplication(td, backend=backend)
+        app.layer.get_goal = lambda goal_id: _decision_goal()
+        return app, backend
+
+    def test_resolve_contaminated_decision_is_409_with_counts(self):
+        findings = {
+            "label.txt": {
+                "contaminated": True,
+                "encoding": "utf-8",
+                "aigc_marks": {"AI生成": 1},
+                "invisible": {"U+200B": 2},
+                "first_offset": 3,
+                "preview": "AI生成 secret text",
+                "scanned": True,
+            },
+            "clean.txt": {
+                "contaminated": False,
+                "encoding": "utf-8",
+                "aigc_marks": {},
+                "invisible": {},
+            },
+        }
+        summary = "CONTAMINATED label.txt: AI生成x1, U+200Bx2"
+        exc = ArtifactContaminatedError(summary, findings)
+        with tempfile.TemporaryDirectory() as td:
+            app, backend = self._raising_app(td, exc)
+            with self.assertRaises(AppError) as cm:
+                app.resolve("g1", "d1", {"verdict": "pass"})
+        err = cm.exception
+        self.assertEqual(err.status, 409)
+        self.assertEqual(err.code, "artifact_contaminated")
+        self.assertEqual(
+            str(err),
+            "artifact contaminated: "
+            + summary
+            + ". Fail this review so the worker can redo it, or re-open the request "
+            "with acceptance.allow_aigc_marks=true if the marks are intended.",
+        )
+        self.assertEqual(err.extra["hint"], "allow_aigc_marks")
+        label = err.extra["contamination"]["label.txt"]
+        self.assertEqual(label["aigc_marks"], {"AI生成": 1})
+        self.assertEqual(label["invisible"], {"U+200B": 2})
+        self.assertEqual(label["encoding"], "utf-8")
+        self.assertNotIn("preview", label)
+        self.assertNotIn("first_offset", label)
+        self.assertNotIn("secret", json.dumps(err.extra["contamination"]))
+        self.assertEqual(set(err.extra["contamination"]["clean.txt"]), {"aigc_marks", "invisible", "encoding"})
+        self.assertEqual(backend.calls[0][0], "backend-req")
+        self.assertEqual(backend.calls[0][1], "pass")
+
+        class DuckContaminated(ValueError):
+            """Same shape, different class name: detected via ``findings``."""
+
+            def __init__(self) -> None:
+                self.summary = "CONTAMINATED duck.txt: AI生成x1"
+                self.findings = {
+                    "duck.txt": {
+                        "aigc_marks": {"AI生成": 1, "note": "not-a-count"},
+                        "invisible": {"U+200B": True},
+                        "encoding": "utf-8",
+                        "preview": "hidden",
+                    }
+                }
+                super().__init__("plain value error text")
+
+        with tempfile.TemporaryDirectory() as td:
+            app, _backend = self._raising_app(td, DuckContaminated())
+            with self.assertRaises(AppError) as cm:
+                app.resolve("g1", "d1", {"verdict": "pass"})
+        self.assertEqual(cm.exception.code, "artifact_contaminated")
+        duck = cm.exception.extra["contamination"]["duck.txt"]
+        self.assertEqual(duck["aigc_marks"], {"AI生成": 1})
+        self.assertEqual(duck["invisible"], {})
+        self.assertNotIn("hidden", json.dumps(cm.exception.extra))
+        self.assertNotIn("plain value error text", str(cm.exception))
+
+    def test_resolve_other_value_error_names_the_reason(self):
+        with tempfile.TemporaryDirectory() as td:
+            app, _backend = self._raising_app(td, ValueError("Worker is still running"))
+            with self.assertRaises(AppError) as cm:
+                app.resolve("g1", "d1", {"verdict": "pass"})
+        err = cm.exception
+        self.assertEqual(err.status, 409)
+        self.assertEqual(err.code, "worker_decision_rejected")
+        self.assertEqual(str(err), "worker decision rejected: Worker is still running")
+        self.assertEqual(err.extra, {})
+
+        secret = "blocked token=abc123sk-abcdefghijklmnopqrstuvwxyz012345 tail"
+        with tempfile.TemporaryDirectory() as td:
+            app, _backend = self._raising_app(td, ValueError(secret))
+            with self.assertRaises(AppError) as cm:
+                app.resolve("g1", "d1", {"verdict": "pass"})
+        self.assertEqual(cm.exception.code, "worker_decision_rejected")
+        self.assertIn("worker decision rejected: blocked [redacted] tail", str(cm.exception))
+        self.assertNotIn("abc123", str(cm.exception))
+
+    def test_resolve_backend_error_keeps_sanitized_message(self):
+        exc = BackendError(
+            BackendStatus.FAILED,
+            "illegal verdict token=abc123sk-abcdefghijklmnopqrstuvwxyz012345 for review",
+            capability="resolve_decision",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            app, _backend = self._raising_app(td, exc)
+            with self.assertRaises(AppError) as cm:
+                app.resolve("g1", "d1", {"verdict": "nope"})
+        err = cm.exception
+        self.assertEqual(err.status, 409)
+        self.assertEqual(err.code, "worker_decision_failed")
+        self.assertEqual(
+            str(err),
+            "worker decision failed: illegal verdict [redacted] for review",
+        )
+        self.assertNotIn("abc123", str(err))
+
+    def test_resolve_unexpected_exception_is_type_name_only(self):
+        class Boom(RuntimeError):
+            pass
+
+        with tempfile.TemporaryDirectory() as td:
+            app, _backend = self._raising_app(td, Boom("token=should-not-leak secret text"))
+            with self.assertRaises(AppError) as cm:
+                app.resolve("g1", "d1", {"verdict": "pass"})
+        err = cm.exception
+        self.assertEqual(err.status, 409)
+        self.assertEqual(err.code, "worker_decision_failed")
+        self.assertEqual(str(err), "worker decision failed: Boom")
+        self.assertNotIn("should-not-leak", str(err))
+        self.assertNotIn("token", str(err))
+
+    def test_http_contaminated_decision_body_keeps_counts_and_core_keys(self):
+        findings = {
+            "label.txt": {
+                "encoding": "utf-8",
+                "aigc_marks": {"AI生成": 1},
+                "invisible": {},
+                "preview": "do not leak this body",
+            }
+        }
+        exc = ArtifactContaminatedError("CONTAMINATED label.txt: AI生成x1", findings)
+        with tempfile.TemporaryDirectory() as td:
+            app, _backend = self._raising_app(td, exc)
+
+            def resolve_with_override(goal_id, decision_id, payload):
+                try:
+                    return CollabApplication.resolve(app, goal_id, decision_id, payload)
+                except AppError as err:
+                    err.extra = {
+                        **err.extra,
+                        "ok": True,
+                        "code": "not-this",
+                        "error": "not-this",
+                    }
+                    raise
+
+            app.resolve = resolve_with_override  # type: ignore[method-assign]
+            server = CollabHttpServer(("127.0.0.1", 0), app)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_address[1]}"
+            try:
+                req = urllib.request.Request(
+                    f"{base}/v1/requests/g1/decisions/d1",
+                    data=json.dumps({"verdict": "pass"}).encode("utf-8"),
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    urllib.request.urlopen(req, timeout=2)
+                self.assertEqual(cm.exception.code, 409)
+                body = json.loads(cm.exception.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["code"], "artifact_contaminated")
+        self.assertTrue(str(body["error"]).startswith("artifact contaminated: CONTAMINATED label.txt: AI生成x1."))
+        self.assertEqual(body["hint"], "allow_aigc_marks")
+        self.assertEqual(body["contamination"]["label.txt"]["aigc_marks"], {"AI生成": 1})
+        self.assertEqual(body["contamination"]["label.txt"]["invisible"], {})
+        self.assertEqual(body["contamination"]["label.txt"]["encoding"], "utf-8")
+        self.assertNotIn("preview", body["contamination"]["label.txt"])
+        self.assertNotIn("do not leak", json.dumps(body))
+        self.assertNotEqual(body["error"], "not-this")
 
 
 if __name__ == "__main__":

@@ -1387,6 +1387,102 @@ class HermesCollabRequestTests(unittest.TestCase):
         self.assertEqual(payload["code"], "bad_external_input")
         self.assertIn("no-such-file.txt", payload["error"])
 
+    def test_decide_posts_encoded_ids_and_exits_0(self) -> None:
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout=30):
+            captured["url"] = req.full_url
+            captured["method"] = req.get_method()
+            captured["body"] = json.loads(req.data.decode("utf-8"))
+            return _FakeResp({"ok": True, "state": "running", "request_id": "目标/1"})
+
+        code, text = self._run_main(
+            [
+                "decide",
+                "目标/1",
+                "决策 2",
+                "--verdict",
+                "pass",
+                "--reason",
+                "checked",
+                "--answers",
+                '[["yes"]]',
+            ],
+            fake_urlopen,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(captured["method"], "POST")
+        self.assertNotIn("目标", captured["url"])
+        self.assertNotIn("决策", captured["url"])
+        self.assertIn("/v1/requests/", captured["url"])
+        self.assertIn("/decisions/", captured["url"])
+        self.assertIn("%2F", captured["url"])
+        self.assertEqual(captured["body"]["verdict"], "pass")
+        self.assertEqual(captured["body"]["reason"], "checked")
+        self.assertEqual(captured["body"]["answers"], [["yes"]])
+        self.assertTrue(text.strip().endswith("}") or "\n" in text)
+        payload = json.loads(text)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(text.isascii())
+        self.assertEqual(payload["request_id"], "目标/1")
+
+    def test_decide_409_passthrough_exits_5(self) -> None:
+        message = "artifact contaminated: CONTAMINATED label.txt: AI生成x1. Fail this review"
+        err_body = {
+            "ok": False,
+            "code": "artifact_contaminated",
+            "error": message,
+            "contamination": {
+                "label.txt": {
+                    "aigc_marks": {"AI生成": 1},
+                    "invisible": {},
+                    "encoding": "utf-8",
+                }
+            },
+            "hint": "allow_aigc_marks",
+        }
+
+        def fake_urlopen(req, timeout=30):
+            self.assertEqual(req.get_method(), "POST")
+            self.assertTrue(req.full_url.endswith("/v1/requests/g1/decisions/d1"))
+            raise HTTPError(
+                req.full_url,
+                409,
+                "Conflict",
+                hdrs=None,  # type: ignore[arg-type]
+                fp=io.BytesIO(json.dumps(err_body).encode("utf-8")),
+            )
+
+        code, text = self._run_main(
+            ["decide", "g1", "d1", "--verdict", "pass"],
+            fake_urlopen,
+        )
+        self.assertEqual(code, HCR.EXIT_DECISION_REFUSED)
+        self.assertEqual(code, 5)
+        self.assertTrue(text.isascii())
+        self.assertNotIn("AI生成", text)
+        payload = json.loads(text)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["code"], "artifact_contaminated")
+        self.assertEqual(payload["error"], message)
+        self.assertEqual(payload["http_status"], 409)
+        self.assertEqual(payload["hint"], "allow_aigc_marks")
+        self.assertEqual(payload["contamination"]["label.txt"]["aigc_marks"]["AI生成"], 1)
+
+    def test_decide_transport_error_exits_1(self) -> None:
+        def fake_urlopen(req, timeout=30):
+            raise URLError("refused")
+
+        code, text = self._run_main(
+            ["decide", "g1", "d1", "--verdict", "fail", "--reason", "redo"],
+            fake_urlopen,
+        )
+        self.assertEqual(code, 1)
+        payload = json.loads(text)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["code"], "transport_error")
+        self.assertNotIn("contamination", payload)
+
     def test_help_mentions_ascii_default_and_unicode(self) -> None:
         help_text = HCR.build_parser().format_help()
         self.assertIn("--unicode", help_text)

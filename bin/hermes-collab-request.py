@@ -17,7 +17,7 @@ Lookup order:
      (skipped when LOCALAPPDATA is missing)
      other OS: ~/.hermes/.env
 
-Subcommands: open | status | report | wait
+Subcommands: open | status | report | wait | decide
 Stdout: one JSON object (single line). Default is pure ASCII
 (ensure_ascii=True); non-ASCII becomes \\uXXXX so PowerShell 5.1 pipes
 (any code page) and Hermes UTF-8 decoding both keep the text.
@@ -30,11 +30,13 @@ reconfigure exists, so a mismatched code page does not raise
 UnicodeEncodeError.
 
 Exit codes:
-  0  EXIT_OK         success (wait: state completed)
-  1  EXIT_ERROR      HTTP/transport/API error, or payload ok=false
-  2  EXIT_FAILED     wait ended in failed or cancelled
-  3  EXIT_TIMEOUT    wait hit the wall-clock deadline
-  4  EXIT_NEED_HUMAN wait stopped immediately: a human decision is required
+  0  EXIT_OK               success (wait: state completed)
+  1  EXIT_ERROR            HTTP/transport/API error, or payload ok=false
+  2  EXIT_FAILED           wait ended in failed or cancelled
+  3  EXIT_TIMEOUT          wait hit the wall-clock deadline
+  4  EXIT_NEED_HUMAN       wait stopped immediately: a human decision is required
+  5  EXIT_DECISION_REFUSED decide: server refused the decision (HTTP 409).
+                          Body keeps code, error, and contamination/hint when present.
 """
 from __future__ import annotations
 
@@ -63,6 +65,7 @@ EXIT_ERROR = 1
 EXIT_FAILED = 2
 EXIT_TIMEOUT = 3
 EXIT_NEED_HUMAN = 4
+EXIT_DECISION_REFUSED = 5
 _SUMMARY_LIMIT = 200
 
 
@@ -371,6 +374,51 @@ def cmd_status(args: argparse.Namespace) -> dict[str, Any]:
 def cmd_report(args: argparse.Namespace) -> dict[str, Any]:
     rid = _encode_id(args.request_id)
     return request_json("GET", f"/v1/requests/{rid}/report", timeout=float(args.http_timeout))
+
+
+def cmd_decide(args: argparse.Namespace) -> dict[str, Any]:
+    """POST a human verdict. HTTP 409 exits 5; other failures exit 1.
+
+    The error payload is the server JSON (code, error, http_status) plus
+    contamination / hint when the server sent them. Ids are percent-encoded.
+    """
+    rid = _encode_id(args.request_id)
+    did = _encode_id(args.decision_id)
+    body: dict[str, Any] = {"verdict": str(args.verdict)}
+    reason = str(args.reason or "")
+    if reason:
+        body["reason"] = reason
+    raw_answers = str(args.answers or "")
+    if raw_answers:
+        try:
+            parsed = json.loads(raw_answers)
+        except json.JSONDecodeError as e:
+            raise ClientError(
+                {"ok": False, "code": "invalid_answers", "error": "answers must be a JSON array"},
+                exit_code=EXIT_ERROR,
+            ) from e
+        if not isinstance(parsed, list):
+            raise ClientError(
+                {"ok": False, "code": "invalid_answers", "error": "answers must be a JSON array"},
+                exit_code=EXIT_ERROR,
+            )
+        body["answers"] = parsed
+    try:
+        return request_json(
+            "POST",
+            f"/v1/requests/{rid}/decisions/{did}",
+            body=body,
+            timeout=float(args.http_timeout),
+        )
+    except ClientError as exc:
+        status = exc.payload.get("http_status")
+        try:
+            refused = int(status) == 409
+        except (TypeError, ValueError):
+            refused = False
+        if refused:
+            exc.exit_code = EXIT_DECISION_REFUSED
+        raise
 
 
 def _nonempty_str(value: Any) -> str | None:
@@ -852,6 +900,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="poll interval seconds (default 2)",
     )
     p_wait.set_defaults(func=cmd_wait)
+
+    p_dec = sub.add_parser(
+        "decide",
+        help="POST /v1/requests/{id}/decisions/{decision_id} (human verdict; HTTP 409 exits 5)",
+    )
+    p_dec.add_argument("request_id", help="request_id / goal_id")
+    p_dec.add_argument("decision_id", help="decision_id")
+    p_dec.add_argument("--verdict", required=True, help="verdict to submit, exactly as given")
+    p_dec.add_argument("--reason", default="", help="optional reason")
+    p_dec.add_argument(
+        "--answers",
+        default="",
+        help="optional JSON array of answers (question decisions)",
+    )
+    p_dec.set_defaults(func=cmd_decide)
 
     return p
 

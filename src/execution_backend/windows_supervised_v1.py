@@ -321,6 +321,13 @@ class WindowsSupervisedExecutionBackend(ExecutionBackendABC):
         reason: str,
         answers: list | None = None,
     ) -> dict[str, Any]:
+        """Apply one human verdict on the controller inbox.
+
+        Refusals propagate unchanged. ``ArtifactContaminatedError`` keeps
+        ``summary`` and ``findings``; other ``ValueError`` messages stay
+        intact so the application API can explain the HTTP 409. Do not wrap
+        them in ``BackendError`` — that would drop the type and attributes.
+        """
         with self._lock, self._engine() as (store, engine):
             row = store.db.execute(
                 "SELECT kind,data,resolved FROM requests WHERE id=?",
@@ -340,6 +347,8 @@ class WindowsSupervisedExecutionBackend(ExecutionBackendABC):
             }
             if kind == "question" and decision["decision"] == "answer":
                 decision["answers"] = list(answers or [])
+            # engine.decide raises ArtifactContaminatedError / ValueError with
+            # message and attributes. Let them leave this method unwrapped.
             job = engine.decide(decision)
             return {
                 "ok": True,

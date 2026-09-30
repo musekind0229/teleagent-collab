@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 from urllib.parse import unquote, urlparse
 
-from execution_backend.base import ExecutionBackend
+from execution_backend.base import BackendError, ExecutionBackend
 from execution_backend.inprocess_v1 import InProcessExecutionBackend
 from framework.artifact_contamination import scan_file, summarize
 from framework.artifact_handoff import HandoffError, handoff_direct_dependency_artifacts
@@ -37,10 +37,103 @@ MAX_PLAN_TASKS = 8
 
 
 class AppError(ValueError):
-    def __init__(self, message: str, *, status: int = 400, code: str = "invalid_request") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int = 400,
+        code: str = "invalid_request",
+        extra: Mapping[str, Any] | None = None,
+    ) -> None:
         self.status = int(status)
         self.code = code
+        # Merged into the HTTP body by _Handler. ok/code/error stay authoritative.
+        self.extra = dict(extra) if isinstance(extra, Mapping) else {}
         super().__init__(message)
+
+
+_ERROR_BODY_RESERVED = frozenset({"ok", "code", "error"})
+_CONTAMINATION_MESSAGE = (
+    "Fail this review so the worker can redo it, or re-open the request "
+    "with acceptance.allow_aigc_marks=true if the marks are intended."
+)
+
+
+def _count_map(value: Any) -> dict[str, int]:
+    """Copy integer counts only. Drop strings so file text cannot ride along."""
+    if not isinstance(value, Mapping):
+        return {}
+    out: dict[str, int] = {}
+    for key, count in value.items():
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            continue
+        out[str(key)] = count
+    return out
+
+
+def _public_contamination(findings: Any) -> dict[str, dict[str, Any]]:
+    """``{name: {aigc_marks, invisible, encoding}}``. Counts and encoding only."""
+    if not isinstance(findings, Mapping):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for name, scan in findings.items():
+        if not isinstance(scan, Mapping):
+            continue
+        encoding = scan.get("encoding")
+        if (
+            not isinstance(encoding, str)
+            or len(encoding) > 32
+            or any(ord(ch) < 32 for ch in encoding)
+        ):
+            encoding = ""
+        out[str(name)] = {
+            "aigc_marks": _count_map(scan.get("aigc_marks")),
+            "invisible": _count_map(scan.get("invisible")),
+            "encoding": encoding,
+        }
+    return out
+
+
+def _is_artifact_contaminated(exc: BaseException) -> bool:
+    """Detect without importing win_collab (class name or ``findings``)."""
+    if type(exc).__name__ == "ArtifactContaminatedError":
+        return True
+    return isinstance(getattr(exc, "findings", None), Mapping)
+
+
+def _contamination_summary(exc: BaseException) -> str:
+    summary = getattr(exc, "summary", None)
+    if isinstance(summary, str) and summary.strip():
+        return summary.strip()
+    text = str(exc).strip()
+    marker = "Artifact content contaminated (AIGC mark / invisible chars): "
+    if text.startswith(marker):
+        return text[len(marker) :].strip()
+    return text
+
+
+def _artifact_contaminated_error(exc: BaseException) -> AppError:
+    summary = _contamination_summary(exc)
+    return AppError(
+        f"artifact contaminated: {summary}. {_CONTAMINATION_MESSAGE}",
+        status=409,
+        code="artifact_contaminated",
+        extra={
+            "contamination": _public_contamination(getattr(exc, "findings", None)),
+            "hint": "allow_aigc_marks",
+        },
+    )
+
+
+def _app_error_body(err: AppError) -> dict[str, Any]:
+    body: dict[str, Any] = {"ok": False, "code": err.code, "error": str(err)}
+    extra = getattr(err, "extra", None)
+    if isinstance(extra, Mapping):
+        for key, value in extra.items():
+            if str(key) in _ERROR_BODY_RESERVED:
+                continue
+            body[str(key)] = value
+    return body
 
 
 class GoalPlanner(Protocol):
@@ -2074,7 +2167,26 @@ class CollabApplication:
                     reason=str(payload.get("reason") or "Resolved through the application API"),
                     answers=payload.get("answers") if isinstance(payload.get("answers"), list) else None,
                 )
+            except AppError:
+                raise
             except Exception as e:
+                # Contamination keeps counts (no file text). Other ValueError
+                # text is controller copy and is sanitized. Unexpected types
+                # stay as the type name so a traceback or secret cannot leak.
+                if _is_artifact_contaminated(e):
+                    raise _artifact_contaminated_error(e) from e
+                if isinstance(e, ValueError):
+                    raise AppError(
+                        "worker decision rejected: " + sanitize_reason(str(e)),
+                        status=409,
+                        code="worker_decision_rejected",
+                    ) from e
+                if isinstance(e, BackendError):
+                    raise AppError(
+                        "worker decision failed: " + sanitize_reason(str(e)),
+                        status=409,
+                        code="worker_decision_failed",
+                    ) from e
                 raise AppError(
                     f"worker decision failed: {type(e).__name__}",
                     status=409,
@@ -2217,7 +2329,7 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             self._run()
         except AppError as e:
-            self._send(e.status, {"ok": False, "code": e.code, "error": str(e)})
+            self._send(e.status, _app_error_body(e))
         except Exception as e:  # fail closed without a traceback/body leak
             self._send(500, {"ok": False, "code": "internal_error", "error": type(e).__name__})
 

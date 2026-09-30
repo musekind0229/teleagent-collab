@@ -8,7 +8,13 @@ from unittest import mock
 from pathlib import Path
 
 from desktop_lock_isolation import install_desktop_lock_isolation
-from win_collab.core import Engine, Store, contained, validate_charter
+from win_collab.core import (
+    ArtifactContaminatedError,
+    Engine,
+    Store,
+    contained,
+    validate_charter,
+)
 
 
 def charter():
@@ -459,8 +465,14 @@ class Tests(unittest.TestCase):
         self.assertEqual(dirty_scan['invisible']['U+200D'], 3)
         self.assertFalse(clean_scan['contaminated'])
         self.assertEqual(clean_scan['encoding'], 'utf-8')
-        with self.assertRaisesRegex(ValueError, 'Artifact content contaminated'):
+        with self.assertRaises(ArtifactContaminatedError) as cm:
             self.answer(p, 'pass')
+        self.assertIsInstance(cm.exception, ValueError)
+        self.assertTrue(issubclass(ArtifactContaminatedError, ValueError))
+        self.assertIn('Artifact content contaminated', str(cm.exception))
+        self.assertIn('CONTAMINATED a.txt', cm.exception.summary)
+        self.assertEqual(cm.exception.findings['a.txt']['aigc_marks']['AI生成'], 1)
+        self.assertIn('b.txt', cm.exception.findings)
         self.assertEqual(self.store.get(j['id'])['state'], 'awaiting_review')
         self.answer(p, 'fail')
         redone=self.store.get(j['id'])

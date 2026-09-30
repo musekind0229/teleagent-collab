@@ -59,7 +59,7 @@ try {
 - `reply_permission` 固定 **501 unsupported**（与 inprocess 同形）。没有 TeleAgent 的 permission / question / system_action 逐条回传；hello 烟测靠 `AGY_AUTO_APPROVE` 打开 `--dangerously-skip-permissions`，不是把 skip 映射成 once/approve。
 - 账号池在每次 `start_run`（**per-dispatch**）选号+租约；`collect_result` 写回配额/503/冷却并释放 lease。同进程下一 Goal 可换号。一次 Popen 仍钉死该次 HOME（不 mid-run 换）。跨入口切号文件锁强化可另批。
 
-Hermes / 终端调用方可用薄客户端 [hermes-collab-min-client.zh-CN.md](hermes-collab-min-client.zh-CN.md)（`bin/hermes-collab-request.py`：open / status / report / wait）。后端仍由本服务启动参数决定。
+Hermes / 终端调用方可用薄客户端 [hermes-collab-min-client.zh-CN.md](hermes-collab-min-client.zh-CN.md)（`bin/hermes-collab-request.py`：open / status / report / wait / decide）。后端仍由本服务启动参数决定。`decide` 只给人类提交者或操作者提交已经说出口的 verdict；服务拒绝时退出码 `5`，stdout 带上 `code`、`error`，以及有的话 `contamination` / `hint`。
 
 ## 推荐入口（桌面 GUI）
 
@@ -136,7 +136,7 @@ BOM：解码后**第一个字符**如果是那一个来自文件头 BOM 的 U+FE
 
 关闭检查：在 Goal 的 `acceptance` 里放布尔值 `allow_aigc_marks: true`，或写在该 Task 的 `inputs.allow_aigc_marks`。只有布尔 `true` 生效；字符串 `"true"` 不会关闭检查。服务会把这个选择抄进工人章程。Windows 章程上的同名布尔字段同样放行 `pass`（缺省即检查）。
 
-TeleAgent `review` 若产物自带 `contamination.contaminated`，投影出的决策标题是 `TeleAgent review (CONTAMINATED)`，`details.summary` 是上面那行计数。
+TeleAgent `review` 若产物自带 `contamination.contaminated`，投影出的决策标题是 `TeleAgent review (CONTAMINATED)`，`details.summary` 是上面那行计数。人工对这条 review 提交 `pass` 而被工人控制器拒绝时，见下面「决定被拒绝」：HTTP `409`，`code` 为 `artifact_contaminated`。
 
 ## 查询和控制
 
@@ -166,6 +166,14 @@ Windows TeleAgent 后端已从新入口真实创建多个 session，证明入口
 同一时间 GUI 自己的 `NewApi/chat-lite` 与 `chat-pro` 调用成功，说明账号和模型可用。剩余差异位于 GUI 主进程向模型内核交接认证状态的私有流程。GUI 内核的本地 API 密钥通过 stdin 注入，不存在于子进程环境；GUI 以管理员权限运行而入口进程为普通权限时，进程检查还会得到 Windows `Access denied (5)`。生产方案需要 TeleAgent 提供受支持的本地 broker/凭据交接接口，或让入口直接运行在能够取得该接口的同一可信宿主中。完成该项后仍需重跑普通文件任务，才可宣布真实交付闭环通过。
 
 permission / question / system_action 经 `POST /v1/requests/{id}/decisions/{decision_id}` 回传到监督后端；Question 与 system_action 永不由组长自动代答/代批（`system_action_approval` 专类）。 回传成功后协调器立即 `process_goal`（响应含 `tick`），无需另调 tick。
+
+### 决定被拒绝（HTTP 409）
+
+工人控制器拒绝这次决定时，`409` 的 `error` 写明原因，而不是只给异常类型名：
+
+- `artifact_contaminated`：review 的 `pass` 命中 AIGC 水印或不可见字符。`error` 为 `artifact contaminated: ` 加上那一行计数（例如 `CONTAMINATED label.txt: AI生成x1`），并说明应 `fail` 让工人重做，或重新开单时在 `acceptance` 里设 `allow_aigc_marks: true`。body 另有 `contamination`（每个文件只含 `aigc_marks`、`invisible`、`encoding` 计数，不含正文）和 `hint`（`allow_aigc_marks`）。
+- `worker_decision_rejected`：其它控制器拒绝（固定文案的 `ValueError`）。`error` 为 `worker decision rejected: ` 加上截断并脱敏后的原因。
+- `worker_decision_failed`：后端 `BackendError` 同样带上脱敏后的原因。意料外的异常类型仍只返回类型名，避免把内部细节漏出去。
 
 ## need_human（Windows 监督恢复失败）
 

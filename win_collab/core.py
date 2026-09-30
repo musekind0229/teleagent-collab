@@ -52,6 +52,21 @@ SYSTEM_EFFECTS = {'install_files', 'service_change', 'firewall_change', 'shortcu
 USER_GATED_EFFECTS = {'service_change', 'firewall_change'}
 
 
+class ArtifactContaminatedError(ValueError):
+    """Review pass refused because artifact text is contaminated.
+
+    ``summary`` is the ``summarize()`` line (counts, not file text).
+    ``findings`` maps artifact name to that artifact's scan dict.
+    """
+
+    def __init__(self, summary, findings):
+        self.summary = summary
+        self.findings = dict(findings)
+        super().__init__(
+            'Artifact content contaminated (AIGC mark / invisible chars): ' + summary
+        )
+
+
 def _budget_limit(value, default, ceiling):
     """Positive int budget. Invalid or non-positive values use default; values above ceiling clamp."""
     if isinstance(value, bool) or value is None:
@@ -1239,9 +1254,7 @@ class Engine:
                                 findings[name] = scan
                         line = summarize(findings)
                         if line:
-                            raise ValueError(
-                                'Artifact content contaminated (AIGC mark / invisible chars): ' + line
-                            )
+                            raise ArtifactContaminatedError(line, findings)
                     if (job['charter'].get('task_kind', 'file_task') == 'system_install' and
                             (not job.get('action_dispatched') or
                              packet['payload'].get('approved_system_action_hash') !=
