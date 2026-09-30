@@ -536,8 +536,78 @@ def _review_payload_summary(payload: dict[str, Any]) -> str | None:
     return text
 
 
-def _permission_payload_summary(payload: dict[str, Any]) -> str | None:
-    """permission: <permission> <comma-joined patterns>. Ignores other keys."""
+def _scope_entry_text(item: Any, *, marker_before: bool) -> str | None:
+    if not isinstance(item, dict):
+        return None
+    pattern = _stripped(item.get("pattern"))
+    if pattern is None:
+        return None
+    pattern = " ".join(pattern.split())
+    files = item.get("files")
+    names: list[str] = []
+    if isinstance(files, list):
+        for name in files:
+            text = _stripped(name)
+            if text is not None:
+                names.append(" ".join(text.split()))
+    only = item.get("only_pinned") is True
+    flag = "only pinned" if only else "NOT ONLY PINNED"
+    listed = ", ".join(names)
+    trunc = " [truncated]" if item.get("truncated") is True else ""
+    count = len(names)
+    if marker_before and not only:
+        if names:
+            return f"{pattern} -> [NOT ONLY PINNED] dir contains {count} file(s): {listed}{trunc}"
+        return f"{pattern} -> [NOT ONLY PINNED] dir contains {count} file(s){trunc}"
+    if names:
+        return f"{pattern} -> dir contains {count} file(s): {listed} [{flag}]{trunc}"
+    return f"{pattern} -> dir contains {count} file(s) [{flag}]{trunc}"
+
+
+def _format_permission_scope(payload: dict[str, Any], scope: Any, limit: int = _SUMMARY_LIMIT) -> str | None:
+    """Same line as the controller summary. ``NOT ONLY PINNED`` survives truncation.
+
+    When the end-tagged line fits in ``limit``, the tag stays after the file
+    list. Otherwise the tag is placed before the file list and the tail is cut.
+    """
+    if not isinstance(scope, list) or not scope:
+        return None
+    perm = _stripped(payload.get("permission")) or "external_directory"
+    perm = " ".join(perm.split())
+    parts: list[str] = []
+    for item in scope:
+        text = _scope_entry_text(item, marker_before=False)
+        if text:
+            parts.append(text)
+    if not parts:
+        return None
+    text = f"permission: {perm} " + "; ".join(parts)
+    if len(text) <= limit:
+        return text
+    needs_marker = any(isinstance(item, dict) and item.get("only_pinned") is not True for item in scope)
+    if needs_marker:
+        moved = [text for item in scope if (text := _scope_entry_text(item, marker_before=True))]
+        text = f"permission: {perm} " + "; ".join(moved)
+        if len(text) <= limit:
+            return text
+        marker = "[NOT ONLY PINNED]"
+        idx = text.find(marker)
+        if idx != -1 and idx + len(marker) <= limit:
+            return text[:limit]
+        head = f"permission: {perm} [NOT ONLY PINNED] "
+        if len(head) >= limit:
+            return head[:limit]
+        rest = text[len(f"permission: {perm} "):].replace("[NOT ONLY PINNED] ", "").replace(marker, "")
+        return (head + rest)[:limit]
+    return text[:limit]
+
+
+def _permission_payload_summary(payload: dict[str, Any], scope: Any = None) -> str | None:
+    """permission: <permission> <patterns>, or the scope line when scope is present."""
+    if isinstance(scope, list) and scope:
+        scoped = _format_permission_scope(payload, scope)
+        if scoped:
+            return scoped
     perm = _stripped(payload.get("permission"))
     patterns = payload.get("patterns")
     names: list[str] = []
@@ -625,7 +695,9 @@ def _decision_summary(row: dict[str, Any]) -> str:
     details.payload is a dict, a payload summary comes next and beats the
     generic title ``TeleAgent <kind>`` and the row reason. A review summary
     that starts with ``CONTAMINATED`` is returned before the title so a
-    watermark is not hidden by ``TeleAgent review (CONTAMINATED)``. Then the
+    watermark is not hidden by ``TeleAgent review (CONTAMINATED)``. When
+    ``details.scope`` is present, the permission scope line is returned next
+    (already within 200 characters, with ``NOT ONLY PINNED`` kept). Then the
     row reason, lead_error.message, title, and finally kind.
     """
     title = row.get("title")
@@ -647,6 +719,11 @@ def _decision_summary(row: dict[str, Any]) -> str:
                 generic_title = f"TeleAgent {backend_kind}"
                 if payload_summary.startswith("CONTAMINATED"):
                     return _one_line(payload_summary)
+    if isinstance(details, dict) and isinstance(details.get("scope"), list) and details.get("scope"):
+        scope_payload = payload if isinstance(payload, dict) else {}
+        scope_line = _format_permission_scope(scope_payload, details.get("scope"))
+        if scope_line and not (payload_summary or "").startswith("CONTAMINATED"):
+            return scope_line
     title_text = _nonempty_str(title)
     if title_text is not None and title_text.strip() != str(kind or "").strip():
         if not generic_title or title_text.strip() != generic_title:

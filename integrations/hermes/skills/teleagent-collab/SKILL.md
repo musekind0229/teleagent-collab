@@ -1,7 +1,7 @@
 ---
 name: teleagent-collab
 description: "Delegate work to local collab-service workers (agy/antigravity pool) via bin/hermes-collab-request.py: open, wait, report. Use when the user asks to have 'the worker'/'collab'/'agy' do a task or produce a file."
-version: 0.2.7
+version: 0.2.8
 author: teleagent-collab
 license: MIT
 platforms: [windows, linux, macos]
@@ -86,7 +86,8 @@ collab-service 是本机常驻的派工服务（Application API，默认 `http:/
 - 任何层级出现 `need_human: true`（顶层、`failure`、`tasks[].result`），或 `error` 以 `need_human:` 开头；
 - `pending_decisions` 非空（服务在等人拍板）；
 - `wait` 退出码 `4`：已经停在等人拍板。把 `request_id`、`wait.reason`（`pending_decisions` / `awaiting_decision` / `task_awaiting_decision`）、`decision_ids`、每条 `decisions[].summary` 转述给用户。禁止自己批准或拒绝决策（不要代答 `POST …/decisions/…`）；
-  TeleAgent 原生决策的 summary 来自 worker payload（review 的 artifacts/tools、permission 的 pattern、question 题面）。
+  TeleAgent 原生决策的 summary 来自 worker payload（review 的 artifacts/tools、permission 的 pattern 与 scope、question 题面）。
+- 转述 permission 决策的 summary 时带上 scope（目录里实际有哪些文件）；如果 summary 里有 `NOT ONLY PINNED`，告诉用户该目录不只有钉住的输入文件。
 - `wait` 退出码 3 超时，或 401/403/transport_error。401/403 只转告 `auth.token_source`，不要回显 token。
 
 禁止：自行 `POST /v1/requests/{id}/retry`、重新 open 同一目标“再试一次”、换号、改账号池、重启服务、设置 `AGY_AUTO_APPROVE`、自己批准或拒绝决策。

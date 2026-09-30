@@ -57,9 +57,13 @@ Windows 适配器从已验证的 TeleAgent runtime Node 进程环境中只选取
 - 内容检查：`AI生成`（可含空白）、`人工智能生成`，以及 U+200B、U+200C、U+200D、U+2060、U+FEFF（文件头单独一个 BOM 除外）、U+180E、U+2061–U+2064，会使 `pass` 失败，错误以 `Artifact content contaminated` 开头。章程 `allow_aigc_marks: true` 关闭检查。解不开的二进制不扫描。
 - 问题：`answer | deny_job`；answer 另带 `answers: [["第一题回答"], ["第二题回答"]]`。
 - 当前控制器不支持凭据白名单。普通外部输入只能通过 `external_inputs` 声明：最多 8 个仓库内普通文件，每个都固定绝对路径和 SHA-256，单文件不超过 512 KiB；文件变化、路径不一致、符号链接/目录联接和凭据类名称都会拒绝。
+- 提交时先用上述规则校验**原始**路径。通过后，每个文件被复制到 `<控制器主目录>/external-inputs/<job_id>/<序号>/<原文件名>`（一个文件一个子目录，TeleAgent 的 `/*` 通配符只能覆盖这一个文件）。复制件的 SHA-256 必须与钉住的哈希一致，否则提交失败并删掉该工单的复制目录。此后章程里生效的 `external_inputs` 是这些副本路径；原始路径留在 `external_inputs_source` 供审计。副本是控制器刚写出来的，即使 `store.home` 在仓库外，也不再套用「必须在本仓库内」——原始路径只校验这一次，不要对改写后的章程重跑 `validate_charter`。`charter_hash` 是改写后章程的摘要（含副本路径和 `external_inputs_source`），不是调用方提交的原始章程。
+- 工人提示要求只读 `CHARTER.external_inputs` 里的副本绝对路径，不要读目标正文或其它字段里提到的路径。
+- 工单进入终态（`passed` / `failed` / `cancelled` / `timed_out`）时删除 `<store.home>/external-inputs/<job_id>` 这一个目录：路径解析后必须仍在 `external-inputs` 里面，不跟随符号链接或目录联接。成功记事件 `external_inputs_cleaned`。清理出错只记事件，不让 `tick` 崩溃。`tick` 还会清扫副本目录还在的终态工单；目录已经没了则什么都不做。
 - `forbidden_tools` 可列出章程禁止使用的工具；工具即使被 TeleAgent 自动执行，带有已完成违规工具的工单也不能通过验收。
 - `min_approved_permissions` 可要求通过前至少观察到指定次数的真实 `once` 批准，防止用零审批运行冒充审批闭环。
-- `external_directory` 请求只允许本工单精确工作区，或元数据精确指向仍满足路径与哈希约束的 `external_inputs` 文件；其余请求自动拒绝。父级 `workspaces/*`、兄弟工单和仅靠宽泛 pattern 命中的文件均不能由组长覆盖放行。
+- `external_directory` 请求只允许本工单精确工作区，或元数据精确指向仍满足路径与哈希约束的**副本**（章程 `external_inputs`）；原始路径不能靠批准放行。其余请求自动拒绝。父级 `workspaces/*`、兄弟工单和仅靠宽泛 pattern 命中的文件均不能由组长覆盖放行。
+- 待决的 `external_directory` 会在决策上附带 `details.scope`（不写进随后做摘要比对的 TeleAgent permission 对象）：每个 pattern 的非通配前缀目录、该目录里实际有的文件（`/*` 只列这一层；`**` 递归且最多 50 条，多了标 `truncated`），以及 `only_pinned`（列出的文件是否都是本工单钉住的副本）。`details.summary` 形如 `permission: external_directory <pattern> -> dir contains 1 file(s): ext-input.txt [only pinned]`，或 `... contains 3 file(s): a, b, c [NOT ONLY PINNED]`。`NOT ONLY PINNED` 表示这个目录里还有副本以外的文件，批准 `once` 会让工人读到它们。
 
 ### TeleAgent 有效权限（桌面 2.6.0）
 
@@ -70,7 +74,8 @@ Windows 适配器从已验证的 TeleAgent runtime Node 进程环境中只选取
 - 工作区内的读、写、编辑和 PowerShell 执行不会产生 permission 请求。
 - 仍会询问的只有 `external_directory`（访问工作区以外的路径）。
 - 没有写进章程 `external_inputs` 的外部路径由 `hard_reject()` 直接拒绝，事件是 `hard_reject`，不会进入待决队列。Application API 以前不能传 `external_inputs`，所以经这套 API 产不出 permission 决策。
-- 要得到可回传的 permission 决策，在 Goal 上钉住该文件：`external_inputs` 最多 8 项，每项只能是 `{"path": <绝对路径>, "sha256": <64 位十六进制>}`。客户端写法是 `python bin/hermes-collab-request.py open --external-input PATH`（可重复）。客户端解析绝对路径并计算 SHA-256；文件不存在则退出码 1，`code` 为 `bad_external_input`。文件是否在仓库内、哈希是否一致、是否为链接、是否超过 512 KiB，仍由 Windows `validate_charter` 把关。antigravity 与 inprocess 忽略该字段。
+- 要得到可回传的 permission 决策，在 Goal 上钉住该文件：`external_inputs` 最多 8 项，每项只能是 `{"path": <绝对路径>, "sha256": <64 位十六进制>}`。客户端写法是 `python bin/hermes-collab-request.py open --external-input PATH`（可重复）。客户端解析绝对路径并计算 SHA-256；文件不存在则退出码 1，`code` 为 `bad_external_input`。文件是否在仓库内、哈希是否一致、是否为链接、是否超过 512 KiB，仍由 Windows `validate_charter` 把关；通过后控制器改用上面的单文件副本路径。antigravity 与 inprocess 忽略该字段。
+- 权限决策的 summary 会带上该目录的 scope。看到 `NOT ONLY PINNED` 时，目录里不只有钉住的副本，不要把 `once` 当成「只读那一个文件」。
 - agent 规则 `question=allow` 下，question 工具产生的是 `question` 决策，不是 permission 请求。
 
 ### Windows 系统安装两阶段门禁

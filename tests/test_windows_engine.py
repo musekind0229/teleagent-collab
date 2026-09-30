@@ -8,11 +8,14 @@ from unittest import mock
 from pathlib import Path
 
 from desktop_lock_isolation import install_desktop_lock_isolation
+from execution_backend.windows_supervised_v1 import WindowsSupervisedExecutionBackend
 from win_collab.core import (
     ArtifactContaminatedError,
     Engine,
     Store,
     contained,
+    digest,
+    external_directory_scope,
     validate_charter,
 )
 
@@ -273,9 +276,10 @@ class Tests(unittest.TestCase):
         with mock.patch('win_collab.core.REPO',Path(self.tmp.name)):
             j=self.engine.submit(c)
         self.engine.tick();j=self.store.get(j['id'])
+        copy=j['charter']['external_inputs'][0]['path']
         self.client.pending=[{'id':'external-input','sessionID':j['session_id'],
-                              'permission':'external_directory','patterns':[str(source.parent/'*')],
-                              'metadata':{'filepath':str(source.resolve())}}]
+                              'permission':'external_directory','patterns':[str(Path(copy).parent/'*')],
+                              'metadata':{'filepath':copy}}]
         self.rescan(j)
         p=self.store.inbox()[0]
         self.answer(p,'once')
@@ -513,6 +517,226 @@ class Tests(unittest.TestCase):
         self.assertEqual(review['payload']['artifacts']['a.txt']['contamination']['encoding'], 'utf-8-bom')
         self.answer(review, 'pass')
         self.assertEqual(self.store.get(bom['id'])['state'], 'passed')
+
+    def _events(self, job, kind):
+        rows = self.store.db.execute(
+            'SELECT data FROM events WHERE job_id=? AND kind=? ORDER BY seq',
+            (job['id'], kind),
+        ).fetchall()
+        return [json.loads(row['data']) for row in rows]
+
+    def _pinned_charter(self, name, text):
+        source = Path(self.tmp.name) / name
+        source.write_text(text, encoding='utf-8')
+        body = charter()
+        digest_hex = hashlib.sha256(source.read_bytes()).hexdigest()
+        body['external_inputs'] = [{'path': str(source.resolve()), 'sha256': digest_hex}]
+        return body, source, digest_hex
+
+    def test_submit_isolates_external_inputs_and_rewrites_charter(self):
+        first, source_a, sha_a = self._pinned_charter('ext-input.txt', 'alpha\n')
+        source_b = Path(self.tmp.name) / 'notes.txt'
+        source_b.write_text('beta\n', encoding='utf-8')
+        sha_b = hashlib.sha256(source_b.read_bytes()).hexdigest()
+        first['external_inputs'].append({'path': str(source_b.resolve()), 'sha256': sha_b})
+        original = copy.deepcopy(first)
+        with mock.patch('win_collab.core.REPO', Path(self.tmp.name)):
+            job = self.engine.submit(first)
+        stored = self.store.get(job['id'])
+        pins = stored['charter']['external_inputs']
+        self.assertEqual([item['sha256'] for item in pins], [sha_a, sha_b])
+        self.assertEqual(stored['charter']['external_inputs_source'], [
+            {'path': str(source_a.resolve()), 'sha256': sha_a},
+            {'path': str(source_b.resolve()), 'sha256': sha_b},
+        ])
+        self.assertEqual(stored['charter_hash'], digest(stored['charter']))
+        self.assertNotEqual(stored['charter_hash'], digest(original))
+        for index, (pin, source, expected) in enumerate((
+                (pins[0], source_a, sha_a), (pins[1], source_b, sha_b))):
+            copy_path = Path(pin['path'])
+            self.assertEqual(copy_path.name, source.name)
+            self.assertEqual(copy_path.parent.name, str(index))
+            self.assertEqual(copy_path.parent.parent.name, job['id'])
+            self.assertEqual(copy_path.parent.parent.parent.name, 'external-inputs')
+            self.assertEqual(hashlib.sha256(copy_path.read_bytes()).hexdigest(), expected)
+            self.assertNotEqual(copy_path.resolve(), source.resolve())
+        text = self.engine.prompt(stored)['parts'][0]['text']
+        self.assertIn('Read external inputs ONLY at the exact copy paths listed in CHARTER.external_inputs', text)
+        self.assertIn('not paths mentioned elsewhere', text)
+        self.assertIn(pins[0]['path'], text)
+        self.assertNotIn('external_inputs_source', text)
+        self.assertNotIn(str(source_a.resolve()), text)
+
+    def test_external_input_copy_hash_mismatch_fails_submit_and_leaves_no_dir(self):
+        body, _source, _sha = self._pinned_charter('ext-input.txt', 'pinned\n')
+        with mock.patch('win_collab.core.REPO', Path(self.tmp.name)), \
+                mock.patch('win_collab.core.file_sha256', return_value='0' * 64), \
+                self.assertRaisesRegex(ValueError, 'copy hash mismatch'):
+            self.engine.submit(body)
+        self.assertEqual(self.store.jobs(), [])
+        root = Path(self.store.home) / 'external-inputs'
+        if root.exists():
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_hard_reject_accepts_copy_path_and_rejects_original(self):
+        body, source, _sha = self._pinned_charter('ext-input.txt', 'pinned\n')
+        with mock.patch('win_collab.core.REPO', Path(self.tmp.name)):
+            job = self.engine.submit(body)
+        self.engine.tick()
+        job = self.store.get(job['id'])
+        copy = job['charter']['external_inputs'][0]['path']
+        original = job['charter']['external_inputs_source'][0]['path']
+        self.assertEqual(original, str(source.resolve()))
+        self.client.pending = [{
+            'id': 'original-path', 'sessionID': job['session_id'],
+            'permission': 'external_directory', 'patterns': [str(source.parent / '*')],
+            'metadata': {'filepath': original},
+        }]
+        self.rescan(job)
+        self.assertFalse(self.store.inbox())
+        self.assertEqual(self.store.get(job['id'])['handled'], ['original-path'])
+        self.client.pending = [{
+            'id': 'copy-path', 'sessionID': job['session_id'],
+            'permission': 'external_directory', 'patterns': [str(Path(copy).parent / '*')],
+            'metadata': {'filepath': copy},
+        }]
+        self.rescan(job)
+        pending = self.store.inbox()[0]
+        self.assertEqual(pending['payload']['metadata']['filepath'], copy)
+        self.assertNotIn('scope', pending['payload'])
+        self.answer(pending, 'once')
+        self.assertEqual(self.store.get(job['id'])['approved_permissions'], 1)
+
+    def test_external_inputs_cleaned_on_pass_and_sweep_is_idempotent(self):
+        body, _source, _sha = self._pinned_charter('ext-input.txt', 'pinned\n')
+        with mock.patch('win_collab.core.REPO', Path(self.tmp.name)):
+            job = self.engine.submit(body)
+        self.engine.tick()
+        job = self.store.get(job['id'])
+        copy = Path(job['charter']['external_inputs'][0]['path'])
+        job_dir = copy.parent.parent
+        self.assertTrue(copy.is_file())
+        review = self.deliver(job)
+        self.answer(review, 'pass')
+        done = self.store.get(job['id'])
+        self.assertEqual(done['state'], 'passed')
+        self.assertFalse(job_dir.exists())
+        self.assertEqual(len(self._events(done, 'external_inputs_cleaned')), 1)
+        self.engine.tick()
+        self.assertEqual(len(self._events(done, 'external_inputs_cleaned')), 1)
+        job_dir.mkdir(parents=True)
+        (job_dir / 'leftover.txt').write_text('x', encoding='utf-8')
+        self.engine.tick()
+        self.assertFalse(job_dir.exists())
+        self.assertEqual(len(self._events(done, 'external_inputs_cleaned')), 2)
+        self.engine.tick()
+        self.assertEqual(len(self._events(done, 'external_inputs_cleaned')), 2)
+
+    def test_external_inputs_cleaned_on_fail_and_cancel_without_following_links(self):
+        body, _source, _sha = self._pinned_charter('ext-input.txt', 'pinned\n')
+        with mock.patch('win_collab.core.REPO', Path(self.tmp.name)):
+            job = self.engine.submit(body)
+        self.engine.tick()
+        job = self.store.get(job['id'])
+        copy = Path(job['charter']['external_inputs'][0]['path'])
+        outside = Path(self.tmp.name) / 'outside.txt'
+        outside.write_text('secret', encoding='utf-8')
+        (copy.parent / 'link.txt').symlink_to(outside)
+        self.client.status[job['session_id']] = {'type': 'idle'}
+        self.client.messages[job['session_id']].append(
+            {'info': {'role': 'assistant', 'finish': 'error', 'error': {'message': 'boom'}}})
+        self.rescan(job)
+        failed = self.store.get(job['id'])
+        self.assertEqual(failed['state'], 'failed')
+        self.assertFalse(copy.parent.parent.exists())
+        self.assertEqual(outside.read_text(encoding='utf-8'), 'secret')
+        self.assertTrue(self._events(failed, 'external_inputs_cleaned'))
+
+        body, _source, _sha = self._pinned_charter('other-input.txt', 'other\n')
+        with mock.patch('win_collab.core.REPO', Path(self.tmp.name)):
+            queued = self.engine.submit(body)
+        queued = self.store.get(queued['id'])
+        copy = Path(queued['charter']['external_inputs'][0]['path'])
+        job_dir = copy.parent.parent
+        sentinel = Path(self.tmp.name) / 'sentinel-target'
+        sentinel.mkdir()
+        (sentinel / 'keep.txt').write_text('keep', encoding='utf-8')
+        backup = Path(self.tmp.name) / 'backup-inputs'
+        job_dir.rename(backup)
+        job_dir.symlink_to(sentinel, target_is_directory=True)
+        self.engine.cancel(queued['id'])
+        cancelled = self.store.get(queued['id'])
+        self.assertEqual(cancelled['state'], 'cancelled')
+        self.assertFalse(job_dir.is_symlink())
+        self.assertEqual((sentinel / 'keep.txt').read_text(encoding='utf-8'), 'keep')
+        self.assertTrue((backup / '0' / 'other-input.txt').is_file())
+        self.assertTrue(self._events(cancelled, 'external_inputs_cleaned'))
+
+    def test_permission_scope_only_pinned_for_copy_dir(self):
+        body, _source, _sha = self._pinned_charter('ext-input.txt', 'pinned\n')
+        with mock.patch('win_collab.core.REPO', Path(self.tmp.name)):
+            job = self.engine.submit(body)
+        self.engine.tick()
+        job = self.store.get(job['id'])
+        copy = job['charter']['external_inputs'][0]['path']
+        pattern = str(Path(copy).parent / '*')
+        self.client.pending = [{
+            'id': 'scoped', 'sessionID': job['session_id'],
+            'permission': 'external_directory', 'patterns': [pattern],
+            'metadata': {'filepath': copy},
+        }]
+        self.rescan(job)
+        packet = json.loads(self.store.db.execute(
+            'SELECT data FROM requests WHERE job_id=?', (job['id'],)).fetchone()['data'])
+        self.assertNotIn('scope', packet)
+        self.assertNotIn('scope', packet['payload'])
+        backend = WindowsSupervisedExecutionBackend(state_dir=self.tmp.name, client=self.client)
+        code, actions = backend.list_pending_actions()
+        self.assertEqual(code, 200)
+        self.assertEqual(len(actions), 1)
+        self.assertNotIn('scope', actions[0]['payload'])
+        self.assertEqual(digest(actions[0]['payload']), digest(self.client.pending[0]))
+        scope = actions[0]['scope']
+        self.assertEqual(len(scope), 1)
+        self.assertEqual(scope[0]['pattern'], pattern)
+        self.assertEqual(scope[0]['files'], ['ext-input.txt'])
+        self.assertTrue(scope[0]['only_pinned'])
+        self.assertFalse(scope[0]['truncated'])
+        (Path(copy).parent / 'extra.txt').write_text('extra', encoding='utf-8')
+        _code, again = backend.list_pending_actions()
+        widened = again[0]['scope'][0]
+        self.assertFalse(widened['only_pinned'])
+        self.assertEqual(sorted(widened['files']), ['ext-input.txt', 'extra.txt'])
+        self.assertEqual(digest(again[0]['payload']), digest(self.client.pending[0]))
+
+    def test_external_directory_scope_bounds_double_star(self):
+        root = Path(self.tmp.name) / 'tree'
+        nested = root / 'sub'
+        nested.mkdir(parents=True)
+        for index in range(60):
+            (nested / f'f{index}.txt').write_text('x', encoding='utf-8')
+        scope = external_directory_scope(
+            {'permission': 'external_directory', 'patterns': [str(root) + '/**']},
+            [],
+        )
+        self.assertEqual(len(scope), 1)
+        self.assertTrue(scope[0]['truncated'])
+        self.assertEqual(len(scope[0]['files']), 50)
+        self.assertFalse(scope[0]['only_pinned'])
+        self.assertIsNone(external_directory_scope({'permission': 'edit', 'patterns': ['*']}, []))
+
+    def test_single_star_scope_counts_nested_files(self):
+        root = Path(self.tmp.name) / 'star'
+        (root / 'sub').mkdir(parents=True)
+        pinned = root / 'only.txt'
+        pinned.write_text('p', encoding='utf-8')
+        (root / 'sub' / 'hidden.txt').write_text('h', encoding='utf-8')
+        scope = external_directory_scope(
+            {'permission': 'external_directory', 'patterns': [str(root) + '/*']},
+            [{'path': str(pinned), 'sha256': '0' * 64}],
+        )
+        self.assertFalse(scope[0]['only_pinned'])
+        self.assertEqual(sorted(scope[0]['files']), ['only.txt', 'sub/hidden.txt'])
 
     def test_system_install_requires_explicit_sensitive_effect_authorization(self):
         source=Path(self.tmp.name)/'source.msi';source.write_bytes(b'fixed-msi-fixture')

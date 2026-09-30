@@ -983,6 +983,21 @@ class AppCoordinator:
                     if contamination_summary:
                         decision_title = "TeleAgent review (CONTAMINATED)"
                         decision_details["summary"] = contamination_summary
+                if backend_kind == "permission" and isinstance(action.get("scope"), list):
+                    # Scope is computed beside the TeleAgent permission object.
+                    # It is not part of the payload Engine.decide digest-compares.
+                    decision_details["scope"] = action.get("scope")
+                    try:
+                        from win_collab.core import format_permission_scope_summary
+
+                        scope_summary = format_permission_scope_summary(
+                            action.get("payload") or {},
+                            action.get("scope"),
+                        )
+                    except Exception:
+                        scope_summary = None
+                    if scope_summary:
+                        decision_details["summary"] = scope_summary
                 opened = self.layer.open_decision(
                     goal_id,
                     kind=public_kind,

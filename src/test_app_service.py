@@ -45,7 +45,7 @@ from framework.artifact_handoff import (
 )
 from execution_backend.base import BackendError, BackendStatus
 from execution_backend.windows_supervised_v1 import WindowsSupervisedExecutionBackend
-from win_collab.core import ArtifactContaminatedError, Store
+from win_collab.core import ArtifactContaminatedError, Store, format_permission_scope_summary
 
 GOAL_SCHEMA = json.loads(
     (Path(__file__).resolve().parent.parent / "contracts" / "goal.schema.json").read_text(encoding="utf-8")
@@ -443,6 +443,46 @@ class _ContaminatedReviewBackend:
 
 
 _DIRTY_ARTIFACT = "hello decision\n\nAI生成\n" + ("\u200b\u200d" * 3)
+
+
+class _PermissionScopeBackend:
+    backend_id = "fake.permission_scope_v1"
+
+    def start_run(self, *, title, directory, instruction="", artifacts=None, charter=None):
+        return {"ok": True, "backend": self.backend_id, "run_id": "perm-scope", "native_handle": "perm-scope"}
+
+    def observe_run(self, run_id, **kwargs):
+        return {"busy": True}
+
+    def list_pending_actions(self, *, session_id=None):
+        return 200, [
+            {
+                "request_id": "req-perm-scope",
+                "kind": "permission",
+                "context_hash": "abc",
+                "payload": {
+                    "id": "perm-1",
+                    "permission": "external_directory",
+                    "patterns": ["C:/repo/.collab-app-knifeI/0/*"],
+                    "metadata": {"filepath": "C:/repo/.collab-app-knifeI/0/a"},
+                },
+                "scope": [
+                    {
+                        "pattern": "C:/repo/.collab-app-knifeI/0/*",
+                        "directory": "C:/repo/.collab-app-knifeI/0",
+                        "files": ["a", "b", "c"],
+                        "only_pinned": False,
+                        "truncated": False,
+                    }
+                ],
+            }
+        ]
+
+    def collect_result(self, run_id):
+        return {"ok": False, "run_id": run_id, "error": "still pending"}
+
+    def cancel(self, run_id):
+        return 200, {"ok": True, "run_id": run_id, "state": "cancelled"}
 
 
 class _PendingCancelBackend(_AsyncBackend):
@@ -1505,6 +1545,38 @@ class AppServiceTests(unittest.TestCase):
                 pending[0]["details"]["summary"],
                 "CONTAMINATED hello.txt: AI生成x1, U+200Bx4, U+200Dx4",
             )
+
+    def test_permission_decision_projects_directory_scope(self):
+        with tempfile.TemporaryDirectory() as td:
+            app = CollabApplication(td, backend=_PermissionScopeBackend())
+            opened = app.submit(_request())
+            first = app.coordinator.process_goal(opened["goal_id"])
+            self.assertEqual(first.get("action"), "worker_running", first)
+            second = app.coordinator.process_goal(opened["goal_id"])
+            self.assertEqual(second.get("action"), "decision_required", second)
+            pending = app.status(opened["goal_id"])["pending_decisions"]
+            self.assertEqual(len(pending), 1)
+            details = pending[0]["details"]
+            self.assertEqual(details["scope"][0]["files"], ["a", "b", "c"])
+            self.assertFalse(details["scope"][0]["only_pinned"])
+            self.assertEqual(
+                details["summary"],
+                "permission: external_directory C:/repo/.collab-app-knifeI/0/* "
+                "-> dir contains 3 file(s): a, b, c [NOT ONLY PINNED]",
+            )
+            self.assertNotIn("scope", details["payload"])
+        only = format_permission_scope_summary(
+            {"permission": "external_directory"},
+            [{
+                "pattern": "C:/d/0/*",
+                "files": ["ext-input.txt"],
+                "only_pinned": True,
+            }],
+        )
+        self.assertEqual(
+            only,
+            "permission: external_directory C:/d/0/* -> dir contains 1 file(s): ext-input.txt [only pinned]",
+        )
 
     def _raising_app(self, td: str, exc: BaseException) -> tuple[CollabApplication, _RaisingBackend]:
         backend = _RaisingBackend(exc)

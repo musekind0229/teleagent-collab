@@ -16,7 +16,7 @@ from typing import Any, Callable, Iterator, Mapping
 from execution_backend.base import BackendError, BackendStatus, ExecutionBackendABC
 from framework.artifact_handoff import HandoffError, copy_staged_inputs
 from win_collab.client import Client, KEYS
-from win_collab.core import Engine, Store, TERMINAL
+from win_collab.core import TERMINAL, Engine, Store, external_directory_scope
 
 
 
@@ -273,8 +273,19 @@ class WindowsSupervisedExecutionBackend(ExecutionBackendABC):
                 rows = store.inbox()
                 if session_id:
                     rows = [row for row in rows if str(row.get("job_id") or "") == str(session_id)]
-                return 200, [
-                    {
+                jobs: dict[str, dict] = {}
+                try:
+                    for job in store.jobs():
+                        if isinstance(job, dict) and job.get("id"):
+                            jobs[str(job.get("id"))] = job
+                except Exception:
+                    jobs = {}
+                actions = []
+                for row in rows:
+                    # scope is computed here and is not part of the permission
+                    # payload. Engine.decide digest-compares that payload with
+                    # the live TeleAgent object and must not see scope in it.
+                    action = {
                         "request_id": row.get("request_id"),
                         "kind": row.get("kind"),
                         "run_id": row.get("job_id"),
@@ -282,8 +293,24 @@ class WindowsSupervisedExecutionBackend(ExecutionBackendABC):
                         "context_hash": row.get("context_hash"),
                         "payload": row.get("payload"),
                     }
-                    for row in rows
-                ]
+                    if row.get("kind") == "permission":
+                        charter: dict = {}
+                        job = jobs.get(str(row.get("job_id") or ""))
+                        if isinstance(job, dict) and isinstance(job.get("charter"), dict):
+                            charter = job["charter"]
+                        elif isinstance(row.get("charter"), dict):
+                            charter = row["charter"]
+                        try:
+                            scope = external_directory_scope(
+                                row.get("payload"),
+                                charter.get("external_inputs") or [],
+                            )
+                        except Exception:
+                            scope = None
+                        if scope is not None:
+                            action["scope"] = scope
+                    actions.append(action)
+                return 200, actions
             finally:
                 store.db.close()
 
