@@ -609,38 +609,88 @@ def external_directory_scope(payload, external_inputs):
     return scope
 
 
-def _scope_entry_text(item, *, marker_before):
+def _shorten_middle(text, max_len):
+    """Keep the head and tail of ``text`` within ``max_len``, joined by ``…``."""
+    if max_len <= 0:
+        return ''
+    if len(text) <= max_len:
+        return text
+    if max_len == 1:
+        return text[:1]
+    inner = max_len - 1
+    head_len = inner // 2
+    tail_len = inner - head_len
+    return text[:head_len] + '\u2026' + text[-tail_len:]
+
+
+def _fit_pattern_lengths(lengths, budget):
+    """Shrink the longest lengths so they sum to at most ``budget``."""
+    lengths = [max(0, int(size)) for size in lengths]
+    if sum(lengths) <= budget or not lengths:
+        return lengths
+    if budget <= 0:
+        return [0 for _ in lengths]
+    lo, hi = 0, max(lengths)
+    best = 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if sum(min(size, mid) for size in lengths) <= budget:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    fitted = [min(size, best) for size in lengths]
+    extra = budget - sum(fitted)
+    for index in sorted(range(len(lengths)), key=lambda i: lengths[i], reverse=True):
+        if extra <= 0:
+            break
+        room = lengths[index] - fitted[index]
+        if room <= 0:
+            continue
+        give = min(extra, room)
+        fitted[index] += give
+        extra -= give
+    return fitted
+
+
+def _scope_entry_parts(item):
+    """``(pattern, protected, expendable)`` or None.
+
+    ``protected`` is the flag, the file count and the first file name.
+    ``expendable`` is the rest of the file list, then ``[truncated]`` if set.
+    """
     if not isinstance(item, dict):
         return None
     pattern = item.get('pattern')
     if not isinstance(pattern, str) or not pattern.strip():
         return None
     pattern = ' '.join(pattern.split())
-    files = item.get('files')
     names = []
+    files = item.get('files')
     if isinstance(files, list):
         for name in files:
             if isinstance(name, str) and name.strip():
                 names.append(' '.join(name.split()))
-    only = item.get('only_pinned') is True
-    flag = 'only pinned' if only else 'NOT ONLY PINNED'
-    listed = ', '.join(names)
-    trunc = ' [truncated]' if item.get('truncated') is True else ''
+    flag = 'only pinned' if item.get('only_pinned') is True else 'NOT ONLY PINNED'
     count = len(names)
-    if marker_before and not only:
-        if names:
-            return f'{pattern} -> [NOT ONLY PINNED] dir contains {count} file(s): {listed}{trunc}'
-        return f'{pattern} -> [NOT ONLY PINNED] dir contains {count} file(s){trunc}'
+    trunc = ' [truncated]' if item.get('truncated') is True else ''
     if names:
-        return f'{pattern} -> dir contains {count} file(s): {listed} [{flag}]{trunc}'
-    return f'{pattern} -> dir contains {count} file(s) [{flag}]{trunc}'
+        protected = f' [{flag}] -> dir contains {count} file(s): {names[0]}'
+        rest = ', '.join(names[1:])
+        expendable = (', ' + rest if rest else '') + trunc
+    else:
+        protected = f' [{flag}] -> dir contains {count} file(s)'
+        expendable = trunc
+    return pattern, protected, expendable
 
 
 def format_permission_scope_summary(payload, scope, limit=None):
-    """``permission: external_directory <pattern> -> dir contains N file(s): ...``.
+    """``permission: <perm> <pattern> [only pinned] -> dir contains N file(s): ...``.
 
-    The tag sits at the end when the line fits. Past ``limit``, a ``NOT ONLY
-    PINNED`` tag is moved ahead of the file list so truncation cannot drop it.
+    The flag always sits immediately after the pattern. When ``limit`` is set
+    and the line is longer, patterns are shortened in the middle (head + ``…``
+    + tail, so a tail like ``/0/*`` remains) so the flag, the file count and
+    the first file name still fit.
     """
     if not isinstance(scope, list) or not scope:
         return None
@@ -649,36 +699,56 @@ def format_permission_scope_summary(payload, scope, limit=None):
         raw = payload.get('permission')
         if isinstance(raw, str) and raw.strip():
             perm = ' '.join(raw.split())
-    parts = []
+    entries = []
     for item in scope:
-        text = _scope_entry_text(item, marker_before=False)
-        if text:
-            parts.append(text)
-    if not parts:
+        parts = _scope_entry_parts(item)
+        if parts:
+            entries.append(parts)
+    if not entries:
         return None
-    text = f'permission: {perm} ' + '; '.join(parts)
+    prefix = f'permission: {perm} '
+    separator = '; '
+
+    def assemble(patterns, extras):
+        chunks = []
+        for pattern, (_original, protected, _expendable), extra in zip(patterns, entries, extras):
+            chunks.append(pattern + protected + extra)
+        return prefix + separator.join(chunks)
+
+    full_patterns = [pattern for pattern, _protected, _expendable in entries]
+    full_extras = [expendable for _pattern, _protected, expendable in entries]
+    text = assemble(full_patterns, full_extras)
     if limit is None or len(text) <= limit:
         return text
-    needs_marker = any(isinstance(item, dict) and item.get('only_pinned') is not True for item in scope)
-    if needs_marker:
-        moved = []
-        for item in scope:
-            text_item = _scope_entry_text(item, marker_before=True)
-            if text_item:
-                moved.append(text_item)
-        text = f'permission: {perm} ' + '; '.join(moved)
-        if len(text) <= limit:
-            return text
-        marker = '[NOT ONLY PINNED]'
-        idx = text.find(marker)
-        if idx != -1 and idx + len(marker) <= limit:
-            return text[:limit]
-        head = f'permission: {perm} [NOT ONLY PINNED] '
-        if len(head) >= limit:
-            return head[:limit]
-        rest = text[len(f'permission: {perm} '):].replace('[NOT ONLY PINNED] ', '').replace(marker, '')
-        return (head + rest)[:limit]
-    return text[:limit]
+    protected_len = len(prefix) + len(separator) * (len(entries) - 1)
+    protected_len += sum(len(protected) for _pattern, protected, _expendable in entries)
+    pattern_budget = limit - protected_len
+    if pattern_budget < 0:
+        return assemble(['' for _ in entries], ['' for _ in entries])[:limit]
+    lengths = _fit_pattern_lengths([len(pattern) for pattern in full_patterns], pattern_budget)
+    fitted = [_shorten_middle(pattern, length) for pattern, length in zip(full_patterns, lengths)]
+    room = limit - len(assemble(fitted, ['' for _ in entries]))
+    extras = []
+    for expendable in full_extras:
+        if room <= 0 or not expendable:
+            extras.append('')
+            continue
+        if len(expendable) <= room:
+            extras.append(expendable)
+            room -= len(expendable)
+            continue
+        snippet = expendable[:room]
+        cut = snippet.rfind(',')
+        if cut > 0:
+            snippet = snippet[:cut]
+        else:
+            snippet = ''
+        marker = ' [truncated]'
+        if expendable.endswith(marker) and len(snippet) + len(marker) <= room:
+            snippet += marker
+        extras.append(snippet)
+        room -= len(snippet)
+    return assemble(fitted, extras)
 
 
 def public_system_action(action):

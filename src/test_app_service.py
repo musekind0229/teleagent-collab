@@ -1562,7 +1562,7 @@ class AppServiceTests(unittest.TestCase):
             self.assertEqual(
                 details["summary"],
                 "permission: external_directory C:/repo/.collab-app-knifeI/0/* "
-                "-> dir contains 3 file(s): a, b, c [NOT ONLY PINNED]",
+                "[NOT ONLY PINNED] -> dir contains 3 file(s): a, b, c",
             )
             self.assertNotIn("scope", details["payload"])
         only = format_permission_scope_summary(
@@ -1575,8 +1575,34 @@ class AppServiceTests(unittest.TestCase):
         )
         self.assertEqual(
             only,
-            "permission: external_directory C:/d/0/* -> dir contains 1 file(s): ext-input.txt [only pinned]",
+            "permission: external_directory C:/d/0/* [only pinned] -> dir contains 1 file(s): ext-input.txt",
         )
+
+    def test_permission_scope_summary_shrinks_long_pattern_under_cap(self):
+        tail = "/0/*"
+        head = "C:/Users/"
+        pattern = head + ("n" * (180 - len(head) - len(tail))) + tail
+        self.assertEqual(len(pattern), 180)
+        scope = [{
+            "pattern": pattern,
+            "files": ["ext-input.txt"],
+            "only_pinned": True,
+        }]
+        full = format_permission_scope_summary({"permission": "external_directory"}, scope)
+        self.assertIn(pattern, full)
+        self.assertIn("[only pinned]", full)
+        capped = format_permission_scope_summary(
+            {"permission": "external_directory"}, scope, limit=200,
+        )
+        self.assertLessEqual(len(capped), 200)
+        self.assertNotIn(pattern, capped)
+        head_part, flag, tail_part = capped.partition(" [only pinned]")
+        self.assertEqual(flag, " [only pinned]")
+        self.assertTrue(head_part.startswith("permission: external_directory C:/"))
+        self.assertIn("\u2026", head_part)
+        self.assertTrue(head_part.endswith("/0/*"))
+        self.assertIn("dir contains 1 file(s): ext-input.txt", tail_part)
+        self.assertLess(capped.find("[only pinned]"), capped.find("ext-input.txt"))
 
     def _raising_app(self, td: str, exc: BaseException) -> tuple[CollabApplication, _RaisingBackend]:
         backend = _RaisingBackend(exc)

@@ -63,7 +63,7 @@ Windows 适配器从已验证的 TeleAgent runtime Node 进程环境中只选取
 - `forbidden_tools` 可列出章程禁止使用的工具；工具即使被 TeleAgent 自动执行，带有已完成违规工具的工单也不能通过验收。
 - `min_approved_permissions` 可要求通过前至少观察到指定次数的真实 `once` 批准，防止用零审批运行冒充审批闭环。
 - `external_directory` 请求只允许本工单精确工作区，或元数据精确指向仍满足路径与哈希约束的**副本**（章程 `external_inputs`）；原始路径不能靠批准放行。其余请求自动拒绝。父级 `workspaces/*`、兄弟工单和仅靠宽泛 pattern 命中的文件均不能由组长覆盖放行。
-- 待决的 `external_directory` 会在决策上附带 `details.scope`（不写进随后做摘要比对的 TeleAgent permission 对象）：每个 pattern 的非通配前缀目录、该目录里实际有的文件（`/*` 只列这一层；`**` 递归且最多 50 条，多了标 `truncated`），以及 `only_pinned`（列出的文件是否都是本工单钉住的副本）。`details.summary` 形如 `permission: external_directory <pattern> -> dir contains 1 file(s): ext-input.txt [only pinned]`，或 `... contains 3 file(s): a, b, c [NOT ONLY PINNED]`。`NOT ONLY PINNED` 表示这个目录里还有副本以外的文件，批准 `once` 会让工人读到它们。
+- 待决的 `external_directory` 会在决策上附带 `details.scope`（不写进随后做摘要比对的 TeleAgent permission 对象）：每个 pattern 的非通配前缀目录、该目录里实际有的文件（`/*` 只列这一层；`**` 递归且最多 50 条，多了标 `truncated`），以及 `only_pinned`（列出的文件是否都是本工单钉住的副本）。`details.summary` 形如 `permission: external_directory <pattern> [only pinned] -> dir contains 1 file(s): ext-input.txt`，或 `... [NOT ONLY PINNED] -> dir contains 3 file(s): a, b, c`。`NOT ONLY PINNED` 表示这个目录里还有副本以外的文件，批准 `once` 会让工人读到它们。
 
 ### TeleAgent 有效权限（桌面 2.6.0）
 

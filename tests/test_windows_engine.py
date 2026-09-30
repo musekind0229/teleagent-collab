@@ -563,7 +563,7 @@ class Tests(unittest.TestCase):
         text = self.engine.prompt(stored)['parts'][0]['text']
         self.assertIn('Read external inputs ONLY at the exact copy paths listed in CHARTER.external_inputs', text)
         self.assertIn('not paths mentioned elsewhere', text)
-        self.assertIn(pins[0]['path'], text)
+        self.assertIn(json.dumps(pins[0]['path'])[1:-1], text)
         self.assertNotIn('external_inputs_source', text)
         self.assertNotIn(str(source_a.resolve()), text)
 
@@ -641,7 +641,12 @@ class Tests(unittest.TestCase):
         copy = Path(job['charter']['external_inputs'][0]['path'])
         outside = Path(self.tmp.name) / 'outside.txt'
         outside.write_text('secret', encoding='utf-8')
-        (copy.parent / 'link.txt').symlink_to(outside)
+        file_link_error = None
+        try:
+            (copy.parent / 'link.txt').symlink_to(outside)
+        except OSError as exc:
+            # WinError 1314: process has no symlink privilege.
+            file_link_error = exc
         self.client.status[job['session_id']] = {'type': 'idle'}
         self.client.messages[job['session_id']].append(
             {'info': {'role': 'assistant', 'finish': 'error', 'error': {'message': 'boom'}}})
@@ -649,8 +654,11 @@ class Tests(unittest.TestCase):
         failed = self.store.get(job['id'])
         self.assertEqual(failed['state'], 'failed')
         self.assertFalse(copy.parent.parent.exists())
-        self.assertEqual(outside.read_text(encoding='utf-8'), 'secret')
         self.assertTrue(self._events(failed, 'external_inputs_cleaned'))
+        with self.subTest('file symlink is not followed'):
+            if file_link_error is not None:
+                self.skipTest(f'symlink unsupported: {file_link_error}')
+            self.assertEqual(outside.read_text(encoding='utf-8'), 'secret')
 
         body, _source, _sha = self._pinned_charter('other-input.txt', 'other\n')
         with mock.patch('win_collab.core.REPO', Path(self.tmp.name)):
@@ -663,14 +671,23 @@ class Tests(unittest.TestCase):
         (sentinel / 'keep.txt').write_text('keep', encoding='utf-8')
         backup = Path(self.tmp.name) / 'backup-inputs'
         job_dir.rename(backup)
-        job_dir.symlink_to(sentinel, target_is_directory=True)
+        dir_link_error = None
+        try:
+            job_dir.symlink_to(sentinel, target_is_directory=True)
+        except OSError as exc:
+            dir_link_error = exc
+            backup.rename(job_dir)
         self.engine.cancel(queued['id'])
         cancelled = self.store.get(queued['id'])
         self.assertEqual(cancelled['state'], 'cancelled')
-        self.assertFalse(job_dir.is_symlink())
+        self.assertFalse(job_dir.exists())
         self.assertEqual((sentinel / 'keep.txt').read_text(encoding='utf-8'), 'keep')
-        self.assertTrue((backup / '0' / 'other-input.txt').is_file())
         self.assertTrue(self._events(cancelled, 'external_inputs_cleaned'))
+        with self.subTest('directory symlink is unlinked not followed'):
+            if dir_link_error is not None:
+                self.skipTest(f'symlink unsupported: {dir_link_error}')
+            self.assertFalse(job_dir.is_symlink())
+            self.assertTrue((backup / '0' / 'other-input.txt').is_file())
 
     def test_permission_scope_only_pinned_for_copy_dir(self):
         body, _source, _sha = self._pinned_charter('ext-input.txt', 'pinned\n')

@@ -786,7 +786,7 @@ class HermesCollabRequestTests(unittest.TestCase):
         }
         self.assertEqual(
             HCR._decision_summary(only),
-            "permission: external_directory C:/d/0/* -> dir contains 1 file(s): ext-input.txt [only pinned]",
+            "permission: external_directory C:/d/0/* [only pinned] -> dir contains 1 file(s): ext-input.txt",
         )
         self.assertEqual(
             HCR._permission_payload_summary(
@@ -797,7 +797,7 @@ class HermesCollabRequestTests(unittest.TestCase):
                     "only_pinned": False,
                 }],
             ),
-            "permission: external_directory C:/d/* -> dir contains 3 file(s): a, b, c [NOT ONLY PINNED]",
+            "permission: external_directory C:/d/* [NOT ONLY PINNED] -> dir contains 3 file(s): a, b, c",
         )
         flagged = {
             "kind": "action_approval",
@@ -821,7 +821,7 @@ class HermesCollabRequestTests(unittest.TestCase):
         summary = HCR._decision_summary(flagged)
         self.assertEqual(
             summary,
-            "permission: external_directory C:/d/* -> dir contains 3 file(s): a, b, c [NOT ONLY PINNED]",
+            "permission: external_directory C:/d/* [NOT ONLY PINNED] -> dir contains 3 file(s): a, b, c",
         )
         self.assertNotIn("do-not-include", summary)
         long_files = [f"file{i}.txt" for i in range(40)]
@@ -847,7 +847,38 @@ class HermesCollabRequestTests(unittest.TestCase):
         truncated = HCR._decision_summary(long_row)
         self.assertLessEqual(len(truncated), 200)
         self.assertIn("NOT ONLY PINNED", truncated)
+        self.assertIn("file0.txt", truncated)
         self.assertLess(truncated.find("NOT ONLY PINNED"), truncated.find("file"))
+
+    def test_permission_scope_summary_keeps_only_pinned_for_long_pattern(self) -> None:
+        tail = "/0/*"
+        head = "C:/Users/"
+        pattern = head + ("n" * (180 - len(head) - len(tail))) + tail
+        self.assertEqual(len(pattern), 180)
+        row = {
+            "kind": "action_approval",
+            "title": "TeleAgent permission",
+            "reason": "TeleAgent worker requires a bounded decision",
+            "details": {
+                "backend_kind": "permission",
+                "payload": {"permission": "external_directory", "patterns": [pattern]},
+                "scope": [{
+                    "pattern": pattern,
+                    "files": ["ext-input.txt"],
+                    "only_pinned": True,
+                }],
+            },
+        }
+        summary = HCR._decision_summary(row)
+        self.assertLessEqual(len(summary), 200)
+        self.assertNotIn(pattern, summary)
+        head_part, flag, tail_part = summary.partition(" [only pinned]")
+        self.assertEqual(flag, " [only pinned]")
+        self.assertTrue(head_part.startswith("permission: external_directory C:/"))
+        self.assertIn("\u2026", head_part)
+        self.assertTrue(head_part.endswith("/0/*"))
+        self.assertIn("dir contains 1 file(s): ext-input.txt", tail_part)
+        self.assertLess(summary.find("[only pinned]"), summary.find("ext-input.txt"))
 
     def test_native_question_summary_from_payload(self) -> None:
         row = {
