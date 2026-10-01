@@ -156,6 +156,28 @@ set COLLAB_CODEX_LEAD_BIN=C:\Users\Admin\.local\share\TeleAgent\runtimes\node\co
 
 测例：`src/test_codex_cli_lead.py`（假二进制 / mock，不跑真 `codex`、不登录、不读凭据）。
 
+## 在 collab-service 里用 Codex 组长
+
+`--planner lead` 调用 `get_lead_adapter()`，种类只看**这个 collab-service 进程**的 `COLLAB_LEAD_ADAPTER`（未设置时工厂默认 `grok_cli`）。不要把这些变量写进仓库 `.env`，也不必设给工人进程。`deterministic` 与 `--planner grok` 不变：`grok` 仍是 `GrokCliLeadAdapter()`，不读 `COLLAB_LEAD_ADAPTER`。
+
+HTTP 服务没有对话去答文件协议的询问。解析结果是 `inprocess` 时拒绝启动（argparse 错误，退出码 2）。别名 `codex` 就是 inprocess，不是 Codex CLI。要用 Codex CLI 请设 `COLLAB_LEAD_ADAPTER=codex_cli`。
+
+```bat
+set COLLAB_LEAD_ADAPTER=codex_cli
+set COLLAB_CODEX_LEAD_BIN=C:\Users\Admin\.local\share\TeleAgent\runtimes\node\codex.cmd
+python bin/collab-service.py --planner lead --backend teleagent-windows ...
+```
+
+`--lead-timeout <秒>`（浮点，默认 180，必须 > 0）给 `grok` 和 `lead` 共用。启动时 stderr 一行：`lead planner: adapter=<name> timeout=<sec>s`（`codex_cli` 可加 `bin=<文件名>`，不打印目录）。
+
+组长决定规划，以及日常的 permission / review，决定了就代为回给工人。定不了的留给人：
+
+- `question` 和 `system_action`（对外是 `system_action_approval`）不进自动裁决，直接待人。
+- 可重试错误最多 `MAX_LEAD_ATTEMPTS_PER_DECISION=2` 次（超时、`illegal_json`、`application_id` / `context_summary` 不匹配、`illegal_verdict`、缺 reason；错误文本里若已有配额、登录/鉴权、`spawn failed` 等标记则不算可重试）。用尽仍待人。
+- 不可重试的错误第一次失败后立刻留给人，不再打第二次。Codex 非法输出以 `call_failed` 出现，属于这一类；Codex 超时仍可重试，最多 2 次。
+
+规划失败（lead 错误、非法 JSON、超时）不会编造任务图：Goal 在 planning 阶段失败（`lead_unavailable`），而不是变成一条待人规划。
+
 ## Claude / Codex 待办
 
 - `claude_code` 仍是骨架：返回 `_lead_status=call_failed`，**绝不**自动 `once`/`pass`。

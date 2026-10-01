@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,8 +27,84 @@ from framework.app_service import (  # noqa: E402
     write_running_tip,
 )
 
+_INPROCESS_LEAD_REFUSAL = (
+    "refusing inprocess lead adapter: the HTTP service has no dialogue to "
+    "answer file-protocol asks. The codex alias means inprocess; "
+    "use COLLAB_LEAD_ADAPTER=codex_cli for the Codex CLI."
+)
 
-def _planner(name: str, persist: Path):
+
+class InProcessLeadRefused(ValueError):
+    """--planner lead cannot host an inprocess / file-protocol lead."""
+
+
+def _positive_timeout(text: str) -> float:
+    try:
+        value = float(text)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"lead timeout must be a float > 0, got {text!r}"
+        ) from exc
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(f"lead timeout must be > 0, got {text!r}")
+    return value
+
+
+def _format_seconds(timeout_sec: float) -> str:
+    value = float(timeout_sec)
+    if math.isfinite(value) and value.is_integer():
+        return str(int(value))
+    return format(value, "g")
+
+
+def _basename_only(raw: str) -> str:
+    """File name only. Slashes and backslashes never survive into the log line."""
+    text = str(raw).strip().replace("\\", "/").rstrip("/")
+    if not text:
+        return ""
+    name = text.rsplit("/", 1)[-1].strip()
+    if not name or name in {".", ".."} or "/" in name or "\\" in name or ":" in name:
+        return ""
+    return name
+
+
+def _codex_bin_basename(adapter: object) -> str:
+    """Basename of the Codex binary, or "" if it cannot be named safely."""
+    override = getattr(adapter, "_bin_override", None)
+    if isinstance(override, str) and override.strip():
+        return _basename_only(override)
+    for var in ("COLLAB_CODEX_LEAD_BIN", "COLLAB_LEAD_BIN"):
+        raw = (os.environ.get(var) or "").strip()
+        if raw and os.path.isfile(raw):
+            return _basename_only(raw)
+    for candidate in ("codex", "codex.cmd", "codex.exe"):
+        found = shutil.which(candidate)
+        if found and os.path.isfile(found):
+            return _basename_only(found)
+    return _basename_only(os.environ.get("COLLAB_CODEX_LEAD_BIN") or "")
+
+
+def _lead_planner_stderr_line(planner: object) -> str | None:
+    if not isinstance(planner, LeadAdapterPlanner):
+        return None
+    adapter = getattr(planner, "adapter", None)
+    name = str(getattr(adapter, "name", "") or type(adapter).__name__)
+    line = f"lead planner: adapter={name} timeout={_format_seconds(planner.timeout_sec)}s"
+    if name == "codex_cli":
+        base = _codex_bin_basename(adapter)
+        if base:
+            line += f" bin={base}"
+    return line
+
+
+def _announce_lead_planner(planner: object) -> None:
+    line = _lead_planner_stderr_line(planner)
+    if line:
+        print(line, file=sys.stderr, flush=True)
+
+
+def _planner(name: str, persist: str | Path, timeout_sec: float = 180):
+    persist = Path(persist)
     if name == "deterministic":
         return DeterministicPlanner()
     if name == "grok":
@@ -33,7 +112,27 @@ def _planner(name: str, persist: Path):
 
         lead_work = persist / "lead-work"
         lead_work.mkdir(parents=True, exist_ok=True)
-        return LeadAdapterPlanner(GrokCliLeadAdapter(), cwd=lead_work)
+        return LeadAdapterPlanner(
+            GrokCliLeadAdapter(),
+            cwd=lead_work,
+            timeout_sec=timeout_sec,
+        )
+    if name == "lead":
+        from lead_adapter import get_lead_adapter
+
+        # exchange_dir is ignored by every adapter except inprocess. A refused
+        # inprocess lead must not create the file-protocol exchange in the repo
+        # or in COLLAB_LEAD_EXCHANGE — this process has no dialogue to answer it.
+        probe = tempfile.mkdtemp(prefix="collab-inprocess-probe-")
+        try:
+            adapter = get_lead_adapter(exchange_dir=probe)
+            if str(getattr(adapter, "name", "") or "") == "inprocess":
+                raise InProcessLeadRefused(_INPROCESS_LEAD_REFUSAL)
+        finally:
+            shutil.rmtree(probe, ignore_errors=True)
+        lead_work = persist / "lead-work"
+        lead_work.mkdir(parents=True, exist_ok=True)
+        return LeadAdapterPlanner(adapter, cwd=lead_work, timeout_sec=timeout_sec)
     raise ValueError(f"unknown planner {name!r}")
 
 
@@ -74,14 +173,36 @@ def _backend(
     raise ValueError(f"unknown backend {name!r}")
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Local Goal API: ingress -> lead planning -> worker backend",
     )
     parser.add_argument("--persist", default=str(ROOT / ".collab-app"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--planner", choices=("deterministic", "grok"), default="deterministic")
+    parser.add_argument(
+        "--planner",
+        choices=("deterministic", "grok", "lead"),
+        default="deterministic",
+        help=(
+            "deterministic: bootstrap planner. "
+            "grok: Grok CLI lead; ignores COLLAB_LEAD_ADAPTER. "
+            "lead: LeadAdapter from COLLAB_LEAD_ADAPTER (default grok_cli; "
+            "inprocess and the codex alias are refused). "
+            "The lead decides the plan and routine permission/review gates; "
+            "anything it cannot decide (lead error, illegal JSON, timeout, "
+            "non-auto kinds like question/system_action) stays a pending human decision."
+        ),
+    )
+    parser.add_argument(
+        "--lead-timeout",
+        type=_positive_timeout,
+        default=180.0,
+        help=(
+            "Timeout in seconds for grok and lead planner decisions "
+            "(float, must be > 0). Default: 180."
+        ),
+    )
     parser.add_argument(
         "--backend",
         choices=("inprocess", "teleagent-windows", "antigravity", "agy"),
@@ -132,6 +253,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--token-env", default="COLLAB_API_TOKEN")
     parser.add_argument("--once", action="store_true", help="process all queued Goals once and exit")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
 
     if args.ready:
@@ -173,7 +299,15 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     persist = Path(args.persist).resolve()
-    planner = _planner(args.planner, persist)
+    try:
+        planner = _planner(args.planner, persist, args.lead_timeout)
+    except ValueError as exc:
+        # inprocess (including the codex alias) and unknown COLLAB_LEAD_ADAPTER.
+        # grok / deterministic errors are not argparse failures.
+        if args.planner != "lead":
+            raise
+        parser.error(str(exc))
+    _announce_lead_planner(planner)
     backend = _backend(
         args.backend,
         persist,
