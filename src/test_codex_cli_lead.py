@@ -436,14 +436,24 @@ class _FakeCodex:
         self.work.mkdir()
         self.script = root / "fake_codex.py"
         self.script.write_text(_FAKE_PY, encoding="utf-8")
-        self.shim = root / "codex"
-        self.shim.write_text(
-            "#!/bin/sh\n"
-            f"exec {shlex.quote(sys.executable)} {shlex.quote(str(self.script))} "
-            '"$0" "$@"\n',
-            encoding="utf-8",
-        )
-        self.shim.chmod(0o755)
+        if sys.platform == "win32":
+            # Windows cannot exec a #!/bin/sh shim; a .cmd shim also exercises
+            # the real cmd /d /s /c spawn path.
+            self.shim = root / "codex.cmd"
+            self.shim.write_text(
+                "@echo off\r\n"
+                f'"{sys.executable}" "{self.script}" "%~f0" %*\r\n',
+                encoding="utf-8",
+            )
+        else:
+            self.shim = root / "codex"
+            self.shim.write_text(
+                "#!/bin/sh\n"
+                f"exec {shlex.quote(sys.executable)} {shlex.quote(str(self.script))} "
+                '"$0" "$@"\n',
+                encoding="utf-8",
+            )
+            self.shim.chmod(0o755)
 
     def clear_record(self) -> None:
         for child in self.record.iterdir():
@@ -853,7 +863,8 @@ class TestCodexCliDecide(unittest.TestCase):
                             )
                     popen.assert_not_called()
                     self.assertEqual(parsed["_lead_status"], "call_failed")
-                    self.assertIn(str(folder), parsed["error"])
+                    # repr() doubles Windows backslashes; match the leaf name.
+                    self.assertIn(folder.name, parsed["error"])
                     self.assertIn(needle, parsed["error"])
                     self._assert_failed(raw, parsed, req, kind="permission", code="call_failed")
                     self._assert_temp_gone(created)
