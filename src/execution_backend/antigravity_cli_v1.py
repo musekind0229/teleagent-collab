@@ -12,7 +12,6 @@ import logging
 import os
 import re
 import shutil
-import signal
 import subprocess
 import tempfile
 import threading
@@ -36,9 +35,18 @@ from execution_backend.base import (
     BackendError,
     BackendStatus,
     ExecutionBackendABC,
+    PROMPT_ONLY_INPUTS_WARNING,
     SKIP_PERMISSIONS_WARNING,
     default_capabilities,
     unsupported,
+)
+from execution_backend.agy_run_registry import (
+    ENV_RUN_REGISTRY,
+    AgyRunRegistry,
+    descendant_pids,
+    describe_reaped,
+    kill_process_tree,
+    process_start_token,
 )
 from framework.progress_budget import (
     artifact_checkpoint,
@@ -324,11 +332,13 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         caps["acceptance"]["lead_review"] = False
         caps["acceptance"]["executable_checks"] = False
         caps["usage"]["source"] = "worker_self_reported"
-        # One-shot JSON: no percent and no subagent count. Process poll and
-        # workspace mtimes are real runner signals, so progress is available.
+        # One-shot JSON: no percent and no subagent count. The heartbeat is
+        # real activity (stdout/stderr growth, workspace mtimes, agy session
+        # files under the run's HOME), not "the process still exists", so a
+        # hung agy goes stale.
         caps["progress"] = progress_capability(
             available=True,
-            heartbeat="runner_process",
+            heartbeat="runner_activity",
             artifact_checkpoint=True,
             subagent_observability=False,
         )
@@ -354,7 +364,9 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             "max_runs": self._account_pool_run_limit(),
             "limited_by": ["agy_account_pool"],
         }
-        caps["warnings"] = [SKIP_PERMISSIONS_WARNING] if skip else []
+        # The prompt-only warning holds with or without skip-permissions; the
+        # status view shows it only on Goals that actually pin inputs.
+        caps["warnings"] = [PROMPT_ONLY_INPUTS_WARNING] + ([SKIP_PERMISSIONS_WARNING] if skip else [])
         return caps
 
     def _account_pool_run_limit(self) -> int:
@@ -382,6 +394,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         account_pool_path: str | None = None,
         persist_pool: bool = True,
         precheck: Any | None = None,
+        run_registry_path: str | None = None,
     ) -> None:
         # Base environ (no account pin). Per-dispatch HOME lives on each run rec.
         # Only an explicit account_pool_path (from inject / factory) enables
@@ -397,6 +410,23 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         self.timeout_sec = 300.0 if timeout_sec is None else float(timeout_sec)
         self.poll_sec = float(poll_sec)
         self._runs: dict[str, dict[str, Any]] = {}
+        # Durable pid record so a restarted service can stop orphaned workers
+        # instead of letting them keep writing into task workspaces.
+        reg_path = (str(run_registry_path).strip() if run_registry_path else "") or str(
+            self._base_env().get(ENV_RUN_REGISTRY) or ""
+        ).strip()
+        self._registry: AgyRunRegistry | None = AgyRunRegistry(reg_path) if reg_path else None
+        self.reaped_at_start: list[dict[str, Any]] = []
+        if self._registry is not None:
+            try:
+                self.reaped_at_start = self._registry.reap_orphans()
+            except Exception as exc:  # noqa: BLE001 — startup must not crash on a bad registry
+                _LOG.warning("agy run registry reap failed (%s)", type(exc).__name__)
+            for row in self.reaped_at_start:
+                _LOG.warning(
+                    "agy orphan from previous service: run=%s pid=%s outcome=%s",
+                    row.get("run_id"), row.get("pid"), row.get("outcome"),
+                )
 
     def _base_env(self) -> Mapping[str, str]:
         return self._base_environ if self._base_environ is not None else os.environ
@@ -517,6 +547,11 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             return failed
         proc = rec["proc"]
         rec["pid"] = proc.pid
+        if self._registry is not None:
+            try:
+                self._registry.record(rec["run_id"], pid=int(proc.pid), directory=str(root))
+            except Exception as exc:  # noqa: BLE001
+                _LOG.warning("agy run registry record failed (%s)", type(exc).__name__)
         self._start_pipe_drainers(rec, proc)
         return self._start_payload(rec, ok=True)
 
@@ -645,39 +680,88 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
     def _get(self, run_id: str) -> dict[str, Any]:
         rec = self._runs.get(run_id)
         if rec is None:
-            raise BackendError(BackendStatus.FAILED, f"unknown run_id={run_id}", capability="observe_run")
+            key = str(run_id or "")
+            if key.startswith("agy_native_"):
+                key = key[len("agy_native_"):]
+            reaped = self._registry.reaped() if self._registry is not None else {}
+            if key in reaped:
+                raise BackendError(BackendStatus.FAILED, describe_reaped(key, reaped[key]), capability="observe_run")
+            raise BackendError(
+                BackendStatus.FAILED,
+                f"unknown run_id={run_id}: no agy run with this id in this service process "
+                "(run handles do not survive a restart)",
+                capability="observe_run",
+            )
         return rec
 
-    def _kill_proc(self, proc: subprocess.Popen) -> bool:
+    @staticmethod
+    def _stop_leftover_children(rec: Mapping[str, Any]) -> None:
+        """Tool processes still running after agy itself exited are stopped.
+
+        Only children whose start token still matches are touched; the
+        exited agy pid itself is never signalled (it may be reused).
+        """
+        for row in list(rec.get("_children_seen") or []):
+            cpid = row.get("pid") if isinstance(row, Mapping) else None
+            token = str(row.get("start_token") or "") if isinstance(row, Mapping) else ""
+            if not isinstance(cpid, int) or not token or process_start_token(cpid) != token:
+                continue
+            try:
+                kill_process_tree(cpid, pgid=cpid, wait_sec=1.0)
+            except Exception:  # noqa: BLE001
+                continue
+
+    def _forget_run(self, rec: Mapping[str, Any]) -> None:
+        if self._registry is None:
+            return
+        try:
+            self._registry.forget(str(rec.get("run_id") or ""))
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warning("agy run registry forget failed (%s)", type(exc).__name__)
+
+    def close(self) -> None:
+        """Service shutdown: stop live workers; they cannot be collected later."""
+        for run_id, rec in list(self._runs.items()):
+            if run_id != rec.get("run_id"):
+                continue
+            proc = rec.get("proc")
+            if proc is None or proc.poll() is not None:
+                continue
+            self._kill_proc(proc, rec)
+            rec["cancelled"] = True
+            if self._registry is not None:
+                try:
+                    self._registry.mark_stopped(run_id, "stopped_at_shutdown")
+                except Exception as exc:  # noqa: BLE001
+                    _LOG.warning("agy run registry mark failed (%s)", type(exc).__name__)
+            self._harvest(rec)
+            self._release_pool_lease_after_cancel(rec)
+
+    def _kill_proc(self, proc: subprocess.Popen, rec: Mapping[str, Any] | None = None) -> bool:
         if proc.poll() is not None:
             return True
         # Windows has no os.killpg. taskkill /T is the process-tree equivalent
         # (a .cmd agy shim otherwise leaves the Python child holding the pipes).
         if not hasattr(os, "killpg"):
             return self._kill_proc_tree_windows(proc)
-        killed = False
+        # agy puts tool commands in their own process groups: kill the group,
+        # the session, every descendant and the tool children seen so far.
+        children = list((rec or {}).get("_children_seen") or [])
         try:
-            os.killpg(proc.pid, signal.SIGTERM)
-            killed = True
-        except (ProcessLookupError, PermissionError, OSError):
+            killed = kill_process_tree(proc.pid, pgid=proc.pid, children=children, wait_sec=2.0)
+        except Exception:  # noqa: BLE001
+            killed = False
             try:
-                proc.terminate()
-                killed = True
+                proc.kill()
             except OSError:
                 return False
         try:
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                try:
-                    proc.kill()
-                except OSError:
-                    return False
-            try:
+                proc.kill()
                 proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
+            except (OSError, subprocess.TimeoutExpired):
                 return proc.poll() is not None
         return killed or proc.poll() is not None
 
@@ -784,6 +868,8 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         if proc.poll() is None:
             return
         # Child has exited; finish draining (already streaming, no communicate deadlock).
+        self._stop_leftover_children(rec)
+        self._forget_run(rec)
         self._join_drainers(rec, timeout=5.0)
         try:
             # Reap without reading pipes again (drainers already consumed them).
@@ -872,7 +958,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
                 if wall is not None and wall >= 0 and (time.time() - float(started)) >= wall:
                     rec["timed_out"] = True
                     rec["assistant_error"] = rec.get("assistant_error") or "timeout"
-                    self._kill_proc(proc)
+                    self._kill_proc(proc, rec)
                     self._harvest(rec)
                     return
             rec["activity"] = "busy"
@@ -943,12 +1029,64 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         out["progress"] = self._runner_progress(rec)
         return _apply_contract_meta(out, rec)
 
+    @staticmethod
+    def _session_activity_at(rec: Mapping[str, Any]) -> float | None:
+        """Newest mtime of agy's own session files for this run's HOME.
+
+        agy --print emits JSON only at the end, but while it works it keeps
+        updating ``.gemini/antigravity-cli/{conversations,log}`` under HOME
+        (USERPROFILE on Windows). Only names and mtimes are read, never
+        contents. With several runs sharing one HOME (no account pool) the
+        signal is per-HOME, not per-run.
+        """
+        spawn = rec.get("spawn_environ") if isinstance(rec.get("spawn_environ"), Mapping) else {}
+        home = str(spawn.get("HOME") or spawn.get("USERPROFILE") or "").strip()
+        if not home:
+            return None
+        base = Path(home) / ".gemini" / "antigravity-cli"
+        latest: float | None = None
+        for sub in ("conversations", "log", "brain"):
+            folder = base / sub
+            try:
+                children = list(os.scandir(folder))[:400]
+            except OSError:
+                continue
+            for entry in children:
+                try:
+                    if entry.is_symlink():
+                        continue
+                    mtime = entry.stat(follow_symlinks=False).st_mtime
+                except OSError:
+                    continue
+                if latest is None or mtime > latest:
+                    latest = mtime
+        return latest
+
+    def _note_children(self, rec: dict[str, Any], pid: int) -> list[int]:
+        """Track tool processes (Linux /proc) so a restart can still stop them."""
+        try:
+            kids = descendant_pids(pid)
+        except Exception:  # noqa: BLE001
+            return []
+        seen = rec.setdefault("_children_seen", [])
+        known = {row.get("pid") for row in seen}
+        fresh = [k for k in kids if k not in known]
+        for k in fresh:
+            token = process_start_token(k)
+            if token:
+                seen.append({"pid": k, "start_token": token})
+        if fresh and self._registry is not None:
+            try:
+                self._registry.record_children(str(rec.get("run_id") or ""), fresh)
+            except Exception as exc:  # noqa: BLE001
+                _LOG.warning("agy run registry children failed (%s)", type(exc).__name__)
+        del seen[:-64]
+        return kids
+
     def _runner_progress(self, rec: dict[str, Any]) -> dict[str, Any]:
-        """Process poll, byte counts, and workspace names. No stream text."""
+        """Activity-based heartbeat, byte counts, and workspace names. No stream text."""
         proc = rec.get("proc")
         alive = proc is not None and callable(getattr(proc, "poll", None)) and proc.poll() is None
-        if alive:
-            rec["_last_alive_at"] = time.time()
         out_n = sum(len(piece) for piece in (rec.get("stdout_chunks") or []) if isinstance(piece, str))
         err_n = sum(len(piece) for piece in (rec.get("stderr_chunks") or []) if isinstance(piece, str))
         if out_n == 0 and isinstance(rec.get("stdout"), str):
@@ -964,26 +1102,47 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         rec["_stdout_bytes"] = out_n
         rec["_stderr_bytes"] = err_n
         entries, latest = artifact_checkpoint(str(rec.get("directory") or ""))
+        kids: list[int] = []
+        if alive and proc is not None:
+            kids = self._note_children(rec, int(proc.pid))
         if alive:
             phase = "executing" if (out_n or err_n or entries) else "starting"
         elif not rec.get("harvested"):
             phase = "finalizing"
         else:
             phase = "done"
-        hb_epoch = rec.get("_last_alive_at")
-        if not isinstance(hb_epoch, (int, float)) or isinstance(hb_epoch, bool):
-            hb_epoch = rec.get("started_at")
-        heartbeat = utc_iso(float(hb_epoch)) if isinstance(hb_epoch, (int, float)) and not isinstance(hb_epoch, bool) else None
-        progress_epoch = latest
+        started = rec.get("started_at")
+        started_at = float(started) if isinstance(started, (int, float)) and not isinstance(started, bool) else None
+        session_at = self._session_activity_at(rec)
+        if session_at is not None and started_at is not None and session_at < started_at:
+            session_at = None  # files from an earlier run
+        # Heartbeat = last observed activity, never "process still alive" (#5/#10):
+        # a live but silent agy must be able to go stale.
+        signals: dict[str, float] = {}
         output_at = rec.get("_output_progress_at")
         if isinstance(output_at, (int, float)) and not isinstance(output_at, bool):
-            if progress_epoch is None or float(output_at) > float(progress_epoch):
-                progress_epoch = float(output_at)
+            signals["output"] = float(output_at)
+        if latest is not None and (started_at is None or latest >= started_at):
+            signals["workspace"] = float(latest)
+        if session_at is not None:
+            signals["session"] = float(session_at)
+        progress_epoch = max(signals.values()) if signals else None
+        hb_epoch = progress_epoch if progress_epoch is not None else started_at
+        if progress_epoch is not None and started_at is not None:
+            hb_epoch = max(progress_epoch, started_at)
+        heartbeat = utc_iso(float(hb_epoch)) if hb_epoch is not None else None
+        if alive and phase == "starting" and session_at is not None:
+            phase = "executing"
+        source_name = max(signals, key=signals.get) if signals else "none"
         events = [
             sanitize_event(f"phase {phase}"),
             sanitize_event(f"stdout_bytes {out_n}"),
             sanitize_event(f"stderr_bytes {err_n}"),
+            sanitize_event(f"last_activity {source_name}"),
         ]
+        if kids:
+            # A long tool command is silent; say so instead of hiding why it may go stale.
+            events.append(sanitize_event(f"child_processes {len(kids)}"))
         return {
             "phase": phase,
             "last_heartbeat_at": heartbeat,
@@ -1003,7 +1162,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             except subprocess.TimeoutExpired:
                 rec["timed_out"] = True
                 rec["assistant_error"] = rec.get("assistant_error") or "timeout"
-                self._kill_proc(proc)
+                self._kill_proc(proc, rec)
         self._refresh(rec)
         obs = self.observe_run(run_id)
         present: list[str] = []
@@ -1119,7 +1278,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
                 "run_id": rec["run_id"],
                 "state": rec.get("state") or "already_finished",
             }
-        if not self._kill_proc(proc):
+        if not self._kill_proc(proc, rec):
             body = unsupported("cancel", f"could not signal agy pid={getattr(proc, 'pid', None)}")
             return 501, body
         rec["cancelled"] = True

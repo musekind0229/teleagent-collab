@@ -184,11 +184,12 @@ def _backend(
         # pool state and releases the lease so the next Goal can switch accounts.
         # In-memory agy run handles are NOT recoverable across restart — the
         # coordinator fails the Task with backend resume failed, never silent
-        # redispatch. reply_permission stays 501 (no TA permission channel).
+        # redispatch. agy-runs.json records worker pids; a restarted service
+        # stops orphaned workers (process group / taskkill /T) at startup. reply_permission stays 501 (no TA permission channel).
         from execution_backend import get_execution_backend
         from execution_backend.agy_account_pool import AccountPoolError
 
-        kw: dict = {}
+        kw: dict = {"run_registry_path": str(persist / "agy-runs.json")}
         pool = (agy_account_pool or "").strip()
         if pool:
             kw["account_pool_path"] = pool
@@ -219,6 +220,26 @@ def _emit_json(payload) -> None:
         except Exception:
             pass
     print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+
+
+def _install_stop_signals() -> None:
+    """SIGTERM (and SIGBREAK on Windows) take the same finally path as Ctrl-C.
+
+    Without it a plain ``kill`` skips backend.close(), so live agy workers
+    outlive the service and keep writing until the next start reaps them.
+    """
+    import signal
+
+    def _stop(signum, frame):  # noqa: ARG001
+        raise KeyboardInterrupt
+
+    for name in ("SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, _stop)
+            except (OSError, ValueError):
+                pass
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -442,6 +463,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
         flush=True,
     )
+    _install_stop_signals()
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:

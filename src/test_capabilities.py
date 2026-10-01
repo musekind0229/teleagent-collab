@@ -213,7 +213,7 @@ class CapabilityDocumentTests(unittest.TestCase):
             self.assertIs(caps["acceptance"]["lead_review"], False)
             self.assertEqual(caps["usage"]["source"], "worker_self_reported")
             self.assertIs(caps["progress"]["available"], True)
-            self.assertEqual(caps["progress"]["heartbeat"], "runner_process")
+            self.assertEqual(caps["progress"]["heartbeat"], "runner_activity")
             self.assertIs(caps["progress"]["artifact_checkpoint"], True)
             self.assertIs(caps["progress"]["percent"], False)
             self.assertIs(caps["progress"]["subagent_observability"], False)
@@ -235,9 +235,12 @@ class CapabilityDocumentTests(unittest.TestCase):
             self.assertEqual(caps["budget_enforcement"]["max_tool_calls"], "unsupported")
             self.assertEqual(caps["budget_enforcement"]["no_progress_sec"], "enforced")
         self.assertIs(off["skip_permissions"], False)
-        self.assertEqual(off["warnings"], [])
+        # Prompt-only external inputs are a fact of this backend, skip or not (#1, round-3 retest).
+        from execution_backend.base import PROMPT_ONLY_INPUTS_WARNING
+
+        self.assertEqual(off["warnings"], [PROMPT_ONLY_INPUTS_WARNING])
         self.assertIs(on["skip_permissions"], True)
-        self.assertEqual(on["warnings"], [SKIP_PERMISSIONS_WARNING])
+        self.assertEqual(on["warnings"], [PROMPT_ONLY_INPUTS_WARNING, SKIP_PERMISSIONS_WARNING])
         self.assertEqual(SKIP_PERMISSIONS_WARNING, BASE_SKIP_WARNING)
 
     def test_supervised_backends_expose_native_decisions(self) -> None:

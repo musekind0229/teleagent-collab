@@ -16,7 +16,11 @@ STALE_AFTER_DEFAULT = 120.0
 
 PROGRESS_STATES = frozenset(
     {
+        "planning",
+        "preparing",
         "executing",
+        "testing",
+        "reviewing",
         "waiting_decision",
         "waiting_capacity",
         "stale",
@@ -306,7 +310,7 @@ def progress_capability(
     a real observation and is not emitted.
     """
     beat: str | bool = False
-    if heartbeat in {"runner_process", "engine"}:
+    if heartbeat in {"runner_process", "runner_activity", "engine"}:
         beat = heartbeat
     sub: bool | str = "unknown"
     if subagent_observability is False:

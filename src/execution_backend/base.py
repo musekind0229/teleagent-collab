@@ -31,6 +31,13 @@ REQUIRED_CAPABILITY_NAMES = frozenset(
     }
 )
 
+# Same text in capabilities.warnings and on every Goal that pins external
+# inputs on such a backend, whether or not skip-permissions is on.
+PROMPT_ONLY_INPUTS_WARNING = (
+    "pinned external inputs are prompt-only: the worker is told which files it may "
+    "read, but nothing enforces it (no OS sandbox, no access audit)"
+)
+
 SKIP_PERMISSIONS_WARNING = (
     "backend runs with skip-permissions: no permission gate; "
     "pinned external inputs are prompt-only"
