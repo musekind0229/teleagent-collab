@@ -483,6 +483,343 @@ class HermesCollabRequestTests(unittest.TestCase):
         self.assertTrue(printed["wait"]["terminal"])
         self.assertNotEqual(printed.get("code"), "need_human")
 
+    def test_need_human_view_lead_rows_keep_polling(self) -> None:
+        all_lead = HCR.need_human_view(
+            {
+                "state": "running",
+                "awaiting_decision": True,
+                "pending_decision_count": 2,
+                "awaiting_lead_count": 2,
+                "awaiting_human_count": 0,
+                "pending_decisions": [
+                    {
+                        "decision_id": "d-lead",
+                        "kind": "artifact_review",
+                        "title": "review",
+                        "awaiting": "lead",
+                    },
+                    {
+                        "decision_id": "d-perm",
+                        "kind": "action_approval",
+                        "title": "perm",
+                        "awaiting": "lead",
+                    },
+                ],
+            }
+        )
+        self.assertIsNone(all_lead)
+
+        mixed = HCR.need_human_view(
+            {
+                "state": "running",
+                "pending_decisions": [
+                    {
+                        "decision_id": "h1",
+                        "kind": "question",
+                        "title": "ask",
+                        "status": "pending",
+                        "awaiting": "human",
+                    },
+                    {
+                        "decision_id": "l1",
+                        "kind": "artifact_review",
+                        "title": "rev",
+                        "awaiting": "lead",
+                    },
+                    {
+                        "decision_id": "h2",
+                        "kind": "system_action_approval",
+                        "title": "sys",
+                        "status": "pending",
+                        "awaiting": "human",
+                    },
+                ],
+            }
+        )
+        self.assertIsNotNone(mixed)
+        assert mixed is not None
+        self.assertEqual(mixed["reason"], "pending_decisions")
+        self.assertEqual(mixed["decision_ids"], ["h1", "h2"])
+        self.assertEqual([row["decision_id"] for row in mixed["decisions"]], ["h1", "h2"])
+        self.assertEqual(mixed["decisions"][0]["awaiting"], "human")
+        self.assertEqual(mixed["decisions"][1]["awaiting"], "human")
+        self.assertEqual(mixed["lead_pending_ids"], ["l1"])
+
+        old = HCR.need_human_view(
+            {
+                "state": "blocked",
+                "pending_decisions": [
+                    {
+                        "decision_id": "dec-1",
+                        "kind": "system_action_approval",
+                        "title": "需要批准安装",
+                        "task_id": "task-1",
+                        "status": "pending",
+                    }
+                ],
+            }
+        )
+        self.assertIsNotNone(old)
+        assert old is not None
+        self.assertEqual(old["reason"], "pending_decisions")
+        self.assertEqual(old["decision_ids"], ["dec-1"])
+        self.assertEqual(old["decisions"][0]["summary"], "需要批准安装")
+        self.assertEqual(old["decisions"][0]["kind"], "system_action_approval")
+        self.assertNotIn("awaiting", old["decisions"][0])
+        self.assertNotIn("lead_pending_ids", old)
+
+        mixed_old = HCR.need_human_view(
+            {
+                "state": "running",
+                "pending_decisions": [
+                    {"decision_id": "old-1", "kind": "question", "title": "旧服务"},
+                    {
+                        "decision_id": "lead-1",
+                        "kind": "artifact_review",
+                        "title": "rev",
+                        "awaiting": "lead",
+                    },
+                ],
+            }
+        )
+        self.assertIsNotNone(mixed_old)
+        assert mixed_old is not None
+        self.assertEqual(mixed_old["decision_ids"], ["old-1"])
+        self.assertNotIn("awaiting", mixed_old["decisions"][0])
+        self.assertEqual(mixed_old["lead_pending_ids"], ["lead-1"])
+
+        self.assertIsNone(
+            HCR.need_human_view(
+                {
+                    "state": "running",
+                    "pending_decisions": [],
+                    "pending_decision_count": 1,
+                    "awaiting_decision": True,
+                    "awaiting_human_count": 0,
+                    "awaiting_lead_count": 2,
+                }
+            )
+        )
+        old_counts = HCR.need_human_view(
+            {
+                "state": "running",
+                "pending_decisions": [],
+                "pending_decision_count": 1,
+                "awaiting_decision": True,
+            }
+        )
+        self.assertIsNotNone(old_counts)
+        assert old_counts is not None
+        self.assertEqual(old_counts["reason"], "awaiting_decision")
+        self.assertEqual(old_counts["decisions"], [])
+        self.assertNotIn("lead_pending_ids", old_counts)
+        human_counts = HCR.need_human_view(
+            {
+                "state": "running",
+                "awaiting_decision": True,
+                "pending_decision_count": 2,
+                "awaiting_human_count": 1,
+                "awaiting_lead_count": 1,
+            }
+        )
+        self.assertIsNotNone(human_counts)
+        assert human_counts is not None
+        self.assertEqual(human_counts["reason"], "awaiting_decision")
+        missing_lead = HCR.need_human_view(
+            {
+                "state": "running",
+                "awaiting_decision": True,
+                "pending_decision_count": 1,
+                "awaiting_human_count": 0,
+            }
+        )
+        self.assertIsNotNone(missing_lead)
+        assert missing_lead is not None
+        self.assertEqual(missing_lead["reason"], "awaiting_decision")
+
+    def test_wait_lead_pending_then_completed_exits_0(self) -> None:
+        states = iter(
+            [
+                {
+                    "ok": True,
+                    "state": "running",
+                    "request_id": "g1",
+                    "awaiting_decision": True,
+                    "pending_decision_count": 1,
+                    "awaiting_lead_count": 1,
+                    "awaiting_human_count": 0,
+                    "pending_decisions": [
+                        {
+                            "decision_id": "d-lead",
+                            "kind": "artifact_review",
+                            "title": "TeleAgent review",
+                            "status": "pending",
+                            "awaiting": "lead",
+                        }
+                    ],
+                },
+                {
+                    "ok": True,
+                    "state": "completed",
+                    "request_id": "g1",
+                    "pending_decisions": [],
+                    "awaiting_lead_count": 0,
+                    "awaiting_human_count": 0,
+                },
+            ]
+        )
+
+        def fake_urlopen(req, timeout=30):
+            self.assertNotIn("/decisions", req.full_url)
+            return _FakeResp(next(states))
+
+        code, printed, slept = self._wait_main(
+            ["wait", "g1", "--timeout", "30", "--interval", "0.2"],
+            fake_urlopen,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(slept.call_count, 1)
+        self.assertEqual(printed["state"], "completed")
+        self.assertTrue(printed["wait"]["terminal"])
+        self.assertNotEqual(printed.get("code"), "need_human")
+
+    def test_wait_lead_pending_then_human_exits_4(self) -> None:
+        states = iter(
+            [
+                {
+                    "ok": True,
+                    "state": "running",
+                    "request_id": "g1",
+                    "awaiting_decision": True,
+                    "pending_decision_count": 1,
+                    "awaiting_lead_count": 1,
+                    "awaiting_human_count": 0,
+                    "pending_decisions": [
+                        {
+                            "decision_id": "d-lead",
+                            "kind": "artifact_review",
+                            "title": "TeleAgent review",
+                            "status": "pending",
+                            "awaiting": "lead",
+                        }
+                    ],
+                },
+                {
+                    "ok": True,
+                    "state": "running",
+                    "request_id": "g1",
+                    "awaiting_decision": True,
+                    "pending_decision_count": 1,
+                    "awaiting_lead_count": 0,
+                    "awaiting_human_count": 1,
+                    "pending_decisions": [
+                        {
+                            "decision_id": "d-lead",
+                            "kind": "artifact_review",
+                            "title": "TeleAgent review",
+                            "status": "pending",
+                            "awaiting": "human",
+                            "reason": "quota",
+                            "lead_error": {
+                                "code": "quota",
+                                "retryable": False,
+                                "message": "quota",
+                            },
+                        }
+                    ],
+                },
+            ]
+        )
+
+        def fake_urlopen(req, timeout=30):
+            return _FakeResp(next(states))
+
+        code, printed, slept = self._wait_main(
+            ["wait", "g1", "--timeout", "30", "--interval", "0.2"],
+            fake_urlopen,
+        )
+        self.assertEqual(code, 4)
+        self.assertEqual(slept.call_count, 1)
+        self.assertEqual(printed["code"], "need_human")
+        wait = printed["wait"]
+        self.assertEqual(wait["reason"], "pending_decisions")
+        self.assertEqual(wait["decision_ids"], ["d-lead"])
+        self.assertEqual(wait["decisions"][0]["awaiting"], "human")
+        self.assertEqual(wait["decisions"][0]["summary"], "TeleAgent review")
+        self.assertFalse(wait["timed_out"])
+        self.assertNotIn("lead_pending_ids", wait)
+
+    def test_wait_mixed_emits_human_only_and_lead_ids(self) -> None:
+        def fake_urlopen(req, timeout=30):
+            return _FakeResp(
+                {
+                    "ok": True,
+                    "state": "running",
+                    "request_id": "g1",
+                    "pending_decisions": [
+                        {
+                            "decision_id": "h1",
+                            "kind": "question",
+                            "title": "ask",
+                            "awaiting": "human",
+                        },
+                        {
+                            "decision_id": "l1",
+                            "kind": "artifact_review",
+                            "title": "rev",
+                            "awaiting": "lead",
+                        },
+                    ],
+                }
+            )
+
+        code, printed, slept = self._wait_main(
+            ["wait", "g1", "--timeout", "30", "--interval", "0.2"],
+            fake_urlopen,
+        )
+        self.assertEqual(code, 4)
+        self.assertEqual(slept.call_count, 0)
+        self.assertEqual(printed["wait"]["decision_ids"], ["h1"])
+        self.assertEqual(printed["wait"]["lead_pending_ids"], ["l1"])
+        self.assertEqual(printed["wait"]["decisions"][0]["awaiting"], "human")
+        self.assertEqual(len(printed["wait"]["decisions"]), 1)
+
+    def test_wait_lead_pending_times_out_exit_3(self) -> None:
+        def fake_urlopen(req, timeout=30):
+            return _FakeResp(
+                {
+                    "ok": True,
+                    "state": "running",
+                    "request_id": "g1",
+                    "awaiting_decision": True,
+                    "pending_decision_count": 1,
+                    "awaiting_lead_count": 1,
+                    "awaiting_human_count": 0,
+                    "pending_decisions": [
+                        {
+                            "decision_id": "d-lead",
+                            "kind": "permission",
+                            "title": "perm",
+                            "awaiting": "lead",
+                        }
+                    ],
+                }
+            )
+
+        mono = iter([100.0, 101.0])
+        buf = io.StringIO()
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with mock.patch.object(HCR.time, "monotonic", side_effect=lambda: next(mono)):
+                with mock.patch.object(HCR.time, "sleep", return_value=None) as slept:
+                    with mock.patch("sys.stdout", buf):
+                        code = HCR.main(["wait", "g1", "--timeout", "1", "--interval", "0.2"])
+        printed = json.loads(buf.getvalue())
+        self.assertEqual(code, 3)
+        self.assertEqual(slept.call_count, 0)
+        self.assertTrue(printed["wait"]["timed_out"])
+        self.assertNotEqual(printed.get("code"), "need_human")
+        self.assertEqual(printed["wait"]["timeout_sec"], 1.0)
+
     def test_need_human_view_summary_truncate_and_fallback(self) -> None:
         long_summary = "第一行\n" + ("测" * 250)
         truncated = HCR.need_human_view(

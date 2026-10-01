@@ -339,6 +339,57 @@ AUTO_RESOLVE_BACKEND_KINDS = frozenset({"permission", "review"})
 # Permission / question / review / system_action surface through Goal decision API.
 # system_action maps to system_action_approval and is NEVER in AUTO_RESOLVE_BACKEND_KINDS.
 PROJECTABLE_BACKEND_KINDS = frozenset({"permission", "question", "review", "system_action"})
+
+
+def _decision_details(decision: Mapping[str, Any]) -> Mapping[str, Any]:
+    details = decision.get("details")
+    return details if isinstance(details, Mapping) else {}
+
+
+def _pending_lead_error(decision: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Lead error on the decision: ``details`` first, then the top-level copy."""
+    details = _decision_details(decision)
+    err = details.get("lead_error") if isinstance(details.get("lead_error"), Mapping) else {}
+    if not err and isinstance(decision.get("lead_error"), Mapping):
+        err = dict(decision.get("lead_error") or {})
+    return err
+
+
+def _pending_lead_attempts(decision: Mapping[str, Any]) -> int:
+    return int(_decision_details(decision).get("lead_attempts") or 0)
+
+
+def _lead_auto_resolve_capable(planner: Any, backend: Any, backend_kind: str) -> bool:
+    """Planner can decide, the backend can apply it, and this kind is auto-resolved."""
+    return bool(
+        callable(getattr(planner, "decide_action", None))
+        and callable(getattr(backend, "resolve_decision", None))
+        and str(backend_kind or "") in AUTO_RESOLVE_BACKEND_KINDS
+    )
+
+
+def _lead_attempts_exhausted(decision: Mapping[str, Any]) -> bool:
+    """True when the lead must stop and the decision waits for a human.
+
+    Exhausted means ``attempts >= MAX_LEAD_ATTEMPTS_PER_DECISION``, or at least
+    one attempt whose ``lead_error.retryable`` is not true (missing counts as
+    not retryable).
+    """
+    err = _pending_lead_error(decision)
+    attempts = _pending_lead_attempts(decision)
+    return attempts >= MAX_LEAD_ATTEMPTS_PER_DECISION or (
+        attempts >= 1 and not err.get("retryable", False)
+    )
+
+
+def _lead_will_decide(planner: Any, backend: Any, decision: Mapping[str, Any]) -> bool:
+    """True when the next tick will ask the lead instead of a human."""
+    if not isinstance(decision, Mapping):
+        return False
+    kind = str(_decision_details(decision).get("backend_kind") or "")
+    if not _lead_auto_resolve_capable(planner, backend, kind):
+        return False
+    return not _lead_attempts_exhausted(decision)
 _NONRETRYABLE_LEAD_MARKERS = (
     "quota",
     "rate limit",
@@ -1119,41 +1170,32 @@ class AppCoordinator:
             return {**finished, "action": "task_finished"}
         return {"ok": True, "goal_id": goal_id, "state": snap.get("state"), "action": "waiting"}
 
+    def lead_will_decide(self, decision: Mapping[str, Any]) -> bool:
+        """Whether the next tick resolves ``decision`` by the lead, not a human."""
+        return _lead_will_decide(self.planner, self.backend, decision)
+
     def _continue_pending_decision(
         self,
         snap: Mapping[str, Any],
         task: Mapping[str, Any],
         decision: Mapping[str, Any],
     ) -> dict[str, Any]:
-        details = decision.get("details") if isinstance(decision.get("details"), Mapping) else {}
+        details = _decision_details(decision)
         backend_kind = str(details.get("backend_kind") or "")
-        lead_decider = getattr(self.planner, "decide_action", None)
-        backend_resolver = getattr(self.backend, "resolve_decision", None)
-        if not (
-            callable(lead_decider)
-            and callable(backend_resolver)
-            and backend_kind in AUTO_RESOLVE_BACKEND_KINDS
-        ):
-            return {
+        if not self.lead_will_decide(decision):
+            required: dict[str, Any] = {
                 "ok": True,
                 "goal_id": snap.get("goal_id"),
                 "state": "running",
                 "action": "decision_required",
                 "decision_id": decision.get("decision_id"),
             }
-        err = details.get("lead_error") if isinstance(details.get("lead_error"), Mapping) else {}
-        if not err and isinstance(decision.get("lead_error"), Mapping):
-            err = dict(decision.get("lead_error") or {})
-        attempts = int(details.get("lead_attempts") or 0)
-        if attempts >= MAX_LEAD_ATTEMPTS_PER_DECISION or (attempts >= 1 and not err.get("retryable", False)):
-            return {
-                "ok": True,
-                "goal_id": snap.get("goal_id"),
-                "state": "running",
-                "action": "decision_required",
-                "decision_id": decision.get("decision_id"),
-                "lead_error": err or {"code": "lead_exhausted", "retryable": False},
-            }
+            # Capable but exhausted: surface the lead error. Incapable kinds
+            # (question / system_action, or no decide/resolve hooks) stay quiet.
+            if _lead_auto_resolve_capable(self.planner, self.backend, backend_kind):
+                err = _pending_lead_error(decision)
+                required["lead_error"] = err or {"code": "lead_exhausted", "retryable": False}
+            return required
         action = {
             "kind": backend_kind,
             "request_id": str(details.get("backend_request_id") or decision.get("request_id") or ""),
@@ -1176,11 +1218,7 @@ class AppCoordinator:
         decision_id = str(decision.get("decision_id") or "")
         request_id = str(action.get("request_id") or decision.get("request_id") or "")
         details = decision.get("details") if isinstance(decision.get("details"), Mapping) else {}
-        if not (
-            callable(lead_decider)
-            and callable(backend_resolver)
-            and backend_kind in AUTO_RESOLVE_BACKEND_KINDS
-        ):
+        if not _lead_auto_resolve_capable(self.planner, self.backend, backend_kind):
             return {
                 "ok": True,
                 "goal_id": snap.get("goal_id"),
@@ -1847,6 +1885,21 @@ class CollabApplication:
             "status_url": f"/v1/requests/{result['goal_id']}",
         }
 
+    def _publish_pending(self, rows: Any) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        """Public pending rows tagged ``awaiting`` lead or human, plus counts.
+
+        Uses the coordinator's planner and backend, the same predicate as
+        ``AppCoordinator.lead_will_decide``. ``pending_decisions`` /
+        ``pending_decision_count`` / ``awaiting_decision`` stay unchanged.
+        """
+        pending = public_pending_decisions(rows)
+        for row in pending:
+            row["awaiting"] = "lead" if self.coordinator.lead_will_decide(row) else "human"
+        return pending, {
+            "awaiting_lead_count": sum(1 for row in pending if row.get("awaiting") == "lead"),
+            "awaiting_human_count": sum(1 for row in pending if row.get("awaiting") == "human"),
+        }
+
     def status(self, goal_id: str) -> dict[str, Any]:
         result = self.layer.get_goal(goal_id)
         if not result.get("ok"):
@@ -1858,7 +1911,7 @@ class CollabApplication:
             failure=failure if isinstance(failure, Mapping) else None,
             tasks=tasks if isinstance(tasks, list) else [],
         )
-        pending = public_pending_decisions(snap.get("pending_decisions") or [])
+        pending, awaiting_counts = self._publish_pending(snap.get("pending_decisions") or [])
         out = {
             "ok": True,
             "api_version": API_VERSION,
@@ -1869,6 +1922,7 @@ class CollabApplication:
             "pending_decisions": pending,
             "pending_decision_count": len(pending),
             "awaiting_decision": bool(pending),
+            **awaiting_counts,
             "failure": failure,
             "need_human": bool(nh_view.get("need_human")),
             "failure_reason": nh_view.get("failure_reason") or "",
@@ -1901,7 +1955,7 @@ class CollabApplication:
         if not current.get("ok"):
             raise AppError(str(current.get("error")), status=404, code="not_found")
         snap = current.get("goal") if isinstance(current.get("goal"), Mapping) else {}
-        pending = public_pending_decisions(snap.get("pending_decisions") or [])
+        pending, awaiting_counts = self._publish_pending(snap.get("pending_decisions") or [])
         return {
             "ok": True,
             "api_version": API_VERSION,
@@ -1909,6 +1963,7 @@ class CollabApplication:
             "pending_decisions": pending,
             "pending_decision_count": len(pending),
             "awaiting_decision": bool(pending),
+            **awaiting_counts,
         }
 
     def get_decision(self, goal_id: str, decision_id: str) -> dict[str, Any]:
@@ -1917,11 +1972,12 @@ class CollabApplication:
         if not current.get("ok"):
             raise AppError(str(current.get("error")), status=404, code="not_found")
         snap = current.get("goal") if isinstance(current.get("goal"), Mapping) else {}
-        pending = public_pending_decisions(snap.get("pending_decisions") or [])
+        pending, _awaiting_counts = self._publish_pending(snap.get("pending_decisions") or [])
         want = str(decision_id or "")
         row = next((item for item in pending if str(item.get("decision_id") or "") == want), None)
         if row is None:
             raise AppError("decision not found", status=404, code="not_found")
+        awaiting = str(row.get("awaiting") or "human")
         return {
             "ok": True,
             "api_version": API_VERSION,
@@ -1929,19 +1985,22 @@ class CollabApplication:
             "decision": row,
             "pending_decision_count": 1,
             "awaiting_decision": True,
+            "awaiting_lead_count": 1 if awaiting == "lead" else 0,
+            "awaiting_human_count": 0 if awaiting == "lead" else 1,
         }
 
     def events(self, goal_id: str) -> dict[str, Any]:
         out = self.layer.list_events(goal_id)
         if not out.get("ok"):
             raise AppError(str(out.get("error")), status=404, code="not_found")
-        pending = public_pending_decisions(out.get("pending") or out.get("pending_decisions") or [])
+        pending, awaiting_counts = self._publish_pending(out.get("pending") or out.get("pending_decisions") or [])
         return {
             **out,
             "pending": pending,
             "pending_decisions": pending,
             "pending_decision_count": len(pending),
             "awaiting_decision": bool(pending),
+            **awaiting_counts,
         }
 
     def report(self, goal_id: str) -> dict[str, Any]:

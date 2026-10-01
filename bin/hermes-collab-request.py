@@ -34,7 +34,7 @@ Exit codes:
   1  EXIT_ERROR            HTTP/transport/API error, or payload ok=false
   2  EXIT_FAILED           wait ended in failed or cancelled
   3  EXIT_TIMEOUT          wait hit the wall-clock deadline
-  4  EXIT_NEED_HUMAN       wait stopped immediately: a human decision is required
+  4  EXIT_NEED_HUMAN       a human decision is required (lead-owned rows keep polling)
   5  EXIT_DECISION_REFUSED decide: server refused the decision (HTTP 409).
                           Body keeps code, error, and contamination/hint when present.
 """
@@ -827,7 +827,7 @@ def _decision_brief(row: dict[str, Any]) -> dict[str, Any]:
             return ""
         return str(value)
 
-    return {
+    brief = {
         "decision_id": _text(row.get("decision_id")),
         "kind": _text(row.get("kind")),
         "title": _text(row.get("title")),
@@ -836,12 +836,62 @@ def _decision_brief(row: dict[str, Any]) -> dict[str, Any]:
         "reason": _text(row.get("reason")),
         "summary": _decision_summary(row),
     }
+    if "awaiting" in row and row.get("awaiting") is not None:
+        awaiting = str(row.get("awaiting"))
+        if awaiting:
+            brief["awaiting"] = awaiting
+    return brief
 
 
 def _decision_briefs(rows: Any) -> list[dict[str, Any]]:
     if not isinstance(rows, list):
         return []
     return [_decision_brief(row) for row in rows if isinstance(row, dict)]
+
+
+def _partition_pending_rows(rows: Any) -> tuple[str, list[dict[str, Any]], list[str]]:
+    """Split pending rows into human vs lead.
+
+    Returns ``(mode, human_rows, lead_ids)``:
+
+    - ``all_lead``: at least one dict row, and every dict row has
+      ``awaiting == "lead"`` (wait should keep polling).
+    - ``rows``: human rows are everything that is not explicitly lead,
+      including old-server rows that omit ``awaiting``. ``lead_ids`` are the
+      lead-owned decision ids, in row order.
+    - ``none``: no dict rows.
+    """
+    if not isinstance(rows, list):
+        return "none", [], []
+    dict_rows = [row for row in rows if isinstance(row, dict)]
+    if not dict_rows:
+        return "none", [], []
+    human: list[dict[str, Any]] = []
+    lead_ids: list[str] = []
+    for row in dict_rows:
+        if row.get("awaiting") == "lead":
+            lead_ids.append("" if row.get("decision_id") is None else str(row.get("decision_id")))
+        else:
+            human.append(row)
+    if not human and lead_ids:
+        return "all_lead", [], lead_ids
+    return "rows", human, lead_ids
+
+
+def _counts_say_lead_only(status: dict[str, Any]) -> bool:
+    """True when the status says every pending decision is the lead's.
+
+    Both counts must be present. A missing ``awaiting_human_count`` is an old
+    server and must not be treated as zero.
+    """
+    if "awaiting_human_count" not in status or "awaiting_lead_count" not in status:
+        return False
+    try:
+        human = int(status.get("awaiting_human_count"))
+        lead = int(status.get("awaiting_lead_count"))
+    except (TypeError, ValueError):
+        return False
+    return human == 0 and lead > 0
 
 
 def need_human_view(status: dict[str, Any]) -> dict[str, Any] | None:
@@ -851,6 +901,12 @@ def need_human_view(status: dict[str, Any]) -> dict[str, Any] | None:
     decision rows are still present. Otherwise the first matching signal is
     pending_decisions, then awaiting_decision / pending_decision_count, then
     a task whose status is awaiting_decision.
+
+    Rows with ``awaiting == "lead"`` belong to the lead. If every pending row
+    is lead-owned, return None so wait keeps polling. A mix returns only the
+    human rows and ``lead_pending_ids`` for the rest. Rows without ``awaiting``
+    (old server) stay human, same as before. When the status has no rows but
+    ``awaiting_human_count == 0`` and ``awaiting_lead_count > 0``, keep polling.
     """
     if not isinstance(status, dict):
         return None
@@ -861,14 +917,25 @@ def need_human_view(status: dict[str, Any]) -> dict[str, Any] | None:
     raw_pending = status.get("pending_decisions")
     pending_nonempty = isinstance(raw_pending, list) and len(raw_pending) > 0
     task_ids: list[str] | None = None
+    lead_pending_ids: list[str] | None = None
+    decision_source: Any = raw_pending
     if pending_nonempty:
+        mode, human_rows, lead_ids = _partition_pending_rows(raw_pending)
+        if mode == "all_lead":
+            return None
         reason = "pending_decisions"
+        if mode == "rows":
+            decision_source = human_rows
+            if lead_ids:
+                lead_pending_ids = lead_ids
     else:
         try:
             count_n = int(status.get("pending_decision_count") or 0)
         except (TypeError, ValueError):
             count_n = 0
         if status.get("awaiting_decision") or count_n > 0:
+            if _counts_say_lead_only(status):
+                return None
             reason = "awaiting_decision"
         else:
             tasks = status.get("tasks")
@@ -882,7 +949,7 @@ def need_human_view(status: dict[str, Any]) -> dict[str, Any] | None:
             reason = "task_awaiting_decision"
             task_ids = ids
 
-    decisions = _decision_briefs(raw_pending)
+    decisions = _decision_briefs(decision_source)
     view: dict[str, Any] = {
         "reason": reason,
         "state": state,
@@ -891,6 +958,8 @@ def need_human_view(status: dict[str, Any]) -> dict[str, Any] | None:
     }
     if task_ids is not None:
         view["task_ids"] = task_ids
+    if lead_pending_ids:
+        view["lead_pending_ids"] = lead_pending_ids
     return view
 
 
@@ -912,6 +981,8 @@ def cmd_wait(args: argparse.Namespace) -> dict[str, Any]:
             decisions = list(view.get("decisions") or [])
             decision_ids = list(view.get("decision_ids") or [])
             reason = str(view.get("reason") or "")
+            lead_pending_ids = list(view.get("lead_pending_ids") or [])
+            fetched_all_lead = False
             # Status can flag awaiting_decision before rows are copied onto it.
             if not decisions and reason != "pending_decisions":
                 try:
@@ -923,25 +994,38 @@ def cmd_wait(args: argparse.Namespace) -> dict[str, Any]:
                 except ClientError:
                     extra = None
                 if isinstance(extra, dict):
-                    filled = _decision_briefs(extra.get("pending_decisions"))
-                    if filled:
-                        decisions = filled
-                        decision_ids = [item["decision_id"] for item in filled]
-            last["code"] = "need_human"
-            last["need_human"] = True
-            wait_info: dict[str, Any] = {
-                "terminal": False,
-                "need_human": True,
-                "timed_out": False,
-                "reason": reason,
-                "state": view.get("state", state),
-                "decision_ids": decision_ids,
-                "decisions": decisions,
-            }
-            if "task_ids" in view:
-                wait_info["task_ids"] = list(view["task_ids"])
-            last["wait"] = wait_info
-            raise ClientError(last, exit_code=EXIT_NEED_HUMAN)
+                    mode, human_rows, extra_lead = _partition_pending_rows(
+                        extra.get("pending_decisions")
+                    )
+                    if mode == "all_lead":
+                        # The list endpoint caught up: still the lead's. Keep polling.
+                        fetched_all_lead = True
+                    else:
+                        source = human_rows if mode == "rows" else extra.get("pending_decisions")
+                        filled = _decision_briefs(source)
+                        if filled:
+                            decisions = filled
+                            decision_ids = [item["decision_id"] for item in filled]
+                        if extra_lead:
+                            lead_pending_ids = extra_lead
+            if not fetched_all_lead:
+                last["code"] = "need_human"
+                last["need_human"] = True
+                wait_info: dict[str, Any] = {
+                    "terminal": False,
+                    "need_human": True,
+                    "timed_out": False,
+                    "reason": reason,
+                    "state": view.get("state", state),
+                    "decision_ids": decision_ids,
+                    "decisions": decisions,
+                }
+                if "task_ids" in view:
+                    wait_info["task_ids"] = list(view["task_ids"])
+                if lead_pending_ids:
+                    wait_info["lead_pending_ids"] = lead_pending_ids
+                last["wait"] = wait_info
+                raise ClientError(last, exit_code=EXIT_NEED_HUMAN)
         if time.monotonic() >= deadline:
             last["wait"] = {
                 "terminal": False,

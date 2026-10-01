@@ -530,6 +530,24 @@ class _RaisingBackend:
         raise self._exc
 
 
+class _DecidePlanner:
+    """Planner stub with decide_action. plan() is unused by the awaiting tests."""
+
+    name = "test.decide"
+
+    def decide_action(self, goal_snapshot, task, action):
+        return {"verdict": "once", "reason": "bounded"}
+
+
+class _ResolveBackend:
+    """Backend stub with resolve_decision. No worker loop."""
+
+    backend_id = "test.resolve"
+
+    def resolve_decision(self, request_id, *, verdict, reason, answers=None):
+        return {"ok": True, "request_id": request_id, "verdict": verdict}
+
+
 class AppServiceTests(unittest.TestCase):
     def setUp(self):
         install_desktop_lock_isolation(self)
@@ -1428,6 +1446,243 @@ class AppServiceTests(unittest.TestCase):
             self.assertEqual(second["action"], "decision_required", second)
             self.assertEqual(lead.review_calls, 1)
             self.assertEqual(len(app.status(opened["goal_id"])["pending_decisions"]), 1)
+
+    def test_public_pending_awaiting_lead_or_human(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            lead_app = CollabApplication(
+                root / "lead",
+                planner=_DecidePlanner(),
+                backend=_ResolveBackend(),
+            )
+            gid = lead_app.submit(_request())["goal_id"]
+            bare = lead_app.status(gid)
+            self.assertEqual(bare["pending_decisions"], [])
+            self.assertEqual(bare["pending_decision_count"], 0)
+            self.assertFalse(bare["awaiting_decision"])
+            self.assertEqual(bare["awaiting_lead_count"], 0)
+            self.assertEqual(bare["awaiting_human_count"], 0)
+
+            def open_dec(decision_id: str, kind: str, backend_kind: str, **details: object) -> None:
+                result = lead_app.layer.open_decision(
+                    gid,
+                    kind=kind,
+                    decision_id=decision_id,
+                    request_id=decision_id,
+                    title=kind,
+                    details={
+                        "backend_kind": backend_kind,
+                        "backend_request_id": decision_id,
+                        **details,
+                    },
+                )
+                self.assertTrue(result.get("ok"), result)
+
+            open_dec("dec-review", "artifact_review", "review")
+            open_dec("dec-perm", "action_approval", "permission")
+            open_dec("dec-q", "question", "question")
+            open_dec("dec-sys", "system_action_approval", "system_action")
+            open_dec("dec-ex", "artifact_review", "review", lead_attempts=1)
+            noted = lead_app.layer.annotate_decision(
+                gid,
+                decision_id="dec-ex",
+                details={
+                    "lead_attempts": 1,
+                    "lead_error": {"code": "quota", "retryable": False, "message": "quota"},
+                },
+                lead_error={"code": "quota", "retryable": False, "message": "quota"},
+            )
+            self.assertTrue(noted.get("ok"), noted)
+            open_dec(
+                "dec-retry",
+                "action_approval",
+                "permission",
+                lead_attempts=1,
+                lead_error={"code": "timeout", "retryable": True, "message": "timeout"},
+            )
+            open_dec(
+                "dec-max",
+                "artifact_review",
+                "review",
+                lead_attempts=2,
+                lead_error={"code": "timeout", "retryable": True, "message": "timeout"},
+            )
+
+            self.assertTrue(
+                lead_app.coordinator.lead_will_decide({"details": {"backend_kind": "permission"}})
+            )
+            self.assertTrue(
+                lead_app.coordinator.lead_will_decide({"details": {"backend_kind": "review"}})
+            )
+            self.assertFalse(
+                lead_app.coordinator.lead_will_decide({"details": {"backend_kind": "question"}})
+            )
+            self.assertFalse(
+                lead_app.coordinator.lead_will_decide({"details": {"backend_kind": "system_action"}})
+            )
+            self.assertFalse(
+                lead_app.coordinator.lead_will_decide(
+                    {
+                        "details": {
+                            "backend_kind": "review",
+                            "lead_attempts": 1,
+                            "lead_error": {"code": "quota", "retryable": False},
+                        }
+                    }
+                )
+            )
+            # Top-level lead_error is enough when details only carry the attempt count.
+            self.assertFalse(
+                lead_app.coordinator.lead_will_decide(
+                    {
+                        "lead_error": {"code": "quota", "retryable": False},
+                        "details": {"backend_kind": "review", "lead_attempts": 1},
+                    }
+                )
+            )
+            self.assertTrue(
+                lead_app.coordinator.lead_will_decide(
+                    {
+                        "details": {
+                            "backend_kind": "permission",
+                            "lead_attempts": 1,
+                            "lead_error": {"retryable": True, "code": "timeout"},
+                        }
+                    }
+                )
+            )
+            self.assertFalse(
+                lead_app.coordinator.lead_will_decide(
+                    {
+                        "details": {
+                            "backend_kind": "review",
+                            "lead_attempts": 2,
+                            "lead_error": {"retryable": True, "code": "timeout"},
+                        }
+                    }
+                )
+            )
+
+            exhausted = lead_app.coordinator._continue_pending_decision(
+                {"goal_id": gid},
+                {"task_id": "t"},
+                {
+                    "decision_id": "dec-ex",
+                    "details": {
+                        "backend_kind": "review",
+                        "lead_attempts": 1,
+                        "lead_error": {"code": "quota", "retryable": False},
+                    },
+                },
+            )
+            self.assertEqual(exhausted["action"], "decision_required")
+            self.assertEqual(exhausted["lead_error"]["code"], "quota")
+            self.assertFalse(exhausted["lead_error"]["retryable"])
+            quiet = lead_app.coordinator._continue_pending_decision(
+                {"goal_id": gid},
+                {"task_id": "t"},
+                {"decision_id": "dec-q", "details": {"backend_kind": "question"}},
+            )
+            self.assertEqual(quiet["action"], "decision_required")
+            self.assertNotIn("lead_error", quiet)
+            still_lead = lead_app.coordinator._continue_pending_decision(
+                {"goal_id": gid},
+                {"task_id": "t"},
+                {
+                    "decision_id": "dec-missing",
+                    "request_id": "missing",
+                    "details": {"backend_kind": "system_action"},
+                },
+            )
+            self.assertEqual(still_lead["action"], "decision_required")
+            self.assertNotIn("lead_error", still_lead)
+
+            status = lead_app.status(gid)
+            by_id = {row["decision_id"]: row for row in status["pending_decisions"]}
+            self.assertEqual(by_id["dec-review"]["awaiting"], "lead")
+            self.assertEqual(by_id["dec-perm"]["awaiting"], "lead")
+            self.assertEqual(by_id["dec-retry"]["awaiting"], "lead")
+            self.assertEqual(by_id["dec-q"]["awaiting"], "human")
+            self.assertEqual(by_id["dec-sys"]["awaiting"], "human")
+            self.assertEqual(by_id["dec-ex"]["awaiting"], "human")
+            self.assertEqual(by_id["dec-max"]["awaiting"], "human")
+            self.assertEqual(status["pending_decision_count"], 7)
+            self.assertTrue(status["awaiting_decision"])
+            self.assertEqual(status["awaiting_lead_count"], 3)
+            self.assertEqual(status["awaiting_human_count"], 4)
+
+            listed = lead_app.list_decisions(gid)
+            listed_by_id = {row["decision_id"]: row["awaiting"] for row in listed["pending_decisions"]}
+            self.assertEqual(
+                listed_by_id,
+                {row["decision_id"]: row["awaiting"] for row in status["pending_decisions"]},
+            )
+            self.assertEqual(listed["pending_decision_count"], 7)
+            self.assertTrue(listed["awaiting_decision"])
+            self.assertEqual(listed["awaiting_lead_count"], 3)
+            self.assertEqual(listed["awaiting_human_count"], 4)
+
+            events = lead_app.events(gid)
+            ev_by_id = {row["decision_id"]: row["awaiting"] for row in events["pending_decisions"]}
+            self.assertEqual(ev_by_id["dec-q"], "human")
+            self.assertEqual(ev_by_id["dec-sys"], "human")
+            self.assertEqual(ev_by_id["dec-review"], "lead")
+            self.assertEqual(ev_by_id["dec-ex"], "human")
+            self.assertEqual(events["awaiting_lead_count"], 3)
+            self.assertEqual(events["awaiting_human_count"], 4)
+            self.assertEqual(events["pending_decision_count"], 7)
+
+            one = lead_app.get_decision(gid, "dec-q")
+            self.assertEqual(one["decision"]["awaiting"], "human")
+            self.assertEqual(one["pending_decision_count"], 1)
+            self.assertTrue(one["awaiting_decision"])
+            self.assertEqual(one["awaiting_human_count"], 1)
+            self.assertEqual(one["awaiting_lead_count"], 0)
+            review = lead_app.get_decision(gid, "dec-review")
+            self.assertEqual(review["decision"]["awaiting"], "lead")
+            self.assertEqual(review["awaiting_lead_count"], 1)
+            self.assertEqual(review["awaiting_human_count"], 0)
+
+            det = CollabApplication(root / "det", backend=_ResolveBackend())
+            det_id = det.submit(_request())["goal_id"]
+            for decision_id, kind, backend_kind in (
+                ("dec-det", "action_approval", "permission"),
+                ("dec-det-review", "artifact_review", "review"),
+                ("dec-det-q", "question", "question"),
+            ):
+                opened_det = det.layer.open_decision(
+                    det_id,
+                    kind=kind,
+                    decision_id=decision_id,
+                    request_id=decision_id,
+                    details={"backend_kind": backend_kind, "backend_request_id": decision_id},
+                )
+                self.assertTrue(opened_det.get("ok"), opened_det)
+            det_status = det.status(det_id)
+            self.assertEqual(
+                [row["awaiting"] for row in det_status["pending_decisions"]],
+                ["human", "human", "human"],
+            )
+            self.assertEqual(det_status["awaiting_lead_count"], 0)
+            self.assertEqual(det_status["awaiting_human_count"], 3)
+            self.assertFalse(det.coordinator.lead_will_decide(det_status["pending_decisions"][0]))
+
+            no_resolve = CollabApplication(root / "plain", planner=_DecidePlanner())
+            plain_id = no_resolve.submit(_request())["goal_id"]
+            opened_plain = no_resolve.layer.open_decision(
+                plain_id,
+                kind="artifact_review",
+                decision_id="dec-plain",
+                request_id="dec-plain",
+                details={"backend_kind": "review", "backend_request_id": "dec-plain"},
+            )
+            self.assertTrue(opened_plain.get("ok"), opened_plain)
+            plain = no_resolve.status(plain_id)
+            self.assertEqual(plain["pending_decisions"][0]["awaiting"], "human")
+            self.assertEqual(plain["awaiting_lead_count"], 0)
+            self.assertEqual(plain["awaiting_human_count"], 1)
+            self.assertEqual(plain["pending_decision_count"], 1)
+            self.assertTrue(plain["awaiting_decision"])
 
     def test_contaminated_artifact_fails_successful_collect(self):
         with tempfile.TemporaryDirectory() as td:

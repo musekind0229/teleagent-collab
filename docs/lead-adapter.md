@@ -176,6 +176,10 @@ python bin/collab-service.py --planner lead --backend teleagent-windows ...
 - 可重试错误最多 `MAX_LEAD_ATTEMPTS_PER_DECISION=2` 次（超时、`illegal_json`、`application_id` / `context_summary` 不匹配、`illegal_verdict`、缺 reason；错误文本里若已有配额、登录/鉴权、`spawn failed` 等标记则不算可重试）。用尽仍待人。
 - 不可重试的错误第一次失败后立刻留给人，不再打第二次。Codex 非法输出以 `call_failed` 出现，属于这一类；Codex 超时仍可重试，最多 2 次。
 
+公开待决行带 `awaiting`：`lead` 表示下一拍仍由组长裁决（规划器有 `decide_action`、工人后端有 `resolve_decision`、`details.backend_kind` 是 `permission` 或 `review`，且尝试还没耗尽）；否则是 `human`。`question` / `system_action`，以及不可重试或次数用尽的 `lead_error`，都是 `human`。`status` 和 `GET …/decisions` 同时给出 `awaiting_lead_count`、`awaiting_human_count`。`pending_decisions`、`pending_decision_count`、`awaiting_decision` 的含义不变。
+
+`hermes-collab-request.py wait` 在待决全是 `awaiting=lead`（或还没有行、但 `awaiting_human_count==0` 且 `awaiting_lead_count>0`）时继续轮询，不退出 4，避免人和组长抢答。人和组长各有待决时，退出码 4 只列出 `human` 行，其余 id 在 `lead_pending_ids`。组长失败并把该行翻成 `human` 之后，`wait` 才停下来问人。`--timeout` 仍是墙钟上限，到点退出码 3。
+
 规划失败（lead 错误、非法 JSON、超时）不会编造任务图：Goal 在 planning 阶段失败（`lead_unavailable`），而不是变成一条待人规划。
 
 ## Claude / Codex 待办

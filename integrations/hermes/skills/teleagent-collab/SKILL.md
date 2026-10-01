@@ -1,7 +1,7 @@
 ---
 name: teleagent-collab
 description: "Delegate work to local collab-service workers (agy/antigravity pool) via bin/hermes-collab-request.py: open, wait, report. Use when the user asks to have 'the worker'/'collab'/'agy' do a task or produce a file."
-version: 0.2.8
+version: 0.2.9
 author: teleagent-collab
 license: MIT
 platforms: [windows, linux, macos]
@@ -87,6 +87,7 @@ collab-service 是本机常驻的派工服务（Application API，默认 `http:/
 - `pending_decisions` 非空（服务在等人拍板）；
 - `wait` 退出码 `4`：已经停在等人拍板。把 `request_id`、`wait.reason`（`pending_decisions` / `awaiting_decision` / `task_awaiting_decision`）、`decision_ids`、每条 `decisions[].summary` 转述给用户。禁止自己批准或拒绝决策（不要代答 `POST …/decisions/…`）；
   TeleAgent 原生决策的 summary 来自 worker payload（review 的 artifacts/tools、permission 的 pattern 与 scope、question 题面）。
+- `pending_decisions` 里 `awaiting: "lead"` 的行正在由组长裁决，不要就这些行问用户；`wait` 会继续轮询。退出码 `4` 现在表示确实需要人拍板。
 - 转述 permission 决策的 summary 时带上 scope（目录里实际有哪些文件）；如果 summary 里有 `NOT ONLY PINNED`，告诉用户该目录不只有钉住的输入文件。
 - `wait` 退出码 3 超时，或 401/403/transport_error。401/403 只转告 `auth.token_source`，不要回显 token。
 
