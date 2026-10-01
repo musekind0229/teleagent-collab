@@ -174,6 +174,8 @@ TeleAgent `review` 若产物自带 `contamination.contaminated`，投影出的�
 | `resume` | bool 或 `unknown`。监督后端为 true（同一 state 目录上 `Engine.tick` 能续跑；TeleAgent 实例变了会 fail-closed）。agy / inprocess 句柄只在本进程内存，为 false |
 | `acceptance.artifact_presence` | 文件在不在。当前实现为 true |
 | `acceptance.exact_content` | 能否核对「path must contain exactly BODY」。只有 agy 门禁为 true |
+
+多 Task 的 Goal 上，Goal 级「PATH must contain exactly BODY」只门禁 expected_artifacts 里有 PATH 的那个 Task；没有 Task 声明 PATH 时落到汇点 Task（没人依赖的那些），不会静默丢掉。普通文字验收仍然发给每个 Task。
 | `acceptance.lead_review` | 本进程规划器会审 **并且** 后端扛得住组长审查时才是 true |
 | `acceptance.executable_checks` | 当前为 false |
 | `progress.available` | 有真实、便宜的观察才是 true。agy 是进程心跳 + 工作区文件名/大小/mtime（`heartbeat=runner_process`）。in-process 看自己的状态机（`heartbeat` 为 false，不每拍刷新）。监督后端看作业状态（`heartbeat=engine`）。没有这些信号的一次性后端是 false，并且 **`percent` 永远是 false**，不编百分比 |

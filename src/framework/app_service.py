@@ -506,12 +506,53 @@ def allows_aigc_marks(
     return acceptance.get("allow_aigc_marks") is True or inputs.get("allow_aigc_marks") is True
 
 
+_GOAL_EXACT_RE = re.compile(r"(?P<path>\S+)\s+must\s+contain\s+exactly\s+(?P<body>.+)$", re.IGNORECASE)
+
+
+def goal_acceptance_applies(
+    text: str,
+    task: Mapping[str, Any],
+    siblings: list[Any] | None,
+) -> bool:
+    """Whether a Goal-level acceptance text gates this Task.
+
+    Prose applies to every Task (and is reported unsupported where nothing
+    can check it). An exact-content criterion names one file: it gates the
+    Task(s) whose expected_artifacts contain that path. When no Task declares
+    it, the sink Tasks (nothing depends on them) carry it, so the check is
+    never silently skipped. Without sibling context the old behaviour holds.
+    """
+    match = _GOAL_EXACT_RE.match(str(text or "").strip())
+    if not match or siblings is None:
+        return True
+    rows = [r for r in siblings if isinstance(r, Mapping)]
+    if len(rows) <= 1:
+        return True
+    target = match.group("path").strip().strip("\"'")
+    me = str(task.get("task_id") or "")
+    owners = [
+        str(r.get("task_id") or "")
+        for r in rows
+        if target in [str(a).strip() for a in (r.get("expected_artifacts") or [])]
+    ]
+    if owners:
+        return me in owners
+    depended = {str(d) for r in rows for d in (r.get("depends_on") or [])}
+    sinks = [str(r.get("task_id") or "") for r in rows if str(r.get("task_id") or "") not in depended]
+    return me in sinks
+
+
 def worker_charter_for_task(
     *,
     goal: Mapping[str, Any] | None,
     task: Mapping[str, Any],
+    siblings: list[Any] | None = None,
 ) -> dict[str, Any]:
-    """Per-task worker contract. Do not send the whole Goal as the worker goal."""
+    """Per-task worker contract. Do not send the whole Goal as the worker goal.
+
+    ``siblings`` (the Goal's tasks) scopes an exact-content Goal acceptance to
+    the Task that delivers the named file (see goal_acceptance_applies).
+    """
     goal_obj = goal if isinstance(goal, Mapping) else {}
     boundaries = goal_obj.get("boundaries") if isinstance(goal_obj.get("boundaries"), Mapping) else {}
     instruction = str((task.get("inputs") or {}).get("instruction") or task.get("title") or "").strip()
@@ -534,9 +575,11 @@ def worker_charter_for_task(
         acc_text = acceptance_src.get("text")
         if not isinstance(acc_text, str):
             raise AppError("acceptance.text must be a string")
-        charter["acceptance"] = acc_text
+        if goal_acceptance_applies(acc_text, task, siblings):
+            charter["acceptance"] = acc_text
     elif isinstance(acceptance_src, str):
-        charter["acceptance"] = acceptance_src
+        if goal_acceptance_applies(acceptance_src, task, siblings):
+            charter["acceptance"] = acceptance_src
     raw_forbidden = goal_obj.get("forbidden_tools")
     if isinstance(raw_forbidden, list):
         forbidden = [str(x).strip() for x in raw_forbidden if str(x).strip()]
@@ -2395,7 +2438,9 @@ class AppCoordinator:
             except InputManifestError as exc:
                 return self._fail_task(goal_id, task_id, {"ok": False, "error": str(exc)})
             try:
-                charter = worker_charter_for_task(goal=goal_obj, task=task)
+                charter = worker_charter_for_task(
+                    goal=goal_obj, task=task, siblings=list(snap.get("tasks") or [])
+                )
             except AppError as exc:
                 return self._fail_task(goal_id, task_id, {"ok": False, "error": str(exc)})
             try:
@@ -2472,7 +2517,9 @@ class AppCoordinator:
             return result
         goal = snap.get("goal") if isinstance(snap.get("goal"), Mapping) else {}
         try:
-            charter = worker_charter_for_task(goal=goal, task=task)
+            charter = worker_charter_for_task(
+                goal=goal, task=task, siblings=list(snap.get("tasks") or [])
+            )
         except AppError as exc:
             failed = dict(result)
             failed["ok"] = False

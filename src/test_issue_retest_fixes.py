@@ -152,5 +152,44 @@ class SubmitAndPlanValidationTests(unittest.TestCase):
             self.assertEqual(cm.exception.code, "invalid_plan")
 
 
+class GoalExactAcceptanceScopeTests(unittest.TestCase):
+    """Real agy A->B on the box: goal 'b.txt must contain exactly X' failed task A."""
+
+    def _rows(self):
+        return [
+            {"task_id": "A", "expected_artifacts": ["a.txt"], "depends_on": []},
+            {"task_id": "B", "expected_artifacts": ["b.txt"], "depends_on": ["A"]},
+        ]
+
+    def test_exact_criterion_gates_only_the_owner(self):
+        from framework.app_service import goal_acceptance_applies, worker_charter_for_task
+
+        rows = self._rows()
+        text = "b.txt must contain exactly COLLAB_B_OK"
+        self.assertFalse(goal_acceptance_applies(text, rows[0], rows))
+        self.assertTrue(goal_acceptance_applies(text, rows[1], rows))
+        goal = {"acceptance": {"artifacts": ["b.txt"], "text": text}}
+        a = worker_charter_for_task(goal=goal, task={**rows[0], "inputs": {"instruction": "a"}}, siblings=rows)
+        b = worker_charter_for_task(goal=goal, task={**rows[1], "inputs": {"instruction": "b"}}, siblings=rows)
+        self.assertNotIn("acceptance", a)
+        self.assertEqual(b["acceptance"], text)
+
+    def test_unowned_exact_criterion_goes_to_sinks_not_dropped(self):
+        from framework.app_service import goal_acceptance_applies
+
+        rows = self._rows()
+        text = "final.txt must contain exactly DONE"
+        self.assertFalse(goal_acceptance_applies(text, rows[0], rows))
+        self.assertTrue(goal_acceptance_applies(text, rows[1], rows))
+
+    def test_prose_single_task_and_no_context_keep_old_behaviour(self):
+        from framework.app_service import goal_acceptance_applies
+
+        rows = self._rows()
+        self.assertTrue(goal_acceptance_applies("the report is accurate", rows[0], rows))
+        self.assertTrue(goal_acceptance_applies("b.txt must contain exactly X", rows[0], None))
+        self.assertTrue(goal_acceptance_applies("b.txt must contain exactly X", rows[0], rows[:1]))
+
+
 if __name__ == "__main__":
     unittest.main()
