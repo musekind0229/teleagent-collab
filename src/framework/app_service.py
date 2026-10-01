@@ -42,6 +42,18 @@ from framework.artifact_handoff import (
 )
 from framework.failure_projection import project_failed_tasks
 from framework.need_human import goal_need_human_view, sanitize_reason
+from framework.concurrency import (
+    IN_FLIGHT,
+    as_limit,
+    budget_block_reason,
+    directory_key,
+    dispatch_directory,
+    global_decision_blocks,
+    public_concurrency,
+    remaining_slots,
+    scheduler_view,
+    task_is_ready,
+)
 from framework.durable_api import DurableLayer
 from lead_adapter.schema import context_summary_of, unwrap_structured
 
@@ -160,7 +172,13 @@ def planner_capability(planner: Any) -> dict[str, Any]:
     return {"name": name, "decomposes": False, "lead_review": False}
 
 
-def compose_capabilities(backend: Any, planner: Any) -> dict[str, Any]:
+def compose_capabilities(
+    backend: Any,
+    planner: Any,
+    *,
+    max_parallel_per_goal: int = 2,
+    max_parallel_global: int = 4,
+) -> dict[str, Any]:
     """Backend document with this process's planner overlaid.
 
     ``acceptance.lead_review`` is true only when the backend can carry a lead
@@ -186,6 +204,11 @@ def compose_capabilities(backend: Any, planner: Any) -> dict[str, Any]:
     caps["acceptance"] = acceptance
     if not isinstance(caps.get("warnings"), list):
         caps["warnings"] = []
+    caps["concurrency"] = public_concurrency(
+        max_parallel_per_goal=max_parallel_per_goal,
+        max_parallel_global=max_parallel_global,
+        backend_caps=caps,
+    )
     return caps
 
 
@@ -1073,14 +1096,22 @@ class AppCoordinator:
         planner: GoalPlanner | None = None,
         backend: ExecutionBackend | None = None,
         workspaces_root: str | Path,
+        max_parallel_per_goal: int = 2,
+        max_parallel_global: int = 4,
     ) -> None:
         self.layer = layer
         self.planner = planner or DeterministicPlanner()
         self.backend = backend or InProcessExecutionBackend()
         self.workspaces_root = Path(workspaces_root)
+        self.max_parallel_per_goal = as_limit(max_parallel_per_goal) or 2
+        self.max_parallel_global = as_limit(max_parallel_global) or 4
+        # Claims whose start_run is in progress in this process. A running
+        # task with no run_id is "dispatch in progress" only while its token
+        # is here; a restarted process fails that task closed.
+        self._inflight_claims: set[str] = set()
         # HTTP ticks and the background loop may fire together.  Serialize
         # coordination so a queued Task is dispatched at most once by this
-        # service instance.
+        # service instance. Released only around start_run.
         self._lock = threading.RLock()
 
     def process_all(self) -> dict[str, Any]:
@@ -1170,167 +1201,443 @@ class AppCoordinator:
             snap = current["goal"]
             tasks = [dict(t) for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
 
-        # A real worker backend is normally asynchronous.  Resume polling a
-        # persisted Run before considering new queued work.
+        return self._advance_goal(goal_id)
+
+    _PREFERRED_TICK_ACTIONS = frozenset(
+        {"decision_required", "decision_resolved", "backend_gate_unprojected"}
+    )
+    _TICK_TERMINAL = frozenset({"completed", "failed", "cancelled", "cancel_requested"})
+
+    def _advance_goal(self, goal_id: str) -> dict[str, Any]:
+        """Observe every in-flight task, then start ready tasks up to capacity.
+
+        One busy observe does not end the tick. A capacity wait is not a failure.
+        """
+        blocked = self._budget_stop(goal_id)
+        if blocked is not None:
+            return blocked
+        current = self.layer.get_goal(goal_id)
+        if not current.get("ok"):
+            return current
+        snap = current["goal"]
+        tasks = [dict(t) for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
+        outcomes: list[dict[str, Any]] = []
         for task in tasks:
-            if task.get("status") == "awaiting_decision":
+            status = str(task.get("status") or "")
+            if status == "awaiting_decision":
+                outcomes.append(
+                    {
+                        "ok": True,
+                        "goal_id": goal_id,
+                        "state": "running",
+                        "action": "decision_required",
+                    }
+                )
+                continue
+            if status != "running":
+                continue
+            observed = self._observe_running_task(snap, task)
+            if observed is None:
+                continue
+            outcomes.append(observed)
+        skipped: set[str] = set()
+        while True:
+            current = self.layer.get_goal(goal_id)
+            if not current.get("ok"):
+                return current
+            snap = current["goal"]
+            if snap.get("state") in self._TICK_TERMINAL:
+                break
+            blocked = self._budget_stop(goal_id)
+            if blocked is not None:
+                return blocked
+            current = self.layer.get_goal(goal_id)
+            if not current.get("ok"):
+                return current
+            snap = current["goal"]
+            if snap.get("state") in self._TICK_TERMINAL:
+                break
+            if global_decision_blocks(snap.get("pending_decisions") or []):
+                break
+            tasks = [dict(t) for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
+            status_by_id = {str(t.get("task_id") or ""): str(t.get("status") or "") for t in tasks}
+            ready = [
+                t
+                for t in tasks
+                if task_is_ready(t, status_by_id) and str(t.get("task_id") or "") not in skipped
+            ]
+            if not ready:
+                break
+            if self._slots_for(goal_id) <= 0:
+                break
+            _rows, held, _running = self._occupancy()
+            chosen = None
+            for task in ready:
+                key = directory_key(
+                    dispatch_directory(task, workspaces_root=self.workspaces_root, goal_id=goal_id)
+                )
+                if key not in held:
+                    chosen = task
+                    break
+            if chosen is None:
+                break
+            task_id = str(chosen.get("task_id") or "")
+            outcome = self._dispatch_one(goal_id, task_id)
+            if outcome is None:
+                skipped.add(task_id)
+                continue
+            if outcome.get("_return"):
+                returned = dict(outcome["_return"])
+                return returned
+            outcomes.append(outcome)
+        return self._select_outcome(goal_id, outcomes)
+
+    def _select_outcome(self, goal_id: str, outcomes: list[dict[str, Any]]) -> dict[str, Any]:
+        current = self.layer.get_goal(goal_id)
+        snap = current.get("goal") if current.get("ok") else {}
+        state = str((snap or {}).get("state") or "")
+        preferred = [row for row in outcomes if row.get("action") in self._PREFERRED_TICK_ACTIONS]
+        finished = [row for row in outcomes if row.get("action") == "task_finished"]
+        running = [row for row in outcomes if row.get("action") == "worker_running"]
+        if preferred:
+            return preferred[-1]
+        if finished:
+            return finished[-1]
+        if running:
+            return running[-1]
+        raws = [row for row in outcomes if "action" not in row and (row.get("task") or row.get("reason"))]
+        if raws:
+            payload = dict(raws[-1])
+            payload.pop("_stop", None)
+            payload.pop("_return", None)
+            if state:
+                payload["state"] = state
+            return payload
+        if state in {"completed", "failed", "cancelled"}:
+            return {"ok": True, "goal_id": goal_id, "state": state, "action": "terminal"}
+        return {"ok": True, "goal_id": goal_id, "state": state or "running", "action": "waiting"}
+
+    def _budget_stop(self, goal_id: str) -> dict[str, Any] | None:
+        current = self.layer.get_goal(goal_id)
+        if not current.get("ok"):
+            return current
+        snap = current["goal"]
+        if snap.get("state") in self._TICK_TERMINAL:
+            return None
+        reason = budget_block_reason(snap)
+        if not reason:
+            return None
+        tasks = [t for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
+        for task in tasks:
+            if str(task.get("status") or "") not in IN_FLIGHT:
+                continue
+            run_id = str(task.get("run_id") or "").strip()
+            if run_id:
+                try:
+                    self.backend.cancel(run_id)
+                except Exception:
+                    pass
+            result: dict[str, Any] = {"ok": False, "run_id": run_id, "error": reason}
+            if "wall_sec" in reason:
+                result["error_source"] = "worker_timeout"
+            self.layer.finish_task(
+                goal_id,
+                str(task.get("task_id") or ""),
+                succeeded=False,
+                close_goal=True,
+                result=result,
+            )
+        failed = self.layer.fail_goal(goal_id, phase="budget", error=reason)
+        return {**failed, "action": "budget_exhausted"}
+
+    def _fail_task(self, goal_id: str, task_id: str, result: Mapping[str, Any]) -> dict[str, Any]:
+        finished = self.layer.finish_task(
+            goal_id,
+            task_id,
+            succeeded=False,
+            close_goal=False,
+            result=result,
+        )
+        reconciled = self.layer.reconcile_goal_progress(goal_id)
+        payload = dict(finished) if isinstance(finished, dict) else {"ok": False}
+        state = reconciled.get("state") or payload.get("state")
+        if state:
+            payload["state"] = state
+        return payload
+
+    def _backend_run_limit(self) -> int | None:
+        fn = getattr(self.backend, "capabilities", None)
+        if not callable(fn):
+            return None
+        try:
+            raw = fn()
+        except Exception:
+            return None
+        if not isinstance(raw, dict):
+            return None
+        conc = raw.get("concurrency")
+        if not isinstance(conc, dict):
+            return None
+        return as_limit(conc.get("max_runs"))
+
+    def _goal_task_rows(self) -> list[tuple[str, list[dict[str, Any]]]]:
+        out: list[tuple[str, list[dict[str, Any]]]] = []
+        listed = self.layer.list_goals()
+        for row in listed.get("goals") or []:
+            if not isinstance(row, Mapping):
+                continue
+            gid = str(row.get("goal_id") or "")
+            if not gid:
+                continue
+            got = self.layer.get_goal(gid)
+            if not got.get("ok"):
+                continue
+            snap = got.get("goal") if isinstance(got.get("goal"), Mapping) else {}
+            tasks = [dict(t) for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
+            out.append((gid, tasks))
+        return out
+
+    def _occupancy(self) -> tuple[list[tuple[str, list[dict[str, Any]]]], set[str], dict[str, int]]:
+        rows = self._goal_task_rows()
+        held: set[str] = set()
+        running: dict[str, int] = {}
+        for gid, tasks in rows:
+            count = 0
+            for task in tasks:
+                if str(task.get("status") or "") not in IN_FLIGHT:
+                    continue
+                count += 1
+                key = directory_key(
+                    dispatch_directory(task, workspaces_root=self.workspaces_root, goal_id=gid)
+                )
+                if key:
+                    held.add(key)
+            running[gid] = count
+        return rows, held, running
+
+    def _slots_for(self, goal_id: str) -> int:
+        _rows, _held, running = self._occupancy()
+        total = sum(running.values())
+        return remaining_slots(
+            per_goal=self.max_parallel_per_goal,
+            running_here=int(running.get(goal_id) or 0),
+            global_limit=self.max_parallel_global,
+            running_total=total,
+            backend_limit=self._backend_run_limit(),
+        )
+
+    def scheduler_snapshot(
+        self,
+        goal_id: str,
+        snap: Mapping[str, Any],
+        public_caps: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        conc = public_caps.get("concurrency") if isinstance(public_caps.get("concurrency"), Mapping) else {}
+        per = as_limit(conc.get("max_parallel_per_goal")) or self.max_parallel_per_goal
+        glob = as_limit(conc.get("max_parallel_global")) or self.max_parallel_global
+        backend_limit = as_limit(conc.get("backend_max_runs"))
+        running_elsewhere = 0
+        held: set[str] = set()
+        for gid, tasks in self._goal_task_rows():
+            for task in tasks:
+                if str(task.get("status") or "") not in IN_FLIGHT:
+                    continue
+                if gid != goal_id:
+                    running_elsewhere += 1
+                key = directory_key(
+                    dispatch_directory(task, workspaces_root=self.workspaces_root, goal_id=gid)
+                )
+                if key:
+                    held.add(key)
+        return scheduler_view(
+            tasks=snap.get("tasks") or [],
+            pending=snap.get("pending_decisions") or [],
+            per_goal=per,
+            global_limit=glob,
+            backend_limit=backend_limit,
+            running_elsewhere=running_elsewhere,
+            held_keys=held,
+            workspaces_root=self.workspaces_root,
+            goal_id=goal_id,
+        )
+
+    def _observe_fresh_run(self, snap: Mapping[str, Any], task: Mapping[str, Any]) -> dict[str, Any]:
+        """Observe a run that was just bound. Do not open decisions yet."""
+        goal_id = str(snap.get("goal_id") or task.get("goal_id") or "")
+        run_id = str(task.get("run_id") or "").strip()
+        try:
+            observation = self.backend.observe_run(run_id)
+            if isinstance(observation, Mapping) and observation.get("busy"):
+                return {"ok": True, "goal_id": goal_id, "state": "running", "action": "worker_running"}
+            result = self.backend.collect_result(run_id)
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "run_id": run_id,
+                "error": f"backend observation failed: {type(exc).__name__}",
+            }
+        return self._finish_gated(snap, task, result)
+
+    def _observe_running_task(self, snap: Mapping[str, Any], task: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Poll one running task. A decision resolved here is not observed again this tick."""
+        goal_id = str(snap.get("goal_id") or task.get("goal_id") or "")
+        task_id = str(task.get("task_id") or "")
+        existing_decision = next(
+            (
+                d
+                for d in (snap.get("pending_decisions") or [])
+                if isinstance(d, Mapping) and str(d.get("task_id") or "") == task_id
+            ),
+            None,
+        )
+        if existing_decision is not None:
+            return self._continue_pending_decision(snap, task, existing_decision)
+        run_id = str(task.get("run_id") or "").strip()
+        claim = str(task.get("dispatch_claim") or "")
+        if not run_id:
+            if claim and claim in self._inflight_claims:
+                return None
+            return self._fail_task(
+                goal_id,
+                task_id,
+                {"ok": False, "error": "running task has no persisted run handle"},
+            )
+        try:
+            pending_code, pending = self.backend.list_pending_actions(session_id=run_id)
+        except Exception as e:
+            pending_code, pending = 503, []
+            pending_error = f"pending action scan failed: {type(e).__name__}"
+        else:
+            pending_error = ""
+        if int(pending_code) >= 300:
+            return self._fail_task(
+                goal_id,
+                task_id,
+                {"ok": False, "run_id": run_id, "error": pending_error or "pending action scan failed"},
+            )
+        if pending:
+            action: Mapping[str, Any] = {}
+            for candidate in pending:
+                if not isinstance(candidate, Mapping):
+                    continue
+                kind = str(candidate.get("kind") or "").strip()
+                if kind in PROJECTABLE_BACKEND_KINDS:
+                    action = candidate
+                    break
+            if not action:
                 return {
                     "ok": True,
                     "goal_id": goal_id,
                     "state": "running",
-                    "action": "decision_required",
+                    "action": "backend_gate_unprojected",
+                    "pending_kinds": [
+                        str(row.get("kind") or "") for row in pending if isinstance(row, Mapping)
+                    ],
                 }
-            if task.get("status") != "running":
-                continue
-            existing_decision = next(
-                (
-                    d
-                    for d in (snap.get("pending_decisions") or [])
-                    if isinstance(d, Mapping) and str(d.get("task_id") or "") == str(task.get("task_id") or "")
-                ),
-                None,
-            )
-            if existing_decision is not None:
-                return self._continue_pending_decision(snap, task, existing_decision)
-            run_id = str(task.get("run_id") or "").strip()
-            if not run_id:
-                return self.layer.finish_task(
+            request_id = str(action.get("request_id") or "").strip()
+            if not request_id:
+                return self._fail_task(
                     goal_id,
-                    str(task["task_id"]),
-                    succeeded=False,
-                    result={"ok": False, "error": "running task has no persisted run handle"},
+                    task_id,
+                    {"ok": False, "run_id": run_id, "error": "backend decision has no request_id"},
                 )
-            try:
-                pending_code, pending = self.backend.list_pending_actions(session_id=run_id)
-            except Exception as e:
-                pending_code, pending = 503, []
-                pending_error = f"pending action scan failed: {type(e).__name__}"
-            else:
-                pending_error = ""
-            if int(pending_code) >= 300:
-                return self.layer.finish_task(
-                    goal_id,
-                    str(task["task_id"]),
-                    succeeded=False,
-                    result={"ok": False, "run_id": run_id, "error": pending_error or "pending action scan failed"},
-                )
-            if pending:
-                action: Mapping[str, Any] = {}
-                for candidate in pending:
-                    if not isinstance(candidate, Mapping):
-                        continue
-                    kind = str(candidate.get("kind") or "").strip()
-                    if kind in PROJECTABLE_BACKEND_KINDS:
-                        action = candidate
-                        break
-                if not action:
-                    return {
-                        "ok": True,
-                        "goal_id": goal_id,
-                        "state": "running",
-                        "action": "backend_gate_unprojected",
-                        "pending_kinds": [
-                            str(row.get("kind") or "")
-                            for row in pending
-                            if isinstance(row, Mapping)
-                        ],
-                    }
-                request_id = str(action.get("request_id") or "").strip()
-                if not request_id:
-                    return self.layer.finish_task(
-                        goal_id,
-                        str(task["task_id"]),
-                        succeeded=False,
-                        result={"ok": False, "run_id": run_id, "error": "backend decision has no request_id"},
-                    )
-                backend_kind = str(action.get("kind") or "permission")
-                public_kind = {
-                    "permission": "action_approval",
-                    "question": "question",
-                    "review": "artifact_review",
-                    "system_action": "system_action_approval",
-                }[backend_kind]
-                decision_id = f"dec_{hashlib.sha256(request_id.encode('utf-8')).hexdigest()[:12]}"
-                decision_title = f"TeleAgent {backend_kind}"
-                decision_details: dict[str, Any] = {
-                    "backend_kind": backend_kind,
-                    "backend_request_id": request_id,
-                    "context_hash": action.get("context_hash"),
-                    "payload": action.get("payload"),
-                }
-                if backend_kind == "review":
-                    contamination_summary = review_contamination_summary(action.get("payload"))
-                    if contamination_summary:
-                        decision_title = "TeleAgent review (CONTAMINATED)"
-                        decision_details["summary"] = contamination_summary
-                if backend_kind == "permission" and isinstance(action.get("scope"), list):
-                    # Scope is computed beside the TeleAgent permission object.
-                    # It is not part of the payload Engine.decide digest-compares.
-                    decision_details["scope"] = action.get("scope")
-                    try:
-                        from win_collab.core import format_permission_scope_summary
+            backend_kind = str(action.get("kind") or "permission")
+            public_kind = {
+                "permission": "action_approval",
+                "question": "question",
+                "review": "artifact_review",
+                "system_action": "system_action_approval",
+            }[backend_kind]
+            decision_id = f"dec_{hashlib.sha256(request_id.encode('utf-8')).hexdigest()[:12]}"
+            decision_title = f"TeleAgent {backend_kind}"
+            decision_details: dict[str, Any] = {
+                "backend_kind": backend_kind,
+                "backend_request_id": request_id,
+                "context_hash": action.get("context_hash"),
+                "payload": action.get("payload"),
+            }
+            if backend_kind == "review":
+                contamination_summary = review_contamination_summary(action.get("payload"))
+                if contamination_summary:
+                    decision_title = "TeleAgent review (CONTAMINATED)"
+                    decision_details["summary"] = contamination_summary
+            if backend_kind == "permission" and isinstance(action.get("scope"), list):
+                decision_details["scope"] = action.get("scope")
+                try:
+                    from win_collab.core import format_permission_scope_summary
 
-                        scope_summary = format_permission_scope_summary(
-                            action.get("payload") or {},
-                            action.get("scope"),
-                        )
-                    except Exception:
-                        scope_summary = None
-                    if scope_summary:
-                        decision_details["summary"] = scope_summary
-                opened = self.layer.open_decision(
-                    goal_id,
-                    kind=public_kind,
-                    task_id=str(task["task_id"]),
-                    run_id=run_id,
-                    decision_id=decision_id,
-                    request_id=request_id,
-                    actions=[{"request_id": request_id, "kind": backend_kind}],
-                    title=decision_title,
-                    return_to_upper=False,
-                    details=decision_details,
-                    reason="TeleAgent worker requires a bounded decision",
-                )
-                if opened.get("ok"):
-                    rec = opened.get("decision") if isinstance(opened.get("decision"), Mapping) else {}
-                    return self._lead_resolve_opened(
-                        snap,
-                        task,
-                        decision=rec or {"decision_id": decision_id, "request_id": request_id},
-                        action=action,
+                    scope_summary = format_permission_scope_summary(
+                        action.get("payload") or {},
+                        action.get("scope"),
                     )
-                return {**opened, "action": "decision_required"}
-            try:
-                observation = self.backend.observe_run(run_id)
-                if observation.get("busy"):
-                    return {"ok": True, "goal_id": goal_id, "state": "running", "action": "worker_running"}
-                result = self.backend.collect_result(run_id)
-            except Exception as e:
-                result = {
-                    "ok": False,
-                    "run_id": run_id,
-                    "error": f"backend resume failed: {type(e).__name__}",
-                }
-            return self._finish_gated(snap, task, result)
-
-        status_by_id = {str(t.get("task_id")): str(t.get("status")) for t in tasks}
-        for task in tasks:
-            if task.get("status") != "queued":
-                continue
-            deps = [str(x) for x in (task.get("depends_on") or [])]
-            if any(status_by_id.get(dep) == "failed" for dep in deps):
-                continue
-            if any(status_by_id.get(dep) != "succeeded" for dep in deps):
-                continue
-            started = self.layer.start_task(goal_id, str(task["task_id"]))
-            if not started.get("ok"):
-                return started
-            root = scheduler_task_workspace(
-                self.workspaces_root,
-                str(task.get("goal_id") or goal_id),
-                str(task["task_id"]),
+                except Exception:
+                    scope_summary = None
+                if scope_summary:
+                    decision_details["summary"] = scope_summary
+            opened = self.layer.open_decision(
+                goal_id,
+                kind=public_kind,
+                task_id=task_id,
+                run_id=run_id,
+                decision_id=decision_id,
+                request_id=request_id,
+                actions=[{"request_id": request_id, "kind": backend_kind}],
+                title=decision_title,
+                return_to_upper=False,
+                details=decision_details,
+                reason="TeleAgent worker requires a bounded decision",
             )
-            root.mkdir(parents=True, exist_ok=True)
+            if opened.get("ok"):
+                rec = opened.get("decision") if isinstance(opened.get("decision"), Mapping) else {}
+                return self._lead_resolve_opened(
+                    snap,
+                    task,
+                    decision=rec or {"decision_id": decision_id, "request_id": request_id},
+                    action=action,
+                )
+            return {**opened, "action": "decision_required"}
+        try:
+            observation = self.backend.observe_run(run_id)
+            if observation.get("busy"):
+                return {"ok": True, "goal_id": goal_id, "state": "running", "action": "worker_running"}
+            result = self.backend.collect_result(run_id)
+        except Exception as e:
+            result = {
+                "ok": False,
+                "run_id": run_id,
+                "error": f"backend resume failed: {type(e).__name__}",
+            }
+        return self._finish_gated(snap, task, result)
+
+    def _dispatch_one(self, goal_id: str, task_id: str) -> dict[str, Any] | None:
+        """Claim, handoff, start_run outside the coordinator lock, then bind.
+
+        The claim token stays in ``_inflight_claims`` until this method returns,
+        and only while the coordinator lock is held around the add/discard.
+        ``start_run`` is the only section that drops the lock.
+        """
+        token = f"claim_{uuid.uuid4().hex[:12]}"
+        self._inflight_claims.add(token)
+        try:
+            claimed = self.layer.claim_task_dispatch(goal_id, task_id, claim=token)
+            if not claimed.get("ok"):
+                return None
+            task = dict(claimed.get("task") or {})
+            current = self.layer.get_goal(goal_id)
+            snap = current.get("goal") if current.get("ok") else {}
+            if not isinstance(snap, Mapping):
+                snap = {}
+            tasks = [dict(t) for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
+            directory = dispatch_directory(task, workspaces_root=self.workspaces_root, goal_id=goal_id)
+            root = Path(directory)
+            try:
+                root.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                return self._fail_task(
+                    goal_id,
+                    task_id,
+                    {"ok": False, "error": f"backend dispatch failed: {type(exc).__name__}"},
+                )
             try:
                 staged = handoff_direct_dependency_artifacts(
                     task=task,
@@ -1338,12 +1645,11 @@ class AppCoordinator:
                     dest_root=root,
                     workspaces_root=self.workspaces_root,
                 )
-            except HandoffError as e:
-                return self.layer.finish_task(
+            except HandoffError as exc:
+                return self._fail_task(
                     goal_id,
-                    str(task["task_id"]),
-                    succeeded=False,
-                    result={"ok": False, "error": f"dependency handoff failed: {e}"},
+                    task_id,
+                    {"ok": False, "error": f"dependency handoff failed: {exc}"},
                 )
             if staged:
                 inputs = dict(task.get("inputs") or {})
@@ -1353,74 +1659,66 @@ class AppCoordinator:
             try:
                 charter = worker_charter_for_task(goal=goal_obj, task=task)
             except AppError as exc:
-                return self.layer.finish_task(
-                    goal_id,
-                    str(task["task_id"]),
-                    succeeded=False,
-                    result={"ok": False, "error": str(exc)},
-                )
-            # Fail closed before dispatch. A patched or corrupt renderer must
-            # not start the worker on a goal-only prompt.
+                return self._fail_task(goal_id, task_id, {"ok": False, "error": str(exc)})
             try:
                 normalized = contract_render.normalize_worker_contract(charter)
                 contract_render.render_contract_section(normalized)
             except contract_render.ContractRenderError as exc:
-                return self.layer.finish_task(
+                return self._fail_task(
                     goal_id,
-                    str(task["task_id"]),
-                    succeeded=False,
-                    result={"ok": False, "error": f"contract_render_error: {exc}"},
+                    task_id,
+                    {"ok": False, "error": f"contract_render_error: {exc}"},
                 )
+            self._lock.release()
             try:
-                launched = self.backend.start_run(
-                    title=str(task.get("title") or task["task_id"]),
-                    directory=str(root),
-                    instruction=str((task.get("inputs") or {}).get("instruction") or ""),
-                    artifacts=[str(x) for x in (task.get("expected_artifacts") or [])],
-                    charter=charter,
-                )
-            except contract_render.ContractRenderError as exc:
-                launched = {"ok": False, "error": f"contract_render_error: {exc}"}
-            except Exception as e:
-                # Keep the type, and a short redacted reason when the message
-                # is non-empty. An empty message stays type-only.
-                detail = sanitize_reason(str(e))[:300]
-                if detail:
-                    error = f"backend dispatch failed: {type(e).__name__}: {detail}"
-                else:
-                    error = f"backend dispatch failed: {type(e).__name__}"
-                launched = {"ok": False, "error": error, "error_source": "spawn"}
+                try:
+                    launched = self.backend.start_run(
+                        title=str(task.get("title") or task_id),
+                        directory=directory,
+                        instruction=str((task.get("inputs") or {}).get("instruction") or ""),
+                        artifacts=[str(x) for x in (task.get("expected_artifacts") or [])],
+                        charter=charter,
+                    )
+                except contract_render.ContractRenderError as exc:
+                    launched = {"ok": False, "error": f"contract_render_error: {exc}"}
+                except Exception as exc:
+                    detail = sanitize_reason(str(exc))[:300]
+                    if detail:
+                        error = f"backend dispatch failed: {type(exc).__name__}: {detail}"
+                    else:
+                        error = f"backend dispatch failed: {type(exc).__name__}"
+                    launched = {"ok": False, "error": error, "error_source": "spawn"}
+            finally:
+                self._lock.acquire()
+            if not isinstance(launched, Mapping):
+                launched = {"ok": False, "error": "backend dispatch failed: bad result"}
             run_id = str(launched.get("run_id") or launched.get("native_handle") or "")
             if not launched.get("ok") or not run_id:
-                return self.layer.finish_task(goal_id, str(task["task_id"]), succeeded=False, result=launched)
+                return self._fail_task(goal_id, task_id, dict(launched))
             bound = self.layer.bind_task_run(
                 goal_id,
-                str(task["task_id"]),
+                task_id,
                 run_id=run_id,
                 native_handle=str(launched.get("native_handle") or ""),
                 backend=str(launched.get("backend") or getattr(self.backend, "backend_id", "")),
-                workspace=str(root),
+                workspace=directory,
             )
             if not bound.get("ok"):
-                # The Run may already exist, so fail closed and never launch a
-                # replacement.  The returned binding error remains durable.
-                return bound
+                return {"_return": bound}
             bound_task = bound.get("task") if isinstance(bound.get("task"), Mapping) else {}
             if bound_task.get("workspace"):
                 task["workspace"] = bound_task.get("workspace")
-            try:
-                observation = self.backend.observe_run(run_id)
-                if observation.get("busy"):
-                    return {"ok": True, "goal_id": goal_id, "state": "running", "action": "worker_running"}
-                result = self.backend.collect_result(run_id)
-            except Exception as e:
-                result = {
-                    "ok": False,
-                    "run_id": run_id,
-                    "error": f"backend observation failed: {type(e).__name__}",
-                }
-            return self._finish_gated(snap, task, result)
-        return {"ok": True, "goal_id": goal_id, "state": snap.get("state"), "action": "waiting"}
+            task["run_id"] = run_id
+            task["status"] = "running"
+            fresh = self.layer.get_goal(goal_id)
+            if fresh.get("ok") and isinstance(fresh.get("goal"), Mapping):
+                snap = fresh["goal"]
+            # Pending actions are scanned on a later tick. This tick only
+            # distinguishes a still-busy run from one that already finished,
+            # so a successor can start without waiting a tick.
+            return self._observe_fresh_run(snap, task)
+        finally:
+            self._inflight_claims.discard(token)
 
     def _apply_agy_acceptance(self, snap: Mapping[str, Any], task: Mapping[str, Any], result: Any) -> Any:
         """Shared agy gate. Other backends keep contamination-only gating."""
@@ -1527,9 +1825,15 @@ class AppCoordinator:
             goal_id,
             str(task["task_id"]),
             succeeded=bool(isinstance(result, Mapping) and result.get("ok")),
+            close_goal=False,
             result=result if isinstance(result, Mapping) else {"ok": False, "error": "backend result was not an object"},
         )
-        return {**finished, "action": "task_finished"}
+        reconciled = self.layer.reconcile_goal_progress(goal_id) if goal_id else {}
+        state = reconciled.get("state") or finished.get("state")
+        out = {**finished, "action": "task_finished"}
+        if state:
+            out["state"] = state
+        return out
 
     def lead_will_decide(self, decision: Mapping[str, Any]) -> bool:
         """Whether the next tick resolves ``decision`` by the lead, not a human."""
@@ -2169,15 +2473,21 @@ class CollabApplication:
         backend: ExecutionBackend | None = None,
         coordinator_id: str = "app-coordinator",
         connection_probe: Callable[[], Mapping[str, Any]] | None = None,
+        max_parallel_per_goal: int = 2,
+        max_parallel_global: int = 4,
     ) -> None:
         self.persist_root = Path(persist_root)
         self.layer = DurableLayer.open(self.persist_root, use_cache=False)
         self.coordinator_id = coordinator_id
+        self.max_parallel_per_goal = as_limit(max_parallel_per_goal) or 2
+        self.max_parallel_global = as_limit(max_parallel_global) or 4
         self.coordinator = AppCoordinator(
             self.layer,
             planner=planner,
             backend=backend,
             workspaces_root=self.persist_root / "workspaces",
+            max_parallel_per_goal=self.max_parallel_per_goal,
+            max_parallel_global=self.max_parallel_global,
         )
         self._connection_probe = connection_probe
 
@@ -2322,6 +2632,7 @@ class CollabApplication:
             "backend": str(backend.get("id") or ""),
             "planner": str(planner.get("name") or ""),
         }
+        out["scheduler"] = self.coordinator.scheduler_snapshot(goal_id, snap, caps)
         # Pending decisions are not task failures. Observation-window timeouts
         # never reach this method; they are a client wait, not a goal state.
         if str(out.get("state") or "") == "failed" and not pending:
@@ -2336,7 +2647,12 @@ class CollabApplication:
 
     def capabilities(self) -> dict[str, Any]:
         """GET /v1/capabilities. No secrets. Planner is this process's planner."""
-        doc = compose_capabilities(self.coordinator.backend, self.coordinator.planner)
+        doc = compose_capabilities(
+            self.coordinator.backend,
+            self.coordinator.planner,
+            max_parallel_per_goal=self.coordinator.max_parallel_per_goal,
+            max_parallel_global=self.coordinator.max_parallel_global,
+        )
         return {"ok": True, **doc}
 
     def health(self) -> dict[str, Any]:

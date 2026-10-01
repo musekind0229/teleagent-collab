@@ -103,6 +103,8 @@ class WindowsSupervisedExecutionBackend(ExecutionBackendABC):
         caps["acceptance"]["lead_review"] = True
         caps["acceptance"]["executable_checks"] = False
         caps["usage"]["source"] = "unknown"
+        # One desktop session lock. Parallel goals still queue; they do not fail.
+        caps["concurrency"] = {"max_runs": 1, "limited_by": ["desktop_session_lock"]}
         caps["warnings"] = []
         return caps
 

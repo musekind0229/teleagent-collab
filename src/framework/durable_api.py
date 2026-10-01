@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
 from framework.artifact_handoff import workspace_paths_match
+from framework.concurrency import all_tasks_succeeded, any_task_failed, goal_has_progress
 from framework.delegation import (
     ESCALATE_KINDS,
     EVENT_CLASS_DECISION,
@@ -1360,6 +1361,55 @@ class DurableLayer:
             self._persist_unlocked()
             return {"ok": True, "reason": REASON_READY, "task": found, "state": snap.get("state")}
 
+    def claim_task_dispatch(self, goal_id: str, task_id: str, *, claim: str) -> dict[str, Any]:
+        """Compare-and-set a queued task into running with a dispatch token.
+
+        Succeeds only when the task is still queued, has no run handle, and
+        has no existing claim. A concurrent tick loses the race instead of
+        starting a second run.
+        """
+        gid = _norm_key(goal_id)
+        tid = _norm_key(task_id)
+        token = _norm_key(claim)
+        if not token:
+            return {"ok": False, "reason": "missing_claim", "error": "dispatch claim is required"}
+        with self._rmw():
+            snap = self.goals.get(gid)
+            if snap is None:
+                return {"ok": False, "reason": REASON_UNKNOWN_GOAL, "error": f"unknown goal_id {gid!r}"}
+            if snap.get("state") in _CANCEL_CLOSED or snap.get("state") in _TERMINAL_GOAL:
+                return {
+                    "ok": False,
+                    "reason": REASON_ADMISSION_CLOSED,
+                    "error": "goal is not accepting dispatch",
+                    "state": snap.get("state"),
+                }
+            tasks = [dict(t) for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
+            found = next((t for t in tasks if t.get("task_id") == tid), None)
+            if found is None:
+                return {"ok": False, "reason": "unknown_task", "error": f"unknown task_id {tid!r}"}
+            src = _norm_key(found.get("status") or "queued") or "queued"
+            if src != "queued" or _norm_key(found.get("run_id")) or _norm_key(found.get("dispatch_claim")):
+                return {
+                    "ok": False,
+                    "reason": "claim_lost",
+                    "error": "task is no longer queued for dispatch",
+                    "state": snap.get("state"),
+                }
+            try:
+                assert_transition("task", src, "running")
+            except LifecycleError as e:
+                return {"ok": False, "reason": REASON_ILLEGAL_STATE, "error": str(e)}
+            found["status"] = "running"
+            found["dispatch_claim"] = token
+            snap["tasks"] = tasks
+            if snap.get("state") == "queued":
+                self._set_state(snap, "running")
+            self._append_history(snap, "claim_task_dispatch", task_id=tid)
+            self._touch(snap)
+            self._persist_unlocked()
+            return {"ok": True, "reason": REASON_READY, "task": found, "state": snap.get("state")}
+
     def bind_task_run(
         self,
         goal_id: str,
@@ -1409,6 +1459,7 @@ class DurableLayer:
             backend_id = _norm_key(backend)
             if backend_id:
                 found["backend"] = backend_id
+            found.pop("dispatch_claim", None)
             # Scheduler-owned directory passed to start_run. Never taken from
             # the worker result. A second bind may not retarget it.
             ws = _norm_key(workspace)
@@ -1468,6 +1519,7 @@ class DurableLayer:
         *,
         succeeded: bool,
         result: Mapping[str, Any] | None = None,
+        close_goal: bool = True,
     ) -> dict[str, Any]:
         """Record one worker result and derive the Goal terminal state.
 
@@ -1496,6 +1548,7 @@ class DurableLayer:
                 except LifecycleError as e:
                     return {"ok": False, "reason": REASON_ILLEGAL_STATE, "error": str(e)}
             found["status"] = dst
+            found.pop("dispatch_claim", None)
             stored_result = None
             if isinstance(result, Mapping):
                 stored_result = enrich_result_for_need_human(result) or dict(result)
@@ -1507,8 +1560,6 @@ class DurableLayer:
             terminal = [str(t.get("status") or "") for t in tasks]
             hist_extra: dict[str, Any] = {"task_id": tid, "task_state": dst}
             if not succeeded:
-                if snap.get("state") not in _TERMINAL_GOAL:
-                    self._set_state(snap, "failed")
                 nh = None
                 if isinstance(stored_result, Mapping):
                     if stored_result.get("need_human") is True:
@@ -1522,6 +1573,10 @@ class DurableLayer:
                         nh = {"need_human": True, "reason": reason}
                     else:
                         nh = parse_need_human(stored_result.get("error"))
+                # A sibling may still be running. Close the Goal now only when
+                # the caller asks, or when the worker needs a human.
+                if (close_goal or nh is not None) and snap.get("state") not in _TERMINAL_GOAL:
+                    self._set_state(snap, "failed")
                 if nh is not None:
                     reason = str(nh.get("reason") or "need_human")[:500]
                     snap["failure"] = {
@@ -1546,6 +1601,46 @@ class DurableLayer:
                 "goal_id": gid,
                 "task": found,
                 "state": snap.get("state"),
+            }
+
+    def reconcile_goal_progress(self, goal_id: str) -> dict[str, Any]:
+        """Derive the Goal state after one or more task results.
+
+        Terminal and cancel-requested goals are left alone. All-succeeded
+        completes the goal. In-flight work, a ready queued task, or a task
+        waiting on a live dependency keeps the goal running. Otherwise a
+        failed task fails the goal. Dependents stay queued. This does not
+        record a capacity wait as a failure, and it does not invent a
+        ``failure`` object (need_human already stored one).
+        """
+        gid = _norm_key(goal_id)
+        with self._rmw():
+            snap = self.goals.get(gid)
+            if snap is None:
+                return {"ok": False, "reason": REASON_UNKNOWN_GOAL, "error": f"unknown goal_id {gid!r}"}
+            state = _norm_key(snap.get("state") or "") or "queued"
+            if state in _TERMINAL_GOAL or state == "cancel_requested":
+                return {"ok": True, "reason": REASON_READY, "goal_id": gid, "state": state, "changed": False}
+            tasks = [t for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
+            changed = False
+            if all_tasks_succeeded(tasks):
+                self._set_state(snap, "completed")
+                changed = True
+            elif goal_has_progress(tasks):
+                changed = False
+            elif any_task_failed(tasks):
+                self._set_state(snap, "failed")
+                changed = True
+            if changed:
+                self._append_history(snap, "reconcile_goal", state=snap.get("state"))
+                self._touch(snap)
+                self._persist_unlocked()
+            return {
+                "ok": True,
+                "reason": REASON_READY,
+                "goal_id": gid,
+                "state": snap.get("state"),
+                "changed": changed,
             }
 
     def retry_need_human(

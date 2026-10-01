@@ -38,6 +38,16 @@ class InProcessLeadRefused(ValueError):
     """--planner lead cannot host an inprocess / file-protocol lead."""
 
 
+def _positive_int(text: str) -> int:
+    try:
+        value = int(text)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"must be an integer >= 1, got {text!r}") from exc
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be an integer >= 1, got {text!r}")
+    return value
+
+
 def _positive_timeout(text: str) -> float:
     try:
         value = float(text)
@@ -290,6 +300,26 @@ def build_parser() -> argparse.ArgumentParser:
             "(same exit rule as --ready). Daily dispatch gate is --ready"
         ),
     )
+    parser.add_argument(
+        "--max-parallel-per-goal",
+        type=_positive_int,
+        default=2,
+        help=(
+            "How many independent tasks of one Goal may run at once "
+            "(integer >= 1). Default: 2. The effective cap is the minimum of "
+            "this, --max-parallel-global, and the backend concurrency limit."
+        ),
+    )
+    parser.add_argument(
+        "--max-parallel-global",
+        type=_positive_int,
+        default=4,
+        help=(
+            "How many tasks may run at once across all Goals "
+            "(integer >= 1). Default: 4. Supervised TeleAgent desktops stay "
+            "serial because of the desktop session lock."
+        ),
+    )
     parser.add_argument("--token-env", default="COLLAB_API_TOKEN")
     parser.add_argument("--once", action="store_true", help="process all queued Goals once and exit")
     return parser
@@ -353,7 +383,13 @@ def main(argv: list[str] | None = None) -> int:
         teleagent_stdin_wrap=args.teleagent_stdin_wrap,
         agy_account_pool=args.agy_account_pool or None,
     )
-    app = CollabApplication(persist, planner=planner, backend=backend)
+    app = CollabApplication(
+        persist,
+        planner=planner,
+        backend=backend,
+        max_parallel_per_goal=args.max_parallel_per_goal,
+        max_parallel_global=args.max_parallel_global,
+    )
     if args.once:
         try:
             print(json.dumps(app.coordinator.process_all(), ensure_ascii=False, indent=2, default=str))
@@ -378,6 +414,8 @@ def main(argv: list[str] | None = None) -> int:
                 "backend": app.coordinator.backend.backend_id,
                 "auth": auth,
                 "persist": str(persist),
+                "max_parallel_per_goal": args.max_parallel_per_goal,
+                "max_parallel_global": args.max_parallel_global,
             },
             ensure_ascii=False,
         ),

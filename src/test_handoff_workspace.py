@@ -176,6 +176,8 @@ class _AgyShapeBackend:
         return {"ok": True, "backend": self.backend_id, "run_id": run_id, "native_handle": run_id}
 
     def observe_run(self, run_id, **kwargs):
+        if getattr(self, "hold_busy", False):
+            return {"busy": True, "finish_successful": False}
         return {"busy": False, "finish_successful": True}
 
     def collect_result(self, run_id):
@@ -213,11 +215,33 @@ def _task_by_title(status: dict, title: str) -> dict:
 
 class LegacyAndContainmentTests(unittest.TestCase):
     def _open(self, td: str, backend: _AgyShapeBackend) -> tuple[CollabApplication, str]:
+        # Hold A busy so the successor is not dispatched in the same tick.
+        # Finish A by hand, then let the next process_goal start B.
+        backend.hold_busy = True
         app = CollabApplication(Path(td) / "app", planner=_AbPlanner(), backend=backend)
         opened = app.submit(_submit_body())
-        first = app.coordinator.process_goal(opened["goal_id"])
-        self.assertEqual(first.get("action"), "task_finished", first)
-        return app, opened["goal_id"]
+        goal_id = opened["goal_id"]
+        first = app.coordinator.process_goal(goal_id)
+        self.assertEqual(first.get("action"), "worker_running", first)
+        task_a = _task_by_title(app.status(goal_id), "Write A")
+        self.assertEqual(task_a["status"], "running")
+        self.assertEqual(_task_by_title(app.status(goal_id), "Write B")["status"], "queued")
+        run_id = str(task_a["run_id"])
+        finished = app.layer.finish_task(
+            goal_id,
+            task_a["task_id"],
+            succeeded=True,
+            result={
+                "ok": True,
+                "run_id": run_id,
+                "backend": backend.backend_id,
+                "artifacts": list(backend._runs[run_id]),
+            },
+        )
+        self.assertTrue(finished.get("ok"), finished)
+        self.assertEqual(finished.get("state"), "running", finished)
+        backend.hold_busy = False
+        return app, goal_id
 
     def test_outside_agy_artifact_is_refused_even_if_result_workspace_points_there(self):
         with tempfile.TemporaryDirectory() as td:

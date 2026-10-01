@@ -141,6 +141,7 @@ exit 4 在原 status 上追加字段（`ok` 保持服务端原值）。默认打
 | `artifacts` | `{task_id, path, size?}`。`size` 只在已知 `size` / `bytes` / `nbytes` 时出现 |
 | `progress` | 没有真实进度字段时固定 `{"available": false, "phase": "unknown"}`。服务端若给了 `phase` / `percent` 等才照抄；**不发明百分比** |
 | `usage` | 某条 task `result.usage` 存在时 `{"source": "worker_self_reported", "values": {...}}`（只有一条时 `values` 就是该对象；多条按 `task_id` 分开）。否则 `{"source": "unknown"}`。**不相加** |
+| `scheduler` | 仅当服务端带了 `scheduler`：`running`、`queued_ready`、`capacity`（整数）、`waiting_reason`（没有则为 `""`）。容量等待不是失败 |
 | `warnings` | 仅当服务端发了 `warnings` 或 `capability_warnings` |
 | `http_status` | 有则带上 |
 | `truncated` | 任一自由文本被截断则为 true，否则 false |

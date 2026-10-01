@@ -136,6 +136,7 @@ def default_capabilities(
         },
         "progress": {"available": False},
         "usage": {"source": "unknown"},
+        "concurrency": {"max_runs": "unknown", "limited_by": []},
         "warnings": [],
     }
 

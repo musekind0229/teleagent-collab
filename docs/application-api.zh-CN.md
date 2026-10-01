@@ -19,7 +19,7 @@ v0.1 已提供真实的请求、防重、持久化、规划、任务依赖、派
 
 Windows 后端保留旧控制器的 session 级 `ask`、请求去重、同 session 恢复、独立产物验收、取消确认和不确定派发不重放。控制器继续使用自己的纯 ASCII UUID 工作区，避免含中文的 Goal ID 进入 TeleAgent HTTP 头。
 
-同一个持久化目录只运行一个服务实例。运行句柄会在首次派工后立刻持久化；服务重启后会继续观察支持持久句柄的后端，无法恢复的后端会把任务明确标成失败，不会静默重派。当前进程实际具备哪些能力，以 `GET /v1/capabilities` 为准，不要从「没有弹出 permission」推断访问是安全的。
+同一个持久化目录只运行一个服务实例。运行句柄会在首次派工后立刻持久化；服务重启后会继续观察支持持久句柄的后端，无法恢复的后端会把任务明确标成失败，不会静默重派。同一 Goal 里没有依赖关系的 Task 可以并行，上限是 `GET /v1/capabilities` 的 `concurrency.effective`（服务默认每 Goal 2、全局 4，再与后端 `max_runs` 取最小）。监督桌面 TeleAgent 因 `desktop_session_lock` 仍是串行。名额不够时任务继续排队，`scheduler.waiting_reason` 为 `capacity`，不会记成业务失败。当前进程实际具备哪些能力，以 `GET /v1/capabilities` 为准，不要从「没有弹出 permission」推断访问是安全的。
 
 ## 启动
 
@@ -85,7 +85,16 @@ python bin/collab-service.py --persist .collab-app --port 8765 `
   --planner grok --backend teleagent-windows --teleagent-stdin-wrap
 ```
 
-启动时输出当前监听地址、规划器、工人后端和持久化目录。默认只监听 `127.0.0.1`。启用 wrap 时 stderr 会打一条 diagnostic-only 警告。
+启动时输出当前监听地址、规划器、工人后端、持久化目录，以及 `max_parallel_per_goal` / `max_parallel_global`。默认只监听 `127.0.0.1`。启用 wrap 时 stderr 会打一条 diagnostic-only 警告。
+
+并行上限（都是整数，且必须 `>= 1`）：
+
+| 启动参数 | 默认 | 含义 |
+| --- | --- | --- |
+| `--max-parallel-per-goal` | 2 | 同一个 Goal 里同时处于 in-flight 的 Task 数 |
+| `--max-parallel-global` | 4 | 全部 Goal 加在一起的 in-flight 数 |
+
+有效容量是这二者与后端 `capabilities().concurrency.max_runs` 里**已知数字**的最小值。`max_runs` 为 `unknown` 时不把上限再压低。后端自己声明的原因会进 `limited_by`：in-process 大约 8（`inprocess`）；agy 等于账号池条数，池子不可用或未配置时是 1（`agy_account_pool`）；Windows / Linux 监督桌面是 1（`desktop_session_lock`，同一桌面会话锁，实质串行）。容量不够只是排队，不是失败。
 
 ## 提交请求
 
@@ -164,8 +173,15 @@ TeleAgent `review` 若产物自带 `contamination.contaminated`，投影出的�
 | `progress.available` | 当前为 false |
 | `usage.source` | agy 为 `worker_self_reported`（CLI JSON 自报）；其它为 `unknown` |
 | `warnings` | 人话。agy 且 skip-permissions 时为：`backend runs with skip-permissions: no permission gate; pinned external inputs are prompt-only` |
+| `concurrency.max_parallel_per_goal` | 服务参数，默认 2 |
+| `concurrency.max_parallel_global` | 服务参数，默认 4 |
+| `concurrency.backend_max_runs` | 后端声明的 `max_runs`（整数或 `unknown`）。与后端文档里的 `concurrency.max_runs` 不是同一个对象：这里是给调用方的合成结果 |
+| `concurrency.effective` | 上述已知数字上限的最小值。同一 Goal 的独立 Task 最多并行到这个数 |
+| `concurrency.limited_by` | 哪些上限等于 `effective`。后端若声明了 `limited_by`（如 `desktop_session_lock`、`agy_account_pool`、`inprocess`），用那些名字；否则是 `backend_max_runs` |
 
-`unknown` 不等于具备。默认实现（未覆盖的后端）全部是 false / `unknown`，不会假装有门禁。
+`unknown` 不等于具备。默认实现（未覆盖的后端）全部是 false / `unknown`，不会假装有门禁。`unknown` 的 `max_runs` 不参与 `effective` 的最小值。
+
+`GET /v1/requests/{id}` 另有派生的 `scheduler`（不落盘）：`running`（本 Goal 的 in-flight 数）、`queued_ready`（依赖已满足、仍在排队的 Task 数）、`capacity`（扣掉其它 Goal 正在占用的名额之后，本 Goal 还能用的上限）、`waiting_reason`。`waiting_reason` 为空表示没有就绪任务，或下一拍可以派工。`global_approval` 是全局决策挡住了派工（某个 Task 自己的 question / permission 不挡其它就绪 Task）。`capacity` 是名额用完，任务继续排队，Goal 保持 `running`，`failure` 不会因此被写成失败。`workdir_claim` 是就绪任务的工作目录都被占用：同一目录（含其它 Goal）同时只跑一个 Task，后来的等，不失败。依赖没完成的不会进 `queued_ready`。失败的依赖不会把下游派出去（下游保持排队）。取消会取消该 Goal 上每一个还在跑的 run。墙钟 `budget.wall_sec` 在多个 run 同时活跃时仍然生效：超时则这些 run 都停，Goal 失败，原因是 wall / budget（投影为 `worker_timeout`），不是容量不够。
 
 ### 调用方要求的能力
 
@@ -264,7 +280,7 @@ TeleAgent `review` 若产物自带 `contamination.contaminated`，投影出的�
 | `GET` | `/v1/capabilities` | 本进程能力快照（要登录，与其它 `/v1` 相同） |
 | `POST` | `/v1/requests` | 提交高层目标。可选 `required_capabilities`、`acknowledge_prompt_only_inputs` |
 | `GET` | `/v1/requests` | 列出请求摘要 |
-| `GET` | `/v1/requests/{id}` | 查询 Goal、Task、待决定、失败信息、`warnings`、`capabilities_ref` |
+| `GET` | `/v1/requests/{id}` | 查询 Goal、Task、待决定、失败信息、`warnings`、`capabilities_ref`、`scheduler` |
 | `GET` | `/v1/requests/{id}/events` | 查询持久化事件 |（与 status 对齐露出 pending_decisions）
 | `GET` | `/v1/requests/{id}/report` | 获取交付报告 |
 | `POST` | `/v1/requests/{id}/cancel` | 请求取消，body 如 `{"reason":"用户取消"}` |

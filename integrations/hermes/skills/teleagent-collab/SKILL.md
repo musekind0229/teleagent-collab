@@ -1,7 +1,7 @@
 ---
 name: teleagent-collab
 description: "Delegate work to local collab-service workers (agy/antigravity pool) via bin/hermes-collab-request.py: open, wait, report. Use when the user asks to have 'the worker'/'collab'/'agy' do a task or produce a file."
-version: 0.2.11
+version: 0.2.12
 author: teleagent-collab
 license: MIT
 platforms: [windows, linux, macos]
@@ -95,6 +95,7 @@ collab-service 是本机常驻的派工服务（Application API，默认 `http:/
 ## planner 能力与分阶段交付
 
 - 服务默认的 `deterministic` planner 只生成 **一个** task，不拆解；验收默认是产物文件存在。
+- Same-goal independent tasks may run in parallel up to `capabilities.concurrency.effective`; supervised TeleAgent desktops stay serial.
 - `--planner lead` / `--planner grok` 由 **collab-service 启动参数** 决定：组长会拆解并审查。客户端不能选择 planner。
 - 复杂工作拆成多张单，按阶段推进：源覆盖核对 → 一份可审查的样例 → 实现 + 独立测试 → dry-run → 操作者批准后再安装。
 - 约束写在 `--must` / `--must-not` / `--acceptance-text`，不要把长约束塞进 `--goal`。

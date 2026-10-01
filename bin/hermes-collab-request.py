@@ -1718,6 +1718,18 @@ def summarize_status(payload: dict[str, Any]) -> dict[str, Any]:
     summary["truncated"] = cut.hit
     summary["full_hint"] = _FULL_HINT
     wait = payload.get("wait")
+    scheduler = _pick(payload, "scheduler")
+    if isinstance(scheduler, dict):
+        running = _as_int(scheduler.get("running"))
+        queued_ready = _as_int(scheduler.get("queued_ready"))
+        capacity = _as_int(scheduler.get("capacity"))
+        reason = scheduler.get("waiting_reason")
+        summary["scheduler"] = {
+            "running": 0 if running is None else running,
+            "queued_ready": 0 if queued_ready is None else queued_ready,
+            "capacity": 0 if capacity is None else capacity,
+            "waiting_reason": cut.text("" if reason is None else str(reason), _SUMMARY_TEXT_CAP),
+        }
     if isinstance(wait, dict):
         summary["wait"] = wait
     return summary

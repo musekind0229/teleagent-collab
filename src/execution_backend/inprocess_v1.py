@@ -43,6 +43,7 @@ class InProcessExecutionBackend(ExecutionBackendABC):
         caps["acceptance"]["lead_review"] = False
         caps["acceptance"]["executable_checks"] = False
         caps["usage"]["source"] = "unknown"
+        caps["concurrency"] = {"max_runs": 8, "limited_by": ["inprocess"]}
         caps["warnings"] = []
         return caps
 

@@ -316,8 +316,26 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         caps["acceptance"]["lead_review"] = False
         caps["acceptance"]["executable_checks"] = False
         caps["usage"]["source"] = "worker_self_reported"
+        caps["concurrency"] = {
+            "max_runs": self._account_pool_run_limit(),
+            "limited_by": ["agy_account_pool"],
+        }
         caps["warnings"] = [SKIP_PERMISSIONS_WARNING] if skip else []
         return caps
+
+    def _account_pool_run_limit(self) -> int:
+        """Lease cap. Known pool size, otherwise one run. Never logs the pool."""
+        path = self._account_pool_path
+        if not path:
+            return 1
+        try:
+            from execution_backend.agy_account_pool import load_pool
+
+            pool = load_pool(path)
+            size = len(pool.accounts)
+        except Exception:
+            return 1
+        return size if size >= 1 else 1
 
     def __init__(
         self,
