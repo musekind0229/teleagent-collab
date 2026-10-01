@@ -1,7 +1,7 @@
 ---
 name: teleagent-collab
 description: "Delegate work to local collab-service workers (agy/antigravity pool) via bin/hermes-collab-request.py: open, wait, report. Use when the user asks to have 'the worker'/'collab'/'agy' do a task or produce a file."
-version: 0.2.9
+version: 0.2.10
 author: teleagent-collab
 license: MIT
 platforms: [windows, linux, macos]
@@ -56,26 +56,40 @@ collab-service 是本机常驻的派工服务（Application API，默认 `http:/
 1. 探活（可选但推荐）：
    ```powershell
    cd $(if ($env:COLLAB_REPO) { $env:COLLAB_REPO } else { 'C:\Users\Admin\src\teleagent-collab' })
-   python bin/hermes-collab-request.py status __ping__
+   python bin/hermes-collab-request.py ping
    ```
    `code=transport_error` → 服务没起，停下告诉用户“collab-service 没在跑”，不要自己启动。
-   （404 / not_found 说明服务在线。）
+   成功时 stdout 有 `ok`、`api_version`、`base`；服务若实现了 `GET /v1/capabilities` 会放在 `capabilities` 里，否则该字段为 `null`。不要用 `status __ping__`。
 2. 开单：目标写清楚要什么产物；`--artifact` 写工作区内相对路径（可重复）。
    ```powershell
    python bin/hermes-collab-request.py open --goal "在工作区写 hello.txt，内容为 hello" --artifact hello.txt --title "hello"
    ```
-   记下返回 JSON 里的 `request_id`（也叫 goal id）。工人若要读工作区以外的文件，开单加可重复的 `--external-input PATH`（解析为绝对路径并附上 SHA-256）；未钉住的外部路径会被静默拒绝，到不了 permission 决策。
-3. 等待终态（阻塞轮询；按任务规模设 `--timeout`，hello 类 600 秒足够）：
+   记下返回 JSON 里的 `request_id`（也叫 goal id）。工人若要读工作区以外的文件，开单加可重复的 `--external-input PATH`（最多 8 个；解析为绝对路径并附上 SHA-256）；超过 8 个客户端直接退出码 1，`code=too_many_external_inputs`，不会发 HTTP。未钉住的外部路径会被静默拒绝，到不了 permission 决策。
+3. 等待：用观察窗口切片，不要一次等到宿主工具上限（约 420 秒）。
    ```powershell
-   python bin/hermes-collab-request.py wait <request_id> --timeout 600 --interval 5
+   python bin/hermes-collab-request.py wait <request_id> --timeout 300 --interval 5
    ```
-   退出码：`0` = completed；`2` = failed / cancelled；`3` = 墙钟超时（服务端仍可能在跑）；`1` = HTTP/传输错误；`4` = 需要人拍板（立即返回，不再等超时）。
-   如果终端工具自身有超时，可以改为循环调用 `status <request_id>`（每 5–10 秒），直到 `state` 为 `completed` / `failed` / `cancelled`，或出现待决策（`pending_decisions` 非空 / `awaiting_decision` / 任务 `status=awaiting_decision`）。后几种按下面「停下问用户」处理，不要干等到超时。
+   `--timeout` 是**客户端观察窗口**，不是任务的墙钟预算。到点退出码 `3`，`wait.kind=observation_timeout`，非终态时 `wait.task_still_running=true`，`wait.resume` 是下一条同一 `request_id` 的 wait 命令。这**不是**任务失败，禁止因此 re-open 或 retry。用同一个 `request_id` 重复 `wait --timeout 300`，直到终态或 need_human。
+   退出码：`0` = completed（`wait.kind=completed`）；`2` = failed / cancelled（`wait.kind=task_failed` 或 `task_cancelled`；若失败文本是目标自己的墙钟预算，`wait.task_timeout=true`）；`3` = 观察窗口到点（见上）；`1` = HTTP/传输错误；`4` = 需要人拍板（`wait.kind=need_human`，立即返回）。
+   换了一个 Hermes 回合或进程重启后，用 `pending` 找回还在跑的单（`request_id`、`state`、`awaiting_decision`、`updated_at`）：
+   ```powershell
+   python bin/hermes-collab-request.py pending
+   ```
+   TUI 没有推送通知。把 `request_id` 告诉用户，并说明他们可以过一会儿再来问结果。
 4. 取报告：
    ```powershell
    python bin/hermes-collab-request.py report <request_id>
    ```
-5. 向用户汇报：`request_id`、最终 `state`、产物列表（report 里的 artifacts / 工作区路径）、必要时产物内容摘要。不要编造没看到的内容。
+5. 向用户汇报：`request_id`、最终 `state`、产物列表（report 里的 artifacts / 工作区路径）、必要时产物内容摘要。不要编造没看到的内容。`status` / `report` / `wait` 默认是简明 SUMMARY；只有用户明确要原始 JSON 时才加 `--full`（或 `COLLAB_OUTPUT_FULL=1`）。
+
+## planner 能力与分阶段交付
+
+- 服务默认的 `deterministic` planner 只生成 **一个** task，不拆解；验收默认是产物文件存在。
+- `--planner lead` / `--planner grok` 由 **collab-service 启动参数** 决定：组长会拆解并审查。客户端不能选择 planner。
+- 复杂工作拆成多张单，按阶段推进：源覆盖核对 → 一份可审查的样例 → 实现 + 独立测试 → dry-run → 操作者批准后再安装。
+- 约束写在 `--must` / `--must-not` / `--acceptance-text`，不要把长约束塞进 `--goal`。
+- `state=completed` 之后读真实产物；completed 不等于业务验收通过。
+- 后续修订是一张 **新** request，并在 goal 里写上上一张 `request_id`。失败的单不要静默重新 open。
 
 ## 停下问用户（不要自己重试）
 
@@ -89,16 +103,18 @@ collab-service 是本机常驻的派工服务（Application API，默认 `http:/
   TeleAgent 原生决策的 summary 来自 worker payload（review 的 artifacts/tools、permission 的 pattern 与 scope、question 题面）。
 - `pending_decisions` 里 `awaiting: "lead"` 的行正在由组长裁决，不要就这些行问用户；`wait` 会继续轮询。退出码 `4` 现在表示确实需要人拍板。
 - 转述 permission 决策的 summary 时带上 scope（目录里实际有哪些文件）；如果 summary 里有 `NOT ONLY PINNED`，告诉用户该目录不只有钉住的输入文件。
-- `wait` 退出码 3 超时，或 401/403/transport_error。401/403 只转告 `auth.token_source`，不要回显 token。
+- 401/403/transport_error。401/403 只转告 `auth.token_source`，不要回显 token。
 
-禁止：自行 `POST /v1/requests/{id}/retry`、重新 open 同一目标“再试一次”、换号、改账号池、重启服务、设置 `AGY_AUTO_APPROVE`、自己批准或拒绝决策。
+`wait` 退出码 3（`observation_timeout`）不在上面这份「停下」清单里：它不是任务失败。按 `wait.resume` 用同一 `request_id` 再 wait，并把 `request_id` 告诉用户（TUI 没有推送，他们可以过一会儿再来问）。不要因此 re-open 或 retry。
+
+禁止：自行 `POST /v1/requests/{id}/retry`、因为观察窗口到期而重新 open 同一目标、把失败的单静默再派一次、换号、改账号池、重启服务、设置 `AGY_AUTO_APPROVE`、自己批准或拒绝决策。
 
 `decide <request_id> <decision_id> --verdict <原话>` 只给人类提交者/操作者用；Hermes 仍禁止自行调用。仅当用户明确说出要提交的 verdict 时，才可按该原话执行 `decide`；若被拒绝（`code` 为 `artifact_contaminated` 或 `worker_decision_rejected`），把 `code` 和 `error` 原样转告。
 
 ## Pitfalls
 
 - `--backend` 只是调用方标注，**不会**切换 worker；worker 后端由 collab-service 启动参数决定。
-- `wait` 超时不代表失败：服务端可能仍在跑，用 `status` 再看，并告诉用户。
+- `wait` 的 `--timeout` 是观察窗口，到点（退出码 3）不代表失败：服务端可能仍在跑。按 `wait.resume` 对同一 `request_id` 再 wait，或重启后用 `pending` 找回；不要因此开新单。把 `request_id` 告诉用户。
 - 中文 goal id 已由脚本做 percent-encoding，直接传原值即可。
 - PowerShell 下 JSON 可用 `| ConvertFrom-Json` 取字段。
 - 输出默认 ASCII 转义（中文为 `\uXXXX`）。读中文字段用 `ConvertFrom-Json` / `json.loads` 解析，不要对原始 JSON 文本匹配中文。不要自己加 `--unicode`，除非确认终端是 UTF-8。
@@ -106,4 +122,5 @@ collab-service 是本机常驻的派工服务（Application API，默认 `http:/
 ## Verification
 
 - `wait` 返回 `state=completed` 且 `report` 中列出预期 artifact；
-- 需要时在 report 给出的工作区里读产物内容确认。
+- 需要时在 report 给出的工作区里读产物内容确认。核对产物用文件读取工具（read_file）读文件，不要用 `python -c`（Hermes 单次查询模式会拦截 `python -c`）。
+- 默认只看 SUMMARY。用户要原始载荷时再加 `--full`。

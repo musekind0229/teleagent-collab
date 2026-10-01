@@ -61,6 +61,9 @@ class HermesCollabRequestTests(unittest.TestCase):
                 # Empty keeps the default ASCII JSON even if the developer shell
                 # exported COLLAB_JSON_UNICODE. patch.dict restores the original.
                 "COLLAB_JSON_UNICODE": "",
+                # Empty keeps the default summary even if the shell exported
+                # COLLAB_OUTPUT_FULL. patch.dict restores the original.
+                "COLLAB_OUTPUT_FULL": "",
             },
             clear=False,
         )
@@ -1598,7 +1601,7 @@ class HermesCollabRequestTests(unittest.TestCase):
                 {"ok": True, "state": "running", "goal": {"desired_outcome": outcome}}
             )
 
-        code, text = self._run_main(["status", "ID"], fake_urlopen)
+        code, text = self._run_main(["status", "ID", "--full"], fake_urlopen)
         self.assertEqual(code, 0)
         self.assertTrue(text.isascii())
         self.assertIn("\\u5728", text)
@@ -1635,13 +1638,13 @@ class HermesCollabRequestTests(unittest.TestCase):
             return _FakeResp({"ok": True, "goal": {"desired_outcome": outcome}})
 
         for argv, env in (
-            (["--unicode", "status", "ID"], None),
-            (["--unicode", "status", "ID"], {"COLLAB_JSON_UNICODE": "0"}),
-            (["status", "ID"], {"COLLAB_JSON_UNICODE": "1"}),
-            (["status", "ID"], {"COLLAB_JSON_UNICODE": "true"}),
-            (["status", "ID"], {"COLLAB_JSON_UNICODE": "yes"}),
-            (["status", "ID"], {"COLLAB_JSON_UNICODE": "on"}),
-            (["status", "ID"], {"COLLAB_JSON_UNICODE": "YES"}),
+            (["--unicode", "status", "ID", "--full"], None),
+            (["--unicode", "status", "ID", "--full"], {"COLLAB_JSON_UNICODE": "0"}),
+            (["status", "ID", "--full"], {"COLLAB_JSON_UNICODE": "1"}),
+            (["status", "ID", "--full"], {"COLLAB_JSON_UNICODE": "true"}),
+            (["status", "ID", "--full"], {"COLLAB_JSON_UNICODE": "yes"}),
+            (["status", "ID", "--full"], {"COLLAB_JSON_UNICODE": "on"}),
+            (["status", "ID", "--full"], {"COLLAB_JSON_UNICODE": "YES"}),
         ):
             code, text = self._run_main(argv, fake_urlopen, env)
             self.assertEqual(code, 0, msg=f"argv={argv} env={env}")
@@ -1649,7 +1652,7 @@ class HermesCollabRequestTests(unittest.TestCase):
             self.assertEqual(json.loads(text)["goal"]["desired_outcome"], outcome)
 
         for env in ({"COLLAB_JSON_UNICODE": "0"}, {"COLLAB_JSON_UNICODE": ""}):
-            code, text = self._run_main(["status", "ID"], fake_urlopen, env)
+            code, text = self._run_main(["status", "ID", "--full"], fake_urlopen, env)
             self.assertEqual(code, 0, msg=repr(env))
             self.assertTrue(text.isascii(), msg=repr(env))
             self.assertIn("\\u5728", text)
@@ -1714,7 +1717,7 @@ class HermesCollabRequestTests(unittest.TestCase):
 
         with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
             with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
-                code = HCR.main(["--unicode", "status", "ID"])
+                code = HCR.main(["--unicode", "status", "--full", "ID"])
         self.assertEqual(code, 0)
         self.assertIn(outcome, out.getvalue())
 
@@ -1735,7 +1738,7 @@ class HermesCollabRequestTests(unittest.TestCase):
         out, err = _Rec(), _Rec()
         with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
             with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
-                code = HCR.main(["status", "ID"])
+                code = HCR.main(["status", "--full", "ID"])
         self.assertEqual(code, 0)
         self.assertEqual(out.calls, [{"errors": "backslashreplace"}])
         self.assertEqual(err.calls, [{"errors": "backslashreplace"}])
@@ -1744,7 +1747,7 @@ class HermesCollabRequestTests(unittest.TestCase):
         out_u, err_u = _Rec(), _Rec()
         with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
             with mock.patch("sys.stdout", out_u), mock.patch("sys.stderr", err_u):
-                code = HCR.main(["--unicode", "status", "ID"])
+                code = HCR.main(["--unicode", "status", "--full", "ID"])
         self.assertEqual(code, 0)
         self.assertEqual(
             out_u.calls,
@@ -1939,6 +1942,509 @@ class HermesCollabRequestTests(unittest.TestCase):
         self.assertIn("ASCII", help_text)
         self.assertIn("\\uXXXX", help_text)
         self.assertIn("COLLAB_JSON_UNICODE", help_text)
+
+    def test_ping_ok_includes_capabilities(self) -> None:
+        calls: list[str] = []
+
+        def fake_urlopen(req, timeout=30):
+            calls.append(req.full_url)
+            if req.full_url.endswith("/health"):
+                return _FakeResp({"ok": True, "api_version": "v9"})
+            if req.full_url.endswith("/v1/capabilities"):
+                auth = req.headers.get("Authorization") or req.headers.get("authorization")
+                self.assertEqual(auth, "Bearer test-token")
+                return _FakeResp({"ok": True, "planners": ["deterministic"]})
+            raise AssertionError(req.full_url)
+
+        code, text = self._run_main(["ping"], fake_urlopen)
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            calls,
+            [
+                "http://127.0.0.1:8765/health",
+                "http://127.0.0.1:8765/v1/capabilities",
+            ],
+        )
+        payload = json.loads(text)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["api_version"], "v9")
+        self.assertEqual(payload["base"], "http://127.0.0.1:8765")
+        self.assertEqual(payload["capabilities"]["planners"], ["deterministic"])
+        self.assertNotIn("test-token", text)
+
+    def test_ping_transport_error(self) -> None:
+        calls: list[str] = []
+
+        def fake_urlopen(req, timeout=30):
+            calls.append(req.full_url)
+            raise URLError("refused")
+
+        code, text = self._run_main(["ping"], fake_urlopen)
+        self.assertEqual(code, 1)
+        self.assertEqual(calls, ["http://127.0.0.1:8765/health"])
+        payload = json.loads(text)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["code"], "transport_error")
+
+    def test_ping_capabilities_404_is_null(self) -> None:
+        def fake_urlopen(req, timeout=30):
+            if req.full_url.endswith("/v1/capabilities"):
+                body = json.dumps({"ok": False, "code": "not_found", "error": "no such route"}).encode()
+                raise HTTPError(
+                    req.full_url,
+                    404,
+                    "Not Found",
+                    hdrs=None,  # type: ignore[arg-type]
+                    fp=io.BytesIO(body),
+                )
+            return _FakeResp({"ok": True, "api_version": "v9"})
+
+        code, text = self._run_main(["ping"], fake_urlopen)
+        self.assertEqual(code, 0)
+        payload = json.loads(text)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["api_version"], "v9")
+        self.assertIsNone(payload["capabilities"])
+        self.assertNotIn("no such route", text)
+
+    def _rich_status_body(self) -> dict:
+        return {
+            "ok": True,
+            "request_id": "g1",
+            "state": "blocked",
+            "need_human": True,
+            "failure_reason": "need a human",
+            "failure_code": "awaiting_user",
+            "warnings": ["disk low"],
+            "capability_warnings": ["no push"],
+            "goal": {
+                "desired_outcome": "GOAL_CONTRACT_SECRET",
+                "boundaries": {"must": ["SECRET_MUST"]},
+            },
+            "goal_contract": {"budget": {"wall_sec": 300}, "text": "SECRET_CONTRACT"},
+            "pending_decisions": [
+                {
+                    "decision_id": "d1",
+                    "kind": "question",
+                    "title": "Pick one",
+                    "status": "pending",
+                    "awaiting": "human",
+                    "reason": "because",
+                }
+            ],
+            "awaiting_lead_count": 1,
+            "awaiting_human_count": 1,
+            "tasks": [
+                {
+                    "task_id": "t1",
+                    "title": "sample",
+                    "status": "awaiting_decision",
+                    "workspace": "/tmp/ws",
+                    "expected_artifacts": ["out.md"],
+                    "result": {
+                        "artifacts": [
+                            {
+                                "path": "out.md",
+                                "bytes": 12,
+                                "preview": "SECRET_PREVIEW",
+                            }
+                        ],
+                        "response": "WORKER_RESPONSE_SECRET",
+                        "stdout": "STDOUT_SECRET_BLOB",
+                        "stderr": "STDERR_SECRET_BLOB",
+                        "error": "E" * 500,
+                        "usage": {"input_tokens": 3, "output_tokens": 4},
+                    },
+                }
+            ],
+        }
+
+    def test_status_summary_hides_secrets_and_keeps_signals(self) -> None:
+        body = self._rich_status_body()
+
+        def fake_urlopen(req, timeout=30):
+            return _FakeResp(body)
+
+        code, text = self._run_main(["status", "g1"], fake_urlopen)
+        self.assertEqual(code, 0)
+        for secret in (
+            "GOAL_CONTRACT_SECRET",
+            "SECRET_MUST",
+            "SECRET_CONTRACT",
+            "WORKER_RESPONSE_SECRET",
+            "STDOUT_SECRET_BLOB",
+            "STDERR_SECRET_BLOB",
+            "SECRET_PREVIEW",
+        ):
+            self.assertNotIn(secret, text)
+        summary = json.loads(text)
+        self.assertTrue(summary["ok"])
+        self.assertEqual(summary["request_id"], "g1")
+        self.assertEqual(summary["state"], "blocked")
+        self.assertFalse(summary["terminal"])
+        self.assertIs(summary["need_human"], True)
+        self.assertEqual(summary["failure_reason"], "need a human")
+        self.assertEqual(summary["failure_code"], "awaiting_user")
+        decision = summary["pending_decisions"][0]
+        self.assertEqual(decision["decision_id"], "d1")
+        self.assertEqual(decision["kind"], "question")
+        self.assertEqual(decision["awaiting"], "human")
+        self.assertEqual(decision["summary"], "Pick one")
+        self.assertEqual(summary["awaiting_lead_count"], 1)
+        self.assertEqual(summary["awaiting_human_count"], 1)
+        task = summary["tasks"][0]
+        self.assertEqual(task["task_id"], "t1")
+        self.assertEqual(task["title"], "sample")
+        self.assertEqual(task["status"], "awaiting_decision")
+        self.assertEqual(task["artifacts"], ["out.md"])
+        self.assertEqual(task["workspace"], "/tmp/ws")
+        self.assertEqual(len(task["error"]), 300)
+        self.assertTrue(set(task["error"]) <= {"E"})
+        self.assertEqual(summary["artifacts"], [{"task_id": "t1", "path": "out.md", "size": 12}])
+        self.assertEqual(summary["progress"], {"available": False, "phase": "unknown"})
+        self.assertNotIn("percent", summary["progress"])
+        self.assertEqual(summary["usage"]["source"], "worker_self_reported")
+        self.assertEqual(summary["usage"]["values"], {"input_tokens": 3, "output_tokens": 4})
+        self.assertEqual(summary["warnings"], ["disk low", "no push"])
+        self.assertEqual(summary["http_status"], 200)
+        self.assertIs(summary["truncated"], True)
+        self.assertEqual(summary["full_hint"], "rerun with --full")
+        self.assertNotIn("goal", summary)
+        self.assertNotIn("stdout", summary)
+        self.assertNotIn("stderr", summary)
+
+    def test_status_full_and_env_print_raw_payload(self) -> None:
+        body = self._rich_status_body()
+
+        def fake_urlopen(req, timeout=30):
+            return _FakeResp(body)
+
+        code, text = self._run_main(["status", "g1", "--full"], fake_urlopen)
+        self.assertEqual(code, 0)
+        raw = json.loads(text)
+        self.assertEqual(raw["goal"]["desired_outcome"], "GOAL_CONTRACT_SECRET")
+        self.assertIn("WORKER_RESPONSE_SECRET", text)
+        self.assertIn("STDOUT_SECRET_BLOB", text)
+        self.assertNotIn("full_hint", raw)
+
+        code, text = self._run_main(
+            ["status", "g1"],
+            fake_urlopen,
+            {"COLLAB_OUTPUT_FULL": "1"},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(text)["goal"]["desired_outcome"], "GOAL_CONTRACT_SECRET")
+
+    def test_report_summary_drops_desired_outcome_and_stdout(self) -> None:
+        def fake_urlopen(req, timeout=30):
+            self.assertTrue(req.full_url.endswith("/report"))
+            return _FakeResp(
+                {
+                    "ok": True,
+                    "goal_id": "g9",
+                    "state": "completed",
+                    "report": {
+                        "desired_outcome": "GOAL_CONTRACT_SECRET",
+                        "state": "completed",
+                        "tasks": [
+                            {
+                                "task_id": "t9",
+                                "title": "done",
+                                "status": "succeeded",
+                                "result": {
+                                    "stdout": "STDOUT_SECRET_BLOB",
+                                    "response": "WORKER_RESPONSE_SECRET",
+                                    "artifacts": ["poem.txt"],
+                                },
+                            }
+                        ],
+                    },
+                }
+            )
+
+        code, text = self._run_main(["report", "g9"], fake_urlopen)
+        self.assertEqual(code, 0)
+        self.assertNotIn("GOAL_CONTRACT_SECRET", text)
+        self.assertNotIn("STDOUT_SECRET_BLOB", text)
+        self.assertNotIn("WORKER_RESPONSE_SECRET", text)
+        summary = json.loads(text)
+        self.assertEqual(summary["request_id"], "g9")
+        self.assertEqual(summary["state"], "completed")
+        self.assertTrue(summary["terminal"])
+        self.assertEqual(summary["tasks"][0]["artifacts"], ["poem.txt"])
+        self.assertEqual(summary["usage"], {"source": "unknown"})
+        self.assertEqual(summary["full_hint"], "rerun with --full")
+
+    def test_summarize_progress_and_usage_are_not_invented(self) -> None:
+        unknown = HCR.summarize_status({"ok": True, "state": "running", "request_id": "g"})
+        self.assertEqual(unknown["progress"], {"available": False, "phase": "unknown"})
+        self.assertNotIn("percent", unknown["progress"])
+        self.assertEqual(unknown["usage"], {"source": "unknown"})
+        self.assertIs(unknown["truncated"], False)
+
+        real = HCR.summarize_status(
+            {
+                "ok": True,
+                "state": "running",
+                "request_id": "g",
+                "progress": {"phase": "writing"},
+                "tasks": [
+                    {"task_id": "a", "title": "a", "status": "running", "result": {"usage": {"input_tokens": 1}}},
+                    {"task_id": "b", "title": "b", "status": "running", "result": {"usage": {"input_tokens": 4}}},
+                ],
+            }
+        )
+        self.assertTrue(real["progress"]["available"])
+        self.assertEqual(real["progress"]["phase"], "writing")
+        self.assertNotIn("percent", real["progress"])
+        self.assertEqual(real["usage"]["source"], "worker_self_reported")
+        values = real["usage"]["values"]
+        self.assertNotEqual(values.get("input_tokens"), 5)
+        self.assertEqual(values["a"], {"input_tokens": 1})
+        self.assertEqual(values["b"], {"input_tokens": 4})
+
+    def test_wait_observation_timeout_is_not_a_task_failure(self) -> None:
+        def fake_urlopen(req, timeout=30):
+            return _FakeResp(
+                {
+                    "ok": True,
+                    "state": "running",
+                    "request_id": "g1",
+                    "goal": {"desired_outcome": "GOAL_CONTRACT_SECRET"},
+                    "tasks": [
+                        {
+                            "task_id": "t1",
+                            "status": "running",
+                            "result": {"stdout": "STDOUT_SECRET_BLOB", "response": "WORKER_RESPONSE_SECRET"},
+                        }
+                    ],
+                }
+            )
+
+        mono = iter([100.0, 100.1, 999.0])
+        buf = io.StringIO()
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with mock.patch.object(HCR.time, "monotonic", side_effect=lambda: next(mono)):
+                with mock.patch.object(HCR.time, "sleep", return_value=None):
+                    with mock.patch("sys.stdout", buf):
+                        code = HCR.main(["wait", "g1", "--timeout", "30", "--interval", "0.01"])
+        self.assertEqual(code, 3)
+        text = buf.getvalue()
+        self.assertNotIn("GOAL_CONTRACT_SECRET", text)
+        self.assertNotIn("STDOUT_SECRET_BLOB", text)
+        self.assertNotIn("WORKER_RESPONSE_SECRET", text)
+        printed = json.loads(text)
+        wait = printed["wait"]
+        self.assertEqual(wait["kind"], "observation_timeout")
+        self.assertTrue(wait["task_still_running"])
+        self.assertTrue(wait["timed_out"])
+        self.assertEqual(wait["timeout_sec"], 30.0)
+        self.assertEqual(
+            wait["resume"],
+            "python bin/hermes-collab-request.py wait g1 --timeout 30",
+        )
+        self.assertIn("NOT a task failure", wait["note"])
+        self.assertIn("do not re-open or retry", wait["note"])
+        self.assertNotEqual(printed.get("code"), "need_human")
+        self.assertNotIn("task_timeout", wait)
+
+    def test_wait_task_failed_wall_budget_sets_task_timeout(self) -> None:
+        def failed(reason: str, state: str = "failed"):
+            def fake_urlopen(req, timeout=30):
+                return _FakeResp(
+                    {
+                        "ok": True,
+                        "state": state,
+                        "request_id": "g1",
+                        "failure_reason": reason,
+                        "failure": {"error": reason},
+                        "goal": {"desired_outcome": "GOAL_CONTRACT_SECRET"},
+                        "tasks": [
+                            {
+                                "task_id": "t1",
+                                "title": "work",
+                                "status": "failed",
+                                "result": {
+                                    "error": reason,
+                                    "stdout": "STDOUT_SECRET_BLOB",
+                                    "response": "WORKER_RESPONSE_SECRET",
+                                },
+                            }
+                        ],
+                    }
+                )
+
+            return fake_urlopen
+
+        code, text = self._run_main(
+            ["wait", "g1", "--timeout", "5", "--interval", "0.01"],
+            failed("need_human: budget_exceeded wall wall_s=301 max=300"),
+        )
+        self.assertEqual(code, 2)
+        self.assertNotIn("GOAL_CONTRACT_SECRET", text)
+        self.assertNotIn("STDOUT_SECRET_BLOB", text)
+        self.assertNotIn("WORKER_RESPONSE_SECRET", text)
+        printed = json.loads(text)
+        self.assertEqual(printed["wait"]["kind"], "task_failed")
+        self.assertIs(printed["wait"]["task_timeout"], True)
+        self.assertTrue(printed["wait"]["terminal"])
+        self.assertEqual(printed["state"], "failed")
+
+        code, text = self._run_main(
+            ["wait", "g1", "--timeout", "5", "--interval", "0.01"],
+            failed("need_human: budget_exceeded steps steps=401 max=400"),
+        )
+        self.assertEqual(code, 2)
+        step_wait = json.loads(text)["wait"]
+        self.assertEqual(step_wait["kind"], "task_failed")
+        self.assertNotIn("task_timeout", step_wait)
+
+        code, text = self._run_main(
+            ["wait", "g1", "--timeout", "5", "--interval", "0.01"],
+            failed("worker crashed", state="cancelled"),
+        )
+        self.assertEqual(code, 2)
+        cancelled = json.loads(text)["wait"]
+        self.assertEqual(cancelled["kind"], "task_cancelled")
+        self.assertNotIn("task_timeout", cancelled)
+
+        code, text = self._run_main(
+            ["wait", "g1", "--timeout", "5", "--interval", "0.01"],
+            failed("Task deadline exhausted (includes approvals and redo)"),
+        )
+        self.assertEqual(code, 2)
+        self.assertIs(json.loads(text)["wait"]["task_timeout"], True)
+
+    def test_wait_need_human_kind(self) -> None:
+        def fake_urlopen(req, timeout=30):
+            return _FakeResp(
+                {
+                    "ok": True,
+                    "state": "blocked",
+                    "request_id": "g1",
+                    "pending_decisions": [
+                        {
+                            "decision_id": "dec-1",
+                            "kind": "question",
+                            "title": "继续吗",
+                            "status": "pending",
+                            "awaiting": "human",
+                        }
+                    ],
+                }
+            )
+
+        code, printed, slept = self._wait_main(
+            ["wait", "g1", "--timeout", "30", "--interval", "0.2"],
+            fake_urlopen,
+        )
+        self.assertEqual(code, 4)
+        self.assertEqual(slept.call_count, 0)
+        self.assertEqual(printed["code"], "need_human")
+        self.assertIs(printed["need_human"], True)
+        self.assertEqual(printed["wait"]["kind"], "need_human")
+        self.assertEqual(printed["wait"]["reason"], "pending_decisions")
+        self.assertFalse(printed["wait"]["timed_out"])
+
+    def test_pending_filters_terminal_requests(self) -> None:
+        def fake_urlopen(req, timeout=30):
+            self.assertEqual(req.get_method(), "GET")
+            self.assertTrue(req.full_url.endswith("/v1/requests"))
+            self.assertNotIn("/v1/requests/", req.full_url)
+            return _FakeResp(
+                {
+                    "ok": True,
+                    "requests": [
+                        {
+                            "goal_id": "run-1",
+                            "state": "running",
+                            "awaiting_decision": False,
+                            "updated_at": 10,
+                            "updated_at_iso": "t1",
+                        },
+                        {"goal_id": "done-1", "state": "completed", "updated_at": 11},
+                        {"request_id": "fail-1", "state": "failed", "updated_at": 12},
+                        {
+                            "goal_id": "blk-1",
+                            "state": "blocked",
+                            "pending_count": 1,
+                            "updated_at_iso": "t2",
+                        },
+                        {"goal_id": "can-1", "state": "cancelled", "updated_at": 13},
+                        {"goal_id": "q-1", "state": "queued", "updated_at": 14},
+                    ],
+                }
+            )
+
+        code, text = self._run_main(["pending"], fake_urlopen)
+        self.assertEqual(code, 0)
+        payload = json.loads(text)
+        self.assertTrue(payload["ok"])
+        rows = payload["requests"]
+        self.assertEqual([row["request_id"] for row in rows], ["run-1", "blk-1", "q-1"])
+        self.assertEqual(rows[0]["state"], "running")
+        self.assertFalse(rows[0]["awaiting_decision"])
+        self.assertEqual(rows[0]["updated_at"], "t1")
+        self.assertEqual(rows[1]["state"], "blocked")
+        self.assertTrue(rows[1]["awaiting_decision"])
+        self.assertEqual(rows[1]["updated_at"], "t2")
+        self.assertEqual(rows[2]["state"], "queued")
+        self.assertFalse(rows[2]["awaiting_decision"])
+        self.assertEqual(rows[2]["updated_at"], 14)
+
+    def test_open_too_many_external_inputs_before_io(self) -> None:
+        argv = ["open", "--goal", "too many"]
+        for index in range(9):
+            argv.extend(["--external-input", f"/tmp/does-not-exist-{index}.txt"])
+
+        def fail_urlopen(req, timeout=30):
+            raise AssertionError("open must not send HTTP when there are too many pins")
+
+        with mock.patch.object(Path, "open", side_effect=AssertionError("opened")) as opened:
+            with mock.patch.object(Path, "read_bytes", side_effect=AssertionError("read_bytes")) as read_bytes:
+                with mock.patch.object(HCR, "_sha256_file", side_effect=AssertionError("hashed")) as hashed:
+                    with mock.patch.object(HCR.hashlib, "sha256", side_effect=AssertionError("sha")) as sha:
+                        code, text = self._run_main(argv, fail_urlopen)
+        self.assertEqual(code, 1)
+        self.assertEqual(opened.call_count, 0)
+        self.assertEqual(read_bytes.call_count, 0)
+        self.assertEqual(hashed.call_count, 0)
+        self.assertEqual(sha.call_count, 0)
+        payload = json.loads(text)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["code"], "too_many_external_inputs")
+        self.assertIn("8", payload["error"])
+        self.assertIn("at most", payload["error"])
+
+    def test_sha256_file_streams_and_matches_hashlib(self) -> None:
+        content = b"abc123" * 50
+        path = Path(self._tmp.name) / "blob.bin"
+        path.write_bytes(content)
+        reads: list[int] = []
+        real_open = Path.open
+
+        def spy_open(self, mode="r", *args, **kwargs):
+            handle = real_open(self, mode, *args, **kwargs)
+            if Path(self) == path and "b" in str(mode):
+                original = handle.read
+
+                def read(n=-1):
+                    data = original(n)
+                    reads.append(0 if not data else len(data))
+                    return data
+
+                handle.read = read  # type: ignore[method-assign]
+            return handle
+
+        with mock.patch.object(HCR, "_HASH_CHUNK", 16):
+            with mock.patch.object(Path, "open", spy_open):
+                digest = HCR._sha256_file(path)
+        self.assertEqual(digest, hashlib.sha256(content).hexdigest())
+        self.assertGreater(sum(1 for size in reads if size), 1)
+
+        record = HCR._external_input_record(str(path))
+        self.assertEqual(record["sha256"], hashlib.sha256(content).hexdigest())
+        self.assertEqual(record["path"], str(path.resolve()))
 
 
 if __name__ == "__main__":

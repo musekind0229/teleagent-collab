@@ -17,7 +17,7 @@ Lookup order:
      (skipped when LOCALAPPDATA is missing)
      other OS: ~/.hermes/.env
 
-Subcommands: open | status | report | wait | decide
+Subcommands: open | ping | status | report | wait | pending | decide
 Stdout: one JSON object (single line). Default is pure ASCII
 (ensure_ascii=True); non-ASCII becomes \\uXXXX so PowerShell 5.1 pipes
 (any code page) and Hermes UTF-8 decoding both keep the text.
@@ -29,12 +29,21 @@ stdout/stderr errors=backslashreplace (encoding unchanged) when
 reconfigure exists, so a mismatched code page does not raise
 UnicodeEncodeError.
 
+status, report, and wait print a stable summary by default. --full on
+that subcommand, or COLLAB_OUTPUT_FULL=1|true|yes|on, prints the raw
+payload. The summary never includes the goal contract, worker response
+text, or stdout/stderr.
+
 Exit codes:
   0  EXIT_OK               success (wait: state completed)
   1  EXIT_ERROR            HTTP/transport/API error, or payload ok=false
   2  EXIT_FAILED           wait ended in failed or cancelled
-  3  EXIT_TIMEOUT          wait hit the wall-clock deadline
+                            (wait.kind task_failed or task_cancelled;
+                            wait.task_timeout when the goal wall budget fired)
+  3  EXIT_TIMEOUT          wait hit the client observation window
+                            (wait.kind observation_timeout; not a task failure)
   4  EXIT_NEED_HUMAN       a human decision is required (lead-owned rows keep polling)
+                            (wait.kind need_human)
   5  EXIT_DECISION_REFUSED decide: server refused the decision (HTTP 409).
                           Body keeps code, error, and contamination/hint when present.
 """
@@ -67,6 +76,31 @@ EXIT_TIMEOUT = 3
 EXIT_NEED_HUMAN = 4
 EXIT_DECISION_REFUSED = 5
 _SUMMARY_LIMIT = 200
+# Server enforces the same limit (src/framework/app_service.py MAX_EXTERNAL_INPUTS).
+MAX_EXTERNAL_INPUTS = 8
+_HASH_CHUNK = 1024 * 1024
+_SUMMARY_TEXT_CAP = 300
+_FULL_HINT = "rerun with --full"
+_OBSERVATION_NOTE = (
+    "Observation window expired. This is NOT a task failure; "
+    "do not re-open or retry. Repeat wait on the same request_id."
+)
+_PROGRESS_KEYS = (
+    "phase",
+    "percent",
+    "pct",
+    "percentage",
+    "step",
+    "steps_done",
+    "steps_total",
+    "completed",
+    "total",
+    "message",
+    "fraction",
+    "eta_sec",
+    "current",
+    "label",
+)
 
 
 class ClientError(Exception):
@@ -291,6 +325,18 @@ def _encode_id(request_id: str) -> str:
     return urllib.parse.quote(str(request_id), safe="")
 
 
+def _sha256_file(path: Path) -> str:
+    """Stream SHA-256 so a large pin is not loaded with read_bytes."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(_HASH_CHUNK)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _external_input_record(raw: str) -> dict[str, str]:
     """Absolute path plus sha256. Missing files are a client error, not HTTP."""
     text = str(raw or "").strip()
@@ -320,7 +366,7 @@ def _external_input_record(raw: str) -> dict[str, str]:
             exit_code=EXIT_ERROR,
         )
     try:
-        digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
+        digest = _sha256_file(resolved)
     except OSError as e:
         raise ClientError(
             {
@@ -360,7 +406,20 @@ def cmd_open(args: argparse.Namespace) -> dict[str, Any]:
     # caller annotation only (server ignores unknown fields today).
     if args.backend:
         body["caller_backend_hint"] = args.backend
-    pins = [_external_input_record(item) for item in (getattr(args, "external_input", None) or [])]
+    # Count before any path resolve, open, or hash. The server rejects the same limit.
+    raw_inputs = list(getattr(args, "external_input", None) or [])
+    if len(raw_inputs) > MAX_EXTERNAL_INPUTS:
+        raise ClientError(
+            {
+                "ok": False,
+                "code": "too_many_external_inputs",
+                "error": (
+                    f"external_inputs must have at most {MAX_EXTERNAL_INPUTS} entries"
+                ),
+            },
+            exit_code=EXIT_ERROR,
+        )
+    pins = [_external_input_record(item) for item in raw_inputs]
     if pins:
         body["external_inputs"] = pins
     return request_json("POST", "/v1/requests", body=body, timeout=float(args.http_timeout))
@@ -963,6 +1022,96 @@ def need_human_view(status: dict[str, Any]) -> dict[str, Any] | None:
     return view
 
 
+def _format_seconds(value: float) -> str:
+    number = float(value)
+    if number.is_integer():
+        return str(int(number))
+    return str(number)
+
+
+def _wait_resume(request_id: str, timeout: float) -> str:
+    return (
+        "python bin/hermes-collab-request.py wait "
+        f"{request_id} --timeout {_format_seconds(timeout)}"
+    )
+
+
+_WALL_TEXT_KEYS = (
+    "error",
+    "failure_reason",
+    "reason",
+    "message",
+    "code",
+    "error_class",
+    "kind",
+    "failure_code",
+    "state",
+)
+# Phrases the server already writes for a goal wall-clock budget
+# (win_collab.budget_exceeded_reason, charter timeout_sec → timed_out).
+_WALL_MARKERS = (
+    "budget_exceeded wall",
+    "budget_exceeded: wall",
+    "budget_exhausted",
+    "timed_out",
+    "wall clock",
+    "wall_clock",
+    "wall budget",
+    "wall_budget",
+    "wall_sec",
+    "wall_s=",
+    "deadline exhausted",
+)
+
+
+def _append_failure_text(chunks: list[str], obj: Any) -> None:
+    if isinstance(obj, str):
+        if obj.strip():
+            chunks.append(obj)
+        return
+    if not isinstance(obj, dict):
+        return
+    for key in _WALL_TEXT_KEYS:
+        value = obj.get(key)
+        if isinstance(value, str) and value.strip():
+            chunks.append(value)
+
+
+def _goal_wall_budget(payload: dict[str, Any]) -> bool:
+    """True when failure/error text is the goal's own wall budget, not a generic error.
+
+    Looks only at failure and error fields the server already produces
+    (budget_exceeded wall / wall clock / timed_out / budget_exhausted).
+    A step budget (``budget_exceeded steps``) does not match.
+    """
+    chunks: list[str] = []
+    _append_failure_text(chunks, payload)
+    _append_failure_text(chunks, payload.get("failure"))
+    report = payload.get("report") if isinstance(payload.get("report"), dict) else None
+    if report is not None:
+        _append_failure_text(chunks, report)
+        _append_failure_text(chunks, report.get("failure"))
+    tasks = payload.get("tasks")
+    if not isinstance(tasks, list) and report is not None:
+        tasks = report.get("tasks")
+    if isinstance(tasks, list):
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            _append_failure_text(chunks, task)
+            result = task.get("result")
+            if isinstance(result, dict):
+                _append_failure_text(chunks, result)
+    blob = "\n".join(chunks).lower()
+    if not blob:
+        return False
+    if any(marker in blob for marker in _WALL_MARKERS):
+        return True
+    if "budget_exceeded" in blob and "timeout" in blob:
+        return True
+    return False
+
+
 def cmd_wait(args: argparse.Namespace) -> dict[str, Any]:
     rid = _encode_id(args.request_id)
     deadline = time.monotonic() + float(args.timeout)
@@ -972,7 +1121,16 @@ def cmd_wait(args: argparse.Namespace) -> dict[str, Any]:
         last = request_json("GET", f"/v1/requests/{rid}", timeout=float(args.http_timeout))
         state = str(last.get("state") or "")
         if state in TERMINAL_STATES:
-            last["wait"] = {"terminal": True, "state": state}
+            if state in SUCCESS_STATES:
+                kind = "completed"
+            elif state == "cancelled":
+                kind = "task_cancelled"
+            else:
+                kind = "task_failed"
+            terminal_wait: dict[str, Any] = {"terminal": True, "state": state, "kind": kind}
+            if state not in SUCCESS_STATES and _goal_wall_budget(last):
+                terminal_wait["task_timeout"] = True
+            last["wait"] = terminal_wait
             if state not in SUCCESS_STATES:
                 raise ClientError(last, exit_code=EXIT_FAILED)
             return last
@@ -1015,6 +1173,7 @@ def cmd_wait(args: argparse.Namespace) -> dict[str, Any]:
                     "terminal": False,
                     "need_human": True,
                     "timed_out": False,
+                    "kind": "need_human",
                     "reason": reason,
                     "state": view.get("state", state),
                     "decision_ids": decision_ids,
@@ -1032,9 +1191,545 @@ def cmd_wait(args: argparse.Namespace) -> dict[str, Any]:
                 "timed_out": True,
                 "state": state,
                 "timeout_sec": float(args.timeout),
+                "kind": "observation_timeout",
+                "task_still_running": state not in TERMINAL_STATES,
+                "resume": _wait_resume(str(args.request_id), float(args.timeout)),
+                "note": _OBSERVATION_NOTE,
             }
             raise ClientError(last, exit_code=EXIT_TIMEOUT)
         time.sleep(interval)
+
+
+class _Cut:
+    """Track whether a free-text field was shortened to the summary cap."""
+
+    def __init__(self) -> None:
+        self.hit = False
+
+    def text(self, value: Any, limit: int = _SUMMARY_TEXT_CAP) -> str:
+        if value is None:
+            return ""
+        text = str(value)
+        if limit < 0:
+            limit = 0
+        if len(text) <= limit:
+            return text
+        self.hit = True
+        return text[:limit]
+
+
+def _layers(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    layers = [payload]
+    report = payload.get("report")
+    if isinstance(report, dict):
+        layers.append(report)
+    return layers
+
+
+def _pick(payload: dict[str, Any], key: str) -> Any:
+    for layer in _layers(payload):
+        if key in layer and layer[key] is not None:
+            return layer[key]
+    return None
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return default
+
+
+def _as_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+            try:
+                return int(value.strip())
+            except ValueError:
+                return None
+        return None
+    return value
+
+
+def _task_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = _pick(payload, "tasks")
+    if not isinstance(raw, list):
+        return []
+    return [row for row in raw if isinstance(row, dict)]
+
+
+def _pending_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = _pick(payload, "pending_decisions")
+    if not isinstance(raw, list):
+        return []
+    return [row for row in raw if isinstance(row, dict)]
+
+
+def _artifact_size(meta: dict[str, Any]) -> int | None:
+    for key in ("size", "bytes", "nbytes"):
+        value = meta.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    return None
+
+
+def _remember_artifact(
+    files: list[dict[str, Any]],
+    index: dict[tuple[str, str], dict[str, Any]],
+    task_id: str,
+    path: str,
+    size: int | None,
+) -> None:
+    if not path:
+        return
+    key = (task_id, path)
+    entry = index.get(key)
+    if entry is None:
+        entry = {"task_id": task_id, "path": path}
+        index[key] = entry
+        files.append(entry)
+    if size is not None and "size" not in entry:
+        entry["size"] = size
+
+
+def _consume_artifacts(
+    value: Any,
+    task_id: str,
+    names: list[str],
+    seen_names: set[str],
+    files: list[dict[str, Any]],
+    index: dict[tuple[str, str], dict[str, Any]],
+    cut: _Cut,
+) -> None:
+    """Collect artifact names and {task_id, path, size?}. Never copy previews or bytes content."""
+
+    def add_name(label: str) -> str:
+        shown = cut.text(label.strip(), _SUMMARY_TEXT_CAP)
+        if shown and shown not in seen_names:
+            seen_names.add(shown)
+            names.append(shown)
+        return shown
+
+    if isinstance(value, str):
+        path = add_name(value)
+        _remember_artifact(files, index, task_id, path, None)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _consume_artifacts(item, task_id, names, seen_names, files, index, cut)
+        return
+    if not isinstance(value, dict):
+        return
+    if any(key in value for key in ("path", "name", "file")):
+        label = value.get("path") or value.get("name") or value.get("file")
+        if isinstance(label, str):
+            path = add_name(label)
+            _remember_artifact(files, index, task_id, path, _artifact_size(value))
+        return
+    for name, meta in value.items():
+        if not isinstance(name, str):
+            continue
+        path = add_name(name)
+        size = _artifact_size(meta) if isinstance(meta, dict) else None
+        _remember_artifact(files, index, task_id, path, size)
+
+
+def _task_workspace(task: dict[str, Any], result: dict[str, Any] | None) -> str:
+    sources: list[dict[str, Any]] = [task]
+    if isinstance(result, dict):
+        sources.append(result)
+    for source in sources:
+        for key in ("workspace", "workdir", "workspace_path", "workspace_dir"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _task_error(task: dict[str, Any], result: dict[str, Any] | None) -> str:
+    candidates: list[Any] = []
+    if isinstance(result, dict):
+        candidates.append(result.get("error"))
+    candidates.append(task.get("error"))
+    if isinstance(result, dict):
+        candidates.append(result.get("failure_reason"))
+    candidates.append(task.get("failure_reason"))
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
+def _cap_usage(usage: Any, cut: _Cut) -> Any:
+    """Copy worker-reported usage. Do not add numeric fields together."""
+    if isinstance(usage, str):
+        return cut.text(usage, _SUMMARY_TEXT_CAP)
+    if isinstance(usage, dict):
+        copied: dict[str, Any] = {}
+        for key, value in usage.items():
+            if isinstance(value, str):
+                copied[str(key)] = cut.text(value, _SUMMARY_TEXT_CAP)
+            elif isinstance(value, (dict, list)):
+                copied[str(key)] = _cap_usage(value, cut)
+            else:
+                copied[str(key)] = value
+        return copied
+    if isinstance(usage, list):
+        return [
+            _cap_usage(item, cut) if isinstance(item, (dict, list, str)) else item
+            for item in usage
+        ]
+    return usage
+
+
+def _usage_summary(tasks: list[dict[str, Any]], cut: _Cut) -> dict[str, Any]:
+    found: list[tuple[str, Any]] = []
+    for task in tasks:
+        result = task.get("result")
+        if not isinstance(result, dict) or "usage" not in result:
+            continue
+        usage = result.get("usage")
+        if usage is None:
+            continue
+        found.append((str(task.get("task_id") or ""), _cap_usage(usage, cut)))
+    if not found:
+        return {"source": "unknown"}
+    if len(found) == 1:
+        return {"source": "worker_self_reported", "values": found[0][1]}
+    values: dict[str, Any] = {}
+    for index, (task_id, usage) in enumerate(found):
+        key = task_id or f"task_{index}"
+        if key in values:
+            key = f"{key}#{index}"
+        values[key] = usage
+    return {"source": "worker_self_reported", "values": values}
+
+
+def _progress_summary(payload: dict[str, Any], cut: _Cut) -> dict[str, Any]:
+    """Pass through real progress fields. Never invent a percentage."""
+    raw = _pick(payload, "progress")
+    if not isinstance(raw, dict):
+        return {"available": False, "phase": "unknown"}
+    present: dict[str, Any] = {}
+    for key in _PROGRESS_KEYS:
+        if key not in raw or raw[key] is None:
+            continue
+        value = raw[key]
+        if isinstance(value, str):
+            value = cut.text(value, _SUMMARY_TEXT_CAP)
+        present[key] = value
+    if not present:
+        return {"available": False, "phase": "unknown"}
+    phase = present.get("phase")
+    if not isinstance(phase, str) or not phase.strip():
+        phase = "unknown"
+    view: dict[str, Any] = {"available": True, "phase": phase}
+    for key, value in present.items():
+        if key == "phase":
+            continue
+        view[key] = value
+    return view
+
+
+def _warning_items(value: Any, cut: _Cut) -> list[str]:
+    if isinstance(value, str):
+        text = value.strip()
+        return [cut.text(text, _SUMMARY_TEXT_CAP)] if text else []
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    for item in value:
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                items.append(cut.text(text, _SUMMARY_TEXT_CAP))
+            continue
+        if isinstance(item, dict):
+            picked = ""
+            for key in ("message", "warning", "text", "detail"):
+                candidate = item.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    picked = candidate.strip()
+                    break
+            if not picked:
+                picked = json.dumps(item, ensure_ascii=True, default=str)
+            items.append(cut.text(picked, _SUMMARY_TEXT_CAP))
+    return items
+
+
+def _need_human_flag(payload: dict[str, Any], tasks: list[dict[str, Any]]) -> bool:
+    for layer in _layers(payload):
+        if isinstance(layer.get("need_human"), bool):
+            return layer["need_human"]
+    failure = _pick(payload, "failure")
+    if isinstance(failure, dict) and failure.get("need_human") is True:
+        return True
+    for task in tasks:
+        if task.get("need_human") is True:
+            return True
+        result = task.get("result")
+        if isinstance(result, dict) and result.get("need_human") is True:
+            return True
+    return False
+
+
+def _failure_fields(payload: dict[str, Any], cut: _Cut) -> tuple[str, str]:
+    reason = ""
+    code = ""
+    picked_reason = _pick(payload, "failure_reason")
+    if isinstance(picked_reason, str) and picked_reason.strip():
+        reason = picked_reason
+    picked_code = _pick(payload, "failure_code")
+    if not picked_code:
+        picked_code = _pick(payload, "error_class")
+    if isinstance(picked_code, str) and picked_code.strip():
+        code = picked_code.strip()
+    failure = _pick(payload, "failure")
+    if isinstance(failure, str) and failure.strip() and not reason:
+        reason = failure
+    elif isinstance(failure, dict):
+        if not reason:
+            for key in ("failure_reason", "error", "message", "reason"):
+                value = failure.get(key)
+                if isinstance(value, str) and value.strip():
+                    reason = value
+                    break
+        if not code:
+            for key in ("failure_code", "code", "error_class", "kind"):
+                value = failure.get(key)
+                if isinstance(value, str) and value.strip():
+                    code = value.strip()
+                    break
+    return cut.text(reason, _SUMMARY_TEXT_CAP), cut.text(code, _SUMMARY_TEXT_CAP)
+
+
+def _awaiting_counts(
+    payload: dict[str, Any], rows: list[dict[str, Any]]
+) -> tuple[int, int]:
+    lead = _as_int(_pick(payload, "awaiting_lead_count"))
+    human = _as_int(_pick(payload, "awaiting_human_count"))
+    if lead is not None and human is not None:
+        return lead, human
+    derived_lead = 0
+    derived_human = 0
+    for row in rows:
+        if row.get("awaiting") == "lead":
+            derived_lead += 1
+        else:
+            derived_human += 1
+    return (
+        lead if lead is not None else derived_lead,
+        human if human is not None else derived_human,
+    )
+
+
+def summarize_status(payload: dict[str, Any]) -> dict[str, Any]:
+    """Stable concise view of a status, report, or wait payload.
+
+    Omits the goal contract, worker response text, and stdout/stderr.
+    Free-text fields are capped; ``truncated`` is true when any cap fired.
+    ``progress.percent`` is included only when the server sent it.
+    ``usage`` is copied from task results and is never summed.
+    """
+    cut = _Cut()
+    tasks = _task_rows(payload)
+    rows = _pending_rows(payload)
+    state = ""
+    picked_state = _pick(payload, "state")
+    if picked_state is not None:
+        state = str(picked_state)
+    request_id = _pick(payload, "request_id")
+    if request_id is None:
+        request_id = _pick(payload, "goal_id")
+    request_id_text = "" if request_id is None else str(request_id)
+    ok_value = _pick(payload, "ok")
+    reason, failure_code = _failure_fields(payload, cut)
+    briefs: list[dict[str, Any]] = []
+    for row in rows:
+        brief = _decision_brief(row)
+        for key in ("title", "reason", "summary", "kind", "decision_id", "awaiting", "status", "task_id"):
+            if key in brief and isinstance(brief[key], str):
+                brief[key] = cut.text(brief[key], _SUMMARY_TEXT_CAP)
+        briefs.append(brief)
+    lead_count, human_count = _awaiting_counts(payload, rows)
+    task_views: list[dict[str, Any]] = []
+    artifacts: list[dict[str, Any]] = []
+    index: dict[tuple[str, str], dict[str, Any]] = {}
+    for task in tasks:
+        task_id = "" if task.get("task_id") is None else str(task.get("task_id"))
+        result = task.get("result") if isinstance(task.get("result"), dict) else None
+        names: list[str] = []
+        seen_names: set[str] = set()
+        for key in ("expected_artifacts", "artifacts"):
+            _consume_artifacts(task.get(key), task_id, names, seen_names, artifacts, index, cut)
+        done = task.get("done_when")
+        if isinstance(done, dict):
+            _consume_artifacts(
+                done.get("artifacts"), task_id, names, seen_names, artifacts, index, cut
+            )
+        if isinstance(result, dict):
+            _consume_artifacts(
+                result.get("artifacts"), task_id, names, seen_names, artifacts, index, cut
+            )
+        task_views.append(
+            {
+                "task_id": task_id,
+                "title": cut.text(task.get("title") or "", _SUMMARY_TEXT_CAP),
+                "status": "" if task.get("status") is None else str(task.get("status")),
+                "artifacts": names,
+                "workspace": cut.text(_task_workspace(task, result), _SUMMARY_TEXT_CAP),
+                "error": cut.text(_task_error(task, result), _SUMMARY_TEXT_CAP),
+            }
+        )
+    summary: dict[str, Any] = {
+        "ok": True if ok_value is None else _as_bool(ok_value),
+        "request_id": request_id_text,
+        "state": state,
+        "terminal": state in TERMINAL_STATES,
+        "need_human": _need_human_flag(payload, tasks),
+        "failure_reason": reason,
+        "pending_decisions": briefs,
+        "awaiting_lead_count": lead_count,
+        "awaiting_human_count": human_count,
+        "tasks": task_views,
+        "artifacts": artifacts,
+        "progress": _progress_summary(payload, cut),
+        "usage": _usage_summary(tasks, cut),
+    }
+    if failure_code:
+        # Insert beside failure_reason without inventing an empty code.
+        ordered = {
+            "ok": summary["ok"],
+            "request_id": summary["request_id"],
+            "state": summary["state"],
+            "terminal": summary["terminal"],
+            "need_human": summary["need_human"],
+            "failure_reason": summary["failure_reason"],
+            "failure_code": failure_code,
+        }
+        for key, value in summary.items():
+            if key not in ordered:
+                ordered[key] = value
+        summary = ordered
+    code = payload.get("code")
+    if isinstance(code, str) and code.strip():
+        summary["code"] = cut.text(code.strip(), _SUMMARY_TEXT_CAP)
+    warning_found = False
+    warnings: list[str] = []
+    for layer in _layers(payload):
+        for key in ("warnings", "capability_warnings"):
+            if key in layer and layer[key] is not None:
+                warning_found = True
+                warnings.extend(_warning_items(layer[key], cut))
+    if warning_found:
+        summary["warnings"] = warnings
+    http_status = payload.get("http_status")
+    if isinstance(http_status, int) and not isinstance(http_status, bool):
+        summary["http_status"] = http_status
+    summary["truncated"] = cut.hit
+    summary["full_hint"] = _FULL_HINT
+    wait = payload.get("wait")
+    if isinstance(wait, dict):
+        summary["wait"] = wait
+    return summary
+
+
+def cmd_ping(args: argparse.Namespace) -> dict[str, Any]:
+    """GET /health, then authenticated GET /v1/capabilities when that route exists."""
+    health = request_json("GET", "/health", timeout=float(args.http_timeout))
+    out: dict[str, Any] = {
+        "ok": health.get("ok") is not False,
+        "api_version": health.get("api_version"),
+        "base": _base_url(),
+    }
+    try:
+        caps = request_json("GET", "/v1/capabilities", timeout=float(args.http_timeout))
+    except ClientError as exc:
+        status = exc.payload.get("http_status")
+        try:
+            missing = int(status) == 404
+        except (TypeError, ValueError):
+            missing = False
+        if not missing:
+            raise
+        out["capabilities"] = None
+    else:
+        out["capabilities"] = caps
+    return out
+
+
+def cmd_pending(args: argparse.Namespace) -> dict[str, Any]:
+    """List non-terminal requests so a new Hermes turn can resume the same id."""
+    payload = request_json("GET", "/v1/requests", timeout=float(args.http_timeout))
+    rows = payload.get("requests")
+    if not isinstance(rows, list):
+        rows = payload.get("goals") if isinstance(payload.get("goals"), list) else []
+    listed: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        state = str(row.get("state") or "")
+        if state in TERMINAL_STATES:
+            continue
+        rid = row.get("request_id")
+        if rid is None:
+            rid = row.get("goal_id")
+        if isinstance(row.get("updated_at_iso"), str) and row.get("updated_at_iso"):
+            updated: Any = row.get("updated_at_iso")
+        else:
+            updated = row.get("updated_at")
+        if "awaiting_decision" in row:
+            awaiting = bool(row.get("awaiting_decision"))
+        else:
+            count = row.get("pending_decision_count")
+            if count is None:
+                count = row.get("pending_count") or 0
+            parsed = _as_int(count) if not isinstance(count, bool) else None
+            if parsed is None:
+                try:
+                    parsed = int(count)
+                except (TypeError, ValueError):
+                    parsed = 1 if count else 0
+            awaiting = parsed > 0
+        listed.append(
+            {
+                "request_id": "" if rid is None else str(rid),
+                "state": state,
+                "awaiting_decision": awaiting,
+                "updated_at": updated,
+            }
+        )
+    result: dict[str, Any] = {"ok": True if payload.get("ok") is not False else False, "requests": listed}
+    http_status = payload.get("http_status")
+    if isinstance(http_status, int) and not isinstance(http_status, bool):
+        result["http_status"] = http_status
+    return result
+
+
+def _output_full_enabled(flag: bool = False) -> bool:
+    """True for --full or COLLAB_OUTPUT_FULL=1|true|yes|on."""
+    if flag:
+        return True
+    raw = (os.environ.get("COLLAB_OUTPUT_FULL") or "").strip().lower()
+    return raw in _JSON_UNICODE_ON
+
+
+def _present_output(args: argparse.Namespace, payload: dict[str, Any]) -> dict[str, Any]:
+    """Summary for status/report/wait. Bare transport errors and --full stay raw."""
+    if getattr(args, "cmd", None) not in {"status", "report", "wait"}:
+        return payload
+    if _output_full_enabled(bool(getattr(args, "full", False))):
+        return payload
+    if not isinstance(payload, dict):
+        return payload
+    if not any(key in payload for key in ("state", "wait", "tasks", "report")):
+        return payload
+    return summarize_status(payload)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1047,7 +1742,8 @@ def build_parser() -> argparse.ArgumentParser:
             "%LOCALAPPDATA%\\hermes\\.env on Windows or ~/.hermes/.env "
             "elsewhere. Only those two keys are read from dotenv. "
             "Stdout is one ASCII JSON line by default (non-ASCII as \\uXXXX); "
-            "--unicode emits raw UTF-8."
+            "--unicode emits raw UTF-8. status/report/wait print a summary; "
+            "--full or COLLAB_OUTPUT_FULL=1 prints the raw payload."
         ),
     )
     p.add_argument(
@@ -1105,18 +1801,35 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help=(
             "pin a file the worker may read outside the task workspace "
-            "(repeatable; sends absolute path and sha256). "
+            "(repeatable, at most 8; sends absolute path and sha256). "
+            "More than 8 exits 1 with code too_many_external_inputs "
+            "before any file is opened. "
             "A missing file exits 1 with code bad_external_input"
         ),
     )
     p_open.set_defaults(func=cmd_open)
 
+    p_ping = sub.add_parser(
+        "ping",
+        help="GET /health; include GET /v1/capabilities when that route exists",
+    )
+    p_ping.set_defaults(func=cmd_ping)
+
+    def _add_full(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--full",
+            action="store_true",
+            help="print the raw JSON payload (also COLLAB_OUTPUT_FULL=1|true|yes|on)",
+        )
+
     p_st = sub.add_parser("status", help="GET /v1/requests/{id}")
     p_st.add_argument("request_id", help="request_id / goal_id")
+    _add_full(p_st)
     p_st.set_defaults(func=cmd_status)
 
     p_rep = sub.add_parser("report", help="GET /v1/requests/{id}/report")
     p_rep.add_argument("request_id", help="request_id / goal_id")
+    _add_full(p_rep)
     p_rep.set_defaults(func=cmd_report)
 
     p_wait = sub.add_parser(
@@ -1128,7 +1841,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--timeout",
         type=float,
         default=600.0,
-        help="wall-clock seconds to wait (default 600)",
+        help=(
+            "client observation window in seconds (default 600). "
+            "Expiry exits 3 with wait.kind=observation_timeout and is not a task failure. "
+            "A 300s slice stays under a ~420s host tool limit."
+        ),
     )
     p_wait.add_argument(
         "--interval",
@@ -1136,7 +1853,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=2.0,
         help="poll interval seconds (default 2)",
     )
+    _add_full(p_wait)
     p_wait.set_defaults(func=cmd_wait)
+
+    p_pending = sub.add_parser(
+        "pending",
+        help="GET /v1/requests and list non-terminal requests",
+    )
+    p_pending.set_defaults(func=cmd_pending)
 
     p_dec = sub.add_parser(
         "decide",
@@ -1167,7 +1891,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         payload = args.func(args)
     except ClientError as e:
-        _emit(e.payload, unicode=as_unicode)
+        _emit(_present_output(args, e.payload), unicode=as_unicode)
         return int(e.exit_code)
     except KeyboardInterrupt:
         _emit(
@@ -1175,7 +1899,7 @@ def main(argv: list[str] | None = None) -> int:
             unicode=as_unicode,
         )
         return 130
-    _emit(payload, unicode=as_unicode)
+    _emit(_present_output(args, payload), unicode=as_unicode)
     if isinstance(payload, dict) and payload.get("ok") is False:
         return EXIT_ERROR
     return EXIT_OK
