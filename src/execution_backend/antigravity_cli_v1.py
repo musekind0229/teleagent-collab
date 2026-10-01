@@ -32,7 +32,14 @@ from execution_backend.agy_account_pool import (
     finish_account_lease,
     prepare_antigravity_environ_from_pool,
 )
-from execution_backend.base import BackendError, BackendStatus, ExecutionBackendABC, unsupported
+from execution_backend.base import (
+    BackendError,
+    BackendStatus,
+    ExecutionBackendABC,
+    SKIP_PERMISSIONS_WARNING,
+    default_capabilities,
+    unsupported,
+)
 from framework import contract_render
 
 _LOG = logging.getLogger(__name__)
@@ -284,6 +291,33 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
     """Spawn `agy --print=` under the job directory. Ledger remains collab."""
 
     backend_id = BACKEND_ID
+
+    def capabilities(self) -> dict[str, Any]:
+        """One-shot ``agy --print``. No permission/question/review channel.
+
+        ``list_pending_actions`` is always empty and ``reply_permission`` is 501.
+        External pins are prompt text only. ``skip_permissions`` mirrors
+        ``agy_auto_approve_enabled(charter=None)`` on this backend's env.
+        Run records are in-process; restart does not resume them.
+        Exact-content acceptance is checked by ``apply_agy_acceptance_gate``,
+        not by a lead. Prompt constraints are not an OS sandbox.
+        """
+        skip = agy_auto_approve_enabled(None, self._base_env())
+        caps = default_capabilities(backend_id=self.backend_id, kind="antigravity_cli")
+        caps["channels"] = {"permission": False, "question": False, "review": False}
+        caps["external_inputs"]["enforcement"] = "prompt_only"
+        caps["isolation"]["os_sandbox"] = False
+        caps["isolation"]["access_audit"] = False
+        caps["isolation"]["prompt_constraints"] = True
+        caps["skip_permissions"] = bool(skip)
+        caps["resume"] = False
+        caps["acceptance"]["artifact_presence"] = True
+        caps["acceptance"]["exact_content"] = True
+        caps["acceptance"]["lead_review"] = False
+        caps["acceptance"]["executable_checks"] = False
+        caps["usage"]["source"] = "worker_self_reported"
+        caps["warnings"] = [SKIP_PERMISSIONS_WARNING] if skip else []
+        return caps
 
     def __init__(
         self,
@@ -1042,6 +1076,51 @@ def _check_exact_content_acceptance(workdir: Path, acceptance: str) -> tuple[boo
     )
 
 
+ACCEPTANCE_UNVERIFIED_WARNING = "acceptance text was not independently verified"
+_REVIEW_EVIDENCE_MAX = 240
+
+
+def _review_record(status: str, source: str, evidence: str = "") -> dict[str, str]:
+    text = str(evidence or "").strip()
+    if len(text) > _REVIEW_EVIDENCE_MAX:
+        text = text[:_REVIEW_EVIDENCE_MAX]
+    return {"status": status, "source": source, "evidence": text}
+
+
+def _ensure_notes(result: dict[str, Any]) -> list[Any]:
+    notes = result.get("notes")
+    if not isinstance(notes, list):
+        notes = []
+        result["notes"] = notes
+    return notes
+
+
+def _append_result_warning(result: dict[str, Any], text: str) -> None:
+    warnings = result.get("warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+        result["warnings"] = warnings
+    if text not in warnings:
+        warnings.append(text)
+
+
+def _fail_acceptance(
+    result: dict[str, Any],
+    notes: list[Any],
+    *,
+    reason: str,
+    source: str,
+    note: str | None = None,
+) -> dict[str, Any]:
+    result["ok"] = False
+    result["state"] = "fail"
+    result["error"] = reason
+    result["acceptance_failed"] = True
+    result["review"] = _review_record("failed", source, reason)
+    notes.append(note or reason)
+    return result
+
+
 def apply_agy_acceptance_gate(
     *,
     charter: dict | None,
@@ -1050,41 +1129,40 @@ def apply_agy_acceptance_gate(
 ) -> dict[str, Any]:
     """Enforce force_lead_review / acceptance on the agy path.
 
-    Presence-only artifact checks already happen in collect_result. When the
-    charter asks for lead review or an exact-content acceptance string, either
-    validate the content or fail closed — never report ok=true for WRONG output.
+    Presence-only artifact checks already happen in collect_result. An
+    exact-content acceptance string is checked here. Prose acceptance that
+    nothing actually reviews is ``review.status=unsupported`` — never
+    ``passed``. ``force_lead_review`` without a checkable criterion still
+    fails closed. Never report ok=true for WRONG exact-content output.
     """
-    if not isinstance(charter, dict):
+    if not isinstance(result, dict):
         return result
-    need = _charter_requests_lead_review(charter)
+    if not isinstance(charter, dict):
+        result["review"] = _review_record("not_requested", "none", "")
+        return result
     acceptance = charter.get("acceptance")
     result["force_lead_review"] = bool(charter.get("force_lead_review"))
-    if not need:
-        return result
+    notes = _ensure_notes(result)
+    exact_text = acceptance.strip() if isinstance(acceptance, str) else ""
+    exact = bool(exact_text and _EXACT_CONTENT_RE.match(exact_text))
     root = Path(workdir)
-    notes = result.setdefault("notes", [])
-    if not isinstance(notes, list):
-        notes = []
-        result["notes"] = notes
 
-    # Exact-content string criteria (offline review probe / charter text).
-    if isinstance(acceptance, str) and acceptance.strip():
-        ok_acc, reason = _check_exact_content_acceptance(root, acceptance)
+    if exact:
+        ok_acc, reason = _check_exact_content_acceptance(root, exact_text)
         if not ok_acc:
-            result["ok"] = False
-            result["state"] = "fail"
-            result["error"] = reason
-            result["acceptance_failed"] = True
-            notes.append(reason)
-            return result
+            return _fail_acceptance(
+                result, notes, reason=reason, source="agy_exact_content"
+            )
         notes.append("agy acceptance: exact-content criteria passed")
+        result["review"] = _review_record(
+            "passed", "agy_exact_content", "exact-content criteria passed"
+        )
+        return result
 
-    # force_lead_review without a checkable acceptance string: refuse the contract
-    # rather than silently claiming review passed (no Hermes/lead channel on agy).
-    if bool(charter.get("force_lead_review")) and not (
-        isinstance(acceptance, str) and _EXACT_CONTENT_RE.match(acceptance.strip())
-    ):
-        # Still run local artifact_review when available for presence/hello rules.
+    # force_lead_review without a checkable exact-content string: local
+    # artifact_review when it can run, otherwise fail closed. Do not claim
+    # the prose was independently verified.
+    if bool(charter.get("force_lead_review")):
         try:
             from execution_backend.closed_loop import artifact_review
 
@@ -1101,30 +1179,42 @@ def apply_agy_acceptance_gate(
                 "error_class": review.get("error_class"),
             }
             if str(review.get("verdict") or "").lower() != "pass":
-                result["ok"] = False
-                result["state"] = "fail"
                 reason = str(
                     review.get("reason")
                     or review.get("error_class")
                     or "acceptance_failed"
                 )
-                result["error"] = reason
-                result["acceptance_failed"] = True
-                notes.append(f"agy artifact_review failed: {reason}")
-                return result
+                return _fail_acceptance(
+                    result,
+                    notes,
+                    reason=reason,
+                    source="artifact_review",
+                    note=f"agy artifact_review failed: {reason}",
+                )
             notes.append("agy artifact_review: pass")
+            result["review"] = _review_record(
+                "passed", "artifact_review", "agy artifact_review: pass"
+            )
             return result
         except Exception as e:  # noqa: BLE001 — fail closed on review wiring errors
-            result["ok"] = False
-            result["state"] = "fail"
             reason = (
                 "force_lead_review unsupported on antigravity.cli_v1 without "
                 f"checkable acceptance ({type(e).__name__})"
             )
-            result["error"] = reason
-            result["acceptance_failed"] = True
-            notes.append(reason)
-            return result
+            return _fail_acceptance(result, notes, reason=reason, source="none")
+
+    requested = bool(exact_text) or _charter_requests_lead_review(charter)
+    if requested:
+        # Acceptance text (or another criterion) was asked for, and neither
+        # exact-content nor artifact_review checked it. Do not mark it passed.
+        result["review"] = _review_record(
+            "unsupported", "none", ACCEPTANCE_UNVERIFIED_WARNING
+        )
+        _append_result_warning(result, ACCEPTANCE_UNVERIFIED_WARNING)
+        notes.append(ACCEPTANCE_UNVERIFIED_WARNING)
+        return result
+
+    result["review"] = _review_record("not_requested", "none", "")
     return result
 
 
@@ -1212,6 +1302,7 @@ __all__ = [
     "BACKEND_ID",
     "DEFAULT_AGY_MODEL",
     "SKIP_PERMISSIONS_FLAG",
+    "ACCEPTANCE_UNVERIFIED_WARNING",
     "AntigravityCliExecutionBackend",
     "agy_auto_approve_enabled",
     "apply_agy_acceptance_gate",

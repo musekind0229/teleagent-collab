@@ -23,6 +23,7 @@ def default_linux_client() -> Any:
 
 class LinuxSupervisedExecutionBackend(WindowsSupervisedExecutionBackend):
     backend_id = "teleagent.linux.supervised_v1"
+    capability_kind = "teleagent_linux"
 
     def __init__(
         self,

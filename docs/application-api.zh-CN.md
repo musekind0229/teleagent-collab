@@ -19,7 +19,7 @@ v0.1 已提供真实的请求、防重、持久化、规划、任务依赖、派
 
 Windows 后端保留旧控制器的 session 级 `ask`、请求去重、同 session 恢复、独立产物验收、取消确认和不确定派发不重放。控制器继续使用自己的纯 ASCII UUID 工作区，避免含中文的 Goal ID 进入 TeleAgent HTTP 头。
 
-同一个持久化目录只运行一个服务实例。运行句柄会在首次派工后立刻持久化；服务重启后会继续观察支持持久句柄的后端，无法恢复的后端会把任务明确标成失败，不会静默重派。
+同一个持久化目录只运行一个服务实例。运行句柄会在首次派工后立刻持久化；服务重启后会继续观察支持持久句柄的后端，无法恢复的后端会把任务明确标成失败，不会静默重派。当前进程实际具备哪些能力，以 `GET /v1/capabilities` 为准，不要从「没有弹出 permission」推断访问是安全的。
 
 ## 启动
 
@@ -138,14 +138,107 @@ BOM：解码后**第一个字符**如果是那一个来自文件头 BOM 的 U+FE
 
 TeleAgent `review` 若产物自带 `contamination.contaminated`，投影出的决策标题是 `TeleAgent review (CONTAMINATED)`，`details.summary` 是上面那行计数。人工对这条 review 提交 `pass` 而被工人控制器拒绝时，见下面「决定被拒绝」：HTTP `409`，`code` 为 `artifact_contaminated`。
 
+## 后端能力（`GET /v1/capabilities`）
+
+与其它 `/v1` 路由一样要 Bearer（若配置了 `COLLAB_API_TOKEN`）。响应没有密钥。`GET /health` 不要求登录，在原来的 `ok` / `api_version` 之外再给 `backend`（后端 id）和 `planner`（规划器 name）。
+
+`GET /v1/capabilities` 的稳定字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `api_version` | 与其它路由相同（`collab-app.v0.1`） |
+| `backend.id` / `backend.kind` | 本进程工人后端。kind 是族：`inprocess`、`antigravity_cli`、`teleagent_windows`、`teleagent_linux` |
+| `planner.name` / `decomposes` / `lead_review` | 本进程规划器。见下节 |
+| `channels.permission` / `question` / `review` | 是否真有 TeleAgent 原生命令通道。agy 与 inprocess 都是 false：`list_pending_actions` 恒为空，`reply_permission` 为 501 |
+| `external_inputs.max` | 8 |
+| `external_inputs.enforcement` | `permission_gate`（硬拒绝，等人或组长决定）、`prompt_only`（只写进提示词）、`none`（不执行） |
+| `isolation.os_sandbox` | 当前实现都是 false。没有容器 / seccomp / Landlock |
+| `isolation.access_audit` | `decision_log`（监督后端的决定日志）、false、或 `unknown` |
+| `isolation.prompt_constraints` | true 只表示合同文本里有约束，**不是**操作系统沙箱 |
+| `skip_permissions` | bool 或 `unknown`。agy 上等于本后端环境里 `agy_auto_approve_enabled(charter=None)`（`AGY_AUTO_APPROVE` / `COLLAB_AGY_AUTO_APPROVE`） |
+| `resume` | bool 或 `unknown`。监督后端为 true（同一 state 目录上 `Engine.tick` 能续跑；TeleAgent 实例变了会 fail-closed）。agy / inprocess 句柄只在本进程内存，为 false |
+| `acceptance.artifact_presence` | 文件在不在。当前实现为 true |
+| `acceptance.exact_content` | 能否核对「path must contain exactly BODY」。只有 agy 门禁为 true |
+| `acceptance.lead_review` | 本进程规划器会审 **并且** 后端扛得住组长审查时才是 true |
+| `acceptance.executable_checks` | 当前为 false |
+| `progress.available` | 当前为 false |
+| `usage.source` | agy 为 `worker_self_reported`（CLI JSON 自报）；其它为 `unknown` |
+| `warnings` | 人话。agy 且 skip-permissions 时为：`backend runs with skip-permissions: no permission gate; pinned external inputs are prompt-only` |
+
+`unknown` 不等于具备。默认实现（未覆盖的后端）全部是 false / `unknown`，不会假装有门禁。
+
+### 调用方要求的能力
+
+`POST /v1/requests` 可选 `required_capabilities`：字符串数组，只能是下面这些名字。未知名字 → **400** `invalid_request`，不建 Goal。
+
+`permission_gate`、`question_channel`、`review_channel`、`external_input_enforcement`、`os_sandbox`、`access_audit`、`no_skip_permissions`、`lead_review`、`decomposition`。
+
+满足条件（`"unknown"` 一律不算）：
+
+| 名字 | 何时算有 |
+| --- | --- |
+| `permission_gate` | `channels.permission` 为 true **且** `skip_permissions` 为 false |
+| `question_channel` / `review_channel` | 对应 channel 为 true |
+| `external_input_enforcement` | `external_inputs.enforcement` 为 `permission_gate` |
+| `os_sandbox` | `isolation.os_sandbox` 为 true |
+| `access_audit` | `isolation.access_audit` 为 `decision_log` |
+| `no_skip_permissions` | `skip_permissions` 为 false |
+| `lead_review` | `planner.lead_review` 为 true |
+| `decomposition` | `planner.decomposes` 为 true |
+
+不满足 → **409** `code=capability_unavailable`，body 有 `missing`（按请求顺序）和 `capabilities`（同上快照）。检查发生在 `submit_goal` 之前：不落盘、不占幂等键、不派工。同一 idempotency key 随后用一份满足能力的请求仍可建单。
+
+另外一条隐式规则：Goal 带了 `external_inputs`，而后端 `enforcement` 是 `prompt_only` **并且** `skip_permissions` 是 true 时，同样 **409** `capability_unavailable`，`missing` 为 `["external_input_enforcement"]`。除非请求写了 `acknowledge_prompt_only_inputs: true`（操作者承认降级）。承认之后 Goal 上记下警告，`GET /v1/requests/{id}` 的 `warnings` 能看到。这**不**等于满足显式的 `required_capabilities` 里的 `external_input_enforcement`。
+
+`GET /v1/requests/{id}` 增加：
+
+- `warnings`：与本 Goal 相关的能力警告、承认降级、以及「验收文本没有被独立核对」
+- `capabilities_ref`：`{"backend": "<id>", "planner": "<name>"}`
+
+### 验收审查状态（`review`）
+
+工人结果上的 `review`：
+
+```json
+{"status": "not_requested|passed|failed|unsupported", "source": "agy_exact_content|artifact_review|lead|none", "evidence": "短说明"}
+```
+
+| `status` | 含义 |
+| --- | --- |
+| `not_requested` | 没有要求验收文本 / 审查 |
+| `passed` | 真有检查并且过了。`source=agy_exact_content` 是「must contain exactly」字面核对；`artifact_review` 是本地产物审查 |
+| `failed` | 检查没过。精确内容不符时任务失败，`acceptance_failed` 为 true，Goal 不会 completed |
+| `unsupported` | 要求了验收文本，但没有审查者真的核过（agy + 不能精确核对的散文）。**不是通过**。任务仍可因文件存在而完成，但 `warnings` 含 `acceptance text was not independently verified` |
+
+`force_lead_review` 在 agy 上又没有可核对标准时，门禁照旧 fail-closed，不把审查说成通过。文件都在但精确内容写错：Application API 与 `run_antigravity_job_via_public_api` 都不会成功。污染扫描仍在成功路径上，不因这道门禁取消。
+
+## 规划器
+
+| 启动参数 | `planner.name` | `decomposes` | `lead_review` |
+| --- | --- | --- | --- |
+| `--planner deterministic`（默认） | `deterministic.single_task` | false | false |
+| `--planner lead` / `--planner grok` | `lead_adapter.plan_v1` | true | true |
+
+确定性规划器每个 Goal **只生成一个 Task**，不拆解、不组长审查。验收默认是产物文件在不在；精确内容只在 agy 门禁认得出「must contain exactly」时才核。
+
+组长规划器会拆成有依赖的多个 Task，并审查 permission / artifact review（Question 与 system_action 仍回外部 decision API）。客户端不能选规划器，它由 collab-service 启动参数决定。
+
+敏感或分阶段的活不要指望一张单自动走完。调用方自己分单，后一张的 goal 里写上上一张 `request_id`：
+
+1. **样例**：只要一份可审查的样例（例如 `--artifact sample.md`）。人看过再继续。
+2. **实现 + 测试**：新开一单，要求实现和独立测试产物，不要在这一步安装。
+3. **dry-run**：再开一单只做演练，不改系统。
+4. **操作者批准**：人看过 dry-run 之后才开安装单。Hermes 不自行批准 decision。
+
 ## 查询和控制
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `GET` | `/health` | 健康检查 |
-| `POST` | `/v1/requests` | 提交高层目标 |
+| `GET` | `/health` | 健康检查。另含 `backend` id 与 `planner` name，无密钥 |
+| `GET` | `/v1/capabilities` | 本进程能力快照（要登录，与其它 `/v1` 相同） |
+| `POST` | `/v1/requests` | 提交高层目标。可选 `required_capabilities`、`acknowledge_prompt_only_inputs` |
 | `GET` | `/v1/requests` | 列出请求摘要 |
-| `GET` | `/v1/requests/{id}` | 查询 Goal、Task、待决定和失败信息 |
+| `GET` | `/v1/requests/{id}` | 查询 Goal、Task、待决定、失败信息、`warnings`、`capabilities_ref` |
 | `GET` | `/v1/requests/{id}/events` | 查询持久化事件 |（与 status 对齐露出 pending_decisions）
 | `GET` | `/v1/requests/{id}/report` | 获取交付报告 |
 | `POST` | `/v1/requests/{id}/cancel` | 请求取消，body 如 `{"reason":"用户取消"}` |

@@ -711,7 +711,7 @@ class LinuxReadyTests(unittest.TestCase):
         process = next(item for item in result["checks"] if item["name"] == "teleagent_process")
         self.assertEqual(process["code"], "no_process")
         self.assertIn("no TeleAgent process", process["detail"])
-        self.assertIn("TeleAgent GUI not logged in", process["next_step"])
+        self.assertIn("TeleAgent is not running", process["next_step"])
         self.assertIn(":4399 starts after login", process["next_step"])
         creds = next(item for item in result["checks"] if item["name"] == "creds")
         self.assertIn("no TeleAgent process", creds["next_step"])

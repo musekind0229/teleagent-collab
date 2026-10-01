@@ -1,7 +1,7 @@
 ---
 name: teleagent-collab
 description: "Delegate work to local collab-service workers (agy/antigravity pool) via bin/hermes-collab-request.py: open, wait, report. Use when the user asks to have 'the worker'/'collab'/'agy' do a task or produce a file."
-version: 0.2.10
+version: 0.2.11
 author: teleagent-collab
 license: MIT
 platforms: [windows, linux, macos]
@@ -59,8 +59,8 @@ collab-service 是本机常驻的派工服务（Application API，默认 `http:/
    python bin/hermes-collab-request.py ping
    ```
    `code=transport_error` → 服务没起，停下告诉用户“collab-service 没在跑”，不要自己启动。
-   成功时 stdout 有 `ok`、`api_version`、`base`；服务若实现了 `GET /v1/capabilities` 会放在 `capabilities` 里，否则该字段为 `null`。不要用 `status __ping__`。
-2. 开单：目标写清楚要什么产物；`--artifact` 写工作区内相对路径（可重复）。
+   成功时 stdout 有 `ok`、`api_version`、`base` 和 `capabilities`（服务实现了 `GET /v1/capabilities` 时是能力快照；路由 404 时该字段为 `null`）。派敏感活之前先读 `capabilities`，见「后端能力边界」。不要用 `status __ping__`。
+2. 开单：目标写清楚要什么产物；`--artifact` 写工作区内相对路径（可重复）。需要某项能力时加可重复的 `--require-capability NAME`。只有用户明确接受「外部输入只是提示词」时才加 `--ack-prompt-only-inputs`。
    ```powershell
    python bin/hermes-collab-request.py open --goal "在工作区写 hello.txt，内容为 hello" --artifact hello.txt --title "hello"
    ```
@@ -80,7 +80,17 @@ collab-service 是本机常驻的派工服务（Application API，默认 `http:/
    ```powershell
    python bin/hermes-collab-request.py report <request_id>
    ```
-5. 向用户汇报：`request_id`、最终 `state`、产物列表（report 里的 artifacts / 工作区路径）、必要时产物内容摘要。不要编造没看到的内容。`status` / `report` / `wait` 默认是简明 SUMMARY；只有用户明确要原始 JSON 时才加 `--full`（或 `COLLAB_OUTPUT_FULL=1`）。
+5. 向用户汇报：`request_id`、最终 `state`、产物列表（report 里的 artifacts / 工作区路径）、必要时产物内容摘要。不要编造没看到的内容。SUMMARY 里的 `warnings` 和每条任务的 `review` 要照实说：`review.status=unsupported` 不是审查通过。`status` / `report` / `wait` 默认是简明 SUMMARY；只有用户明确要原始 JSON 时才加 `--full`（或 `COLLAB_OUTPUT_FULL=1`）。
+
+## 后端能力边界
+
+敏感工作之前读 `ping` 的 `capabilities`，不要凭感觉。
+
+- `channels.permission` 为 false，或 `skip_permissions` 为 true，或 `external_inputs.enforcement` 为 `prompt_only`：这个后端**没有** permission gate。「没有出现 permission 提示」**不**表示访问是安全的。
+- `isolation.prompt_constraints` / 合同里的 must、must_not **不是**操作系统沙箱。`isolation.os_sandbox` 当前为 false。
+- 任务会碰到私人或敏感数据时停下，把上述字段告诉用户。只有用户/操作者明确接受降级时才继续，开单加 `--ack-prompt-only-inputs`。不要自己设 `AGY_AUTO_APPROVE`。
+- `--require-capability NAME` 可重复（例如 `permission_gate`、`no_skip_permissions`）。服务不满足则退出码 1，`code=capability_unavailable`，stdout 有 `missing`。不要改口重试把要求拿掉，除非用户同意。
+- 任务 `review.status` 为 `unsupported` 时，**不要**说审查已通过。验收文本没有被独立核对；文件在不在是另一件事。`passed` 才是真有检查并且过了，`failed` 是没过。
 
 ## planner 能力与分阶段交付
 
@@ -113,7 +123,8 @@ collab-service 是本机常驻的派工服务（Application API，默认 `http:/
 
 ## Pitfalls
 
-- `--backend` 只是调用方标注，**不会**切换 worker；worker 后端由 collab-service 启动参数决定。
+- `--backend` 只是调用方标注，**不会**切换 worker；worker 后端由 collab-service 启动参数决定。能力以 `ping` 的 `capabilities` 为准。
+- 没有弹出 permission 提示，不代表访问安全。先看 `channels.permission`、`skip_permissions`、`external_inputs.enforcement`。
 - `wait` 的 `--timeout` 是观察窗口，到点（退出码 3）不代表失败：服务端可能仍在跑。按 `wait.resume` 对同一 `request_id` 再 wait，或重启后用 `pending` 找回；不要因此开新单。把 `request_id` 告诉用户。
 - 中文 goal id 已由脚本做 percent-encoding，直接传原值即可。
 - PowerShell 下 JSON 可用 `| ConvertFrom-Json` 取字段。

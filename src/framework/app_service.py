@@ -23,7 +23,14 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 from urllib.parse import unquote, urlparse
 
-from execution_backend.base import BackendError, ExecutionBackend
+from execution_backend.base import (
+    REQUIRED_CAPABILITY_NAMES,
+    SKIP_PERMISSIONS_WARNING,
+    BackendError,
+    ExecutionBackend,
+    default_capabilities,
+    unmet_capabilities,
+)
 from execution_backend.inprocess_v1 import InProcessExecutionBackend
 from framework import contract_render
 from framework.artifact_contamination import scan_file, summarize
@@ -135,6 +142,121 @@ def _app_error_body(err: AppError) -> dict[str, Any]:
                 continue
             body[str(key)] = value
     return body
+
+
+def planner_capability(planner: Any) -> dict[str, Any]:
+    """Honest planner flags. Unknown planners do not claim decomposition or review."""
+    name = str(getattr(planner, "name", "") or "unknown")
+    if name == "deterministic.single_task":
+        return {"name": name, "decomposes": False, "lead_review": False}
+    if name == "lead_adapter.plan_v1" or name.startswith("lead_adapter"):
+        return {"name": name, "decomposes": True, "lead_review": True}
+    return {"name": name, "decomposes": False, "lead_review": False}
+
+
+def compose_capabilities(backend: Any, planner: Any) -> dict[str, Any]:
+    """Backend document with this process's planner overlaid.
+
+    ``acceptance.lead_review`` is true only when the backend can carry a lead
+    review AND this planner actually reviews. Exact-content stays a backend fact.
+    """
+    raw_fn = getattr(backend, "capabilities", None)
+    raw: Any
+    if callable(raw_fn):
+        try:
+            raw = raw_fn()
+        except Exception:
+            raw = None
+    else:
+        raw = None
+    if not isinstance(raw, dict):
+        raw = default_capabilities(backend_id=str(getattr(backend, "backend_id", "unknown")))
+    caps = json.loads(json.dumps(raw, default=str))
+    caps["api_version"] = API_VERSION
+    planner_doc = planner_capability(planner)
+    caps["planner"] = planner_doc
+    acceptance = caps.get("acceptance") if isinstance(caps.get("acceptance"), dict) else {}
+    acceptance["lead_review"] = bool(acceptance.get("lead_review")) and bool(planner_doc["lead_review"])
+    caps["acceptance"] = acceptance
+    if not isinstance(caps.get("warnings"), list):
+        caps["warnings"] = []
+    return caps
+
+
+def parse_required_capabilities(payload: Mapping[str, Any]) -> list[str]:
+    """Fixed vocabulary. Unknown names are ``invalid_request`` before any Goal exists."""
+    if "required_capabilities" not in payload or payload.get("required_capabilities") is None:
+        return []
+    raw = payload.get("required_capabilities")
+    if not isinstance(raw, list):
+        raise AppError(
+            "required_capabilities must be a list of capability names",
+            code="invalid_request",
+        )
+    found: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            raise AppError(
+                "required_capabilities must be a list of capability names",
+                code="invalid_request",
+            )
+        name = item.strip()
+        if name not in REQUIRED_CAPABILITY_NAMES:
+            raise AppError(f"unknown capability {name!r}", code="invalid_request")
+        if name not in found:
+            found.append(name)
+    return found
+
+
+def parse_acknowledge_prompt_only(payload: Mapping[str, Any]) -> bool:
+    if "acknowledge_prompt_only_inputs" not in payload or payload.get("acknowledge_prompt_only_inputs") is None:
+        return False
+    value = payload.get("acknowledge_prompt_only_inputs")
+    if not isinstance(value, bool):
+        raise AppError(
+            "acknowledge_prompt_only_inputs must be a boolean",
+            code="invalid_request",
+        )
+    return value
+
+
+def prompt_only_skip_blocked(caps: Mapping[str, Any]) -> bool:
+    """External pins are prompt text while the backend auto-approves tool use."""
+    external = caps.get("external_inputs") if isinstance(caps.get("external_inputs"), Mapping) else {}
+    return external.get("enforcement") == "prompt_only" and caps.get("skip_permissions") is True
+
+
+def _append_unique(out: list[str], seen: set[str], item: Any) -> None:
+    if not isinstance(item, str):
+        return
+    text = item.strip()
+    if not text or text in seen:
+        return
+    seen.add(text)
+    out.append(text)
+
+
+def goal_status_warnings(snap: Mapping[str, Any], caps: Mapping[str, Any]) -> list[str]:
+    """Persisted goal/task warnings plus capability warnings that apply to this goal."""
+    out: list[str] = []
+    seen: set[str] = set()
+    goal = snap.get("goal") if isinstance(snap.get("goal"), Mapping) else {}
+    for item in goal.get("warnings") or []:
+        _append_unique(out, seen, item)
+    for task in snap.get("tasks") or []:
+        if not isinstance(task, Mapping):
+            continue
+        result = task.get("result") if isinstance(task.get("result"), Mapping) else {}
+        for item in result.get("warnings") or []:
+            _append_unique(out, seen, item)
+        review = result.get("review") if isinstance(result.get("review"), Mapping) else {}
+        if review.get("status") == "unsupported":
+            from execution_backend.antigravity_cli_v1 import ACCEPTANCE_UNVERIFIED_WARNING
+
+            _append_unique(out, seen, ACCEPTANCE_UNVERIFIED_WARNING)
+    for item in caps.get("warnings") or []:
+        _append_unique(out, seen, item)
+    return out
 
 
 class GoalPlanner(Protocol):
@@ -1183,14 +1305,7 @@ class AppCoordinator:
                     "run_id": run_id,
                     "error": f"backend resume failed: {type(e).__name__}",
                 }
-            result = _gate_backend_result(snap, task, result)
-            finished = self.layer.finish_task(
-                goal_id,
-                str(task["task_id"]),
-                succeeded=bool(result.get("ok")),
-                result=result,
-            )
-            return {**finished, "action": "task_finished"}
+            return self._finish_gated(snap, task, result)
 
         status_by_id = {str(t.get("task_id")): str(t.get("status")) for t in tasks}
         for task in tasks:
@@ -1282,15 +1397,67 @@ class AppCoordinator:
                     "run_id": run_id,
                     "error": f"backend observation failed: {type(e).__name__}",
                 }
-            result = _gate_backend_result(snap, task, result)
-            finished = self.layer.finish_task(
-                goal_id,
-                str(task["task_id"]),
-                succeeded=bool(result.get("ok")),
-                result=result,
-            )
-            return {**finished, "action": "task_finished"}
+            return self._finish_gated(snap, task, result)
         return {"ok": True, "goal_id": goal_id, "state": snap.get("state"), "action": "waiting"}
+
+    def _apply_agy_acceptance(self, snap: Mapping[str, Any], task: Mapping[str, Any], result: Any) -> Any:
+        """Shared agy gate. Other backends keep contamination-only gating."""
+        if not isinstance(result, dict):
+            return result
+        backend_id = str(result.get("backend") or getattr(self.backend, "backend_id", "") or "")
+        if not backend_id.startswith("antigravity"):
+            return result
+        # Exception stubs (resume/observe failure) have no workspace. Do not
+        # overwrite that error with an acceptance miss on a file that was never collected.
+        if "workspace" not in result and "artifacts" not in result:
+            return result
+        goal = snap.get("goal") if isinstance(snap.get("goal"), Mapping) else {}
+        try:
+            charter = worker_charter_for_task(goal=goal, task=task)
+        except AppError as exc:
+            failed = dict(result)
+            failed["ok"] = False
+            failed["error"] = str(exc)
+            failed["review"] = {
+                "status": "failed",
+                "source": "none",
+                "evidence": str(exc)[:240],
+            }
+            return failed
+        workdir = result.get("workspace")
+        if not isinstance(workdir, str) or not workdir.strip():
+            workdir = str(
+                self.workspaces_root / str(snap.get("goal_id") or "") / str(task.get("task_id") or "")
+            )
+        from execution_backend.antigravity_cli_v1 import apply_agy_acceptance_gate
+
+        return apply_agy_acceptance_gate(charter=charter, workdir=workdir, result=result)
+
+    def _finish_gated(self, snap: Mapping[str, Any], task: Mapping[str, Any], result: Any) -> dict[str, Any]:
+        """Acceptance gate, then contamination scan, then finish_task.
+
+        Agy exact-content failures stay failures. Prose acceptance that no
+        reviewer checked is a warning, not a pass. Contamination still runs
+        when the result is otherwise ok.
+        """
+        result = self._apply_agy_acceptance(snap, task, result)
+        result = _gate_backend_result(snap, task, result)
+        goal_id = str(snap.get("goal_id") or "")
+        if isinstance(result, Mapping):
+            warns = [
+                str(item).strip()
+                for item in (result.get("warnings") or [])
+                if isinstance(item, str) and str(item).strip()
+            ]
+            if warns and goal_id:
+                self.layer.append_goal_warnings(goal_id, warns)
+        finished = self.layer.finish_task(
+            goal_id,
+            str(task["task_id"]),
+            succeeded=bool(isinstance(result, Mapping) and result.get("ok")),
+            result=result if isinstance(result, Mapping) else {"ok": False, "error": "backend result was not an object"},
+        )
+        return {**finished, "action": "task_finished"}
 
     def lead_will_decide(self, decision: Mapping[str, Any]) -> bool:
         """Whether the next tick resolves ``decision`` by the lead, not a human."""
@@ -1972,6 +2139,27 @@ class CollabApplication:
         title = str(payload.get("title") or goal_text[:80]).strip()
         forbidden_tools = project_forbidden_tools(payload=payload)
         external_inputs = project_external_inputs(payload)
+        required = parse_required_capabilities(payload)
+        acknowledge_prompt_only = parse_acknowledge_prompt_only(payload)
+        # Capability refusals happen before submit_goal so a 409 does not bind
+        # the idempotency key or leave a Goal to dispatch.
+        caps = self.capabilities()
+        missing = unmet_capabilities(caps, required)
+        if missing:
+            raise AppError(
+                "required capabilities are not available on this backend",
+                status=409,
+                code="capability_unavailable",
+                extra={"missing": missing, "capabilities": caps},
+            )
+        if external_inputs and prompt_only_skip_blocked(caps) and not acknowledge_prompt_only:
+            raise AppError(
+                "pinned external inputs are prompt-only while this backend runs with "
+                "skip-permissions; set acknowledge_prompt_only_inputs true to record the downgrade",
+                status=409,
+                code="capability_unavailable",
+                extra={"missing": ["external_input_enforcement"], "capabilities": caps},
+            )
         goal = {
             "title": title,
             "desired_outcome": goal_text,
@@ -1985,6 +2173,8 @@ class CollabApplication:
             goal["forbidden_tools"] = forbidden_tools
         if external_inputs:
             goal["external_inputs"] = external_inputs
+        if external_inputs and prompt_only_skip_blocked(caps) and acknowledge_prompt_only:
+            goal["warnings"] = [SKIP_PERMISSIONS_WARNING]
         result = self.layer.submit_goal(
             submit_key=submit_key,
             title=title,
@@ -2052,7 +2242,32 @@ class CollabApplication:
             "failure_reason": nh_view.get("failure_reason") or "",
             "updated_at": snap.get("updated_at_iso"),
         }
+        caps = self.capabilities()
+        backend = caps.get("backend") if isinstance(caps.get("backend"), Mapping) else {}
+        planner = caps.get("planner") if isinstance(caps.get("planner"), Mapping) else {}
+        out["warnings"] = goal_status_warnings(snap, caps)
+        out["capabilities_ref"] = {
+            "backend": str(backend.get("id") or ""),
+            "planner": str(planner.get("name") or ""),
+        }
         return out
+
+    def capabilities(self) -> dict[str, Any]:
+        """GET /v1/capabilities. No secrets. Planner is this process's planner."""
+        doc = compose_capabilities(self.coordinator.backend, self.coordinator.planner)
+        return {"ok": True, **doc}
+
+    def health(self) -> dict[str, Any]:
+        """Unauthenticated liveness plus backend id and planner name. No secrets."""
+        caps = self.capabilities()
+        backend = caps.get("backend") if isinstance(caps.get("backend"), Mapping) else {}
+        planner = caps.get("planner") if isinstance(caps.get("planner"), Mapping) else {}
+        return {
+            "ok": True,
+            "api_version": API_VERSION,
+            "backend": str(backend.get("id") or ""),
+            "planner": str(planner.get("name") or ""),
+        }
 
     def list_requests(self) -> dict[str, Any]:
         out = self.layer.list_goals()
@@ -2484,7 +2699,13 @@ class _Handler(BaseHTTPRequestHandler):
         # looking up durable ids.
         parts = [unquote(p) for p in parsed.path.split("/") if p]
         if self.command == "GET" and parsed.path == "/health":
-            self._send(200, {"ok": True, "api_version": API_VERSION})
+            self._send(200, self.app.health())
+            return
+        if parts == ["v1", "capabilities"]:
+            if self.command == "GET":
+                self._send(200, self.app.capabilities())
+            else:
+                raise AppError("method not allowed", status=405, code="method_not_allowed")
             return
         if parts == ["v1", "requests"]:
             if self.command == "POST":

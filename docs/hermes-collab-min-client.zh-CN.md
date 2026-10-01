@@ -26,6 +26,8 @@ HTTP 401/403 的 stdout JSON 带 `auth.token_source`（`env` / `dotenv` / `none`
 ```text
 python bin/hermes-collab-request.py ping
 python bin/hermes-collab-request.py open --goal "…" [--title …] [--backend antigravity|teleagent-windows]
+python bin/hermes-collab-request.py open --goal "…" --require-capability NAME   # 可重复
+python bin/hermes-collab-request.py open --goal "…" --external-input PATH --ack-prompt-only-inputs
 python bin/hermes-collab-request.py open --goal "…" --external-input PATH   # 可重复，最多 8 个
 python bin/hermes-collab-request.py status <request_id> [--full]
 python bin/hermes-collab-request.py report <request_id> [--full]
@@ -38,6 +40,8 @@ python bin/hermes-collab-request.py decide <request_id> <decision_id> --verdict 
 - `{id}` 会做 percent-encoding（含中文 Goal id）。
 - `status` / `report` / `wait` 默认打下面的 SUMMARY。`--full`（写在子命令后）或 `COLLAB_OUTPUT_FULL=1` 才打服务端原始载荷。
 - `open` 的 `--external-input` 先数个数，再读文件、算 SHA-256。多于 8 个时退出码 1，`code=too_many_external_inputs`，不发 HTTP，也不打开文件。服务端同样限制为 8（`src/framework/app_service.py` 的 `MAX_EXTERNAL_INPUTS`）。哈希按块流式计算，不把整个文件读进内存。
+- `--require-capability NAME` 可重复，写入 `required_capabilities`。服务不满足时 HTTP 409，`code=capability_unavailable`，stdout 带 `missing`（以及能力快照），退出码 **1**（不是 `decide` 的 5）。未知名字是 400 `invalid_request`，同样退出码 1。两种都不会建 Goal。
+- `--ack-prompt-only-inputs` 写入 `acknowledge_prompt_only_inputs: true`。只用于操作者承认「钉住的外部输入在 skip-permissions 后端上只是提示词」。它不满足显式的 `--require-capability external_input_enforcement`。
 
 ### `ping`
 
@@ -47,7 +51,9 @@ python bin/hermes-collab-request.py decide <request_id> <decision_id> --verdict 
 {"ok": true, "api_version": "…", "base": "http://127.0.0.1:8765", "capabilities": null}
 ```
 
-接着带认证请求 `GET /v1/capabilities`。返回 200 时，响应对象放在 `capabilities`。路由还不存在（HTTP 404）时静默忽略，`capabilities` 为 `null`，探活仍算成功。传输失败与今天一样：退出码 1，`code=transport_error`。stdout 不含 token。
+接着带认证请求 `GET /v1/capabilities`。返回 200 时，响应对象放在 `capabilities`（字段见 [application-api.zh-CN.md](application-api.zh-CN.md) 的「后端能力」）。路由还不存在（HTTP 404）时静默忽略，`capabilities` 为 `null`，探活仍算成功。传输失败与今天一样：退出码 1，`code=transport_error`。stdout 不含 token。
+
+派敏感活之前先读 `capabilities`。`channels.permission` 为 false、`skip_permissions` 为 true，或 `external_inputs.enforcement` 为 `prompt_only`，都表示**没有** permission gate。没弹出 permission **不**表示访问安全。`isolation.prompt_constraints` 不是操作系统沙箱。私人或敏感数据应停下告诉用户；只有用户明确接受时才加 `--ack-prompt-only-inputs`。`review.status` 为 `unsupported` 时不要说审查已通过。
 
 ### `pending`
 
@@ -129,7 +135,7 @@ exit 4 在原 status 上追加字段（`ok` 保持服务端原值）。默认打
 | `failure_code` | 仅当有 `failure_code` / `error_class` / `failure.code` 时出现 |
 | `pending_decisions` | 决策摘要：`awaiting`、`summary`、`kind`、`decision_id`（以及 title / task_id / status / reason） |
 | `awaiting_lead_count` / `awaiting_human_count` | 服务端计数；没有则按行上的 `awaiting` 统计（缺 `awaiting` 的旧行算 human） |
-| `tasks` | `{task_id, title, status, artifacts（名字）, workspace, error}`。`error` 最多 300 字，不取 stdout/stderr |
+| `tasks` | `{task_id, title, status, artifacts（名字）, workspace, error, review}`。`error` 最多 300 字，不取 stdout/stderr。`review` 是 `{status, source, evidence}`：服务端任务结果里有 `review` 就照抄（文本截断）；没有则 `status=not_requested`、`source=none`、`evidence=""`。`unsupported` 不是通过 |
 | `artifacts` | `{task_id, path, size?}`。`size` 只在已知 `size` / `bytes` / `nbytes` 时出现 |
 | `progress` | 没有真实进度字段时固定 `{"available": false, "phase": "unknown"}`。服务端若给了 `phase` / `percent` 等才照抄；**不发明百分比** |
 | `usage` | 某条 task `result.usage` 存在时 `{"source": "worker_self_reported", "values": {...}}`（只有一条时 `values` 就是该对象；多条按 `task_id` 分开）。否则 `{"source": "unknown"}`。**不相加** |

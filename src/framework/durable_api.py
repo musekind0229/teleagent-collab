@@ -671,6 +671,11 @@ def _default_goal_body(
     ):
         if extra_key in src:
             body[extra_key] = src[extra_key]
+    raw_warnings = src.get("warnings") if "warnings" in src else None
+    if isinstance(raw_warnings, list):
+        cleaned = [str(item).strip() for item in raw_warnings if isinstance(item, str) and str(item).strip()]
+        if cleaned:
+            body["warnings"] = cleaned
     return body
 
 
@@ -1407,6 +1412,36 @@ class DurableLayer:
             self._touch(snap)
             self._persist_unlocked()
             return {"ok": True, "reason": REASON_READY, "task": found, "state": snap.get("state")}
+
+    def append_goal_warnings(self, goal_id: str, warnings: Sequence[str]) -> dict[str, Any]:
+        """Append human-readable warnings onto the persisted Goal body.
+
+        Duplicate strings are skipped. Does not change the submit fingerprint.
+        """
+        gid = _norm_key(goal_id)
+        texts: list[str] = []
+        for item in warnings:
+            if isinstance(item, str) and item.strip() and item.strip() not in texts:
+                texts.append(item.strip())
+        if not gid or not texts:
+            return {"ok": True, "goal_id": gid, "warnings": []}
+        with self._rmw():
+            snap = self.goals.get(gid)
+            if snap is None:
+                return {"ok": False, "reason": REASON_UNKNOWN_GOAL, "error": f"unknown goal_id {gid!r}"}
+            goal = dict(snap.get("goal") or {}) if isinstance(snap.get("goal"), Mapping) else {}
+            existing: list[str] = []
+            raw = goal.get("warnings")
+            if isinstance(raw, list):
+                existing = [str(item) for item in raw if isinstance(item, str) and str(item).strip()]
+            for text in texts:
+                if text not in existing:
+                    existing.append(text)
+            goal["warnings"] = existing
+            snap["goal"] = goal
+            self._touch(snap)
+            self._persist_unlocked()
+            return {"ok": True, "goal_id": gid, "warnings": list(existing)}
 
     def finish_task(
         self,

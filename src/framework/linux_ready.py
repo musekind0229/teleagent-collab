@@ -19,6 +19,11 @@ _LOGIN_STEP = (
     "TeleAgent GUI not logged in: open the GUI (VNC to the Xvfb display) "
     "and log in; :4399 starts after login"
 )
+_START_STEP = (
+    "TeleAgent is not running: install TeleAgent (/opt/TeleAgent or "
+    "~/.local/share/TeleAgent/runtimes), start the GUI on the Xvfb display, "
+    "then log in via VNC; :4399 starts after login"
+)
 _JSONSCHEMA_STEP = "pip install -r requirements.txt"
 
 
@@ -212,7 +217,7 @@ def assess_linux_gui_readiness(
             process_ok,
             blocks=True,
             detail=str(process.get("detail") or ("TeleAgent process present" if process_ok else "no TeleAgent process")),
-            next_step=_LOGIN_STEP,
+            next_step=_START_STEP,
             code="" if process_ok else "no_process",
         )
     )

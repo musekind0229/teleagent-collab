@@ -2,8 +2,33 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping, Sequence
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
+
+# Same token as framework.app_service.API_VERSION. Kept here so backends do not
+# import the application facade (that import is the other direction).
+CAPABILITIES_API_VERSION = "collab-app.v0.1"
+
+# Caller-required names accepted by POST /v1/requests. Unknown names are 400.
+REQUIRED_CAPABILITY_NAMES = frozenset(
+    {
+        "permission_gate",
+        "question_channel",
+        "review_channel",
+        "external_input_enforcement",
+        "os_sandbox",
+        "access_audit",
+        "no_skip_permissions",
+        "lead_review",
+        "decomposition",
+    }
+)
+
+SKIP_PERMISSIONS_WARNING = (
+    "backend runs with skip-permissions: no permission gate; "
+    "pinned external inputs are prompt-only"
+)
 
 
 class BackendCapability(str, Enum):
@@ -79,8 +104,101 @@ class ExecutionBackend(Protocol):
         ...
 
 
+def default_capabilities(
+    *,
+    backend_id: str = "unknown",
+    kind: str = "unknown",
+) -> dict[str, Any]:
+    """Conservative capability document. Real backends override the honest fields.
+
+    Bools are False. Tri-state fields are ``"unknown"`` except
+    ``external_inputs.enforcement``, whose closed set uses ``"none"`` for
+    "no gate". ``"unknown"`` is never treated as satisfied.
+    """
+    return {
+        "api_version": CAPABILITIES_API_VERSION,
+        "backend": {"id": str(backend_id or "unknown"), "kind": str(kind or "unknown")},
+        "planner": {"name": "unknown", "decomposes": False, "lead_review": False},
+        "channels": {"permission": False, "question": False, "review": False},
+        "external_inputs": {"max": 8, "enforcement": "none"},
+        "isolation": {
+            "os_sandbox": False,
+            "access_audit": "unknown",
+            "prompt_constraints": False,
+        },
+        "skip_permissions": "unknown",
+        "resume": "unknown",
+        "acceptance": {
+            "artifact_presence": False,
+            "exact_content": False,
+            "lead_review": False,
+            "executable_checks": False,
+        },
+        "progress": {"available": False},
+        "usage": {"source": "unknown"},
+        "warnings": [],
+    }
+
+
+def _channels(caps: Mapping[str, Any]) -> Mapping[str, Any]:
+    raw = caps.get("channels")
+    return raw if isinstance(raw, Mapping) else {}
+
+
+def _isolation(caps: Mapping[str, Any]) -> Mapping[str, Any]:
+    raw = caps.get("isolation")
+    return raw if isinstance(raw, Mapping) else {}
+
+
+def _external(caps: Mapping[str, Any]) -> Mapping[str, Any]:
+    raw = caps.get("external_inputs")
+    return raw if isinstance(raw, Mapping) else {}
+
+
+def _planner(caps: Mapping[str, Any]) -> Mapping[str, Any]:
+    raw = caps.get("planner")
+    return raw if isinstance(raw, Mapping) else {}
+
+
+def capability_met(caps: Mapping[str, Any], name: str) -> bool:
+    """True only for a positive, known capability. ``"unknown"`` is not enough."""
+    if name == "permission_gate":
+        # A channel that is bypassed by skip-permissions is not a gate.
+        return _channels(caps).get("permission") is True and caps.get("skip_permissions") is False
+    if name == "question_channel":
+        return _channels(caps).get("question") is True
+    if name == "review_channel":
+        return _channels(caps).get("review") is True
+    if name == "external_input_enforcement":
+        return _external(caps).get("enforcement") == "permission_gate"
+    if name == "os_sandbox":
+        return _isolation(caps).get("os_sandbox") is True
+    if name == "access_audit":
+        return _isolation(caps).get("access_audit") == "decision_log"
+    if name == "no_skip_permissions":
+        return caps.get("skip_permissions") is False
+    if name == "lead_review":
+        return _planner(caps).get("lead_review") is True
+    if name == "decomposition":
+        return _planner(caps).get("decomposes") is True
+    return False
+
+
+def unmet_capabilities(caps: Mapping[str, Any], required: Sequence[str]) -> list[str]:
+    """Required names this snapshot does not satisfy, in request order."""
+    missing: list[str] = []
+    for name in required:
+        if name not in missing and not capability_met(caps, name):
+            missing.append(name)
+    return missing
+
+
 class ExecutionBackendABC(ABC):
     backend_id: str = "abstract"
+
+    def capabilities(self) -> dict[str, Any]:
+        """What this backend actually enforces. Default is unknown/false, not a grant."""
+        return default_capabilities(backend_id=str(getattr(self, "backend_id", "unknown")))
 
     @abstractmethod
     def start_run(

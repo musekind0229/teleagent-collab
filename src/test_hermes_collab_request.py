@@ -2446,6 +2446,108 @@ class HermesCollabRequestTests(unittest.TestCase):
         self.assertEqual(record["sha256"], hashlib.sha256(content).hexdigest())
         self.assertEqual(record["path"], str(path.resolve()))
 
+    def test_open_require_capability_and_ack_flags(self) -> None:
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout=30):
+            captured["body"] = json.loads(req.data.decode("utf-8"))
+            return _FakeResp({"ok": True, "request_id": "g", "state": "queued"}, status=202)
+
+        code, text = self._run_main(
+            [
+                "open",
+                "--goal",
+                "write the file",
+                "--require-capability",
+                "permission_gate",
+                "--require-capability",
+                "no_skip_permissions",
+                "--ack-prompt-only-inputs",
+            ],
+            fake_urlopen,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            captured["body"]["required_capabilities"],
+            ["permission_gate", "no_skip_permissions"],
+        )
+        self.assertIs(captured["body"]["acknowledge_prompt_only_inputs"], True)
+        self.assertEqual(json.loads(text)["request_id"], "g")
+
+    def test_open_capability_unavailable_prints_missing_and_exits_1(self) -> None:
+        def fake_urlopen(req, timeout=30):
+            raw = json.dumps(
+                {
+                    "ok": False,
+                    "code": "capability_unavailable",
+                    "error": "required capabilities are not available on this backend",
+                    "missing": ["permission_gate", "os_sandbox"],
+                    "capabilities": {"backend": {"id": "inprocess.local_v1"}},
+                }
+            ).encode("utf-8")
+            raise HTTPError(
+                req.full_url,
+                409,
+                "Conflict",
+                hdrs=None,  # type: ignore[arg-type]
+                fp=io.BytesIO(raw),
+            )
+
+        code, text = self._run_main(
+            ["open", "--goal", "write the file", "--require-capability", "permission_gate"],
+            fake_urlopen,
+        )
+        self.assertEqual(code, 1)
+        payload = json.loads(text)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["code"], "capability_unavailable")
+        self.assertEqual(payload["missing"], ["permission_gate", "os_sandbox"])
+        self.assertEqual(payload["http_status"], 409)
+        self.assertEqual(payload["capabilities"]["backend"]["id"], "inprocess.local_v1")
+
+    def test_status_summary_includes_task_review(self) -> None:
+        def fake_urlopen(req, timeout=30):
+            return _FakeResp(
+                {
+                    "ok": True,
+                    "state": "completed",
+                    "request_id": "g1",
+                    "tasks": [
+                        {
+                            "task_id": "t1",
+                            "title": "write",
+                            "status": "succeeded",
+                            "result": {
+                                "review": {
+                                    "status": "unsupported",
+                                    "source": "none",
+                                    "evidence": "acceptance text was not independently verified",
+                                }
+                            },
+                        }
+                    ],
+                }
+            )
+
+        code, text = self._run_main(["status", "g1"], fake_urlopen)
+        self.assertEqual(code, 0)
+        task = json.loads(text)["tasks"][0]
+        self.assertEqual(
+            task["review"],
+            {
+                "status": "unsupported",
+                "source": "none",
+                "evidence": "acceptance text was not independently verified",
+            },
+        )
+        bare = HCR.summarize_status(
+            {"ok": True, "state": "running", "tasks": [{"task_id": "t"}]}
+        )
+        self.assertEqual(
+            bare["tasks"][0]["review"],
+            {"status": "not_requested", "source": "none", "evidence": ""},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

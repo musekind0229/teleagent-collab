@@ -9,7 +9,13 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from execution_backend.base import BackendError, BackendStatus, ExecutionBackendABC, unsupported
+from execution_backend.base import (
+    BackendError,
+    BackendStatus,
+    ExecutionBackendABC,
+    default_capabilities,
+    unsupported,
+)
 
 
 class InProcessExecutionBackend(ExecutionBackendABC):
@@ -17,6 +23,28 @@ class InProcessExecutionBackend(ExecutionBackendABC):
 
     def __init__(self) -> None:
         self._runs: dict[str, dict[str, Any]] = {}
+
+    def capabilities(self) -> dict[str, Any]:
+        """Local file writer. No permission channel, no sandbox, no resume.
+
+        Runs live in this process. A restart cannot observe them. The worker
+        does not read external pins and does not check exact-content acceptance.
+        """
+        caps = default_capabilities(backend_id=self.backend_id, kind="inprocess")
+        caps["channels"] = {"permission": False, "question": False, "review": False}
+        caps["external_inputs"]["enforcement"] = "none"
+        caps["isolation"]["os_sandbox"] = False
+        caps["isolation"]["access_audit"] = False
+        caps["isolation"]["prompt_constraints"] = True
+        caps["skip_permissions"] = False
+        caps["resume"] = False
+        caps["acceptance"]["artifact_presence"] = True
+        caps["acceptance"]["exact_content"] = False
+        caps["acceptance"]["lead_review"] = False
+        caps["acceptance"]["executable_checks"] = False
+        caps["usage"]["source"] = "unknown"
+        caps["warnings"] = []
+        return caps
 
     def start_run(
         self,

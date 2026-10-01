@@ -13,7 +13,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
-from execution_backend.base import BackendError, BackendStatus, ExecutionBackendABC
+from execution_backend.base import (
+    BackendError,
+    BackendStatus,
+    ExecutionBackendABC,
+    default_capabilities,
+)
 from framework.artifact_handoff import HandoffError, copy_staged_inputs
 from win_collab.client import Client, KEYS
 from win_collab.core import TERMINAL, Engine, Store, external_directory_scope
@@ -30,6 +35,33 @@ def _need_human_fields(error: str) -> dict:
 
 class WindowsSupervisedExecutionBackend(ExecutionBackendABC):
     backend_id = "teleagent.windows.supervised_v1"
+    capability_kind = "teleagent_windows"
+
+    def capabilities(self) -> dict[str, Any]:
+        """TeleAgent native permission/question/review. Not an OS sandbox.
+
+        External reads go through the permission gate (hard reject until a
+        lead or human decides). Decisions are stored on the controller
+        (``access_audit=decision_log``). ``skip_permissions`` is never on.
+        Jobs live in the controller Store: a new process with the same
+        state_dir continues non-terminal jobs in ``Engine.tick`` (a changed
+        TeleAgent instance fails closed; it does not silently redispatch).
+        """
+        caps = default_capabilities(backend_id=self.backend_id, kind=self.capability_kind)
+        caps["channels"] = {"permission": True, "question": True, "review": True}
+        caps["external_inputs"]["enforcement"] = "permission_gate"
+        caps["isolation"]["os_sandbox"] = False
+        caps["isolation"]["access_audit"] = "decision_log"
+        caps["isolation"]["prompt_constraints"] = True
+        caps["skip_permissions"] = False
+        caps["resume"] = True
+        caps["acceptance"]["artifact_presence"] = True
+        caps["acceptance"]["exact_content"] = False
+        caps["acceptance"]["lead_review"] = True
+        caps["acceptance"]["executable_checks"] = False
+        caps["usage"]["source"] = "unknown"
+        caps["warnings"] = []
+        return caps
 
     def __init__(
         self,

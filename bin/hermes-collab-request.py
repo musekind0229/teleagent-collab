@@ -422,6 +422,15 @@ def cmd_open(args: argparse.Namespace) -> dict[str, Any]:
     pins = [_external_input_record(item) for item in raw_inputs]
     if pins:
         body["external_inputs"] = pins
+    required = [
+        str(item).strip()
+        for item in (getattr(args, "require_capability", None) or [])
+        if str(item).strip()
+    ]
+    if required:
+        body["required_capabilities"] = required
+    if getattr(args, "ack_prompt_only_inputs", False):
+        body["acknowledge_prompt_only_inputs"] = True
     return request_json("POST", "/v1/requests", body=body, timeout=float(args.http_timeout))
 
 
@@ -1436,6 +1445,22 @@ def _progress_summary(payload: dict[str, Any], cut: _Cut) -> dict[str, Any]:
     return view
 
 
+def _task_review(task: dict[str, Any], result: dict[str, Any] | None, cut: _Cut) -> dict[str, str]:
+    """Review object from the task result. Missing means it was not requested."""
+    raw: Any = None
+    if isinstance(result, dict) and isinstance(result.get("review"), dict):
+        raw = result.get("review")
+    elif isinstance(task.get("review"), dict):
+        raw = task.get("review")
+    if not isinstance(raw, dict):
+        raw = {"status": "not_requested", "source": "none", "evidence": ""}
+    return {
+        "status": cut.text(raw.get("status") or "not_requested", _SUMMARY_TEXT_CAP),
+        "source": cut.text(raw.get("source") or "none", _SUMMARY_TEXT_CAP),
+        "evidence": cut.text(raw.get("evidence") or "", _SUMMARY_TEXT_CAP),
+    }
+
+
 def _warning_items(value: Any, cut: _Cut) -> list[str]:
     if isinstance(value, str):
         text = value.strip()
@@ -1584,6 +1609,7 @@ def summarize_status(payload: dict[str, Any]) -> dict[str, Any]:
                 "artifacts": names,
                 "workspace": cut.text(_task_workspace(task, result), _SUMMARY_TEXT_CAP),
                 "error": cut.text(_task_error(task, result), _SUMMARY_TEXT_CAP),
+                "review": _task_review(task, result, cut),
             }
         )
     summary: dict[str, Any] = {
@@ -1805,6 +1831,26 @@ def build_parser() -> argparse.ArgumentParser:
             "More than 8 exits 1 with code too_many_external_inputs "
             "before any file is opened. "
             "A missing file exits 1 with code bad_external_input"
+        ),
+    )
+    p_open.add_argument(
+        "--require-capability",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help=(
+            "capability this request requires (repeatable). "
+            "Unmet names: HTTP 409 capability_unavailable, stdout includes missing, exit 1. "
+            "The server does not create a goal."
+        ),
+    )
+    p_open.add_argument(
+        "--ack-prompt-only-inputs",
+        action="store_true",
+        help=(
+            "operator acknowledges pinned external inputs are prompt-only "
+            "on a skip-permissions backend (acknowledge_prompt_only_inputs true). "
+            "Does not satisfy an explicit --require-capability."
         ),
     )
     p_open.set_defaults(func=cmd_open)
