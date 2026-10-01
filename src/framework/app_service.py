@@ -40,6 +40,13 @@ from framework.artifact_handoff import (
     scheduler_task_workspace,
     workspace_paths_match,
 )
+from framework.input_manifest import (
+    InputManifestError,
+    capability_document,
+    merge_manifest_input_files,
+    project_input_manifest,
+    snapshot_metadata,
+)
 from framework.failure_projection import project_failed_tasks
 from framework.need_human import goal_need_human_view, sanitize_reason
 from framework.concurrency import (
@@ -367,11 +374,12 @@ def project_forbidden_tools(
     return found
 
 
-def project_external_inputs(payload: Mapping[str, Any] | None = None) -> list[dict[str, str]]:
+def project_external_inputs(payload: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
     """Return Goal.external_inputs after shape validation.
 
-    Absent or null means no pins. Each item must be exactly an absolute
-    ``path`` and a 64-hex ``sha256``, at most eight. File-inside-repo, hash
+    Absent or null means no pins. Each item is an absolute ``path`` and a
+    64-hex ``sha256``, at most eight. Optional ``metadata`` is only the closed
+    snapshot record (kind, basename source, taken_at). File-inside-repo, hash
     match, link, and size checks stay in ``win_collab.validate_charter``.
     """
     src = payload if isinstance(payload, Mapping) else {}
@@ -388,10 +396,16 @@ def project_external_inputs(payload: Mapping[str, Any] | None = None) -> list[di
             f"external_inputs must have at most {MAX_EXTERNAL_INPUTS} entries",
             code="invalid_external_inputs",
         )
-    out: list[dict[str, str]] = []
+    out: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in raw:
-        if not isinstance(item, Mapping) or set(item) != {"path", "sha256"}:
+        if not isinstance(item, Mapping):
+            raise AppError(
+                "each external input requires only path and sha256",
+                code="invalid_external_inputs",
+            )
+        extra = set(item) - {"path", "sha256", "metadata"}
+        if extra or not {"path", "sha256"} <= set(item):
             raise AppError(
                 "each external input requires only path and sha256",
                 code="invalid_external_inputs",
@@ -421,7 +435,16 @@ def project_external_inputs(payload: Mapping[str, Any] | None = None) -> list[di
                 code="invalid_external_inputs",
             )
         seen.add(path)
-        out.append({"path": path, "sha256": digest})
+        metadata = None
+        if "metadata" in item:
+            try:
+                metadata = snapshot_metadata(item.get("metadata"))
+            except InputManifestError as exc:
+                raise AppError(str(exc), code="invalid_external_inputs") from exc
+        row: dict[str, Any] = {"path": path, "sha256": digest}
+        if metadata is not None:
+            row["metadata"] = metadata
+        out.append(row)
     return out
 
 
@@ -1657,6 +1680,10 @@ class AppCoordinator:
                 task["inputs"] = inputs
             goal_obj = snap.get("goal") if isinstance(snap.get("goal"), Mapping) else {}
             try:
+                merge_manifest_input_files(task, goal_obj, root)
+            except InputManifestError as exc:
+                return self._fail_task(goal_id, task_id, {"ok": False, "error": str(exc)})
+            try:
                 charter = worker_charter_for_task(goal=goal_obj, task=task)
             except AppError as exc:
                 return self._fail_task(goal_id, task_id, {"ok": False, "error": str(exc)})
@@ -2521,6 +2548,10 @@ class CollabApplication:
         title = str(payload.get("title") or goal_text[:80]).strip()
         forbidden_tools = project_forbidden_tools(payload=payload)
         external_inputs = project_external_inputs(payload)
+        try:
+            input_manifest = project_input_manifest(payload)
+        except InputManifestError as exc:
+            raise AppError(str(exc), code=exc.code) from exc
         required = parse_required_capabilities(payload)
         acknowledge_prompt_only = parse_acknowledge_prompt_only(payload)
         # Capability refusals happen before submit_goal so a 409 does not bind
@@ -2555,6 +2586,8 @@ class CollabApplication:
             goal["forbidden_tools"] = forbidden_tools
         if external_inputs:
             goal["external_inputs"] = external_inputs
+        if input_manifest:
+            goal["input_manifest"] = input_manifest
         if external_inputs and prompt_only_skip_blocked(caps) and acknowledge_prompt_only:
             goal["warnings"] = [SKIP_PERMISSIONS_WARNING]
         result = self.layer.submit_goal(
@@ -2653,6 +2686,7 @@ class CollabApplication:
             max_parallel_per_goal=self.coordinator.max_parallel_per_goal,
             max_parallel_global=self.coordinator.max_parallel_global,
         )
+        doc.update(capability_document())
         return {"ok": True, **doc}
 
     def health(self) -> dict[str, Any]:

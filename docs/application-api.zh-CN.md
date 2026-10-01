@@ -161,6 +161,11 @@ TeleAgent `review` 若产物自带 `contamination.contaminated`，投影出的�
 | `channels.permission` / `question` / `review` | 是否真有 TeleAgent 原生命令通道。agy 与 inprocess 都是 false：`list_pending_actions` 恒为空，`reply_permission` 为 501 |
 | `external_inputs.max` | 8 |
 | `external_inputs.enforcement` | `permission_gate`（硬拒绝，等人或组长决定）、`prompt_only`（只写进提示词）、`none`（不执行） |
+| `input_manifest.max_files` | 256 |
+| `input_manifest.max_total_bytes` | 268435456（256 MiB） |
+| `input_manifest.staging` | `copy_into_workspace`（派工时拷进任务工作区，不是把 root 授给工人） |
+| `snapshots.sqlite` | `client_backup_api`（客户端 `Connection.backup()`，服务端不读活动 WAL） |
+| `snapshots.file` | `client_prefix_copy`（客户端按打开时的长度做前缀拷贝） |
 | `isolation.os_sandbox` | 当前实现都是 false。没有容器 / seccomp / Landlock |
 | `isolation.access_audit` | `decision_log`（监督后端的决定日志）、false、或 `unknown` |
 | `isolation.prompt_constraints` | true 只表示合同文本里有约束，**不是**操作系统沙箱 |
@@ -182,6 +187,27 @@ TeleAgent `review` 若产物自带 `contamination.contaminated`，投影出的�
 `unknown` 不等于具备。默认实现（未覆盖的后端）全部是 false / `unknown`，不会假装有门禁。`unknown` 的 `max_runs` 不参与 `effective` 的最小值。
 
 `GET /v1/requests/{id}` 另有派生的 `scheduler`（不落盘）：`running`（本 Goal 的 in-flight 数）、`queued_ready`（依赖已满足、仍在排队的 Task 数）、`capacity`（扣掉其它 Goal 正在占用的名额之后，本 Goal 还能用的上限）、`waiting_reason`。`waiting_reason` 为空表示没有就绪任务，或下一拍可以派工。`global_approval` 是全局决策挡住了派工（某个 Task 自己的 question / permission 不挡其它就绪 Task）。`capacity` 是名额用完，任务继续排队，Goal 保持 `running`，`failure` 不会因此被写成失败。`workdir_claim` 是就绪任务的工作目录都被占用：同一目录（含其它 Goal）同时只跑一个 Task，后来的等，不失败。依赖没完成的不会进 `queued_ready`。失败的依赖不会把下游派出去（下游保持排队）。取消会取消该 Goal 上每一个还在跑的 run。墙钟 `budget.wall_sec` 在多个 run 同时活跃时仍然生效：超时则这些 run 都停，Goal 失败，原因是 wall / budget（投影为 `worker_timeout`），不是容量不够。
+
+### 多文件清单与一致快照
+
+`POST /v1/requests` 可选 `input_manifest`。这是客户端已经展开并哈希过的**显式文件列表**，不是目录授权。服务端不按 glob 再扫一遍，也不会因为 root 存在就递归读取。
+
+```json
+{
+  "root": "/绝对目录",
+  "entries": [{"relative": "logs/a.jsonl", "sha256": "<64 hex>", "size": 12}],
+  "max_files": 256,
+  "max_total_bytes": 268435456
+}
+```
+
+校验（不通过则 **400** `invalid_input_manifest`，不建 Goal）：`root` 必须是绝对路径；`entries[].relative` 走和产物一样的相对路径规则（拒绝 `..`、绝对路径、盘符、凭据式名字）；`sha256` 为 64 位十六进制；`size` 为非负整数；条目数 ≤ `max_files` ≤ 256；字节合计 ≤ `max_total_bytes` ≤ 256 MiB；相对名唯一。未知字段拒绝。
+
+这里的哈希是**哈希当时的内容**。派工时（工人进程启动之前）服务端把每个条目拷进该任务工作区的 `inputs/manifest/<relative>`，拷贝过程中重新流式计算 sha256。对不上、或字节数对不上，任务失败，错误为 `hash_changed: <relative>`，**不**启动工人，也**不**改去读别的路径。链接、越出 root 的解析结果同样在拷贝时拒绝。
+
+工人合同里的 `input_files` 只增加这些工作区内的相对路径（提示词会列出它们）。这不是把 manifest root 加进外部读取权限。哈希不能当成隔离。
+
+活动 SQLite 与还在增长的 JSONL 由**客户端**做一致快照后再钉成 `external_inputs`（仍受最多 8 个的限制），不要把 db 和 `-wal`/`-shm` 当成一对外部输入。快照条目可以带 `metadata`：`kind` 为 `sqlite_snapshot` 或 `file_snapshot`，`source` 只有文件名，`taken_at` 为 UTC `YYYY-MM-DDTHH:MM:SSZ`。工人合同仍只抄 `path` 和 `sha256`。
 
 ### 调用方要求的能力
 

@@ -1,6 +1,6 @@
 # Hermes 最小派工客户端
 
-薄封装：`bin/hermes-collab-request.py`。只做 Application API 的 HTTP 调用（open / ping / status / report / wait / pending / decide），**不**持有账号池、**不**拉起 agy 子进程、**不**把 Hermes 当账本。
+薄封装：`bin/hermes-collab-request.py`。对 Application API 做 HTTP 调用（open / ping / status / report / wait / pending / decide），并在本地做有边界的输入清单与一致快照（`--input-manifest`、`--sqlite-snapshot`、`--file-snapshot`、`snapshots-clean`）。**不**持有账号池、**不**拉起 agy 子进程、**不**把 Hermes 当账本。
 
 工人后端（`teleagent-windows` / `antigravity` / `inprocess`）在 **`collab-service` 启动时**选定；本客户端的 `--backend` 仅作调用方标注（写入 `caller_backend_hint`），当前服务端会忽略未知字段。完整 API 见 [application-api.zh-CN.md](application-api.zh-CN.md)。
 
@@ -18,6 +18,7 @@
 | `COLLAB_API_TOKEN` | 有则发 `Authorization: Bearer …` | 空（无 Bearer） |
 | `COLLAB_OUTPUT_FULL` | `1` / `true` / `yes` / `on` 时，`status` / `report` / `wait` 打原始载荷（等同该子命令的 `--full`） | 关（打 SUMMARY） |
 | `COLLAB_JSON_UNICODE` | `1` / `true` / `yes` / `on` 时输出原始 UTF-8（等同 `--unicode`） | 关（纯 ASCII） |
+| `COLLAB_SNAPSHOT_DIR` | 客户端快照根目录。其下建 `<UTC时间>-<随机>` 子目录（支持时模式 0700） | `~/.cache/teleagent-collab/snapshots` |
 
 HTTP 401/403 的 stdout JSON 带 `auth.token_source`（`env` / `dotenv` / `none`）和 `auth.env_file`（路径或 `null`），不含 token。排查看 `auth.token_source`，不要回显 token。密钥不要写进仓库、profile 或本文件示例。
 
@@ -28,7 +29,11 @@ python bin/hermes-collab-request.py ping
 python bin/hermes-collab-request.py open --goal "…" [--title …] [--backend antigravity|teleagent-windows]
 python bin/hermes-collab-request.py open --goal "…" --require-capability NAME   # 可重复
 python bin/hermes-collab-request.py open --goal "…" --external-input PATH --ack-prompt-only-inputs
-python bin/hermes-collab-request.py open --goal "…" --external-input PATH   # 可重复，最多 8 个
+python bin/hermes-collab-request.py open --goal "…" --external-input PATH   # 可重复，与快照合计算最多 8 个
+python bin/hermes-collab-request.py open --goal "…" --input-manifest manifest.json
+python bin/hermes-collab-request.py open --goal "…" --sqlite-snapshot DB    # 可重复；只钉快照，不钉 -wal/-shm
+python bin/hermes-collab-request.py open --goal "…" --file-snapshot LOG.jsonl
+python bin/hermes-collab-request.py snapshots-clean [--hours 24]
 python bin/hermes-collab-request.py status <request_id> [--full]
 python bin/hermes-collab-request.py report <request_id> [--full]
 python bin/hermes-collab-request.py wait <request_id> [--timeout 600] [--interval 2] [--full]
@@ -39,7 +44,11 @@ python bin/hermes-collab-request.py decide <request_id> <decision_id> --verdict 
 - 始终向 **stdout** 打一行 JSON（默认纯 ASCII，`\uXXXX`；见「输出编码 / PowerShell」）；失败、观察窗口到点、待决策时 JSON 仍打出，**exit ≠ 0**。
 - `{id}` 会做 percent-encoding（含中文 Goal id）。
 - `status` / `report` / `wait` 默认打下面的 SUMMARY。`--full`（写在子命令后）或 `COLLAB_OUTPUT_FULL=1` 才打服务端原始载荷。
-- `open` 的 `--external-input` 先数个数，再读文件、算 SHA-256。多于 8 个时退出码 1，`code=too_many_external_inputs`，不发 HTTP，也不打开文件。服务端同样限制为 8（`src/framework/app_service.py` 的 `MAX_EXTERNAL_INPUTS`）。哈希按块流式计算，不把整个文件读进内存。
+- `open` 的 `--external-input`、`--sqlite-snapshot`、`--file-snapshot` 先合计算个数，再读文件、算 SHA-256。多于 8 个时退出码 1，`code=too_many_external_inputs`，不发 HTTP，也不打开文件。服务端同样限制为 8（`src/framework/app_service.py` 的 `MAX_EXTERNAL_INPUTS`）。哈希按块流式计算，不把整个文件读进内存。
+- `--input-manifest FILE` 读一份 JSON：`{"root":"<绝对目录>","include":["a.txt","logs/*.jsonl"],"max_files":N,"max_total_bytes":B}`。每个模式只做**一层** glob；出现 `**` 且没有 `"recursive": true` 时退出码 1，`code=manifest_recursive_refused`。即便递归，仍受 `max_files`（硬顶 256）和 `max_total_bytes`（硬顶 256 MiB）约束。越出 root、符号链接/junction、凭据式文件名、目录、超个数、超字节都在本地拒绝，**先数个数和字节，再哈希**。请求体是 `input_manifest: {root, entries:[{relative,sha256,size}], max_files, max_total_bytes}`。这是哈希当时的内容；派工时对不上则任务失败 `hash_changed: <相对路径>`，不要因此扩大读取范围。哈希不是权限隔离。
+- `--sqlite-snapshot DB` 以只读 URI 打开源库，用 `Connection.backup()` 做一致快照，把快照设为 `journal_mode=DELETE` 并要求 `PRAGMA integrity_check` 为 `ok`，然后只钉**快照文件**（`metadata.kind=sqlite_snapshot`，`source` 只有文件名）。不钉 `-wal` / `-shm`。活动库带非空的同名 `-wal` 时，`--external-input` 直接退出码 1，`code=sqlite_live_wal`。直接钉 `*-wal` / `*-shm` 退出码 1，`code=sqlite_sidecar_refused`。
+- `--file-snapshot FILE` 只复制打开时 `stat` 到的前缀（避免追加写把快照撕开）。`.jsonl` 会丢掉末尾不完整的一行。钉的是副本，`metadata.kind=file_snapshot`。
+- 快照留在本机，成功或失败的 stdout 在 `snapshots` 里给出路径，由调用方删除。`snapshots-clean` 只删除快照根目录下、修改时间早于 N 小时（默认 24）的子目录，不跟着符号链接出去删。
 - `--require-capability NAME` 可重复，写入 `required_capabilities`。服务不满足时 HTTP 409，`code=capability_unavailable`，stdout 带 `missing`（以及能力快照），退出码 **1**（不是 `decide` 的 5）。未知名字是 400 `invalid_request`，同样退出码 1。两种都不会建 Goal。
 - `--ack-prompt-only-inputs` 写入 `acknowledge_prompt_only_inputs: true`。只用于操作者承认「钉住的外部输入在 skip-permissions 后端上只是提示词」。它不满足显式的 `--require-capability external_input_enforcement`。
 

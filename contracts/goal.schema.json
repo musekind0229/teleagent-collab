@@ -180,6 +180,70 @@
           "sha256": {
             "type": "string",
             "pattern": "^[0-9a-fA-F]{64}$"
+          },
+          "metadata": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Optional client snapshot record. Basename only; not a directory grant.",
+            "required": ["kind", "source", "taken_at"],
+            "properties": {
+              "kind": {
+                "enum": ["sqlite_snapshot", "file_snapshot"]
+              },
+              "source": {
+                "type": "string",
+                "minLength": 1
+              },
+              "taken_at": {
+                "type": "string",
+                "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+              }
+            }
+          }
+        }
+      }
+    },
+    "input_manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Explicit file list hashed by the client (content at hash time). Dispatch copies each entry into the task workspace and checks the hash again (content at run time). Not a recursive directory grant.",
+      "required": ["root", "entries", "max_files", "max_total_bytes"],
+      "properties": {
+        "root": {
+          "type": "string",
+          "minLength": 1
+        },
+        "max_files": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 256
+        },
+        "max_total_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 268435456
+        },
+        "entries": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["relative", "sha256", "size"],
+            "properties": {
+              "relative": {
+                "type": "string",
+                "minLength": 1
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F]{64}$"
+              },
+              "size": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
           }
         }
       }

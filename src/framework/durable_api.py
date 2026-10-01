@@ -670,6 +670,7 @@ def _default_goal_body(
         "source_charter_path",
         "forbidden_tools",
         "external_inputs",
+        "input_manifest",
     ):
         if extra_key in src:
             body[extra_key] = src[extra_key]

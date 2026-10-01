@@ -1,7 +1,7 @@
 ---
 name: teleagent-collab
 description: "Delegate work to local collab-service workers (agy/antigravity pool) via bin/hermes-collab-request.py: open, wait, report. Use when the user asks to have 'the worker'/'collab'/'agy' do a task or produce a file."
-version: 0.2.12
+version: 0.2.13
 author: teleagent-collab
 license: MIT
 platforms: [windows, linux, macos]
@@ -81,6 +81,13 @@ collab-service 是本机常驻的派工服务（Application API，默认 `http:/
    python bin/hermes-collab-request.py report <request_id>
    ```
 5. 向用户汇报：`request_id`、最终 `state`、产物列表（report 里的 artifacts / 工作区路径）、必要时产物内容摘要。不要编造没看到的内容。SUMMARY 里的 `warnings` 和每条任务的 `review` 要照实说：`review.status=unsupported` 不是审查通过。`status` / `report` / `wait` 默认是简明 SUMMARY；只有用户明确要原始 JSON 时才加 `--full`（或 `COLLAB_OUTPUT_FULL=1`）。
+
+## 很多文件、活动 SQLite、增长中的 JSONL
+
+- 很多文件用 `--input-manifest FILE`。清单里写绝对 `root`、相对 `include`、`max_files`、`max_total_bytes`。默认**不**递归：模式里的 `**` 会被拒绝。只有清单显式 `"recursive": true` 才向下展开，并且仍然受文件数和总字节上限（最多 256 个、256 MiB）。列出目录不等于授权递归读取。
+- 正在写入的 SQLite 用 `--sqlite-snapshot DB`（可重复，和 `--external-input` 合计算进最多 8 个钉）。客户端用 backup API 做一致快照，只钉快照文件。不要把 db 和 `-wal` / `-shm` 一起钉成 `--external-input`。
+- 还在追加的 JSONL 用 `--file-snapshot FILE`。只复制打开时量到的前缀，并丢掉末尾不完整的一行。
+- 任务失败里的 `hash_changed: <相对路径>` 表示开单哈希之后、派工复制之前源变了。把原文告诉用户，不要扩大读取范围再重试。哈希不是权限隔离：工人只该看到工作区里 `inputs/manifest/` 下的副本，以及明确钉住的快照文件。
 
 ## 后端能力边界
 

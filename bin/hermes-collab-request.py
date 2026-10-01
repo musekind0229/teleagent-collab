@@ -17,7 +17,7 @@ Lookup order:
      (skipped when LOCALAPPDATA is missing)
      other OS: ~/.hermes/.env
 
-Subcommands: open | ping | status | report | wait | pending | decide
+Subcommands: open | ping | status | report | wait | pending | decide | snapshots-clean
 Stdout: one JSON object (single line). Default is pure ASCII
 (ensure_ascii=True); non-ASCII becomes \\uXXXX so PowerShell 5.1 pipes
 (any code page) and Hermes UTF-8 decoding both keep the text.
@@ -67,6 +67,20 @@ from typing import Any
 # (or PosixPath on Windows). Bind the flavour at import so tests can patch
 # os.name and still receive a Path.
 _Path = WindowsPath if os.name == "nt" else PosixPath
+
+_SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SRC_ROOT))
+
+from framework.input_manifest import (  # noqa: E402
+    InputManifestError,
+    assert_sqlite_pin_allowed,
+    clean_snapshots,
+    file_snapshot,
+    load_client_manifest,
+    make_snapshot_dir,
+    sqlite_snapshot,
+)
 
 DEFAULT_BASE = "http://127.0.0.1:8765"
 TERMINAL_STATES = frozenset({"completed", "failed", "cancelled"})
@@ -368,6 +382,13 @@ def _external_input_record(raw: str) -> dict[str, str]:
             exit_code=EXIT_ERROR,
         )
     try:
+        assert_sqlite_pin_allowed(resolved)
+    except InputManifestError as exc:
+        raise ClientError(
+            {"ok": False, "code": exc.code, "error": str(exc)},
+            exit_code=EXIT_ERROR,
+        ) from exc
+    try:
         digest = _sha256_file(resolved)
     except OSError as e:
         raise ClientError(
@@ -408,9 +429,13 @@ def cmd_open(args: argparse.Namespace) -> dict[str, Any]:
     # caller annotation only (server ignores unknown fields today).
     if args.backend:
         body["caller_backend_hint"] = args.backend
-    # Count before any path resolve, open, or hash. The server rejects the same limit.
+    # Count before any path resolve, open, or hash. Snapshots share the pin cap.
+    # The server rejects the same external_inputs limit. Manifest files are
+    # separate and are staged into the workspace, not pinned.
     raw_inputs = list(getattr(args, "external_input", None) or [])
-    if len(raw_inputs) > MAX_EXTERNAL_INPUTS:
+    raw_sqlite = list(getattr(args, "sqlite_snapshot", None) or [])
+    raw_file_snaps = list(getattr(args, "file_snapshot", None) or [])
+    if len(raw_inputs) + len(raw_sqlite) + len(raw_file_snaps) > MAX_EXTERNAL_INPUTS:
         raise ClientError(
             {
                 "ok": False,
@@ -421,7 +446,50 @@ def cmd_open(args: argparse.Namespace) -> dict[str, Any]:
             },
             exit_code=EXIT_ERROR,
         )
-    pins = [_external_input_record(item) for item in raw_inputs]
+    manifest_arg = str(getattr(args, "input_manifest", "") or "").strip()
+    if manifest_arg:
+        try:
+            body["input_manifest"] = load_client_manifest(manifest_arg)
+        except InputManifestError as exc:
+            raise _manifest_client_error(exc) from exc
+    pins: list[dict[str, Any]] = []
+    snapshot_paths: list[str] = []
+    snap_dir: Path | None = None
+
+    def _one_snapshot_dir() -> Path:
+        nonlocal snap_dir
+        if snap_dir is None:
+            snap_dir = make_snapshot_dir()
+        return snap_dir
+
+    try:
+        for item in raw_inputs:
+            pins.append(_external_input_record(item))
+        for item in raw_sqlite:
+            snap = sqlite_snapshot(item, _one_snapshot_dir())
+            snapshot_paths.append(str(snap.path))
+            rec = _external_input_record(str(snap.path))
+            rec["metadata"] = dict(snap.metadata)
+            pins.append(rec)
+        for item in raw_file_snaps:
+            snap = file_snapshot(item, _one_snapshot_dir())
+            snapshot_paths.append(str(snap.path))
+            rec = _external_input_record(str(snap.path))
+            rec["metadata"] = dict(snap.metadata)
+            pins.append(rec)
+    except InputManifestError as exc:
+        raise _manifest_client_error(exc, snapshot_paths) from exc
+    except ClientError as exc:
+        if snapshot_paths:
+            merged = dict(exc.payload)
+            prior = merged.get("snapshots")
+            paths = [str(item) for item in prior] if isinstance(prior, list) else []
+            for path in snapshot_paths:
+                if path not in paths:
+                    paths.append(path)
+            merged["snapshots"] = paths
+            exc.payload = merged
+        raise
     if pins:
         body["external_inputs"] = pins
     required = [
@@ -433,7 +501,37 @@ def cmd_open(args: argparse.Namespace) -> dict[str, Any]:
         body["required_capabilities"] = required
     if getattr(args, "ack_prompt_only_inputs", False):
         body["acknowledge_prompt_only_inputs"] = True
-    return request_json("POST", "/v1/requests", body=body, timeout=float(args.http_timeout))
+    try:
+        payload = request_json("POST", "/v1/requests", body=body, timeout=float(args.http_timeout))
+    except ClientError as exc:
+        if snapshot_paths:
+            merged = dict(exc.payload)
+            merged["snapshots"] = list(snapshot_paths)
+            exc.payload = merged
+        raise
+    if snapshot_paths:
+        payload["snapshots"] = list(snapshot_paths)
+    return payload
+
+
+def _manifest_client_error(
+    exc: InputManifestError,
+    snapshot_paths: list[str] | None = None,
+) -> ClientError:
+    paths = list(snapshot_paths or [])
+    paths.extend(getattr(exc, "snapshot_paths", []) or [])
+    payload: dict[str, Any] = {"ok": False, "code": exc.code, "error": str(exc)}
+    if paths:
+        payload["snapshots"] = paths
+    return ClientError(payload, exit_code=EXIT_ERROR)
+
+
+def cmd_snapshots_clean(args: argparse.Namespace) -> dict[str, Any]:
+    """Delete snapshot directories older than N hours. Never leaves the snapshot root."""
+    try:
+        return clean_snapshots(hours=float(args.hours))
+    except InputManifestError as exc:
+        raise _manifest_client_error(exc) from exc
 
 
 def cmd_status(args: argparse.Namespace) -> dict[str, Any]:
@@ -1897,10 +1995,47 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help=(
             "pin a file the worker may read outside the task workspace "
-            "(repeatable, at most 8; sends absolute path and sha256). "
+            "(repeatable, at most 8 combined with --sqlite-snapshot and "
+            "--file-snapshot; sends absolute path and sha256). "
             "More than 8 exits 1 with code too_many_external_inputs "
             "before any file is opened. "
-            "A missing file exits 1 with code bad_external_input"
+            "A missing file exits 1 with code bad_external_input. "
+            "A SQLite file with a non-empty sibling -wal exits 1 with "
+            "code sqlite_live_wal (use --sqlite-snapshot). "
+            "Pinning a -wal or -shm file exits 1 with code sqlite_sidecar_refused"
+        ),
+    )
+    p_open.add_argument(
+        "--input-manifest",
+        default="",
+        metavar="FILE",
+        help=(
+            "JSON manifest {root, include, max_files, max_total_bytes}. "
+            "Single-level globs unless recursive is true. Hard cap 256 files "
+            "and 256 MiB. Count and size are checked before hashing. "
+            "Sends input_manifest entries (relative, sha256, size)"
+        ),
+    )
+    p_open.add_argument(
+        "--sqlite-snapshot",
+        action="append",
+        default=[],
+        metavar="DB",
+        help=(
+            "consistent read-only backup of a SQLite database "
+            "(repeatable; counts toward the 8 external input cap). "
+            "Pins the snapshot file only, never -wal or -shm"
+        ),
+    )
+    p_open.add_argument(
+        "--file-snapshot",
+        action="append",
+        default=[],
+        metavar="FILE",
+        help=(
+            "copy the byte prefix measured at open "
+            "(repeatable; counts toward the 8 external input cap). "
+            ".jsonl copies drop a trailing partial line"
         ),
     )
     p_open.add_argument(
@@ -1992,6 +2127,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional JSON array of answers (question decisions)",
     )
     p_dec.set_defaults(func=cmd_decide)
+
+    p_clean = sub.add_parser(
+        "snapshots-clean",
+        help="delete client snapshot directories older than N hours (snapshot root only)",
+    )
+    p_clean.add_argument(
+        "--hours",
+        type=float,
+        default=24.0,
+        help="delete snapshot dirs older than this many hours (default 24)",
+    )
+    p_clean.set_defaults(func=cmd_snapshots_clean)
 
     return p
 
