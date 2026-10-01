@@ -415,11 +415,13 @@ def cmd_open(args: argparse.Namespace) -> dict[str, Any]:
         "title": args.title or (args.goal[:80] if args.goal else "hermes-collab"),
         "goal": args.goal,
         "boundaries": {"must": must, "must_not": must_not},
-        "acceptance": {
-            "artifacts": artifacts,
-            "text": args.acceptance_text
-            or (", ".join(artifacts) + " exist"),
-        },
+        # No synthesized "X exist" text: artifact presence is checked anyway, and a
+        # made-up prose criterion would be reported as "not independently verified".
+        "acceptance": (
+            {"artifacts": artifacts, "text": args.acceptance_text}
+            if args.acceptance_text
+            else {"artifacts": artifacts}
+        ),
         "budget": {
             "wall_sec": int(args.wall_sec),
             "max_reworks": int(args.max_reworks),

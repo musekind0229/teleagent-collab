@@ -220,6 +220,8 @@ class HermesCollabRequestTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(captured["body"]["goal"], "写一份说明")
         self.assertEqual(captured["body"]["acceptance"]["artifacts"], ["out.md"])
+        # No synthesized prose criterion when --acceptance-text is absent.
+        self.assertNotIn("text", captured["body"]["acceptance"])
         self.assertEqual(captured["body"]["caller_backend_hint"], "antigravity")
         self.assertEqual(captured["body"]["idempotency_key"], "k-1")
         printed = json.loads(buf.getvalue())
