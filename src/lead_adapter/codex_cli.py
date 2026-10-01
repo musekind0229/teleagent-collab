@@ -393,7 +393,6 @@ def _kill_process_tree(proc: subprocess.Popen, platform: str) -> None:
             subprocess.run(
                 ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
                 capture_output=True,
-                text=True,
                 timeout=10,
             )
         except Exception:

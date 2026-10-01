@@ -502,7 +502,11 @@ class TestCodexCliDecide(unittest.TestCase):
         real = subprocess.Popen
 
         def wrapped(args, **kwargs):
-            calls.append((args, kwargs))
+            # The patch is module-global, so the timeout path's taskkill
+            # subprocess.run lands here too; it is not a codex spawn.
+            first = args if isinstance(args, str) else (args[0] if args else "")
+            if not str(first).lower().startswith("taskkill"):
+                calls.append((args, kwargs))
             return real(args, **kwargs)
 
         created: list[str] = []
@@ -524,6 +528,14 @@ class TestCodexCliDecide(unittest.TestCase):
                         timeout_sec=timeout_sec,
                     )
                     elapsed = time.monotonic() - t0
+        if sys.platform == "win32" and calls and isinstance(calls[0][0], str):
+            # .cmd shim: Popen got one `cmd /d /s /c "..."` string. Check its
+            # shape, then compare the argv the fake actually received.
+            cmdline, kwargs = calls[0]
+            self.assertIn(' /d /s /c "', cmdline)
+            self.assertIn(str(self.fake.shim), cmdline)
+            if (self.fake.record / "argv.json").exists():
+                calls[0] = (self.fake.recorded_argv(), kwargs)
         return raw, parsed, calls, created, elapsed
 
     def _assert_failed(self, raw, parsed, req, *, kind, code):
@@ -565,7 +577,10 @@ class TestCodexCliDecide(unittest.TestCase):
                 argv, kwargs = calls[0]
                 self.assertIsInstance(argv, list)
                 self.assertFalse(kwargs.get("shell", False))
-                self.assertTrue(kwargs.get("start_new_session"))
+                if sys.platform == "win32":
+                    self.assertTrue(kwargs.get("creationflags"))
+                else:
+                    self.assertTrue(kwargs.get("start_new_session"))
                 self.assertEqual(kwargs.get("encoding"), "utf-8")
                 self.assertEqual(kwargs.get("errors"), "replace")
                 self.assertIs(kwargs.get("stdin"), subprocess.PIPE)
