@@ -1,7 +1,7 @@
 ---
 name: teleagent-collab
 description: "Delegate work to local collab-service workers (agy/antigravity pool) via bin/hermes-collab-request.py: open, wait, report. Use when the user asks to have 'the worker'/'collab'/'agy' do a task or produce a file."
-version: 0.2.13
+version: 0.2.14
 author: teleagent-collab
 license: MIT
 platforms: [windows, linux, macos]
@@ -98,6 +98,14 @@ collab-service 是本机常驻的派工服务（Application API，默认 `http:/
 - 任务会碰到私人或敏感数据时停下，把上述字段告诉用户。只有用户/操作者明确接受降级时才继续，开单加 `--ack-prompt-only-inputs`。不要自己设 `AGY_AUTO_APPROVE`。
 - `--require-capability NAME` 可重复（例如 `permission_gate`、`no_skip_permissions`）。服务不满足则退出码 1，`code=capability_unavailable`，stdout 有 `missing`。不要改口重试把要求拿掉，除非用户同意。
 - 任务 `review.status` 为 `unsupported` 时，**不要**说审查已通过。验收文本没有被独立核对；文件在不在是另一件事。`passed` 才是真有检查并且过了，`failed` 是没过。
+
+## 进度与预算
+
+- 要看慢但还活着、在等决定、还是没心跳：`python bin/hermes-collab-request.py progress <request_id>`。它只给 `state`、`phase`、心跳/进度年龄（秒）和最近几条事件。没有进度就是 `unknown`。**不要编百分比**。
+- 一次性后端 `progress.available` 为 false。agy 的进程是否还在、以及产物清单（文件名、大小、mtime，没有正文）是真的。`subagent_observability` 只有 `false` 或 `unknown`，不会假装是 0。
+- 预算旗标：`--wall-sec`、`--max-tokens`、`--max-tool-calls`、`--no-progress-sec`、`--on-no-progress checkpoint|fail`、`--budget-report-only`。这个后端标成 unsupported 的字段会被拒绝（退出码 1，`code=capability_unavailable`，`missing` 里有 `budget:<字段>`），除非用户明确要求 `--budget-report-only`。不要为了过提交自己拿掉限制。
+- `post_hoc` 表示跑完才核对，中途停不了。用量是工人自报，**不是账单**，不要把它说成费用。
+- 检查点决策（`kind=checkpoint`，摘要像 `checkpoint: no progress for Ns` 或 `budget exceeded: continue or stop`）就是停下来问用户。不要自动 `continue`，不要静默加预算或再 open 一次。只有用户明确说出 verdict 时才 `decide`。`continue` 算一次 rework，计入 `max_reworks`。`stop` 留下已有文件。
 
 ## planner 能力与分阶段交付
 

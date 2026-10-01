@@ -93,6 +93,7 @@ python bin/collab-service.py --persist .collab-app --port 8765 `
 | --- | --- | --- |
 | `--max-parallel-per-goal` | 2 | 同一个 Goal 里同时处于 in-flight 的 Task 数 |
 | `--max-parallel-global` | 4 | 全部 Goal 加在一起的 in-flight 数 |
+| `--stale-after` | 120 | 任务仍在跑时，心跳早于这么多秒就算 `progress.state=stale`。未知进度保持 unknown，不会被当成超时 |
 
 有效容量是这二者与后端 `capabilities().concurrency.max_runs` 里**已知数字**的最小值。`max_runs` 为 `unknown` 时不把上限再压低。后端自己声明的原因会进 `limited_by`：in-process 大约 8（`inprocess`）；agy 等于账号池条数，池子不可用或未配置时是 1（`agy_account_pool`）；Windows / Linux 监督桌面是 1（`desktop_session_lock`，同一桌面会话锁，实质串行）。容量不够只是排队，不是失败。
 
@@ -175,7 +176,15 @@ TeleAgent `review` 若产物自带 `contamination.contaminated`，投影出的�
 | `acceptance.exact_content` | 能否核对「path must contain exactly BODY」。只有 agy 门禁为 true |
 | `acceptance.lead_review` | 本进程规划器会审 **并且** 后端扛得住组长审查时才是 true |
 | `acceptance.executable_checks` | 当前为 false |
-| `progress.available` | 当前为 false |
+| `progress.available` | 有真实、便宜的观察才是 true。agy 是进程心跳 + 工作区文件名/大小/mtime（`heartbeat=runner_process`）。in-process 看自己的状态机（`heartbeat` 为 false，不每拍刷新）。监督后端看作业状态（`heartbeat=engine`）。没有这些信号的一次性后端是 false，并且 **`percent` 永远是 false**，不编百分比 |
+| `progress.subagent_observability` | `false` 或 `"unknown"`。不会假装观察到 0 个子代理 |
+| `progress.artifact_checkpoint` | 能否给出产物清单（名字、大小、mtime，无正文） |
+| `metering.live_usage` / `usage_at_end` / `tool_calls` | 是否有跑中用量、结束时用量、工具调用次数。没有就不要当成有 |
+| `metering.fields` / `metering.source` | 会原样转述的字段名。`source` 是 `worker_self_reported` 或 `none`。这些数字不是账单 |
+| `budget_enforcement.wall_sec` | 协调器总能执行墙钟，值为 `enforced` |
+| `budget_enforcement.max_tokens` | `enforced_live`（跑中能停）、`post_hoc`（只在结束时对账，停不了中途）、`unsupported` |
+| `budget_enforcement.max_tool_calls` | 同上三档。agy 没有工具次数，是 `unsupported`。agy 的 token 只在 CLI JSON 结束时出现，是 `post_hoc` |
+| `budget_enforcement.no_progress_sec` | `enforced`（用进度里的 `last_progress_at`，没有则用 run 开始时间）或 `unsupported` |
 | `usage.source` | agy 为 `worker_self_reported`（CLI JSON 自报）；其它为 `unknown` |
 | `warnings` | 人话。agy 且 skip-permissions 时为：`backend runs with skip-permissions: no permission gate; pinned external inputs are prompt-only` |
 | `concurrency.max_parallel_per_goal` | 服务参数，默认 2 |
@@ -186,7 +195,24 @@ TeleAgent `review` 若产物自带 `contamination.contaminated`，投影出的�
 
 `unknown` 不等于具备。默认实现（未覆盖的后端）全部是 false / `unknown`，不会假装有门禁。`unknown` 的 `max_runs` 不参与 `effective` 的最小值。
 
-`GET /v1/requests/{id}` 另有派生的 `scheduler`（不落盘）：`running`（本 Goal 的 in-flight 数）、`queued_ready`（依赖已满足、仍在排队的 Task 数）、`capacity`（扣掉其它 Goal 正在占用的名额之后，本 Goal 还能用的上限）、`waiting_reason`。`waiting_reason` 为空表示没有就绪任务，或下一拍可以派工。`global_approval` 是全局决策挡住了派工（某个 Task 自己的 question / permission 不挡其它就绪 Task）。`capacity` 是名额用完，任务继续排队，Goal 保持 `running`，`failure` 不会因此被写成失败。`workdir_claim` 是就绪任务的工作目录都被占用：同一目录（含其它 Goal）同时只跑一个 Task，后来的等，不失败。依赖没完成的不会进 `queued_ready`。失败的依赖不会把下游派出去（下游保持排队）。取消会取消该 Goal 上每一个还在跑的 run。墙钟 `budget.wall_sec` 在多个 run 同时活跃时仍然生效：超时则这些 run 都停，Goal 失败，原因是 wall / budget（投影为 `worker_timeout`），不是容量不够。
+`GET /v1/requests/{id}` 另有派生的 `scheduler`（不落盘）：`running`（本 Goal 的 in-flight 数）、`queued_ready`（依赖已满足、仍在排队的 Task 数）、`capacity`（扣掉其它 Goal 正在占用的名额之后，本 Goal 还能用的上限）、`waiting_reason`。`waiting_reason` 为空表示没有就绪任务，或下一拍可以派工。`global_approval` 是全局决策挡住了派工（某个 Task 自己的 question / permission 不挡其它就绪 Task）。`capacity` 是名额用完，任务继续排队，Goal 保持 `running`，`failure` 不会因此被写成失败。`workdir_claim` 是就绪任务的工作目录都被占用：同一目录（含其它 Goal）同时只跑一个 Task，后来的等，不失败。依赖没完成的不会进 `queued_ready`。失败的依赖不会把下游派出去（下游保持排队）。取消会取消该 Goal 上每一个还在跑的 run。墙钟 `budget.wall_sec` 在多个 run 同时活跃时仍然生效：超时则这些 run 都停，Goal 失败，原因是 wall / budget（投影为 `worker_timeout`），失败对象带上 `elapsed`、`last_progress_at` 和产物清单（名字、大小、mtime）。这不是容量不够。
+
+`GET /v1/requests/{id}` 的 `progress` 是协调器从各 Task 快照派生的，不额外打后端。`available` 为 false 时 `state` 与 `phase` 都是 `unknown`，没有 `percent`。`state` 只取：`executing`、`waiting_decision`、`waiting_capacity`、`stale`、`idle`、`delivering`、`done`、`unknown`。心跳早于 `--stale-after`（默认 120 秒，相等不算）且任务仍在跑，才是 `stale`。没有快照的 running 任务是 `unknown`，不会被改成 `executing` 或 `stale`。`budget_status` 按字段记下 `limit` / `used` / `source` / `exceeded` / `enforced`。用量旁的 `usage_report.note` 是 `not a bill`。
+
+### 预算与检查点
+
+`budget` 缺省仍是 `{wall_sec: 300, max_reworks: 1}`。给出的话必须是对象（`null` 也是 400 `invalid_request`）。已知字段类型不对同样 400：`wall_sec` 非负数字（0 可以），`max_reworks` / `max_tokens` / `max_tool_calls` 非负整数，`no_progress_sec` 必须大于 0，`on_no_progress` 为 `checkpoint`（默认）或 `fail`，`budget_mode` 为 `enforce`（默认）或 `report_only`。布尔值不是数字。不认识的历史键（如 `max_attempts`）会留下，不因此 400。
+
+某字段的 `budget_enforcement` 是 `unsupported` 时，提交直接 409 `capability_unavailable`，`missing` 形如 `budget:max_tokens`，并且**不会**建 Goal、不占幂等键。`budget_mode=report_only` 则接受，并在 Goal 上警告 `budget <field> is report-only on this backend`。`post_hoc` 可以提交，警告里有 `checked after the run; cannot stop mid-run`。
+
+执行时（每一拍，多个 run 一起看）：
+
+- 实时用量超过 `max_tokens`（或工具次数）：取消这些 run，任务失败，`error` 正好是 `budget_exceeded max_tokens`（或 `max_tool_calls`）。不自动加预算、不静默重试。
+- 只在结束时才有用量、并且超了：产物留下。Goal 记 `budget_status`（`exceeded: true`，`enforced: post_hoc`），任务结果 `budget_exceeded: true`，并打开检查点决策，摘要 `budget exceeded: continue or stop`。依赖这个任务的下游**不会**开工。
+- `no_progress_sec`：`on_no_progress=checkpoint`（默认）干净取消 run，留下工作区和部分产物，决策摘要 `checkpoint: no progress for Ns`，不自动重试。`fail` 则失败，`error` 正好是 `no_progress_timeout`。`report_only` 只记状态，不取消。
+- 已经在等决策的任务，这一拍不再因为没进度被杀掉。
+
+检查点的 verdict 只有 `continue` 或 `stop`，不是授权扩张。`continue` 必须是人通过现有 decisions API 明确给出的；它把该任务重新排队，历史记一次 `retry_task`（计入 `max_reworks`），同一条决策再提交不会再记一次。`stop` 让任务失败，不删已经写下的文件。不会偷偷加预算或再跑一圈。
 
 ### 多文件清单与一致快照
 

@@ -61,7 +61,27 @@ from framework.concurrency import (
     scheduler_view,
     task_is_ready,
 )
+from framework.delegation import KIND_CHECKPOINT
 from framework.durable_api import DurableLayer
+from framework.progress_budget import (
+    BudgetValidationError,
+    artifact_checkpoint,
+    bound_task_progress,
+    budget_mode,
+    budget_of,
+    budget_submit_issues,
+    derive_goal_progress,
+    enforcement_level,
+    format_seconds,
+    normalize_budget,
+    on_no_progress,
+    parse_iso,
+    token_total,
+    tool_call_total,
+    usage_fields,
+    usage_report,
+    utc_iso,
+)
 from lead_adapter.schema import context_summary_of, unwrap_structured
 
 API_VERSION = "collab-app.v0.1"
@@ -242,6 +262,24 @@ def parse_required_capabilities(payload: Mapping[str, Any]) -> list[str]:
         if name not in found:
             found.append(name)
     return found
+
+
+def budget_from_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Goal budget from a submit body.
+
+    A missing key keeps today's default. An explicit null or non-object is
+    ``invalid_request``. Unknown keys are kept. Bad types of known fields are
+    ``invalid_request`` and are not coerced.
+    """
+    if "budget" not in payload:
+        return {"wall_sec": 300, "max_reworks": 1}
+    raw = payload.get("budget")
+    if not isinstance(raw, Mapping):
+        raise AppError("budget must be an object")
+    try:
+        return normalize_budget(raw)
+    except BudgetValidationError as exc:
+        raise AppError(str(exc)) from exc
 
 
 def parse_acknowledge_prompt_only(payload: Mapping[str, Any]) -> bool:
@@ -1121,6 +1159,8 @@ class AppCoordinator:
         workspaces_root: str | Path,
         max_parallel_per_goal: int = 2,
         max_parallel_global: int = 4,
+        stale_after_sec: float = 120.0,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self.layer = layer
         self.planner = planner or DeterministicPlanner()
@@ -1128,6 +1168,12 @@ class AppCoordinator:
         self.workspaces_root = Path(workspaces_root)
         self.max_parallel_per_goal = as_limit(max_parallel_per_goal) or 2
         self.max_parallel_global = as_limit(max_parallel_global) or 4
+        try:
+            stale = float(stale_after_sec)
+        except (TypeError, ValueError):
+            stale = 120.0
+        self.stale_after_sec = stale if stale > 0 else 120.0
+        self._clock = clock or time.time
         # Claims whose start_run is in progress in this process. A running
         # task with no run_id is "dispatch in progress" only while its token
         # is here; a restarted process fails that task closed.
@@ -1136,6 +1182,34 @@ class AppCoordinator:
         # coordination so a queued Task is dispatched at most once by this
         # service instance. Released only around start_run.
         self._lock = threading.RLock()
+
+    def now(self) -> float:
+        return float(self._clock())
+
+    def _service_caps(self) -> dict[str, Any]:
+        fn = getattr(self.backend, "capabilities", None)
+        if not callable(fn):
+            return {}
+        try:
+            raw = fn()
+        except Exception:
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    def goal_progress_view(
+        self,
+        snap: Mapping[str, Any],
+        scheduler: Mapping[str, Any] | None,
+        caps: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        progress_cap = caps.get("progress") if isinstance(caps.get("progress"), Mapping) else {}
+        return derive_goal_progress(
+            snap,
+            scheduler=scheduler,
+            capability=progress_cap,
+            stale_after_sec=self.stale_after_sec,
+            now=self.now(),
+        )
 
     def process_all(self) -> dict[str, Any]:
         with self._lock:
@@ -1347,22 +1421,54 @@ class AppCoordinator:
         snap = current["goal"]
         if snap.get("state") in self._TICK_TERMINAL:
             return None
-        reason = budget_block_reason(snap)
+        reason = budget_block_reason(snap, now=self.now())
         if not reason:
             return None
         tasks = [t for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
+        created = snap.get("created_at")
+        elapsed = None
+        if isinstance(created, (int, float)) and not isinstance(created, bool):
+            elapsed = self.now() - float(created)
+        checkpoints: list[dict[str, Any]] = []
+        last_progress_at = None
+        last_progress_epoch: float | None = None
+        wall = "wall_sec" in reason
         for task in tasks:
             if str(task.get("status") or "") not in IN_FLIGHT:
                 continue
             run_id = str(task.get("run_id") or "").strip()
+            observed: Mapping[str, Any] | None = None
             if run_id:
                 try:
-                    self.backend.cancel(run_id)
+                    raw_obs = self.backend.observe_run(run_id)
                 except Exception:
-                    pass
+                    raw_obs = None
+                if isinstance(raw_obs, Mapping):
+                    observed = raw_obs
+            progress = self._progress_from_observation(
+                observed,
+                workspace=str(task.get("workspace") or ""),
+            )
+            if progress:
+                self.layer.record_task_progress(goal_id, str(task.get("task_id") or ""), progress)
+            ck = progress.get("artifacts_checkpoint") if isinstance(progress.get("artifacts_checkpoint"), list) else []
+            for item in ck:
+                if isinstance(item, Mapping) and len(checkpoints) < 32:
+                    checkpoints.append(dict(item))
+            lp = progress.get("last_progress_at")
+            lp_epoch = parse_iso(lp)
+            if lp_epoch is not None and (last_progress_epoch is None or lp_epoch > last_progress_epoch):
+                last_progress_epoch = lp_epoch
+                last_progress_at = lp if isinstance(lp, str) else None
+            if run_id:
+                self._cancel_run(run_id)
             result: dict[str, Any] = {"ok": False, "run_id": run_id, "error": reason}
-            if "wall_sec" in reason:
+            if wall:
                 result["error_source"] = "worker_timeout"
+                if elapsed is not None:
+                    result["elapsed"] = elapsed
+                result["last_progress_at"] = last_progress_at
+                result["artifacts_checkpoint"] = list(ck)
             self.layer.finish_task(
                 goal_id,
                 str(task.get("task_id") or ""),
@@ -1370,8 +1476,381 @@ class AppCoordinator:
                 close_goal=True,
                 result=result,
             )
-        failed = self.layer.fail_goal(goal_id, phase="budget", error=reason)
+        extra = None
+        if wall:
+            extra = {
+                "elapsed": elapsed,
+                "last_progress_at": last_progress_at,
+                "artifacts_checkpoint": checkpoints,
+            }
+        failed = self.layer.fail_goal(goal_id, phase="budget", error=reason, extra=extra)
         return {**failed, "action": "budget_exhausted"}
+
+    def _cancel_run(self, run_id: str) -> None:
+        if not str(run_id or "").strip():
+            return
+        try:
+            self.backend.cancel(run_id)
+        except Exception:
+            return
+
+    def _progress_from_observation(self, observation: Mapping[str, Any] | None, *, workspace: str) -> dict[str, Any]:
+        raw: dict[str, Any] = {}
+        if isinstance(observation, Mapping) and isinstance(observation.get("progress"), Mapping):
+            raw = dict(observation["progress"])
+        if isinstance(observation, Mapping):
+            usage = observation.get("usage")
+            if isinstance(usage, Mapping) and "usage" not in raw and "usage_fields" not in raw:
+                raw["usage"] = dict(usage)
+            calls = tool_call_total(observation if isinstance(observation, Mapping) else None)
+            if calls is not None and "tool_calls" not in raw:
+                raw["tool_calls"] = calls
+        if workspace and not raw.get("artifacts_checkpoint"):
+            entries, latest = artifact_checkpoint(workspace)
+            if entries:
+                raw["artifacts_checkpoint"] = entries
+            if latest is not None and not raw.get("last_progress_at"):
+                raw["last_progress_at"] = utc_iso(latest)
+        if not raw:
+            return {}
+        return bound_task_progress(raw)
+
+    def _note_task_progress(
+        self,
+        goal_id: str,
+        task_id: str,
+        observation: Mapping[str, Any] | None,
+        *,
+        workspace: str,
+    ) -> None:
+        progress = self._progress_from_observation(observation, workspace=workspace)
+        if not progress:
+            return
+        self.layer.record_task_progress(goal_id, task_id, progress)
+
+    def _meter_source(self, caps: Mapping[str, Any]) -> str:
+        metering = caps.get("metering") if isinstance(caps.get("metering"), Mapping) else {}
+        source = str(metering.get("source") or "")
+        if source in {"worker_self_reported", "none"}:
+            return source
+        usage = caps.get("usage") if isinstance(caps.get("usage"), Mapping) else {}
+        if usage.get("source") == "worker_self_reported":
+            return "worker_self_reported"
+        return "none"
+
+    def _usage_rows(self, tasks: list[Mapping[str, Any]]) -> tuple[int, int, dict[str, dict[str, Any]], str]:
+        """Sum reported totals across in-flight tasks. Returns tokens, tool calls, fields, source."""
+        caps = self._service_caps()
+        source = self._meter_source(caps)
+        if source == "none":
+            source = "worker_self_reported"
+        tokens = 0
+        calls = 0
+        saw_tokens = False
+        saw_calls = False
+        fields_by_task: dict[str, dict[str, Any]] = {}
+        for task in tasks:
+            if str(task.get("status") or "") not in IN_FLIGHT:
+                continue
+            progress = task.get("progress") if isinstance(task.get("progress"), Mapping) else {}
+            fields = usage_fields(progress.get("usage_fields"))
+            tid = str(task.get("task_id") or "")
+            if fields:
+                fields_by_task[tid] = fields
+            total = token_total(fields)
+            if total is not None:
+                saw_tokens = True
+                tokens += total
+            counted = progress.get("tool_calls")
+            if isinstance(counted, int) and not isinstance(counted, bool) and counted >= 0:
+                saw_calls = True
+                calls += counted
+        return (tokens if saw_tokens else -1), (calls if saw_calls else -1), fields_by_task, source
+
+    def _enforce_live(self, goal_id: str) -> dict[str, Any] | None:
+        current = self.layer.get_goal(goal_id)
+        if not current.get("ok"):
+            return None
+        snap = current["goal"]
+        if snap.get("state") in self._TICK_TERMINAL:
+            return None
+        budget = budget_of(snap)
+        if budget_mode(budget) != "enforce":
+            return None
+        caps = self._service_caps()
+        tasks = [t for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
+        token_sum, call_sum, fields_by_task, source = self._usage_rows(tasks)
+        tripped: tuple[str, int, int, str] | None = None
+        limit_tokens = budget.get("max_tokens")
+        if (
+            enforcement_level(caps, "max_tokens") == "enforced_live"
+            and isinstance(limit_tokens, int)
+            and not isinstance(limit_tokens, bool)
+            and token_sum >= 0
+            and token_sum > limit_tokens
+        ):
+            tripped = ("max_tokens", int(limit_tokens), int(token_sum), "enforced_live")
+        limit_calls = budget.get("max_tool_calls")
+        if tripped is None and (
+            enforcement_level(caps, "max_tool_calls") == "enforced_live"
+            and isinstance(limit_calls, int)
+            and not isinstance(limit_calls, bool)
+            and call_sum >= 0
+            and call_sum > limit_calls
+        ):
+            tripped = ("max_tool_calls", int(limit_calls), int(call_sum), "enforced_live")
+        if tripped is None:
+            return None
+        field, limit, used, level = tripped
+        self.layer.set_budget_status(
+            goal_id,
+            {
+                field: {
+                    "limit": limit,
+                    "used": used,
+                    "source": source,
+                    "exceeded": True,
+                    "enforced": level,
+                }
+            },
+        )
+        error = f"budget_exceeded {field}"
+        for task in tasks:
+            if str(task.get("status") or "") not in IN_FLIGHT:
+                continue
+            run_id = str(task.get("run_id") or "").strip()
+            self._cancel_run(run_id)
+            tid = str(task.get("task_id") or "")
+            fields = fields_by_task.get(tid) or {}
+            result: dict[str, Any] = {"ok": False, "run_id": run_id, "error": error}
+            if fields:
+                result["usage"] = dict(fields)
+                report = usage_report(fields, source=source)
+                if report:
+                    result["usage_report"] = report
+            self.layer.finish_task(goal_id, tid, succeeded=False, close_goal=False, result=result)
+        reconciled = self.layer.reconcile_goal_progress(goal_id)
+        return {
+            "ok": False,
+            "goal_id": goal_id,
+            "state": reconciled.get("state") or "failed",
+            "action": "budget_exceeded",
+            "error": error,
+        }
+
+    def _enforce_no_progress(self, goal_id: str, task_id: str) -> dict[str, Any] | None:
+        current = self.layer.get_goal(goal_id)
+        if not current.get("ok"):
+            return None
+        snap = current["goal"]
+        if snap.get("state") in self._TICK_TERMINAL:
+            return None
+        budget = budget_of(snap)
+        limit = budget.get("no_progress_sec")
+        if not isinstance(limit, (int, float)) or isinstance(limit, bool) or float(limit) <= 0:
+            return None
+        caps = self._service_caps()
+        if enforcement_level(caps, "no_progress_sec") != "enforced":
+            return None
+        tasks = [t for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
+        task = next((t for t in tasks if str(t.get("task_id") or "") == task_id), None)
+        if task is None or str(task.get("status") or "") != "running":
+            return None
+        pending = [
+            d
+            for d in (snap.get("pending_decisions") or [])
+            if isinstance(d, Mapping) and str(d.get("task_id") or "") == task_id
+        ]
+        if pending:
+            return None
+        progress = task.get("progress") if isinstance(task.get("progress"), Mapping) else {}
+        anchor = parse_iso(progress.get("last_progress_at"))
+        if anchor is None:
+            started = task.get("run_started_at")
+            if isinstance(started, (int, float)) and not isinstance(started, bool):
+                anchor = float(started)
+        if anchor is None:
+            return None
+        if self.now() - anchor < float(limit):
+            return None
+        mode = budget_mode(budget)
+        label = format_seconds(float(limit))
+        if mode != "enforce":
+            self.layer.set_budget_status(
+                goal_id,
+                {
+                    "no_progress_sec": {
+                        "limit": float(limit),
+                        "exceeded": True,
+                        "enforced": "report_only",
+                    }
+                },
+            )
+            return None
+        run_id = str(task.get("run_id") or "").strip()
+        self._cancel_run(run_id)
+        checkpoint = progress.get("artifacts_checkpoint") if isinstance(progress.get("artifacts_checkpoint"), list) else []
+        if on_no_progress(budget) == "fail":
+            failed = self._fail_task(
+                goal_id,
+                task_id,
+                {
+                    "ok": False,
+                    "run_id": run_id,
+                    "error": "no_progress_timeout",
+                    "last_progress_at": progress.get("last_progress_at"),
+                    "artifacts_checkpoint": list(checkpoint),
+                },
+            )
+            return {**failed, "action": "task_finished"}
+        summary = f"checkpoint: no progress for {label}s"
+        workspace = str(task.get("workspace") or "")
+        self.layer.append_goal_warnings(goal_id, [summary])
+        opened = self.layer.open_checkpoint(
+            goal_id,
+            task_id=task_id,
+            run_id=run_id,
+            summary=summary,
+            result={
+                "ok": False,
+                "run_id": run_id,
+                "workspace": workspace,
+                "partial": True,
+                "need_human": True,
+                "artifacts_checkpoint": list(checkpoint),
+                "last_progress_at": progress.get("last_progress_at"),
+                "error": summary,
+            },
+            reason=summary,
+        )
+        decision = opened.get("decision") if isinstance(opened.get("decision"), Mapping) else {}
+        return {
+            "ok": True,
+            "goal_id": goal_id,
+            "state": "running",
+            "action": "decision_required",
+            "decision_id": decision.get("decision_id"),
+        }
+
+    def _enforce_budgets(self, goal_id: str, task_id: str) -> dict[str, Any] | None:
+        live = self._enforce_live(goal_id)
+        if live is not None:
+            return live
+        return self._enforce_no_progress(goal_id, task_id)
+
+    def _attach_usage_report(self, result: Any) -> Any:
+        if not isinstance(result, dict) or not isinstance(result.get("usage"), Mapping):
+            return result
+        source = self._meter_source(self._service_caps())
+        if source == "none":
+            source = "worker_self_reported"
+        report = usage_report(result.get("usage"), source=source)
+        if not report:
+            return result
+        out = dict(result)
+        out["usage_report"] = report
+        return out
+
+    def _post_hoc_budget(self, snap: Mapping[str, Any], task: Mapping[str, Any], result: Any) -> dict[str, Any] | None:
+        """After a run is collected. Post-hoc overage parks the task; it does not drop artifacts."""
+        if not isinstance(result, dict):
+            return None
+        goal_id = str(snap.get("goal_id") or "")
+        task_id = str(task.get("task_id") or "")
+        if not goal_id or not task_id:
+            return None
+        budget = budget_of(snap)
+        caps = self._service_caps()
+        mode = budget_mode(budget)
+        source = self._meter_source(caps)
+        if source == "none":
+            source = "worker_self_reported"
+        fields = usage_fields(result.get("usage"))
+        warnings: list[str] = []
+        parked_summary = ""
+        status_row: dict[str, Any] = {}
+        limit_tokens = budget.get("max_tokens")
+        used_tokens = token_total(fields)
+        token_level = enforcement_level(caps, "max_tokens")
+        if (
+            isinstance(limit_tokens, int)
+            and not isinstance(limit_tokens, bool)
+            and used_tokens is not None
+            and token_level in {"post_hoc", "enforced_live"}
+            and used_tokens > limit_tokens
+        ):
+            status_row["max_tokens"] = {
+                "limit": int(limit_tokens),
+                "used": int(used_tokens),
+                "source": source,
+                "exceeded": True,
+                "enforced": token_level,
+            }
+            if mode == "enforce" and token_level == "post_hoc":
+                result["budget_exceeded"] = True
+                parked_summary = "budget exceeded: continue or stop"
+                warnings.append("budget max_tokens exceeded (post_hoc); not a bill")
+            elif mode == "enforce" and token_level == "enforced_live":
+                result["ok"] = False
+                result["budget_exceeded"] = True
+                result["error"] = "budget_exceeded max_tokens"
+                self._cancel_run(str(result.get("run_id") or task.get("run_id") or ""))
+                warnings.append("budget max_tokens exceeded; not a bill")
+            elif mode != "enforce":
+                warnings.append("budget max_tokens exceeded (report_only); not a bill")
+        calls = tool_call_total(result)
+        limit_calls = budget.get("max_tool_calls")
+        call_level = enforcement_level(caps, "max_tool_calls")
+        if (
+            not parked_summary
+            and isinstance(limit_calls, int)
+            and not isinstance(limit_calls, bool)
+            and calls is not None
+            and call_level in {"post_hoc", "enforced_live"}
+            and calls > limit_calls
+        ):
+            status_row["max_tool_calls"] = {
+                "limit": int(limit_calls),
+                "used": int(calls),
+                "source": source,
+                "exceeded": True,
+                "enforced": call_level,
+            }
+            if mode == "enforce" and call_level == "post_hoc":
+                result["budget_exceeded"] = True
+                parked_summary = "budget exceeded: continue or stop"
+                warnings.append("budget max_tool_calls exceeded (post_hoc); not a bill")
+            elif mode == "enforce" and call_level == "enforced_live":
+                result["ok"] = False
+                result["budget_exceeded"] = True
+                result["error"] = "budget_exceeded max_tool_calls"
+                self._cancel_run(str(result.get("run_id") or task.get("run_id") or ""))
+                warnings.append("budget max_tool_calls exceeded; not a bill")
+            elif mode != "enforce":
+                warnings.append("budget max_tool_calls exceeded (report_only); not a bill")
+        if status_row:
+            self.layer.set_budget_status(goal_id, status_row)
+        if warnings:
+            self.layer.append_goal_warnings(goal_id, warnings)
+        if not parked_summary or mode != "enforce":
+            return None
+        run_id = str(result.get("run_id") or task.get("run_id") or "")
+        opened = self.layer.open_checkpoint(
+            goal_id,
+            task_id=task_id,
+            run_id=run_id,
+            summary=parked_summary,
+            result=result,
+            reason=parked_summary,
+        )
+        decision = opened.get("decision") if isinstance(opened.get("decision"), Mapping) else {}
+        return {
+            "ok": True,
+            "goal_id": goal_id,
+            "state": "running",
+            "action": "decision_required",
+            "decision_id": decision.get("decision_id"),
+        }
 
     def _fail_task(self, goal_id: str, task_id: str, result: Mapping[str, Any]) -> dict[str, Any]:
         finished = self.layer.finish_task(
@@ -1484,27 +1963,73 @@ class AppCoordinator:
             goal_id=goal_id,
         )
 
+    def _after_observe(
+        self,
+        snap: Mapping[str, Any],
+        task: Mapping[str, Any],
+        observation: Mapping[str, Any],
+        *,
+        observe_error: str,
+    ) -> dict[str, Any]:
+        """Record progress, collect a finished run, or enforce budgets on a busy one."""
+        goal_id = str(snap.get("goal_id") or task.get("goal_id") or "")
+        task_id = str(task.get("task_id") or "")
+        run_id = str(task.get("run_id") or "").strip()
+        self._note_task_progress(
+            goal_id,
+            task_id,
+            observation,
+            workspace=str(task.get("workspace") or ""),
+        )
+        if not observation.get("busy"):
+            try:
+                result = self.backend.collect_result(run_id)
+            except Exception as exc:
+                result = {"ok": False, "run_id": run_id, "error": f"{observe_error}: {type(exc).__name__}"}
+            fresh = self.layer.get_goal(goal_id)
+            if fresh.get("ok") and isinstance(fresh.get("goal"), Mapping):
+                snap = fresh["goal"]
+            return self._finish_gated(snap, task, result)
+        enforced = self._enforce_budgets(goal_id, task_id)
+        if enforced is not None:
+            return enforced
+        return {"ok": True, "goal_id": goal_id, "state": "running", "action": "worker_running"}
+
     def _observe_fresh_run(self, snap: Mapping[str, Any], task: Mapping[str, Any]) -> dict[str, Any]:
-        """Observe a run that was just bound. Do not open decisions yet."""
+        """Observe a run that was just bound. Do not open permission decisions yet."""
         goal_id = str(snap.get("goal_id") or task.get("goal_id") or "")
         run_id = str(task.get("run_id") or "").strip()
         try:
             observation = self.backend.observe_run(run_id)
-            if isinstance(observation, Mapping) and observation.get("busy"):
-                return {"ok": True, "goal_id": goal_id, "state": "running", "action": "worker_running"}
-            result = self.backend.collect_result(run_id)
+            if not isinstance(observation, Mapping):
+                raise TypeError("observe_run did not return an object")
         except Exception as exc:
             result = {
                 "ok": False,
                 "run_id": run_id,
                 "error": f"backend observation failed: {type(exc).__name__}",
             }
-        return self._finish_gated(snap, task, result)
+            return self._finish_gated(snap, task, result)
+        return self._after_observe(snap, task, observation, observe_error="backend observation failed")
 
     def _observe_running_task(self, snap: Mapping[str, Any], task: Mapping[str, Any]) -> dict[str, Any] | None:
         """Poll one running task. A decision resolved here is not observed again this tick."""
         goal_id = str(snap.get("goal_id") or task.get("goal_id") or "")
         task_id = str(task.get("task_id") or "")
+        fresh = self.layer.get_goal(goal_id)
+        if fresh.get("ok") and isinstance(fresh.get("goal"), Mapping):
+            snap = fresh["goal"]
+            found = next(
+                (
+                    row
+                    for row in (snap.get("tasks") or [])
+                    if isinstance(row, Mapping) and str(row.get("task_id") or "") == task_id
+                ),
+                None,
+            )
+            if found is None or str(found.get("status") or "") != "running":
+                return None
+            task = found
         existing_decision = next(
             (
                 d
@@ -1539,6 +2064,17 @@ class AppCoordinator:
                 {"ok": False, "run_id": run_id, "error": pending_error or "pending action scan failed"},
             )
         if pending:
+            try:
+                early = self.backend.observe_run(run_id)
+            except Exception:
+                early = None
+            if isinstance(early, Mapping):
+                self._note_task_progress(
+                    goal_id,
+                    task_id,
+                    early,
+                    workspace=str(task.get("workspace") or ""),
+                )
             action: Mapping[str, Any] = {}
             for candidate in pending:
                 if not isinstance(candidate, Mapping):
@@ -1621,16 +2157,16 @@ class AppCoordinator:
             return {**opened, "action": "decision_required"}
         try:
             observation = self.backend.observe_run(run_id)
-            if observation.get("busy"):
-                return {"ok": True, "goal_id": goal_id, "state": "running", "action": "worker_running"}
-            result = self.backend.collect_result(run_id)
+            if not isinstance(observation, Mapping):
+                raise TypeError("observe_run did not return an object")
         except Exception as e:
             result = {
                 "ok": False,
                 "run_id": run_id,
                 "error": f"backend resume failed: {type(e).__name__}",
             }
-        return self._finish_gated(snap, task, result)
+            return self._finish_gated(snap, task, result)
+        return self._after_observe(snap, task, observation, observe_error="backend resume failed")
 
     def _dispatch_one(self, goal_id: str, task_id: str) -> dict[str, Any] | None:
         """Claim, handoff, start_run outside the coordinator lock, then bind.
@@ -1732,6 +2268,7 @@ class AppCoordinator:
             )
             if not bound.get("ok"):
                 return {"_return": bound}
+            self.layer.mark_run_started(goal_id, task_id, started_at=self.now())
             bound_task = bound.get("task") if isinstance(bound.get("task"), Mapping) else {}
             if bound_task.get("workspace"):
                 task["workspace"] = bound_task.get("workspace")
@@ -1839,6 +2376,10 @@ class AppCoordinator:
         result = self._with_trusted_workspace(task, result)
         result = self._apply_agy_acceptance(snap, task, result)
         result = _gate_backend_result(snap, task, result)
+        result = self._attach_usage_report(result)
+        parked = self._post_hoc_budget(snap, task, result)
+        if parked is not None:
+            return parked
         goal_id = str(snap.get("goal_id") or "")
         if isinstance(result, Mapping):
             warns = [
@@ -2502,6 +3043,8 @@ class CollabApplication:
         connection_probe: Callable[[], Mapping[str, Any]] | None = None,
         max_parallel_per_goal: int = 2,
         max_parallel_global: int = 4,
+        stale_after_sec: float = 120.0,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self.persist_root = Path(persist_root)
         self.layer = DurableLayer.open(self.persist_root, use_cache=False)
@@ -2515,6 +3058,8 @@ class CollabApplication:
             workspaces_root=self.persist_root / "workspaces",
             max_parallel_per_goal=self.max_parallel_per_goal,
             max_parallel_global=self.max_parallel_global,
+            stale_after_sec=stale_after_sec,
+            clock=clock,
         )
         self._connection_probe = connection_probe
 
@@ -2540,7 +3085,7 @@ class CollabApplication:
             "Do not modify system settings or install software",
             "Do not write outside the assigned task workspace",
         ]
-        budget = payload.get("budget") if isinstance(payload.get("budget"), Mapping) else {"wall_sec": 300, "max_reworks": 1}
+        budget = budget_from_payload(payload)
         submit_key = str(payload.get("idempotency_key") or payload.get("request_id") or "").strip()
         if not submit_key:
             submit_key = f"req_{uuid.uuid4().hex}"
@@ -2573,6 +3118,14 @@ class CollabApplication:
                 code="capability_unavailable",
                 extra={"missing": ["external_input_enforcement"], "capabilities": caps},
             )
+        budget_missing, budget_warnings = budget_submit_issues(budget, caps)
+        if budget_missing:
+            raise AppError(
+                "budget field is not enforceable on this backend",
+                status=409,
+                code="capability_unavailable",
+                extra={"missing": budget_missing, "capabilities": caps},
+            )
         goal = {
             "title": title,
             "desired_outcome": goal_text,
@@ -2588,8 +3141,14 @@ class CollabApplication:
             goal["external_inputs"] = external_inputs
         if input_manifest:
             goal["input_manifest"] = input_manifest
+        submit_warnings: list[str] = []
         if external_inputs and prompt_only_skip_blocked(caps) and acknowledge_prompt_only:
-            goal["warnings"] = [SKIP_PERMISSIONS_WARNING]
+            submit_warnings.append(SKIP_PERMISSIONS_WARNING)
+        for text in budget_warnings:
+            if text not in submit_warnings:
+                submit_warnings.append(text)
+        if submit_warnings:
+            goal["warnings"] = submit_warnings
         result = self.layer.submit_goal(
             submit_key=submit_key,
             title=title,
@@ -2666,6 +3225,9 @@ class CollabApplication:
             "planner": str(planner.get("name") or ""),
         }
         out["scheduler"] = self.coordinator.scheduler_snapshot(goal_id, snap, caps)
+        raw_budget_status = snap.get("budget_status")
+        out["budget_status"] = dict(raw_budget_status) if isinstance(raw_budget_status, Mapping) else {}
+        out["progress"] = self.coordinator.goal_progress_view(snap, out["scheduler"], caps)
         # Pending decisions are not task failures. Observation-window timeouts
         # never reach this method; they are a client wait, not a goal state.
         if str(out.get("state") or "") == "failed" and not pending:
@@ -2995,6 +3557,56 @@ class CollabApplication:
         }
 
 
+    def _apply_checkpoint_verdict(self, goal_id: str, decision: Mapping[str, Any]) -> None:
+        """Human continue retries once. Stop fails the task and keeps files.
+
+        Continue is not a grant. A second resolve of the same decision is
+        idempotent and does not reach this method.
+        """
+        task_id = str(decision.get("task_id") or "")
+        verdict = str(decision.get("verdict_class") or decision.get("verdict") or "")
+        if verdict == "continue":
+            requeued = self.layer.requeue_checkpoint_task(goal_id, task_id)
+            if not requeued.get("ok"):
+                raise AppError(
+                    str(requeued.get("error") or requeued.get("reason") or "checkpoint continue failed"),
+                    status=409,
+                    code=str(requeued.get("reason") or "checkpoint_continue_failed"),
+                )
+            return
+        if verdict != "stop":
+            return
+        current = self.layer.get_goal(goal_id)
+        snap = current.get("goal") if isinstance(current.get("goal"), Mapping) else {}
+        task = next(
+            (
+                row
+                for row in (snap.get("tasks") or [])
+                if isinstance(row, Mapping) and str(row.get("task_id") or "") == task_id
+            ),
+            None,
+        )
+        prior = task.get("result") if isinstance(task, Mapping) and isinstance(task.get("result"), Mapping) else {}
+        stopped = dict(prior)
+        stopped["ok"] = False
+        if not str(stopped.get("error") or "").strip():
+            stopped["error"] = "checkpoint stop"
+        stopped["checkpoint_stopped"] = True
+        finished = self.layer.finish_task(
+            goal_id,
+            task_id,
+            succeeded=False,
+            close_goal=False,
+            result=stopped,
+        )
+        if not finished.get("ok"):
+            raise AppError(
+                str(finished.get("error") or finished.get("reason") or "checkpoint stop failed"),
+                status=409,
+                code=str(finished.get("reason") or "checkpoint_stop_failed"),
+            )
+        self.layer.reconcile_goal_progress(goal_id)
+
     def resolve(self, goal_id: str, decision_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         current = self.layer.get_goal(goal_id)
         if not current.get("ok"):
@@ -3072,6 +3684,9 @@ class CollabApplication:
         )
         if not out.get("ok"):
             raise AppError(str(out.get("error") or out.get("reason")), status=409, code=str(out.get("reason")))
+        decision = out.get("decision") if isinstance(out.get("decision"), Mapping) else {}
+        if str(decision.get("kind") or "") == KIND_CHECKPOINT and not out.get("idempotent"):
+            self._apply_checkpoint_verdict(goal_id, decision)
         # External decision applied to the worker — resume coordination without waiting for a separate tick.
         try:
             tick = self.coordinator.process_goal(goal_id)

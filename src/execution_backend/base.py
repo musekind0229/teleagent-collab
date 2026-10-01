@@ -6,6 +6,12 @@ from collections.abc import Mapping, Sequence
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
+from framework.progress_budget import (
+    budget_enforcement_capability,
+    metering_capability,
+    progress_capability,
+)
+
 # Same token as framework.app_service.API_VERSION. Kept here so backends do not
 # import the application facade (that import is the other direction).
 CAPABILITIES_API_VERSION = "collab-app.v0.1"
@@ -134,7 +140,20 @@ def default_capabilities(
             "lead_review": False,
             "executable_checks": False,
         },
-        "progress": {"available": False},
+        "progress": progress_capability(
+            available=False,
+            heartbeat=False,
+            artifact_checkpoint=False,
+            subagent_observability="unknown",
+        ),
+        "metering": metering_capability(
+            live_usage=False,
+            usage_at_end=False,
+            tool_calls=False,
+            fields=[],
+            source="none",
+        ),
+        "budget_enforcement": budget_enforcement_capability(),
         "usage": {"source": "unknown"},
         "concurrency": {"max_runs": "unknown", "limited_by": []},
         "warnings": [],

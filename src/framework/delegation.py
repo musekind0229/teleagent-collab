@@ -25,6 +25,7 @@ REASON_UNKNOWN_ESCALATE = "unknown_escalate_kind"
 KIND_ESCALATE_OVER_BUDGET = "escalate_over_budget"
 KIND_ESCALATE_OUT_OF_SCOPE = "escalate_out_of_scope"
 KIND_ESCALATE_INSUFFICIENT_AUTH = "escalate_insufficient_auth"
+KIND_CHECKPOINT = "checkpoint"
 
 ESCALATE_KINDS = frozenset(
     {
@@ -60,6 +61,12 @@ _ACTION_VERDICTS = {
     "deny": VERDICT_CLASS_DENY,
     "reject": VERDICT_CLASS_DENY,
     "fail": VERDICT_CLASS_DENY,
+}
+
+# Checkpoint continue/stop is a human verdict, never a grant and never a retry by itself.
+_CHECKPOINT_VERDICTS = {
+    "continue": "continue",
+    "stop": "stop",
 }
 
 _ESCALATE_VERDICTS = {
@@ -308,6 +315,8 @@ def classify_verdict(verdict: Any, *, kind: str = "", return_to_upper: bool = Fa
     raw = _norm(verdict).lower().replace("-", "_").replace(" ", "_")
     if not raw:
         return ""
+    if _norm(kind) == KIND_CHECKPOINT and not return_to_upper:
+        return _CHECKPOINT_VERDICTS.get(raw, "")
     if is_escalate_kind(kind, return_to_upper=return_to_upper):
         return _ESCALATE_VERDICTS.get(raw, "")
     return _ACTION_VERDICTS.get(raw, "")

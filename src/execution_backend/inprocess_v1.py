@@ -16,6 +16,7 @@ from execution_backend.base import (
     default_capabilities,
     unsupported,
 )
+from framework.progress_budget import artifact_checkpoint, budget_enforcement_capability, metering_capability, progress_capability, sanitize_event, utc_iso
 
 
 class InProcessExecutionBackend(ExecutionBackendABC):
@@ -43,6 +44,24 @@ class InProcessExecutionBackend(ExecutionBackendABC):
         caps["acceptance"]["lead_review"] = False
         caps["acceptance"]["executable_checks"] = False
         caps["usage"]["source"] = "unknown"
+        caps["progress"] = progress_capability(
+            available=True,
+            heartbeat=False,
+            artifact_checkpoint=True,
+            subagent_observability=False,
+        )
+        caps["metering"] = metering_capability(
+            live_usage=False,
+            usage_at_end=False,
+            tool_calls=False,
+            fields=[],
+            source="none",
+        )
+        caps["budget_enforcement"] = budget_enforcement_capability(
+            max_tokens="unsupported",
+            max_tool_calls="unsupported",
+            no_progress_sec="enforced",
+        )
         caps["concurrency"] = {"max_runs": 8, "limited_by": ["inprocess"]}
         caps["warnings"] = []
         return caps
@@ -122,6 +141,37 @@ class InProcessExecutionBackend(ExecutionBackendABC):
             "contract_version": "contract.v0.1-draft",
         }
 
+    def _progress(self, rec: Mapping[str, Any]) -> dict[str, Any]:
+        """Phase from the in-process state machine. Heartbeat stays at start.
+
+        Events name the state only. Instruction and title are not copied.
+        """
+        state = str(rec.get("state") or "")
+        finish = str(rec.get("finish") or "")
+        if rec.get("cancelled") or state in {"succeeded", "failed", "cancelled"} or finish in {"stop", "error", "cancelled", "complete", "completed"}:
+            phase = "done"
+        elif state in {"running", "writing"}:
+            phase = "executing"
+        elif finish:
+            phase = "done"
+        else:
+            phase = "starting"
+        started = rec.get("started_at")
+        heartbeat = None
+        if isinstance(started, (int, float)) and not isinstance(started, bool):
+            heartbeat = utc_iso(float(started))
+        entries, latest = artifact_checkpoint(str(rec.get("directory") or ""))
+        progress_at = utc_iso(latest) if latest is not None else heartbeat
+        event = sanitize_event(f"state {state or 'unknown'}")
+        return {
+            "phase": phase,
+            "last_heartbeat_at": heartbeat,
+            "last_progress_at": progress_at,
+            "events": [event] if event else [],
+            "source": "runner",
+            "artifacts_checkpoint": entries,
+        }
+
     def _get(self, run_id: str) -> dict[str, Any]:
         rec = self._runs.get(run_id)
         if rec is None:
@@ -167,6 +217,7 @@ class InProcessExecutionBackend(ExecutionBackendABC):
             "errored": errored,
             "readonly": True,
             "backend": self.backend_id,
+            "progress": self._progress(rec),
         }
 
     def collect_result(self, run_id: str) -> dict[str, Any]:

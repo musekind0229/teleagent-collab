@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
@@ -20,9 +21,82 @@ from execution_backend.base import (
     default_capabilities,
 )
 from framework.artifact_handoff import HandoffError, copy_staged_inputs
+from framework.progress_budget import (
+    artifact_checkpoint,
+    budget_enforcement_capability,
+    metering_capability,
+    progress_capability,
+    sanitize_event,
+    utc_iso,
+)
 from win_collab.client import Client, KEYS
 from win_collab.core import TERMINAL, Engine, Store, external_directory_scope
 
+
+
+_SUPERVISED_PHASE = {
+    "queued": "starting",
+    "starting": "starting",
+    "running": "executing",
+    "stopping": "finalizing",
+    "passed": "done",
+    "failed": "done",
+    "cancelled": "done",
+    "timed_out": "done",
+    "awaiting_review": "executing",
+    "awaiting_action": "executing",
+    "awaiting_permission": "executing",
+}
+
+
+def supervised_progress(
+    *,
+    state: str,
+    now: float,
+    last_event_at: float | None,
+    event_kinds: list[str],
+    pending_kinds: list[str],
+    checkpoint: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Engine/store signals only. Event payloads are never copied.
+
+    An unrecognized job state stays unknown. A successful read refreshes the
+    heartbeat; last_progress_at is the last event time, not "now".
+    """
+    phase = _SUPERVISED_PHASE.get(str(state or ""))
+    if phase is None:
+        return {
+            "phase": "unknown",
+            "last_heartbeat_at": None,
+            "last_progress_at": None,
+            "events": [],
+            "source": "none",
+            "artifacts_checkpoint": list(checkpoint)[:32],
+        }
+    events: list[str] = []
+    if str(state).startswith("awaiting_"):
+        events.append(f"pending {str(state)[len('awaiting_'):]}")
+    for kind in pending_kinds:
+        text = sanitize_event(f"pending {kind}")
+        if text and text not in events:
+            events.append(text)
+    for kind in event_kinds:
+        text = sanitize_event(kind)
+        if text and text not in events:
+            events.append(text)
+        if len(events) >= 5:
+            break
+    progress_at = None
+    if isinstance(last_event_at, (int, float)) and not isinstance(last_event_at, bool):
+        progress_at = utc_iso(float(last_event_at))
+    return {
+        "phase": phase,
+        "last_heartbeat_at": utc_iso(float(now)),
+        "last_progress_at": progress_at,
+        "events": events[:5],
+        "source": "runner",
+        "artifacts_checkpoint": list(checkpoint)[:32],
+    }
 
 
 def _need_human_fields(error: str) -> dict:
@@ -103,6 +177,25 @@ class WindowsSupervisedExecutionBackend(ExecutionBackendABC):
         caps["acceptance"]["lead_review"] = True
         caps["acceptance"]["executable_checks"] = False
         caps["usage"]["source"] = "unknown"
+        # The store has job state and event times, not token or tool-call counts.
+        caps["progress"] = progress_capability(
+            available=True,
+            heartbeat="engine",
+            artifact_checkpoint=True,
+            subagent_observability="unknown",
+        )
+        caps["metering"] = metering_capability(
+            live_usage=False,
+            usage_at_end=False,
+            tool_calls=False,
+            fields=[],
+            source="none",
+        )
+        caps["budget_enforcement"] = budget_enforcement_capability(
+            max_tokens="unsupported",
+            max_tool_calls="unsupported",
+            no_progress_sec="enforced",
+        )
         # One desktop session lock. Parallel goals still queue; they do not fail.
         caps["concurrency"] = {"max_runs": 1, "limited_by": ["desktop_session_lock"]}
         caps["warnings"] = []
@@ -303,6 +396,28 @@ class WindowsSupervisedExecutionBackend(ExecutionBackendABC):
             errored = state in {"failed", "timed_out"}
             err = job.get("error") or ""
             nh = _need_human_fields(err)
+            event_rows = store.db.execute(
+                "SELECT time, kind FROM events WHERE job_id=? ORDER BY seq DESC LIMIT 5",
+                (job.get("id") or run_id,),
+            ).fetchall()
+            event_kinds = [str(row["kind"]) for row in reversed(event_rows) if row["kind"]]
+            last_event_at = float(event_rows[0]["time"]) if event_rows else None
+            pending_kinds: list[str] = []
+            for packet in store.inbox():
+                if not isinstance(packet, Mapping) or packet.get("job_id") != job.get("id"):
+                    continue
+                kind = str(packet.get("kind") or "").strip()
+                if kind and kind not in pending_kinds:
+                    pending_kinds.append(kind)
+            entries, _latest = artifact_checkpoint(str(job.get("workspace") or ""))
+            progress = supervised_progress(
+                state=state,
+                now=time.time(),
+                last_event_at=last_event_at,
+                event_kinds=event_kinds,
+                pending_kinds=pending_kinds,
+                checkpoint=entries,
+            )
             return {
                 "session_id": job.get("session_id") or "",
                 "native_handle": job.get("session_id") or run_id,
@@ -319,6 +434,7 @@ class WindowsSupervisedExecutionBackend(ExecutionBackendABC):
                 "backend": self.backend_id,
                 "need_human": bool(nh.get("need_human")),
                 "failure_reason": nh.get("failure_reason") or "",
+                "progress": progress,
             }
 
     def collect_result(self, run_id: str) -> dict[str, Any]:

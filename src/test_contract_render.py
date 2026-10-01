@@ -78,6 +78,13 @@ else:
             p = Path.cwd() / p
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(os.environ.get("AGY_FAKE_ARTIFACT_BODY", "hello from agy fake\n"), encoding="utf-8")
+hold = os.environ.get("AGY_FAKE_HOLD_SEC", "")
+if hold:
+    import time
+    try:
+        time.sleep(float(hold))
+    except ValueError:
+        pass
 payload = {
     "conversation_id": "conv_contract",
     "status": "ok",

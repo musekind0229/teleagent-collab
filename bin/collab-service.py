@@ -48,6 +48,16 @@ def _positive_int(text: str) -> int:
     return value
 
 
+def _positive_seconds(text: str) -> float:
+    try:
+        value = float(text)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"must be a number > 0, got {text!r}") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(f"must be a number > 0, got {text!r}")
+    return value
+
+
 def _positive_timeout(text: str) -> float:
     try:
         value = float(text)
@@ -311,6 +321,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--stale-after",
+        type=_positive_seconds,
+        default=120.0,
+        help=(
+            "While a task is running, a heartbeat older than this many seconds "
+            "is stale (number > 0). Default: 120. Unknown progress stays unknown."
+        ),
+    )
+    parser.add_argument(
         "--max-parallel-global",
         type=_positive_int,
         default=4,
@@ -389,6 +408,7 @@ def main(argv: list[str] | None = None) -> int:
         backend=backend,
         max_parallel_per_goal=args.max_parallel_per_goal,
         max_parallel_global=args.max_parallel_global,
+        stale_after_sec=args.stale_after,
     )
     if args.once:
         try:
@@ -416,6 +436,7 @@ def main(argv: list[str] | None = None) -> int:
                 "persist": str(persist),
                 "max_parallel_per_goal": args.max_parallel_per_goal,
                 "max_parallel_global": args.max_parallel_global,
+                "stale_after_sec": args.stale_after,
             },
             ensure_ascii=False,
         ),

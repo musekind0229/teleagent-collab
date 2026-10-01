@@ -36,6 +36,7 @@ from framework.delegation import (
     ESCALATE_KINDS,
     EVENT_CLASS_DECISION,
     EVENT_CLASS_STATUS,
+    KIND_CHECKPOINT,
     KIND_ESCALATE_INSUFFICIENT_AUTH,
     KIND_ESCALATE_OUT_OF_SCOPE,
     KIND_ESCALATE_OVER_BUDGET,
@@ -123,6 +124,7 @@ DECISION_KINDS = frozenset(
         KIND_ESCALATE_OVER_BUDGET,
         KIND_ESCALATE_OUT_OF_SCOPE,
         KIND_ESCALATE_INSUFFICIENT_AUTH,
+        KIND_CHECKPOINT,
         "return_to_upper",
     }
 ) | set(ESCALATE_KINDS)
@@ -1483,6 +1485,234 @@ class DurableLayer:
             self._persist_unlocked()
             return {"ok": True, "reason": REASON_READY, "task": found, "state": snap.get("state")}
 
+    def mark_run_started(self, goal_id: str, task_id: str, *, started_at: float) -> dict[str, Any]:
+        """Remember when this dispatch began. A retry clears it; a second call does not.
+
+        The coordinator clock is stored as-is. No history row: this fires on
+        every dispatch and must not count as a rework.
+        """
+        gid = _norm_key(goal_id)
+        tid = _norm_key(task_id)
+        try:
+            stamp = float(started_at)
+        except (TypeError, ValueError):
+            return {"ok": False, "reason": "bad_clock", "error": "started_at must be a number"}
+        with self._rmw():
+            snap = self.goals.get(gid)
+            if snap is None:
+                return {"ok": False, "reason": REASON_UNKNOWN_GOAL, "error": f"unknown goal_id {gid!r}"}
+            tasks = [dict(t) for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
+            found = next((t for t in tasks if t.get("task_id") == tid), None)
+            if found is None:
+                return {"ok": False, "reason": "unknown_task", "error": f"unknown task_id {tid!r}"}
+            if found.get("run_started_at") is None:
+                found["run_started_at"] = stamp
+                snap["tasks"] = tasks
+                self._touch(snap)
+                self._persist_unlocked()
+            return {"ok": True, "reason": REASON_READY, "task_id": tid, "run_started_at": found.get("run_started_at")}
+
+    def record_task_progress(self, goal_id: str, task_id: str, progress: Mapping[str, Any]) -> dict[str, Any]:
+        """Replace one task's progress snapshot. Does not append history."""
+        gid = _norm_key(goal_id)
+        tid = _norm_key(task_id)
+        body = dict(progress) if isinstance(progress, Mapping) else {}
+        with self._rmw():
+            snap = self.goals.get(gid)
+            if snap is None:
+                return {"ok": False, "reason": REASON_UNKNOWN_GOAL, "error": f"unknown goal_id {gid!r}"}
+            tasks = [dict(t) for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
+            found = next((t for t in tasks if t.get("task_id") == tid), None)
+            if found is None:
+                return {"ok": False, "reason": "unknown_task", "error": f"unknown task_id {tid!r}"}
+            found["progress"] = body
+            snap["tasks"] = tasks
+            self._touch(snap)
+            self._persist_unlocked()
+            return {"ok": True, "reason": REASON_READY, "task_id": tid}
+
+    def set_budget_status(self, goal_id: str, status: Mapping[str, Any]) -> dict[str, Any]:
+        """Merge goal-level budget_status. History is written once when exceeded flips on."""
+        gid = _norm_key(goal_id)
+        incoming = dict(status) if isinstance(status, Mapping) else {}
+        with self._rmw():
+            snap = self.goals.get(gid)
+            if snap is None:
+                return {"ok": False, "reason": REASON_UNKNOWN_GOAL, "error": f"unknown goal_id {gid!r}"}
+            current = dict(snap.get("budget_status") or {}) if isinstance(snap.get("budget_status"), Mapping) else {}
+            flipped: list[str] = []
+            for key, value in incoming.items():
+                name = _norm_key(key)
+                if not name:
+                    continue
+                prev = current.get(name) if isinstance(current.get(name), Mapping) else {}
+                new = dict(value) if isinstance(value, Mapping) else {"value": value}
+                was = bool(prev.get("exceeded")) if isinstance(prev, Mapping) else False
+                now_ex = bool(new.get("exceeded"))
+                if now_ex and not was:
+                    flipped.append(name)
+                current[name] = new
+            snap["budget_status"] = current
+            if flipped:
+                self._append_history(snap, "budget_status", fields=flipped)
+            self._touch(snap)
+            self._persist_unlocked()
+            return {"ok": True, "reason": REASON_READY, "budget_status": current, "flipped": flipped}
+
+    def open_checkpoint(
+        self,
+        goal_id: str,
+        *,
+        task_id: str,
+        summary: str,
+        run_id: str = "",
+        result: Mapping[str, Any] | None = None,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Park one running task and open a task-scoped checkpoint decision.
+
+        The goal stays running. A second call for the same task returns the
+        pending checkpoint instead of opening another. Continue/stop is not a grant.
+        """
+        gid = _norm_key(goal_id)
+        tid = _norm_key(task_id)
+        text = _norm_key(summary)[:500] or "checkpoint"
+        with self._rmw():
+            snap = self.goals.get(gid)
+            if snap is None:
+                return {"ok": False, "reason": REASON_UNKNOWN_GOAL, "error": f"unknown goal_id {gid!r}"}
+            pending = [dict(d) for d in (snap.get("pending_decisions") or []) if isinstance(d, Mapping)]
+            for row in pending:
+                if row.get("task_id") == tid and row.get("kind") == KIND_CHECKPOINT and row.get("status") == STATUS_PENDING:
+                    return {
+                        "ok": True,
+                        "reason": REASON_READY,
+                        "idempotent": True,
+                        "decision": row,
+                        "pending_count": len(pending),
+                    }
+            tasks = [dict(t) for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
+            found = next((t for t in tasks if t.get("task_id") == tid), None)
+            if found is None:
+                return {"ok": False, "reason": "unknown_task", "error": f"unknown task_id {tid!r}"}
+            src = _norm_key(found.get("status") or "") or "queued"
+            if src != "awaiting_decision":
+                try:
+                    assert_transition("task", src, "awaiting_decision")
+                except LifecycleError as e:
+                    return {"ok": False, "reason": REASON_ILLEGAL_STATE, "error": str(e)}
+            payload = dict(result) if isinstance(result, Mapping) else {}
+            payload["need_human"] = True
+            payload.setdefault("failure_reason", text)
+            if not _norm_key(payload.get("error")):
+                payload["error"] = text
+            stored = enrich_result_for_need_human(payload) or payload
+            found["status"] = "awaiting_decision"
+            found["result"] = stored
+            found.pop("dispatch_claim", None)
+            did = new_decision_id()
+            found["blocked_on_decision"] = did
+            snap["tasks"] = tasks
+            rid = _norm_key(run_id) or _norm_key(found.get("run_id"))
+            _store, _own, coordinator, own_ver = _live_ownership(self.persist_root, gid)
+            rec = {
+                "contract_version": CONTRACT_VERSION,
+                "decision_id": did,
+                "request_id": did,
+                "kind": KIND_CHECKPOINT,
+                "goal_id": gid,
+                "task_id": tid,
+                "run_id": rid,
+                "status": STATUS_PENDING,
+                "title": text,
+                "actions": [],
+                "verdict": "",
+                "reason": _norm_key(reason) or text,
+                "created_at": _utc_now(),
+                "created_at_iso": _iso(),
+                "return_to_upper": False,
+                "silent_retry": None,
+                "event_class": EVENT_CLASS_STATUS,
+                "details": {"summary": text, "need_human": True, "backend_kind": ""},
+                "grant_applied": False,
+                "task_resumed": False,
+                "binding": {
+                    "decision_id": did,
+                    "goal_id": gid,
+                    "kind": KIND_CHECKPOINT,
+                    "contract_version": CONTRACT_VERSION,
+                    "contract_fingerprint": _snap_contract_fingerprint(snap),
+                    "ownership_version": own_ver,
+                    "coordinator_id": coordinator,
+                    "submitter_id": _norm_key(snap.get("submitter_id")),
+                },
+            }
+            pending.append(rec)
+            snap["pending_decisions"] = pending
+            self._append_history(
+                snap,
+                "open_decision",
+                decision_id=did,
+                kind=KIND_CHECKPOINT,
+                task_id=tid,
+                return_to_upper=False,
+                event_class=EVENT_CLASS_STATUS,
+            )
+            self._touch(snap)
+            self._persist_unlocked()
+            return {"ok": True, "reason": REASON_READY, "decision": rec, "pending_count": len(pending)}
+
+    def requeue_checkpoint_task(self, goal_id: str, task_id: str) -> dict[str, Any]:
+        """Explicit continue: awaiting_decision → queued, and count one retry_task.
+
+        Clears the run handle and progress so no-progress does not fire again
+        on the old clock. Workspace files stay. A second call does not count twice.
+        """
+        gid = _norm_key(goal_id)
+        tid = _norm_key(task_id)
+        with self._rmw():
+            snap = self.goals.get(gid)
+            if snap is None:
+                return {"ok": False, "reason": REASON_UNKNOWN_GOAL, "error": f"unknown goal_id {gid!r}"}
+            tasks = [dict(t) for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
+            found = next((t for t in tasks if t.get("task_id") == tid), None)
+            if found is None:
+                return {"ok": False, "reason": "unknown_task", "error": f"unknown task_id {tid!r}"}
+            src = _norm_key(found.get("status") or "") or "queued"
+            if src == "queued":
+                return {"ok": True, "reason": REASON_READY, "idempotent": True, "task_id": tid, "state": snap.get("state")}
+            try:
+                assert_transition("task", src, "queued")
+            except LifecycleError as e:
+                return {"ok": False, "reason": REASON_ILLEGAL_STATE, "error": str(e)}
+            prior_run = _norm_key(found.get("run_id") or "")
+            found["status"] = "queued"
+            found.pop("run_id", None)
+            found.pop("native_handle", None)
+            found.pop("blocked_on_decision", None)
+            found.pop("progress", None)
+            found.pop("run_started_at", None)
+            found.pop("dispatch_claim", None)
+            if isinstance(found.get("result"), Mapping):
+                found["last_result"] = {
+                    "budget_exceeded": bool(found["result"].get("budget_exceeded")),
+                    "error": str(found["result"].get("error") or "")[:300],
+                }
+            found["result"] = None
+            snap["tasks"] = tasks
+            self._append_history(
+                snap,
+                "retry_task",
+                task_id=tid,
+                mode="redispatch",
+                prior_run_id=prior_run,
+                event_kind="retry_task",
+                reason="checkpoint_continue",
+            )
+            self._touch(snap)
+            self._persist_unlocked()
+            return {"ok": True, "reason": REASON_READY, "task_id": tid, "task": found, "state": snap.get("state")}
+
     def append_goal_warnings(self, goal_id: str, warnings: Sequence[str]) -> dict[str, Any]:
         """Append human-readable warnings onto the persisted Goal body.
 
@@ -1764,8 +1994,19 @@ class DurableLayer:
                 "prior_run_id": prior_run,
             }
 
-    def fail_goal(self, goal_id: str, *, phase: str, error: str) -> dict[str, Any]:
-        """Close a Goal when coordination fails before a worker result exists."""
+    def fail_goal(
+        self,
+        goal_id: str,
+        *,
+        phase: str,
+        error: str,
+        extra: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Close a Goal when coordination fails before a worker result exists.
+
+        ``extra`` may carry elapsed time, last_progress_at, and an artifact
+        checkpoint. Those keys are not part of primary_failure.
+        """
         gid = _norm_key(goal_id)
         with self._rmw():
             snap = self.goals.get(gid)
@@ -1773,10 +2014,14 @@ class DurableLayer:
                 return {"ok": False, "reason": REASON_UNKNOWN_GOAL, "error": f"unknown goal_id {gid!r}"}
             if snap.get("state") not in _TERMINAL_GOAL:
                 self._set_state(snap, "failed")
-            failure = {
+            failure: dict[str, Any] = {
                 "phase": _norm_key(phase) or "coordination",
                 "error": _norm_key(error)[:500],
             }
+            if isinstance(extra, Mapping):
+                for key in ("elapsed", "last_progress_at", "artifacts_checkpoint"):
+                    if key in extra:
+                        failure[key] = extra[key]
             snap["failure"] = failure
             self._append_history(snap, "fail_goal", **failure)
             self._touch(snap)

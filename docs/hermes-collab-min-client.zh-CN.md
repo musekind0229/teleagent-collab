@@ -35,6 +35,7 @@ python bin/hermes-collab-request.py open --goal "…" --sqlite-snapshot DB    # 
 python bin/hermes-collab-request.py open --goal "…" --file-snapshot LOG.jsonl
 python bin/hermes-collab-request.py snapshots-clean [--hours 24]
 python bin/hermes-collab-request.py status <request_id> [--full]
+python bin/hermes-collab-request.py progress <request_id>
 python bin/hermes-collab-request.py report <request_id> [--full]
 python bin/hermes-collab-request.py wait <request_id> [--timeout 600] [--interval 2] [--full]
 python bin/hermes-collab-request.py pending
@@ -51,6 +52,21 @@ python bin/hermes-collab-request.py decide <request_id> <decision_id> --verdict 
 - 快照留在本机，成功或失败的 stdout 在 `snapshots` 里给出路径，由调用方删除。`snapshots-clean` 只删除快照根目录下、修改时间早于 N 小时（默认 24）的子目录，不跟着符号链接出去删。
 - `--require-capability NAME` 可重复，写入 `required_capabilities`。服务不满足时 HTTP 409，`code=capability_unavailable`，stdout 带 `missing`（以及能力快照），退出码 **1**（不是 `decide` 的 5）。未知名字是 400 `invalid_request`，同样退出码 1。两种都不会建 Goal。
 - `--ack-prompt-only-inputs` 写入 `acknowledge_prompt_only_inputs: true`。只用于操作者承认「钉住的外部输入在 skip-permissions 后端上只是提示词」。它不满足显式的 `--require-capability external_input_enforcement`。
+- 预算旗标：`--wall-sec`（默认 300）、`--max-reworks`（默认 1）、`--max-tokens`、`--max-tool-calls`、`--no-progress-sec`、`--on-no-progress checkpoint|fail`、`--budget-report-only`。没写的可选项不会出现在请求里。后端 `budget_enforcement` 为 `unsupported` 的字段会被 409 拒绝（`missing` 含 `budget:<字段>`），除非加了 `--budget-report-only`。`post_hoc` 可以提交，但跑完才核对，中途停不了。用量数字是工人自报，**不是账单**。
+- 检查点决策（`kind=checkpoint`）表示停下来问用户：`continue` 或 `stop`。不要自己选 continue，也不要因为没进度就重新 open。`continue` 会计入 `max_reworks`。
+
+### `progress`
+
+`GET /v1/requests/{id}`，只打一个小投影，**不是** status 的 SUMMARY，也不吃 `--full`：
+
+| 字段 | 含义 |
+| --- | --- |
+| `state` | `executing` / `waiting_decision` / `waiting_capacity` / `stale` / `idle` / `delivering` / `done` / `unknown`。没有进度块时是 `unknown` |
+| `phase` | 服务端阶段；没有则 `unknown` |
+| `heartbeat_age_sec` / `progress_age_sec` | 相对现在的整数秒，解析不了则为 `null` |
+| `recent_events` | 最多 5 条短事件。没有则 `[]` |
+
+不要根据它编一个百分比。`progress.available=false` 的一次性后端没有心跳可看。
 
 ### `ping`
 
@@ -148,7 +164,8 @@ exit 4 在原 status 上追加字段（`ok` 保持服务端原值）。默认打
 | `awaiting_lead_count` / `awaiting_human_count` | 服务端计数；没有则按行上的 `awaiting` 统计（缺 `awaiting` 的旧行算 human） |
 | `tasks` | `{task_id, title, status, artifacts（名字）, workspace, error, review}`。`error` 最多 300 字，不取 stdout/stderr。`review` 是 `{status, source, evidence}`：服务端任务结果里有 `review` 就照抄（文本截断）；没有则 `status=not_requested`、`source=none`、`evidence=""`。`unsupported` 不是通过 |
 | `artifacts` | `{task_id, path, size?}`。`size` 只在已知 `size` / `bytes` / `nbytes` 时出现 |
-| `progress` | 没有真实进度字段时固定 `{"available": false, "phase": "unknown"}`。服务端若给了 `phase` / `percent` 等才照抄；**不发明百分比** |
+| `progress` | 没有进度对象时固定 `{"available": false, "phase": "unknown"}`。服务端给了对象就整份照抄（自由文本截断），不丢掉 `state` / 心跳时间 / `recent_events` 等。只给了 `phase`、没给 `available` 时仍视为 available。显式 `available: false` 保持 false。**不发明 `percent`**；只有服务端自己带了才出现 |
+| `budget_status` | 仅当服务端带了该对象：按字段照抄 `limit` / `used` / `source` / `exceeded` / `enforced`。用量不是账单 |
 | `usage` | 某条 task `result.usage` 存在时 `{"source": "worker_self_reported", "values": {...}}`（只有一条时 `values` 就是该对象；多条按 `task_id` 分开）。否则 `{"source": "unknown"}`。**不相加** |
 | `scheduler` | 仅当服务端带了 `scheduler`：`running`、`queued_ready`、`capacity`（整数）、`waiting_reason`（没有则为 `""`）。容量等待不是失败 |
 | `warnings` | 仅当服务端发了 `warnings` 或 `capability_warnings` |

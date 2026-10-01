@@ -105,7 +105,8 @@ _TASK_EDGES = {
         "unknown",
         "blocked",
     },
-    "awaiting_decision": {"running", "blocked", "failed", "cancel_requested", "unknown"},
+    # queued is only for an explicit human "continue" after a checkpoint.
+    "awaiting_decision": {"running", "queued", "blocked", "failed", "cancel_requested", "unknown"},
     "review": {"succeeded", "failed", "running", "awaiting_decision"},
     "blocked": {"queued", "running", "cancelled", "failed"},
     "cancel_requested": {"cancelled", "unknown", "failed"},

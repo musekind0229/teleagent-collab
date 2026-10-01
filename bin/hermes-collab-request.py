@@ -17,7 +17,7 @@ Lookup order:
      (skipped when LOCALAPPDATA is missing)
      other OS: ~/.hermes/.env
 
-Subcommands: open | ping | status | report | wait | pending | decide | snapshots-clean
+Subcommands: open | ping | status | progress | report | wait | pending | decide | snapshots-clean
 Stdout: one JSON object (single line). Default is pure ASCII
 (ensure_ascii=True); non-ASCII becomes \\uXXXX so PowerShell 5.1 pipes
 (any code page) and Hermes UTF-8 decoding both keep the text.
@@ -55,13 +55,15 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path, PosixPath, WindowsPath
-from typing import Any
+from typing import Any, Mapping
 
 # pathlib.Path re-reads os.name and cannot construct WindowsPath on POSIX
 # (or PosixPath on Windows). Bind the flavour at import so tests can patch
@@ -423,6 +425,17 @@ def cmd_open(args: argparse.Namespace) -> dict[str, Any]:
             "max_reworks": int(args.max_reworks),
         },
     }
+    if getattr(args, "max_tokens", None) is not None:
+        body["budget"]["max_tokens"] = int(args.max_tokens)
+    if getattr(args, "max_tool_calls", None) is not None:
+        body["budget"]["max_tool_calls"] = int(args.max_tool_calls)
+    if getattr(args, "no_progress_sec", None) is not None:
+        body["budget"]["no_progress_sec"] = float(args.no_progress_sec)
+    on_no_progress = str(getattr(args, "on_no_progress", "") or "").strip()
+    if on_no_progress:
+        body["budget"]["on_no_progress"] = on_no_progress
+    if getattr(args, "budget_report_only", False):
+        body["budget"]["budget_mode"] = "report_only"
     if args.idempotency_key:
         body["idempotency_key"] = args.idempotency_key
     # Backend is selected when collab-service starts. Optional flag is a
@@ -537,6 +550,13 @@ def cmd_snapshots_clean(args: argparse.Namespace) -> dict[str, Any]:
 def cmd_status(args: argparse.Namespace) -> dict[str, Any]:
     rid = _encode_id(args.request_id)
     return request_json("GET", f"/v1/requests/{rid}", timeout=float(args.http_timeout))
+
+
+def cmd_progress(args: argparse.Namespace) -> dict[str, Any]:
+    """GET status, then a tiny projection. Not the status summary."""
+    rid = _encode_id(args.request_id)
+    payload = request_json("GET", f"/v1/requests/{rid}", timeout=float(args.http_timeout))
+    return project_progress(payload)
 
 
 def cmd_report(args: argparse.Namespace) -> dict[str, Any]:
@@ -1524,29 +1544,96 @@ def _usage_summary(tasks: list[dict[str, Any]], cut: _Cut) -> dict[str, Any]:
 
 
 def _progress_summary(payload: dict[str, Any], cut: _Cut) -> dict[str, Any]:
-    """Pass through real progress fields. Never invent a percentage."""
+    """Copy the server progress object. Never invent a percentage.
+
+    Absent or empty stays ``{"available": false, "phase": "unknown"}``.
+    A phase without ``available`` still means available. An explicit
+    ``available: false`` stays false. Extra keys are kept (text capped).
+    """
     raw = _pick(payload, "progress")
-    if not isinstance(raw, dict):
+    if not isinstance(raw, dict) or not raw:
         return {"available": False, "phase": "unknown"}
-    present: dict[str, Any] = {}
-    for key in _PROGRESS_KEYS:
-        if key not in raw or raw[key] is None:
-            continue
-        value = raw[key]
-        if isinstance(value, str):
-            value = cut.text(value, _SUMMARY_TEXT_CAP)
-        present[key] = value
-    if not present:
+    copied = _cap_usage(raw, cut)
+    if not isinstance(copied, dict) or not copied:
         return {"available": False, "phase": "unknown"}
-    phase = present.get("phase")
+    view = dict(copied)
+    phase = view.get("phase")
+    if not isinstance(phase, str) or not phase.strip():
+        view["phase"] = "unknown"
+    if "available" not in raw:
+        view["available"] = True
+        return view
+    if raw.get("available") is False:
+        view["available"] = False
+        return view
+    view["available"] = True
+    return view
+
+
+_PROGRESS_ISO_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?Z$"
+)
+
+
+def _parse_progress_iso(value: Any) -> float | None:
+    """UTC Z timestamp to epoch seconds. Local to this client; no framework import."""
+    if not isinstance(value, str):
+        return None
+    match = _PROGRESS_ISO_RE.match(value.strip())
+    if match is None:
+        return None
+    try:
+        year, month, day, hour, minute, second = (int(match.group(i)) for i in range(1, 7))
+        frac = match.group(7) or "0"
+        micro = int((frac + "000000")[:6])
+        stamp = datetime(year, month, day, hour, minute, second, micro, tzinfo=timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return stamp.timestamp()
+
+
+def _progress_age_sec(raw: Mapping[str, Any], key: str, now: float) -> int | None:
+    epoch = _parse_progress_iso(raw.get(key))
+    if epoch is None:
+        return None
+    return int(now - epoch)
+
+
+def project_progress(payload: Mapping[str, Any], *, now: float | None = None) -> dict[str, Any]:
+    """Tiny progress view: state, phase, ages in seconds, recent events.
+
+    Does not copy the goal contract, usage totals, or artifact bytes.
+    """
+    body = payload if isinstance(payload, Mapping) else {}
+    raw = body.get("progress")
+    progress = raw if isinstance(raw, Mapping) else {}
+    state = progress.get("state")
+    phase = progress.get("phase")
+    if not isinstance(state, str) or not state.strip():
+        state = "unknown"
     if not isinstance(phase, str) or not phase.strip():
         phase = "unknown"
-    view: dict[str, Any] = {"available": True, "phase": phase}
-    for key, value in present.items():
-        if key == "phase":
-            continue
-        view[key] = value
-    return view
+    events_raw = progress.get("recent_events")
+    events: list[str] = []
+    if isinstance(events_raw, list):
+        for item in events_raw:
+            if isinstance(item, str) and item.strip():
+                events.append(item.strip())
+            if len(events) >= 5:
+                break
+    clock = time.time() if now is None else float(now)
+    request_id = body.get("request_id")
+    if request_id is None:
+        request_id = body.get("goal_id")
+    return {
+        "ok": body.get("ok") is not False,
+        "request_id": "" if request_id is None else str(request_id),
+        "state": state,
+        "phase": phase,
+        "heartbeat_age_sec": _progress_age_sec(progress, "last_heartbeat_at", clock),
+        "progress_age_sec": _progress_age_sec(progress, "last_progress_at", clock),
+        "recent_events": events,
+    }
 
 
 def _task_review(task: dict[str, Any], result: dict[str, Any] | None, cut: _Cut) -> dict[str, str]:
@@ -1781,6 +1868,9 @@ def summarize_status(payload: dict[str, Any]) -> dict[str, Any]:
         "progress": _progress_summary(payload, cut),
         "usage": _usage_summary(tasks, cut),
     }
+    budget_status = _pick(payload, "budget_status")
+    if isinstance(budget_status, dict):
+        summary["budget_status"] = _cap_usage(budget_status, cut)
     if failure_code:
         # Insert beside failure_reason without inventing an empty code.
         ordered = {
@@ -1977,8 +2067,40 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="boundaries.must_not (repeatable)",
     )
-    p_open.add_argument("--wall-sec", type=int, default=300, help="budget.wall_sec")
+    p_open.add_argument("--wall-sec", type=int, default=300, help="budget.wall_sec (enforced wall clock)")
     p_open.add_argument("--max-reworks", type=int, default=1, help="budget.max_reworks")
+    p_open.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="budget.max_tokens (total tokens as reported, not a bill)",
+    )
+    p_open.add_argument(
+        "--max-tool-calls",
+        type=int,
+        default=None,
+        help="budget.max_tool_calls",
+    )
+    p_open.add_argument(
+        "--no-progress-sec",
+        type=float,
+        default=None,
+        help="budget.no_progress_sec (positive seconds without meaningful progress)",
+    )
+    p_open.add_argument(
+        "--on-no-progress",
+        choices=("checkpoint", "fail"),
+        default="",
+        help="budget.on_no_progress (default on the server: checkpoint)",
+    )
+    p_open.add_argument(
+        "--budget-report-only",
+        action="store_true",
+        help=(
+            "budget.budget_mode=report_only. Accept fields this backend cannot "
+            "enforce, and do not cancel when a limit is exceeded"
+        ),
+    )
     p_open.add_argument(
         "--backend",
         choices=("teleagent-windows", "antigravity", "agy", "inprocess"),
@@ -2077,6 +2199,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_st.add_argument("request_id", help="request_id / goal_id")
     _add_full(p_st)
     p_st.set_defaults(func=cmd_status)
+
+    p_prog = sub.add_parser(
+        "progress",
+        help="GET /v1/requests/{id} and print state, phase, ages, recent events",
+    )
+    p_prog.add_argument("request_id", help="request_id / goal_id")
+    p_prog.set_defaults(func=cmd_progress)
 
     p_rep = sub.add_parser("report", help="GET /v1/requests/{id}/report")
     p_rep.add_argument("request_id", help="request_id / goal_id")

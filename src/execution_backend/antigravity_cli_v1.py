@@ -40,6 +40,14 @@ from execution_backend.base import (
     default_capabilities,
     unsupported,
 )
+from framework.progress_budget import (
+    artifact_checkpoint,
+    budget_enforcement_capability,
+    metering_capability,
+    progress_capability,
+    sanitize_event,
+    utc_iso,
+)
 from framework import contract_render
 
 _LOG = logging.getLogger(__name__)
@@ -316,6 +324,32 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         caps["acceptance"]["lead_review"] = False
         caps["acceptance"]["executable_checks"] = False
         caps["usage"]["source"] = "worker_self_reported"
+        # One-shot JSON: no percent and no subagent count. Process poll and
+        # workspace mtimes are real runner signals, so progress is available.
+        caps["progress"] = progress_capability(
+            available=True,
+            heartbeat="runner_process",
+            artifact_checkpoint=True,
+            subagent_observability=False,
+        )
+        caps["metering"] = metering_capability(
+            live_usage=False,
+            usage_at_end=True,
+            tool_calls=False,
+            fields=[
+                "input_tokens",
+                "output_tokens",
+                "total_tokens",
+                "cache_read_tokens",
+                "cache_write_tokens",
+            ],
+            source="worker_self_reported",
+        )
+        caps["budget_enforcement"] = budget_enforcement_capability(
+            max_tokens="post_hoc",
+            max_tool_calls="unsupported",
+            no_progress_sec="enforced",
+        )
         caps["concurrency"] = {
             "max_runs": self._account_pool_run_limit(),
             "limited_by": ["agy_account_pool"],
@@ -906,7 +940,58 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         profile = self._agy_profile(rec)
         if profile:
             out["agy_profile"] = profile
+        out["progress"] = self._runner_progress(rec)
         return _apply_contract_meta(out, rec)
+
+    def _runner_progress(self, rec: dict[str, Any]) -> dict[str, Any]:
+        """Process poll, byte counts, and workspace names. No stream text."""
+        proc = rec.get("proc")
+        alive = proc is not None and callable(getattr(proc, "poll", None)) and proc.poll() is None
+        if alive:
+            rec["_last_alive_at"] = time.time()
+        out_n = sum(len(piece) for piece in (rec.get("stdout_chunks") or []) if isinstance(piece, str))
+        err_n = sum(len(piece) for piece in (rec.get("stderr_chunks") or []) if isinstance(piece, str))
+        if out_n == 0 and isinstance(rec.get("stdout"), str):
+            out_n = len(rec["stdout"])
+        if err_n == 0 and isinstance(rec.get("stderr"), str):
+            err_n = len(rec["stderr"])
+        prev_out = rec.get("_stdout_bytes")
+        prev_err = rec.get("_stderr_bytes")
+        prev_out_n = int(prev_out) if isinstance(prev_out, int) and not isinstance(prev_out, bool) else 0
+        prev_err_n = int(prev_err) if isinstance(prev_err, int) and not isinstance(prev_err, bool) else 0
+        if out_n > prev_out_n or err_n > prev_err_n:
+            rec["_output_progress_at"] = time.time()
+        rec["_stdout_bytes"] = out_n
+        rec["_stderr_bytes"] = err_n
+        entries, latest = artifact_checkpoint(str(rec.get("directory") or ""))
+        if alive:
+            phase = "executing" if (out_n or err_n or entries) else "starting"
+        elif not rec.get("harvested"):
+            phase = "finalizing"
+        else:
+            phase = "done"
+        hb_epoch = rec.get("_last_alive_at")
+        if not isinstance(hb_epoch, (int, float)) or isinstance(hb_epoch, bool):
+            hb_epoch = rec.get("started_at")
+        heartbeat = utc_iso(float(hb_epoch)) if isinstance(hb_epoch, (int, float)) and not isinstance(hb_epoch, bool) else None
+        progress_epoch = latest
+        output_at = rec.get("_output_progress_at")
+        if isinstance(output_at, (int, float)) and not isinstance(output_at, bool):
+            if progress_epoch is None or float(output_at) > float(progress_epoch):
+                progress_epoch = float(output_at)
+        events = [
+            sanitize_event(f"phase {phase}"),
+            sanitize_event(f"stdout_bytes {out_n}"),
+            sanitize_event(f"stderr_bytes {err_n}"),
+        ]
+        return {
+            "phase": phase,
+            "last_heartbeat_at": heartbeat,
+            "last_progress_at": utc_iso(progress_epoch) if progress_epoch is not None else None,
+            "events": [item for item in events if item][:5],
+            "source": "runner",
+            "artifacts_checkpoint": entries,
+        }
 
     def collect_result(self, run_id: str) -> dict[str, Any]:
         rec = self._get(run_id)

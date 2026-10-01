@@ -53,6 +53,8 @@ _SCHEMA_KEYS = {
     "resume",
     "acceptance",
     "progress",
+    "metering",
+    "budget_enforcement",
     "usage",
     "warnings",
 }
@@ -117,7 +119,11 @@ def _assert_shape(testcase: unittest.TestCase, caps: dict) -> None:
         {"artifact_presence", "exact_content", "lead_review", "executable_checks"},
     )
     testcase.assertIs(caps["acceptance"]["executable_checks"], False)
-    testcase.assertIs(caps["progress"]["available"], False)
+    testcase.assertIs(caps["progress"]["percent"], False)
+    testcase.assertIn(caps["progress"]["subagent_observability"], (False, "unknown"))
+    # Never a fabricated numeric count (note False == 0 in Python, so check the type).
+    value = caps["progress"]["subagent_observability"]
+    testcase.assertFalse(isinstance(value, int) and not isinstance(value, bool))
     testcase.assertIsInstance(caps["warnings"], list)
 
 
@@ -138,6 +144,16 @@ class CapabilityDocumentTests(unittest.TestCase):
         self.assertFalse(caps["acceptance"]["artifact_presence"])
         self.assertEqual(caps["usage"]["source"], "unknown")
         self.assertEqual(caps["warnings"], [])
+        self.assertIs(caps["progress"]["available"], False)
+        self.assertIs(caps["progress"]["heartbeat"], False)
+        self.assertIs(caps["progress"]["artifact_checkpoint"], False)
+        self.assertEqual(caps["progress"]["subagent_observability"], "unknown")
+        self.assertIs(caps["metering"]["live_usage"], False)
+        self.assertEqual(caps["metering"]["source"], "none")
+        self.assertEqual(caps["budget_enforcement"]["wall_sec"], "enforced")
+        self.assertEqual(caps["budget_enforcement"]["max_tokens"], "unsupported")
+        self.assertEqual(caps["budget_enforcement"]["max_tool_calls"], "unsupported")
+        self.assertEqual(caps["budget_enforcement"]["no_progress_sec"], "unsupported")
         self.assertEqual(unmet_capabilities(caps, ["no_skip_permissions", "permission_gate"]), [
             "no_skip_permissions",
             "permission_gate",
@@ -158,6 +174,17 @@ class CapabilityDocumentTests(unittest.TestCase):
         self.assertIs(caps["acceptance"]["lead_review"], False)
         self.assertEqual(caps["usage"]["source"], "unknown")
         self.assertEqual(caps["warnings"], [])
+        self.assertIs(caps["progress"]["available"], True)
+        self.assertIs(caps["progress"]["heartbeat"], False)
+        self.assertIs(caps["progress"]["artifact_checkpoint"], True)
+        self.assertIs(caps["progress"]["subagent_observability"], False)
+        self.assertIs(caps["metering"]["live_usage"], False)
+        self.assertIs(caps["metering"]["usage_at_end"], False)
+        self.assertIs(caps["metering"]["tool_calls"], False)
+        self.assertEqual(caps["metering"]["source"], "none")
+        self.assertEqual(caps["budget_enforcement"]["max_tokens"], "unsupported")
+        self.assertEqual(caps["budget_enforcement"]["max_tool_calls"], "unsupported")
+        self.assertEqual(caps["budget_enforcement"]["no_progress_sec"], "enforced")
 
     def test_agy_skip_follows_backend_env_not_process_env(self) -> None:
         with mock.patch.dict(os.environ, {"AGY_AUTO_APPROVE": "true"}, clear=False):
@@ -185,6 +212,28 @@ class CapabilityDocumentTests(unittest.TestCase):
             self.assertIs(caps["acceptance"]["exact_content"], True)
             self.assertIs(caps["acceptance"]["lead_review"], False)
             self.assertEqual(caps["usage"]["source"], "worker_self_reported")
+            self.assertIs(caps["progress"]["available"], True)
+            self.assertEqual(caps["progress"]["heartbeat"], "runner_process")
+            self.assertIs(caps["progress"]["artifact_checkpoint"], True)
+            self.assertIs(caps["progress"]["percent"], False)
+            self.assertIs(caps["progress"]["subagent_observability"], False)
+            self.assertIs(caps["metering"]["live_usage"], False)
+            self.assertIs(caps["metering"]["usage_at_end"], True)
+            self.assertIs(caps["metering"]["tool_calls"], False)
+            self.assertEqual(
+                caps["metering"]["fields"],
+                [
+                    "input_tokens",
+                    "output_tokens",
+                    "total_tokens",
+                    "cache_read_tokens",
+                    "cache_write_tokens",
+                ],
+            )
+            self.assertEqual(caps["metering"]["source"], "worker_self_reported")
+            self.assertEqual(caps["budget_enforcement"]["max_tokens"], "post_hoc")
+            self.assertEqual(caps["budget_enforcement"]["max_tool_calls"], "unsupported")
+            self.assertEqual(caps["budget_enforcement"]["no_progress_sec"], "enforced")
         self.assertIs(off["skip_permissions"], False)
         self.assertEqual(off["warnings"], [])
         self.assertIs(on["skip_permissions"], True)
@@ -217,6 +266,15 @@ class CapabilityDocumentTests(unittest.TestCase):
                 self.assertIs(caps["skip_permissions"], False)
                 self.assertIs(caps["resume"], True)
                 self.assertIs(caps["acceptance"]["artifact_presence"], True)
+                self.assertIs(caps["progress"]["available"], True)
+                self.assertEqual(caps["progress"]["heartbeat"], "engine")
+                self.assertIs(caps["progress"]["artifact_checkpoint"], True)
+                self.assertEqual(caps["progress"]["subagent_observability"], "unknown")
+                self.assertIs(caps["metering"]["live_usage"], False)
+                self.assertEqual(caps["metering"]["source"], "none")
+                self.assertEqual(caps["budget_enforcement"]["max_tokens"], "unsupported")
+                self.assertEqual(caps["budget_enforcement"]["max_tool_calls"], "unsupported")
+                self.assertEqual(caps["budget_enforcement"]["no_progress_sec"], "enforced")
                 self.assertIs(caps["acceptance"]["exact_content"], False)
                 self.assertIs(caps["acceptance"]["lead_review"], True)
                 self.assertEqual(caps["usage"]["source"], "unknown")
