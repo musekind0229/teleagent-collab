@@ -72,7 +72,11 @@ class TestLeadStubs(unittest.TestCase):
         self.assertEqual(cm.exception.code, "call_failed")
 
     def test_codex_cli_stub_no_fake_pass(self):
-        ad = get_lead_adapter("codex_cli")
+        # Wired adapter, but no binary: still fail closed. Do not search PATH.
+        ad = get_lead_adapter(
+            "codex_cli",
+            bin_path="/no/such/codex-lead-bin-for-p3",
+        )
         self.assertIsInstance(ad, CodexCliLeadAdapter)
         req = build_lead_request(
             kind="review",
@@ -84,8 +88,17 @@ class TestLeadStubs(unittest.TestCase):
         )
         raw, parsed = ad.decide(req, schema={}, cwd="/tmp")
         self.assertEqual(parsed.get("_lead_status"), "call_failed")
-        # review stub must not yield verdict=pass
+        self.assertNotIn("decision", parsed or {})
+        self.assertNotIn("verdict", parsed or {})
         self.assertNotEqual((parsed or {}).get("verdict"), "pass")
+        hint = ad.doctor_hint()
+        self.assertFalse(hint.get("fake_pass"))
+        self.assertIsNone(hint.get("bin_path"))
+        self.assertTrue(hint.get("bin_error"))
+        self.assertEqual(hint.get("sandbox"), "read-only")
+        with self.assertRaises(LeadDecisionError) as cm:
+            validate_lead_decision(raw, parsed, request=req, kind="review")
+        self.assertEqual(cm.exception.code, "call_failed")
 
     def test_codex_alias_still_inprocess(self):
         ad = get_lead_adapter("codex")
