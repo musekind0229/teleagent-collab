@@ -22,6 +22,7 @@ Public kernel path only. No TeleAgent HTTP. No Hermes ledger. No glue rewrite.
 """
 from __future__ import annotations
 
+import json
 import threading
 import time
 import uuid
@@ -1594,6 +1595,23 @@ class DurableLayer:
             self._touch(snap)
             self._persist_unlocked()
             return {"ok": True, "reason": REASON_READY, "phase": name, "changed": True}
+
+    GOAL_EVENT_OPS = frozenset({"planner_stopped"})
+
+    def record_goal_event(self, goal_id: str, op: str, **fields: Any) -> dict[str, Any]:
+        """Append one coordinator fact to history in any state (also terminal)."""
+        gid = _norm_key(goal_id)
+        if op not in self.GOAL_EVENT_OPS:
+            return {"ok": False, "reason": "bad_event", "error": f"unknown goal event {op!r}"}
+        clean = json.loads(json.dumps(fields, default=str))
+        with self._rmw():
+            snap = self.goals.get(gid)
+            if snap is None:
+                return {"ok": False, "reason": REASON_UNKNOWN_GOAL, "error": f"unknown goal_id {gid!r}"}
+            self._append_history(snap, op, **clean)
+            self._touch(snap)
+            self._persist_unlocked()
+            return {"ok": True, "reason": REASON_READY, "op": op}
 
     def record_task_progress(self, goal_id: str, task_id: str, progress: Mapping[str, Any]) -> dict[str, Any]:
         """Replace one task's progress snapshot. Does not append history."""

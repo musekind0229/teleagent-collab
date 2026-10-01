@@ -23,6 +23,7 @@ import tempfile
 from pathlib import Path
 
 from lead_adapter.base import LeadAdapterABC, safe_failure
+from lead_adapter.cancel import LeadCancelled, current_scope, run_cancellable
 from lead_adapter.schema import format_lead_request_prompt, pin_lead_response_schema
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -108,14 +109,24 @@ class DeepSeekHarnessLeadAdapter(LeadAdapterABC):
             cmd, stdin_text, tmp_path = self._build_cmd(payload)
             # Intentionally NO retry that drops constraints / tool limits (条3).
             try:
-                proc = subprocess.run(
-                    cmd,
-                    input=stdin_text,
-                    capture_output=True,
-                    text=True,
-                    timeout=float(timeout_sec),
-                    cwd=cwd or None,
-                )
+                if current_scope() is not None:
+                    proc = run_cancellable(
+                        cmd,
+                        input_text=stdin_text,
+                        timeout=float(timeout_sec),
+                        cwd=cwd or None,
+                    )
+                else:
+                    proc = subprocess.run(
+                        cmd,
+                        input=stdin_text,
+                        capture_output=True,
+                        text=True,
+                        timeout=float(timeout_sec),
+                        cwd=cwd or None,
+                    )
+            except LeadCancelled as exc:
+                return safe_failure("call_failed", f"deepseek_harness stopped: {exc}")
             except subprocess.TimeoutExpired:
                 return safe_failure("timeout", "deepseek_harness timeout")
             except OSError as e:

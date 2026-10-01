@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from lead_adapter.base import LeadAdapterABC, safe_failure
+from lead_adapter.cancel import LeadCancelled, communicate as _cancellable_communicate, current_scope
 from lead_adapter.schema import format_lead_request_prompt, pin_lead_response_schema
 
 # codex-cli 0.155.0 on DESKTOP-TBB531F. Documentation / error hint only.
@@ -573,9 +574,19 @@ class CodexCliLeadAdapter(LeadAdapterABC):
                 redact_secrets(f"codex_cli spawn failed: {exc}"),
             )
 
+        scope = current_scope()
+        if scope is not None:
+            scope.attach(proc, plat)
         try:
             try:
-                stdout, stderr = proc.communicate(input=prompt, timeout=timeout_sec)
+                if scope is None:
+                    stdout, stderr = proc.communicate(input=prompt, timeout=timeout_sec)
+                else:
+                    stdout, stderr = _cancellable_communicate(
+                        proc, timeout=timeout_sec, input_text=prompt, platform=plat, scope=scope
+                    )
+            except LeadCancelled as exc:
+                return safe_failure("call_failed", redact_secrets(f"codex_cli stopped: {exc}"))
             except subprocess.TimeoutExpired:
                 _kill_process_tree(proc, plat)
                 _reap_after_kill(proc, plat)
@@ -592,6 +603,9 @@ class CodexCliLeadAdapter(LeadAdapterABC):
                 "call_failed",
                 redact_secrets(f"codex_cli spawn failed: {exc}"),
             )
+        finally:
+            if scope is not None:
+                scope.detach(proc)
 
         # Non-zero is never a decision, even if last.json / stdout is valid JSON.
         code = proc.returncode

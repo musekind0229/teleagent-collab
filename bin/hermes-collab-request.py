@@ -1432,6 +1432,33 @@ def _remember_artifact(
         entry["size"] = size
 
 
+_WIN_ABS_RE = re.compile(r"^(?:[A-Za-z]:/|//)")
+
+
+def _workspace_relative(path: str, workspace: str) -> str:
+    """One spelling per file: relative to the task workspace, ``/`` separators.
+
+    ``./a.txt``, ``a.txt``, ``sub\\a.txt`` and ``<workspace>/a.txt`` all become
+    ``a.txt`` / ``sub/a.txt``. Absolute paths outside the workspace stay as given.
+    """
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    unified = text.replace("\\", "/")
+    ws = str(workspace or "").strip().replace("\\", "/").rstrip("/")
+    is_abs = unified.startswith("/") or bool(_WIN_ABS_RE.match(unified))
+    if is_abs:
+        if not ws:
+            return text
+        fold = bool(_WIN_ABS_RE.match(unified)) or bool(_WIN_ABS_RE.match(ws))
+        a, b = (unified.lower(), ws.lower()) if fold else (unified, ws)
+        if not a.startswith(b + "/"):
+            return text
+        unified = unified[len(ws) + 1 :]
+    parts = [seg for seg in unified.split("/") if seg not in ("", ".")]
+    return "/".join(parts) if parts else text
+
+
 def _consume_artifacts(
     value: Any,
     task_id: str,
@@ -1440,11 +1467,15 @@ def _consume_artifacts(
     files: list[dict[str, Any]],
     index: dict[tuple[str, str], dict[str, Any]],
     cut: _Cut,
+    workspace: str = "",
 ) -> None:
-    """Collect artifact names and {task_id, path, size?}. Never copy previews or bytes content."""
+    """Collect artifact names and {task_id, path, size?}. Never copy previews or bytes content.
+
+    Paths are shown relative to the task workspace and deduplicated (#12).
+    """
 
     def add_name(label: str) -> str:
-        shown = cut.text(label.strip(), _SUMMARY_TEXT_CAP)
+        shown = cut.text(_workspace_relative(label, workspace), _SUMMARY_TEXT_CAP)
         if shown and shown not in seen_names:
             seen_names.add(shown)
             names.append(shown)
@@ -1456,7 +1487,7 @@ def _consume_artifacts(
         return
     if isinstance(value, list):
         for item in value:
-            _consume_artifacts(item, task_id, names, seen_names, files, index, cut)
+            _consume_artifacts(item, task_id, names, seen_names, files, index, cut, workspace)
         return
     if not isinstance(value, dict):
         return
@@ -1636,7 +1667,20 @@ def project_progress(payload: Mapping[str, Any], *, now: float | None = None) ->
         "progress_age_sec": _progress_age_sec(progress, "last_progress_at", clock),
         "phase_age_sec": _progress_age_sec(progress, "phase_started_at", clock),
         "recent_events": events,
+        **_session_signal_view(progress),
     }
+
+
+def _session_signal_view(progress: dict[str, Any]) -> dict[str, Any]:
+    """Whether agy session files fed the heartbeat, and why not (only when reported)."""
+    signals = progress.get("heartbeat_signals")
+    note = signals.get("session") if isinstance(signals, dict) else None
+    if not isinstance(note, dict):
+        return {}
+    row: dict[str, Any] = {"used": bool(note.get("used")), "attribution": str(note.get("attribution") or "none")[:32]}
+    if isinstance(note.get("reason"), str) and note["reason"].strip():
+        row["reason"] = note["reason"].strip()[:200]
+    return {"session_signal": row}
 
 
 def _task_review(task: dict[str, Any], result: dict[str, Any] | None, cut: _Cut) -> dict[str, str]:
@@ -1853,16 +1897,17 @@ def summarize_status(payload: dict[str, Any]) -> dict[str, Any]:
         result = task.get("result") if isinstance(task.get("result"), dict) else None
         names: list[str] = []
         seen_names: set[str] = set()
+        ws = _task_workspace(task, result)
         for key in ("expected_artifacts", "artifacts"):
-            _consume_artifacts(task.get(key), task_id, names, seen_names, artifacts, index, cut)
+            _consume_artifacts(task.get(key), task_id, names, seen_names, artifacts, index, cut, ws)
         done = task.get("done_when")
         if isinstance(done, dict):
             _consume_artifacts(
-                done.get("artifacts"), task_id, names, seen_names, artifacts, index, cut
+                done.get("artifacts"), task_id, names, seen_names, artifacts, index, cut, ws
             )
         if isinstance(result, dict):
             _consume_artifacts(
-                result.get("artifacts"), task_id, names, seen_names, artifacts, index, cut
+                result.get("artifacts"), task_id, names, seen_names, artifacts, index, cut, ws
             )
         task_views.append(
             {
@@ -1907,6 +1952,19 @@ def summarize_status(payload: dict[str, Any]) -> dict[str, Any]:
             label = str(row.get("title") or "goal")
             lines.append(cut.text(f"{label}:{row.get('phase')} {secs} {row.get('outcome') or 'running'}".strip(), _SUMMARY_TEXT_CAP))
         summary["phases"] = lines
+    stopped = _pick(payload, "planner_stopped")
+    if isinstance(stopped, dict):
+        # Lead stopped on cancel: how each lead process tree was stopped.
+        procs = [
+            cut.text(f"pid {r.get('pid')} {r.get('method')} {r.get('result')}", _SUMMARY_TEXT_CAP)
+            for r in (stopped.get("lead_processes") or [])[:8]
+            if isinstance(r, dict)
+        ]
+        summary["planner_stopped"] = {
+            "reason": cut.text(str(stopped.get("reason") or ""), _SUMMARY_TEXT_CAP),
+            "planner_thread": cut.text(str(stopped.get("planner_thread") or ""), _SUMMARY_TEXT_CAP),
+            "lead_processes": procs,
+        }
     acceptance_status = _pick(payload, "acceptance_status")
     if isinstance(acceptance_status, dict):
         # Execution / artifacts / checks / review / business acceptance stay separate (#2).

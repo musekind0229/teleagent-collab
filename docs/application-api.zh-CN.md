@@ -178,7 +178,7 @@ TeleAgent `review` 若产物自带 `contamination.contaminated`，投影出的�
 多 Task 的 Goal 上，Goal 级「PATH must contain exactly BODY」只门禁 expected_artifacts 里有 PATH 的那个 Task；没有 Task 声明 PATH 时落到汇点 Task（没人依赖的那些），不会静默丢掉。普通文字验收仍然发给每个 Task。
 | `acceptance.lead_review` | 本进程规划器会审 **并且** 后端扛得住组长审查时才是 true |
 | `acceptance.executable_checks` | 当前为 false |
-| `progress.available` | 有真实、便宜的观察才是 true。agy 是**活动心跳**（`heartbeat=runner_activity`，2026-10-02 起）：取 stdout/stderr 增长、工作区文件 mtime、该 run 的 HOME（Windows 为 USERPROFILE）下 `.gemini/antigravity-cli/{conversations,log,brain}` 的 mtime 中最新的一个；只 stat，不读内容。进程还活着**不再**刷新心跳，所以卡住不动的 agy 超过 `--stale-after` 会显示 `state=stale`。多个 run 共用一个 HOME（没配账号池）时，会话文件信号是按 HOME 而不是按 run 的。`recent_events` 里的 `last_activity output|workspace|session|none` 说明最近一次活动来自哪里。in-process 看自己的状态机（`heartbeat` 为 false，不每拍刷新）。监督后端看作业状态（`heartbeat=engine`）。没有这些信号的一次性后端是 false，并且 **`percent` 永远是 false**，不编百分比 |
+| `progress.available` | 有真实、便宜的观察才是 true。agy 是**活动心跳**（`heartbeat=runner_activity`，2026-10-02 起）：取 stdout/stderr 增长、工作区文件 mtime、该 run 的 HOME（Windows 为 USERPROFILE）下 `.gemini/antigravity-cli/{conversations,log,brain}` 的 mtime 中最新的一个；只 stat，不读内容。进程还活着**不再**刷新心跳，所以卡住不动的 agy 超过 `--stale-after` 会显示 `state=stale`。会话文件必须能归属到这个 run 才算心跳（2026-10-02 第二版）：① 该 run 的进程树正打开着它（Linux 读 `/proc/<pid>/fd`，归属 `open_handle`），按会话 uuid / 日志文件认领，之后句柄关了也算；② 退一步：run 启动后只新出现了一个会话、本服务没有别的 run 共用这个 HOME、也没有别的进程开着它（归属 `new_file`）。其余一律不用，原因写在 `progress.heartbeat_signals.session`（`{used, attribution, reason}`，客户端 `progress` 里是 `session_signal`），例如 `the only new session file is held open by another process`、`ambiguous: 2 runs of this service share this HOME`。`conversation_summaries.db` 这类共享文件从不算。`recent_events` 里的 `last_activity output|workspace|session|none` 说明最近一次活动来自哪里。in-process 看自己的状态机（`heartbeat` 为 false，不每拍刷新）。监督后端看作业状态（`heartbeat=engine`）。没有这些信号的一次性后端是 false，并且 **`percent` 永远是 false**，不编百分比 |
 | `progress.subagent_observability` | `false` 或 `"unknown"`。不会假装观察到 0 个子代理 |
 | `progress.artifact_checkpoint` | 能否给出产物清单（名字、大小、mtime，无正文） |
 | `metering.live_usage` / `usage_at_end` / `tool_calls` | 是否有跑中用量、结束时用量、工具调用次数。没有就不要当成有 |
@@ -314,7 +314,9 @@ Goal 在任何 Task 结果之前就失败（规划失败、预算/协调失败�
 
 status 带 `phase_timeline`：Goal 的 `planning` 加每个 Task 的 `preparing`（依赖交接、清单拷贝、合同渲染、选账号、起进程）→ `executing` → `finalizing`（进程已退出，收 CLI JSON、用量、产物）→ `testing`（产物在不在、精确内容核对、污染扫描）→ `reviewing`（TeleAgent / 组长审查 decision）。每段有 `started_at`、`ended_at`、`duration_sec`、`outcome`（`ok` / `failed` / `cancelled` / `checkpoint` / `discarded`，失败带脱敏 `detail`）。`progress.phase` / `progress.state` 在这些协调器阶段进行中时显示 `preparing` / `delivering`（finalizing）/ `testing` / `reviewing`，并带 `phase_started_at`；客户端 `progress` 多一个 `phase_age_sec`，摘要多一个 `phases` 列表。`finalizing` / `testing` 通常只有几毫秒，主要靠时间线事后看。
 
-规划不再占着协调锁：组长规划在单独线程里跑，第一拍最多等 1 秒，慢的就留到之后的拍子取结果，其它 Goal 照常推进。规划结束时 Goal 已被取消或已有 Task，结果丢弃（`outcome=discarded`）。组长计划必须交付 Goal 验收里列出的每个产物，漏了就是 `invalid_plan`（`lead plan does not deliver goal acceptance artifacts: …`），不派工人。
+规划不再占着协调锁：组长规划在单独线程里跑，第一拍最多等 1 秒，慢的就留到之后的拍子取结果，其它 Goal 照常推进。规划结束时 Goal 已被取消或已有 Task，结果丢弃（`outcome=discarded`）。组长计划必须交付 Goal 验收里列出的每个产物，漏了就是 `invalid_plan`（`lead plan does not deliver goal acceptance artifacts: missing b.txt; plan delivers a.txt`），不派工人。比较前两边都规范化：`./a.txt` 与 `a.txt`、`sub\b.txt` 与 `sub/b.txt` 视为同一个。
+
+**取消时停掉组长**：规划中的 Goal 被取消（或在规划中变成 failed、服务收到 SIGTERM/Ctrl-C）时，立刻停掉规划线程正在等的组长进程树，不等组长超时：组长在自己的进程组里启动，POSIX 先 SIGTERM 整个进程组、1.5 秒后 SIGKILL；Windows 用 `taskkill /F /T /PID`。停完在事件（`GET /v1/requests/{id}/events`）里记一条 `planner_stopped`（`reason`、`lead_processes[{pid, method, result}]`、`planner_thread`、`planning_sec`），status 里也有 `planner_stopped`。服务被 `kill -9` 时组长不在 `agy-runs.json` 里，靠它自己的超时结束。
 
 ### 服务重启与 agy 孤儿进程（2026-10-02 起）
 

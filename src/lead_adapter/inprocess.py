@@ -95,7 +95,12 @@ class InProcessLeadAdapter(LeadAdapterABC):
         # Wait for external writer (current conversation / human / sidecar)
         deadline = time.time() + float(timeout_sec)
         decision_path = self.decisions_dir / f"{app_id}.json"
+        from lead_adapter.cancel import current_scope
+
+        scope = current_scope()
         while time.time() < deadline:
+            if scope is not None and scope.cancelled:
+                return safe_failure("call_failed", f"inprocess wait stopped: {scope.reason}")
             if decision_path.exists():
                 try:
                     text = decision_path.read_text(encoding="utf-8")

@@ -472,6 +472,10 @@ def main(argv: list[str] | None = None) -> int:
         server.shutdown()
         loop.stop()
         server.server_close()
+        try:  # a lead still planning must not outlive the service
+            app.coordinator.stop_all_planning("service shutdown")
+        except Exception:  # noqa: BLE001
+            pass
         close_backend = getattr(app.coordinator.backend, "close", None)
         if callable(close_backend):
             close_backend()

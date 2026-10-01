@@ -40,6 +40,7 @@ from execution_backend.base import (
     default_capabilities,
     unsupported,
 )
+from execution_backend.agy_session_attribution import SessionAttributor, session_base
 from execution_backend.agy_run_registry import (
     ENV_RUN_REGISTRY,
     AgyRunRegistry,
@@ -410,6 +411,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         self.timeout_sec = 300.0 if timeout_sec is None else float(timeout_sec)
         self.poll_sec = float(poll_sec)
         self._runs: dict[str, dict[str, Any]] = {}
+        self._session = SessionAttributor()
         # Durable pid record so a restarted service can stop orphaned workers
         # instead of letting them keep writing into task workspaces.
         reg_path = (str(run_registry_path).strip() if run_registry_path else "") or str(
@@ -625,6 +627,8 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             "agy_profile": profile,
             "contract_sha256": str(contract_meta.get("contract_sha256") or ""),
             "contract_fields": list(contract_meta.get("contract_fields") or []),
+            # Session conversations already present: never this run's (#5 #10).
+            "_session_baseline": self._session.baseline(spawn_env),
         }
         self._runs[run_id] = rec
         self._runs[handle] = rec
@@ -712,6 +716,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
                 continue
 
     def _forget_run(self, rec: Mapping[str, Any]) -> None:
+        self._session.release(str(rec.get("run_id") or ""))
         if self._registry is None:
             return
         try:
@@ -1029,38 +1034,30 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         out["progress"] = self._runner_progress(rec)
         return _apply_contract_meta(out, rec)
 
-    @staticmethod
-    def _session_activity_at(rec: Mapping[str, Any]) -> float | None:
-        """Newest mtime of agy's own session files for this run's HOME.
-
-        agy --print emits JSON only at the end, but while it works it keeps
-        updating ``.gemini/antigravity-cli/{conversations,log}`` under HOME
-        (USERPROFILE on Windows). Only names and mtimes are read, never
-        contents. With several runs sharing one HOME (no account pool) the
-        signal is per-HOME, not per-run.
-        """
-        spawn = rec.get("spawn_environ") if isinstance(rec.get("spawn_environ"), Mapping) else {}
-        home = str(spawn.get("HOME") or spawn.get("USERPROFILE") or "").strip()
-        if not home:
-            return None
-        base = Path(home) / ".gemini" / "antigravity-cli"
-        latest: float | None = None
-        for sub in ("conversations", "log", "brain"):
-            folder = base / sub
-            try:
-                children = list(os.scandir(folder))[:400]
-            except OSError:
+    def _runs_sharing_home(self, rec: Mapping[str, Any]) -> int:
+        """Live runs of this service whose agy session dir is the same as ``rec``'s."""
+        base = session_base(rec.get("spawn_environ"))
+        if base is None:
+            return 0
+        seen: set[int] = set()
+        count = 0
+        for other in self._runs.values():
+            if id(other) in seen:
                 continue
-            for entry in children:
-                try:
-                    if entry.is_symlink():
-                        continue
-                    mtime = entry.stat(follow_symlinks=False).st_mtime
-                except OSError:
-                    continue
-                if latest is None or mtime > latest:
-                    latest = mtime
-        return latest
+            seen.add(id(other))
+            proc = other.get("proc")
+            if proc is None or proc.poll() is not None:
+                continue
+            if session_base(other.get("spawn_environ")) == base:
+                count += 1
+        return count
+
+    def _session_signal(self, rec: dict[str, Any], pids: list[int]) -> tuple[float | None, dict[str, Any]]:
+        """Session-file activity that belongs to this run only (see agy_session_attribution)."""
+        try:
+            return self._session.resolve(rec, pids=pids, runs_sharing_home=self._runs_sharing_home(rec))
+        except Exception as exc:  # noqa: BLE001 — a heartbeat hint must never break observe
+            return None, {"used": False, "attribution": "none", "reason": f"scan failed: {type(exc).__name__}"}
 
     def _note_children(self, rec: dict[str, Any], pid: int) -> list[int]:
         """Track tool processes (Linux /proc) so a restart can still stop them."""
@@ -1113,9 +1110,11 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             phase = "done"
         started = rec.get("started_at")
         started_at = float(started) if isinstance(started, (int, float)) and not isinstance(started, bool) else None
-        session_at = self._session_activity_at(rec)
+        pids = ([int(proc.pid)] + kids) if alive and proc is not None else []
+        session_at, session_note = self._session_signal(rec, pids)
         if session_at is not None and started_at is not None and session_at < started_at:
             session_at = None  # files from an earlier run
+            session_note = {**session_note, "used": False, "reason": "no session activity since this run started"}
         # Heartbeat = last observed activity, never "process still alive" (#5/#10):
         # a live but silent agy must be able to go stale.
         signals: dict[str, float] = {}
@@ -1143,6 +1142,8 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         if kids:
             # A long tool command is silent; say so instead of hiding why it may go stale.
             events.append(sanitize_event(f"child_processes {len(kids)}"))
+        # Bounded to 5 events; the full note is in heartbeat_signals.session.
+        events.append(sanitize_event(f"session_signal {session_note.get('attribution') if session_note.get('used') else 'unused'}"))
         return {
             "phase": phase,
             "last_heartbeat_at": heartbeat,
@@ -1150,6 +1151,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             "events": [item for item in events if item][:5],
             "source": "runner",
             "artifacts_checkpoint": entries,
+            "heartbeat_signals": {"session": session_note},
         }
 
     def collect_result(self, run_id: str) -> dict[str, Any]:

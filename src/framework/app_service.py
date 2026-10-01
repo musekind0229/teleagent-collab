@@ -85,6 +85,7 @@ from framework.progress_budget import (
     usage_report,
     utc_iso,
 )
+from lead_adapter.cancel import CancelScope, use_scope as use_lead_scope
 from lead_adapter.schema import context_summary_of, unwrap_structured
 
 API_VERSION = "collab-app.v0.1"
@@ -371,6 +372,15 @@ def _safe_artifacts(value: Any) -> list[str]:
                 f"artifact must be a relative path inside the task workspace: {raw!r}"
             ) from exc
     return out
+
+
+def _artifact_key(raw: Any) -> str:
+    """Normalized relative spelling used to compare artifact names."""
+    text = str(raw or "").strip()
+    try:
+        return contract_render.safe_relative_artifact(text)
+    except contract_render.ContractRenderError:
+        return text.replace("\\", "/")
 
 
 def _task_id(goal_id: str, key: str) -> str:
@@ -1052,14 +1062,24 @@ def validate_plan(plan: Any, request: Mapping[str, Any]) -> dict[str, Any]:
             raise AppError("task dependency references an unknown/self task", code="invalid_plan")
     # Every artifact the Goal's acceptance names must be produced by some task;
     # otherwise the Goal could "complete" without the file the caller asked for.
+    # Both sides are compared in normalized form (./a.txt == a.txt, sub\\b == sub/b).
     criteria = request.get("acceptance_criteria") if isinstance(request.get("acceptance_criteria"), Mapping) else {}
     wanted = [str(a).strip() for a in (criteria.get("artifacts") or []) if isinstance(a, str) and str(a).strip()]
-    delivered = {str(a).strip() for row in clean for a in (row.get("artifacts") or [])}
-    undelivered = [a for a in wanted if a not in delivered]
+    delivered_order: list[str] = []
+    for row in clean:
+        for a in row.get("artifacts") or []:
+            key = _artifact_key(a)
+            if key not in delivered_order:
+                delivered_order.append(key)
+    undelivered = [a for a in wanted if _artifact_key(a) not in set(delivered_order)]
     if undelivered:
         raise AppError(
-            "lead plan does not deliver goal acceptance artifacts: " + ", ".join(undelivered[:8]),
+            "lead plan does not deliver goal acceptance artifacts: missing "
+            + ", ".join(undelivered[:8])
+            + "; plan delivers "
+            + (", ".join(delivered_order[:8]) or "nothing"),
             code="invalid_plan",
+            extra={"missing_artifacts": undelivered[:32], "plan_artifacts": delivered_order[:32]},
         )
     return {
         "application_id": str(plan["application_id"]),
@@ -1593,6 +1613,7 @@ class AppCoordinator:
             return current
         snap = current["goal"]
         if snap.get("state") == "cancel_requested":
+            self._stop_planning_async(goal_id, "goal cancelled")
             active = [
                 t
                 for t in (snap.get("tasks") or [])
@@ -1624,8 +1645,8 @@ class AppCoordinator:
                 "backend_cancellations": outcomes,
             }
         if snap.get("state") in {"completed", "failed", "cancelled"}:
-            self._planning_jobs.pop(goal_id, None)
-            self._planning_since.pop(goal_id, None)
+            # Failed/cancelled while the lead was still planning: stop it now.
+            self._stop_planning_async(goal_id, f"goal {snap.get('state')}")
             return {"ok": True, "goal_id": goal_id, "state": snap.get("state"), "action": "terminal"}
         tasks = [dict(t) for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
         if not tasks:
@@ -1707,7 +1728,13 @@ class AppCoordinator:
         job = self._planning_jobs.get(goal_id)
         fresh = job is None
         if job is None:
-            job = {"done": threading.Event(), "plan": None, "error": None}
+            job = {
+                "done": threading.Event(),
+                "plan": None,
+                "error": None,
+                "scope": CancelScope(),
+                "started": time.time(),
+            }
             self._planning_jobs[goal_id] = job
             self._planning_since[goal_id] = time.time()
             self._phase(goal_id, "planning")
@@ -1715,7 +1742,8 @@ class AppCoordinator:
 
             def _run() -> None:
                 try:
-                    job["plan"] = self.planner.plan(frozen)
+                    with use_lead_scope(job["scope"]):
+                        job["plan"] = self.planner.plan(frozen)
                 except Exception as exc:  # noqa: BLE001 — surfaced on the next tick
                     job["error"] = exc
                 finally:
@@ -1735,6 +1763,54 @@ class AppCoordinator:
         if job["plan"] is None and job["error"] is None:
             return None, RuntimeError("planner thread ended without a plan")
         return job["plan"], job["error"]
+
+    def stop_planning(self, goal_id: str, reason: str = "goal cancelled") -> dict[str, Any] | None:
+        """Stop a still-running planner call for ``goal_id`` and its lead process tree.
+
+        POSIX stops the lead's process group (TERM, then KILL); Windows uses
+        ``taskkill /F /T``. Records a ``planner_stopped`` history event. Safe
+        to call without the coordinator lock; returns None when nothing ran.
+        """
+        job = self._planning_jobs.pop(goal_id, None)
+        self._planning_since.pop(goal_id, None)
+        if job is None or job["done"].is_set():
+            return None
+        scope = job.get("scope")
+        rows = scope.cancel(reason) if isinstance(scope, CancelScope) else []
+        job["done"].wait(3.0)
+        started = job.get("started")
+        event: dict[str, Any] = {
+            "reason": str(reason or "")[:200],
+            "lead_processes": [dict(r) for r in rows][:8],
+            "planner_thread": "stopped" if job["done"].is_set() else "still_running",
+        }
+        if isinstance(started, (int, float)):
+            event["planning_sec"] = round(max(0.0, time.time() - float(started)), 1)
+        try:
+            self.layer.record_goal_event(goal_id, "planner_stopped", **event)
+        except Exception:  # noqa: BLE001 — the stop itself already happened
+            pass
+        return event
+
+    def stop_all_planning(self, reason: str = "service shutdown") -> list[dict[str, Any]]:
+        out = []
+        for goal_id in list(self._planning_jobs):
+            row = self.stop_planning(goal_id, reason)
+            if row is not None:
+                out.append({"goal_id": goal_id, **row})
+        return out
+
+    def _stop_planning_async(self, goal_id: str, reason: str) -> None:
+        job = self._planning_jobs.get(goal_id)
+        if job is None:
+            return
+        if job["done"].is_set():
+            self._planning_jobs.pop(goal_id, None)
+            self._planning_since.pop(goal_id, None)
+            return
+        threading.Thread(
+            target=self.stop_planning, args=(goal_id, reason), name=f"collab-plan-stop-{goal_id}", daemon=True
+        ).start()
 
     _PREFERRED_TICK_ACTIONS = frozenset(
         {"decision_required", "decision_resolved", "backend_gate_unprojected"}
@@ -3703,6 +3779,14 @@ class CollabApplication:
         out["budget_status"] = dict(raw_budget_status) if isinstance(raw_budget_status, Mapping) else {}
         out["progress"] = self.coordinator.goal_progress_view(snap, out["scheduler"], caps)
         out["phase_timeline"] = phase_timeline(snap)
+        stops = [h for h in (snap.get("history") or []) if isinstance(h, Mapping) and h.get("op") == "planner_stopped"]
+        if stops:
+            last = stops[-1]
+            out["planner_stopped"] = {
+                k: last.get(k)
+                for k in ("at_iso", "reason", "planner_thread", "planning_sec", "lead_processes")
+                if k in last
+            }
         out["acceptance_status"] = acceptance_status_view(
             str(out.get("state") or ""), tasks if isinstance(tasks, list) else [], caps
         )
@@ -3839,6 +3923,8 @@ class CollabApplication:
         out = self.layer.cancel_goal(goal_id, reason=reason)
         if not out.get("ok"):
             raise AppError(str(out.get("error") or out.get("reason")), status=409, code=str(out.get("reason")))
+        # A lead still planning this Goal is stopped now, not at its timeout.
+        planner_stop = self.coordinator.stop_planning(goal_id, "goal cancelled")
         # If no task remains in flight, cancellation can be confirmed immediately.
         # For asynchronous backends, confirm every backend cancellation before
         # changing cancel_requested into the terminal cancelled state.
@@ -3850,7 +3936,10 @@ class CollabApplication:
             and t.get("status") in {"running", "cancel_requested", "awaiting_decision", "review"}
         ]
         if not active:
-            return self.layer.effect_cancel(goal_id, reason=reason)
+            effected = self.layer.effect_cancel(goal_id, reason=reason)
+            if planner_stop is not None:
+                effected["planner_stopped"] = planner_stop
+            return effected
         cancelled_runs: list[dict[str, Any]] = []
         all_stopped = True
         for task in active:

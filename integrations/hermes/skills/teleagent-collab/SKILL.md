@@ -1,7 +1,7 @@
 ---
 name: teleagent-collab
 description: "Delegate work to local collab-service workers (agy/antigravity pool) via bin/hermes-collab-request.py: open, wait, report. Use when the user asks to have 'the worker'/'collab'/'agy' do a task or produce a file."
-version: 0.2.16
+version: 0.2.17
 author: teleagent-collab
 license: MIT
 platforms: [windows, linux, macos]
@@ -105,6 +105,9 @@ collab-service 是本机常驻的派工服务（Application API，默认 `http:/
 - `phase=planning` 表示组长还在出计划，没有工人在跑。慢组长不会卡住别的单。
 - `phase` 还可能是 `preparing`（拷输入、起进程）、`executing`、`delivering`/`finalizing`（工人已退出，在收结果）、`testing`（核产物/精确内容）、`reviewing`（等审查）。`phase_age_sec` 是这一段已经多久。status 的 `phase_timeline`（摘要里是 `phases`）是每段的起止时间和结果，照原样转述，不要说成百分比。
 - `state=stale` 表示**很久没有真实活动**（agy 没有新输出、工作区和它的会话文件都没变），不是进程没了。告诉用户；不要自动取消或重开。
+- `progress` 里的 `session_signal` 说明 agy 会话文件有没有算进心跳：`used=false` 时照原样转述 `reason`（比如别的进程开着那个文件、几个 run 共用一个 HOME），这时 stale 更容易出现，属正常。
+- status 摘要里的 `artifacts` 已去重，都是相对该 Task 工作区的路径（`--full` 原始结果里后端给的仍可能是绝对路径）；要打开文件就拼上 `workspace`。
+- 规划中取消 Goal 会立刻停掉组长；events 和 status 里的 `planner_stopped` 记着停了哪些进程。`invalid_plan` 的原因会写 `missing …; plan delivers …`，转述给用户，别自己改名重开。
 - 一次性后端 `progress.available` 为 false。agy 的活动心跳（输出、工作区、会话文件的 mtime）和产物清单（文件名、大小、mtime，没有正文）是真的。`subagent_observability` 只有 `false` 或 `unknown`，不会假装是 0。
 - 预算旗标：`--wall-sec`、`--max-tokens`、`--max-tool-calls`、`--no-progress-sec`、`--on-no-progress checkpoint|fail`、`--budget-report-only`。这个后端标成 unsupported 的字段会被拒绝（退出码 1，`code=capability_unavailable`，`missing` 里有 `budget:<字段>`），除非用户明确要求 `--budget-report-only`。不要为了过提交自己拿掉限制。
 - `post_hoc` 表示跑完才核对，中途停不了。用量是工人自报，**不是账单**，不要把它说成费用。

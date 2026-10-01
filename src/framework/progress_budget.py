@@ -250,6 +250,24 @@ def tool_call_total(payload: Mapping[str, Any] | None) -> int | None:
     return None
 
 
+SESSION_ATTRIBUTIONS = frozenset({"open_handle", "new_file", "none"})
+
+
+def heartbeat_signals_view(raw: Any) -> dict[str, Any]:
+    """Which heartbeat inputs were used, and why one was not. Bounded, no paths."""
+    if not isinstance(raw, Mapping) or not isinstance(raw.get("session"), Mapping):
+        return {}
+    note = raw["session"]
+    attribution = str(note.get("attribution") or "none")
+    if attribution not in SESSION_ATTRIBUTIONS:
+        attribution = "none"
+    row: dict[str, Any] = {"used": bool(note.get("used")), "attribution": attribution}
+    reason = sanitize_event(str(note.get("reason") or ""), limit=200) if note.get("reason") else ""
+    if reason:
+        row["reason"] = reason[:200]
+    return {"session": row}
+
+
 def bound_task_progress(raw: Mapping[str, Any] | None) -> dict[str, Any]:
     """Durable per-task snapshot. Bounded and free of file contents."""
     src = raw if isinstance(raw, Mapping) else {}
@@ -288,6 +306,9 @@ def bound_task_progress(raw: Mapping[str, Any] | None) -> dict[str, Any]:
         "source": source,
         "artifacts_checkpoint": checkpoint,
     }
+    signals = heartbeat_signals_view(src.get("heartbeat_signals"))
+    if signals:
+        out["heartbeat_signals"] = signals
     fields = usage_fields(src.get("usage_fields") if "usage_fields" in src else src.get("usage"))
     if fields:
         out["usage_fields"] = fields
@@ -601,6 +622,11 @@ def derive_goal_progress(
         "artifacts_checkpoint": list(checkpoint)[:MAX_CHECKPOINT],
         "source": source,
         "subagent_observability": sub,
+        **(
+            {"heartbeat_signals": heartbeat_signals_view(focus_progress.get("heartbeat_signals"))}
+            if heartbeat_signals_view(focus_progress.get("heartbeat_signals"))
+            else {}
+        ),
     }
 
 
