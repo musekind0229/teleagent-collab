@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
+from framework.artifact_handoff import workspace_paths_match
 from framework.delegation import (
     ESCALATE_KINDS,
     EVENT_CLASS_DECISION,
@@ -1367,6 +1368,7 @@ class DurableLayer:
         run_id: str,
         native_handle: str = "",
         backend: str = "",
+        workspace: str = "",
     ) -> dict[str, Any]:
         """Persist the opaque backend handle before an asynchronous Run is polled.
 
@@ -1407,8 +1409,24 @@ class DurableLayer:
             backend_id = _norm_key(backend)
             if backend_id:
                 found["backend"] = backend_id
+            # Scheduler-owned directory passed to start_run. Never taken from
+            # the worker result. A second bind may not retarget it.
+            ws = _norm_key(workspace)
+            if ws:
+                current_ws = _norm_key(found.get("workspace"))
+                if current_ws and not workspace_paths_match(current_ws, ws):
+                    return {
+                        "ok": False,
+                        "reason": "workspace_binding_conflict",
+                        "error": "task workspace is already bound to a different directory",
+                    }
+                if not current_ws:
+                    found["workspace"] = ws
             snap["tasks"] = tasks
-            self._append_history(snap, "bind_task_run", task_id=tid, run_id=rid)
+            hist: dict[str, Any] = {"task_id": tid, "run_id": rid}
+            if found.get("workspace"):
+                hist["workspace"] = found.get("workspace")
+            self._append_history(snap, "bind_task_run", **hist)
             self._touch(snap)
             self._persist_unlocked()
             return {"ok": True, "reason": REASON_READY, "task": found, "state": snap.get("state")}

@@ -34,7 +34,12 @@ from execution_backend.base import (
 from execution_backend.inprocess_v1 import InProcessExecutionBackend
 from framework import contract_render
 from framework.artifact_contamination import scan_file, summarize
-from framework.artifact_handoff import HandoffError, handoff_direct_dependency_artifacts
+from framework.artifact_handoff import (
+    HandoffError,
+    handoff_direct_dependency_artifacts,
+    scheduler_task_workspace,
+    workspace_paths_match,
+)
 from framework.failure_projection import project_failed_tasks
 from framework.need_human import goal_need_human_view, sanitize_reason
 from framework.durable_api import DurableLayer
@@ -1320,13 +1325,18 @@ class AppCoordinator:
             started = self.layer.start_task(goal_id, str(task["task_id"]))
             if not started.get("ok"):
                 return started
-            root = self.workspaces_root / goal_id / str(task["task_id"])
+            root = scheduler_task_workspace(
+                self.workspaces_root,
+                str(task.get("goal_id") or goal_id),
+                str(task["task_id"]),
+            )
             root.mkdir(parents=True, exist_ok=True)
             try:
                 staged = handoff_direct_dependency_artifacts(
                     task=task,
                     siblings=tasks,
                     dest_root=root,
+                    workspaces_root=self.workspaces_root,
                 )
             except HandoffError as e:
                 return self.layer.finish_task(
@@ -1389,11 +1399,15 @@ class AppCoordinator:
                 run_id=run_id,
                 native_handle=str(launched.get("native_handle") or ""),
                 backend=str(launched.get("backend") or getattr(self.backend, "backend_id", "")),
+                workspace=str(root),
             )
             if not bound.get("ok"):
                 # The Run may already exist, so fail closed and never launch a
                 # replacement.  The returned binding error remains durable.
                 return bound
+            bound_task = bound.get("task") if isinstance(bound.get("task"), Mapping) else {}
+            if bound_task.get("workspace"):
+                task["workspace"] = bound_task.get("workspace")
             try:
                 observation = self.backend.observe_run(run_id)
                 if observation.get("busy"):
@@ -1435,11 +1449,60 @@ class AppCoordinator:
         workdir = result.get("workspace")
         if not isinstance(workdir, str) or not workdir.strip():
             workdir = str(
-                self.workspaces_root / str(snap.get("goal_id") or "") / str(task.get("task_id") or "")
+                scheduler_task_workspace(
+                    self.workspaces_root,
+                    str(snap.get("goal_id") or task.get("goal_id") or ""),
+                    str(task.get("task_id") or ""),
+                )
             )
         from execution_backend.antigravity_cli_v1 import apply_agy_acceptance_gate
 
         return apply_agy_acceptance_gate(charter=charter, workdir=workdir, result=result)
+
+    def _trusted_workspace_text(self, task: Mapping[str, Any]) -> str:
+        """Scheduler directory for ``task``. Empty when it cannot be named.
+
+        Prefers the value persisted at dispatch. Otherwise the deterministic
+        scheduler path, and only when that path is already a real directory.
+        """
+        raw = task.get("workspace")
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+        gid = str(task.get("goal_id") or "").strip()
+        tid = str(task.get("task_id") or "").strip()
+        if not gid or not tid:
+            return ""
+        candidate = scheduler_task_workspace(self.workspaces_root, gid, tid)
+        try:
+            if candidate.is_symlink() or not candidate.is_dir():
+                return ""
+            if hasattr(candidate, "is_junction") and candidate.is_junction():
+                return ""
+        except OSError:
+            return ""
+        return str(candidate)
+
+    def _with_trusted_workspace(self, task: Mapping[str, Any], result: Any) -> Any:
+        """Force ``result["workspace"]`` to the scheduler directory.
+
+        Exception stubs (no artifacts and no workspace) are left alone so an
+        observation failure is not rewritten as an acceptance miss. A backend
+        workspace that differs from the trusted directory is ignored.
+        """
+        if not isinstance(result, dict):
+            return result
+        reported = result.get("workspace")
+        reported_text = reported.strip() if isinstance(reported, str) else ""
+        if "artifacts" not in result and not reported_text:
+            return result
+        trusted = self._trusted_workspace_text(task)
+        if not trusted:
+            return result
+        if reported_text and workspace_paths_match(reported_text, trusted):
+            return result
+        out = dict(result)
+        out["workspace"] = trusted
+        return out
 
     def _finish_gated(self, snap: Mapping[str, Any], task: Mapping[str, Any], result: Any) -> dict[str, Any]:
         """Acceptance gate, then contamination scan, then finish_task.
@@ -1448,6 +1511,7 @@ class AppCoordinator:
         reviewer checked is a warning, not a pass. Contamination still runs
         when the result is otherwise ok.
         """
+        result = self._with_trusted_workspace(task, result)
         result = self._apply_agy_acceptance(snap, task, result)
         result = _gate_backend_result(snap, task, result)
         goal_id = str(snap.get("goal_id") or "")

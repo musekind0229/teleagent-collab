@@ -86,6 +86,98 @@ def _workspace_root(raw: Any) -> Path:
     return root
 
 
+def scheduler_task_workspace(
+    workspaces_root: str | os.PathLike[str],
+    goal_id: Any,
+    task_id: Any,
+) -> Path:
+    """Directory the scheduler creates for one task.
+
+    ``workspaces_root / goal_id / task_id``. Not derived from artifact paths
+    or from a worker-reported workspace.
+    """
+    return Path(workspaces_root) / str(goal_id) / str(task_id)
+
+
+def workspace_paths_match(left: Any, right: Any) -> bool:
+    """True when both values name the same directory after resolve."""
+    if not isinstance(left, (str, os.PathLike)) or not isinstance(right, (str, os.PathLike)):
+        return False
+    if not str(left).strip() or not str(right).strip():
+        return False
+    try:
+        return _norm_key(Path(str(left)).resolve()) == _norm_key(Path(str(right)).resolve())
+    except OSError:
+        return _norm_key(str(left)) == _norm_key(str(right))
+
+
+def _identity_ok(value: str) -> bool:
+    if not value or value in {".", ".."}:
+        return False
+    if "/" in value or "\\" in value:
+        return False
+    return True
+
+
+def _recover_scheduler_workspace(
+    src_task: Mapping[str, Any],
+    workspaces_root: str | os.PathLike[str],
+) -> Path:
+    """Recompute a pre-binding task directory. Never reads result.workspace."""
+    label = str(src_task.get("task_id") or "").strip() or "?"
+    goal_id = str(src_task.get("goal_id") or "").strip()
+    task_id = str(src_task.get("task_id") or "").strip()
+    if not _identity_ok(goal_id) or not _identity_ok(task_id):
+        raise HandoffError(
+            f"dependency workspace unrecoverable: task {label} has no scheduler identity"
+        )
+    expected = scheduler_task_workspace(workspaces_root, goal_id, task_id)
+    if _is_link(expected) or not expected.is_dir():
+        raise HandoffError(
+            f"dependency workspace unrecoverable: task {label} scheduler workspace is missing"
+        )
+    try:
+        resolved = expected.resolve()
+        base = Path(workspaces_root).resolve()
+        formula = (Path(workspaces_root) / goal_id / task_id).resolve()
+    except OSError as e:
+        raise HandoffError(
+            f"dependency workspace unrecoverable: task {label} scheduler workspace is unreadable"
+        ) from e
+    if (
+        _is_link(resolved)
+        or not resolved.is_dir()
+        or not _within(resolved, base)
+        or _norm_key(resolved) != _norm_key(formula)
+    ):
+        raise HandoffError(
+            f"dependency workspace unrecoverable: task {label} scheduler workspace does not match"
+        )
+    return _workspace_root(expected)
+
+
+def _dependency_workspace(
+    src_task: Mapping[str, Any],
+    *,
+    workspaces_root: str | os.PathLike[str] | None,
+) -> Path:
+    """Containment root for one succeeded dependency.
+
+    Scheduler-bound ``task["workspace"]`` wins. A result workspace that
+    differs is ignored. Legacy records recompute the scheduler directory
+    when ``workspaces_root`` is set and that directory exists and matches;
+    they do not fall through to ``result["workspace"]``. The result field
+    remains a fallback only for direct callers that omit ``workspaces_root``.
+    """
+    trusted = src_task.get("workspace")
+    if isinstance(trusted, (str, os.PathLike)) and str(trusted).strip():
+        return _workspace_root(trusted)
+    if workspaces_root is not None:
+        return _recover_scheduler_workspace(src_task, workspaces_root)
+    result = src_task.get("result") if isinstance(src_task.get("result"), Mapping) else {}
+    return _workspace_root(result.get("workspace") or src_task.get("workspace"))
+
+
 def contained_path(root: Path, relative: str, *, must_exist: bool = False) -> Path:
     rel = safe_relative_name(relative)
     base = Path(root)
@@ -161,12 +253,16 @@ def _same_file_bytes(left: Path, right: Path) -> bool:
 def collect_direct_dep_artifacts(
     task: Mapping[str, Any],
     siblings: Sequence[Mapping[str, Any]],
+    *,
+    workspaces_root: str | os.PathLike[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Return declared+accepted files from succeeded direct deps only.
 
-    Sources must live in that run's real workspace. Tail-matching an accepted
-    absolute path is not enough: a same-named file outside the workspace is
-    rejected, as are parent-directory links and junctions.
+    Sources must live in that run's real workspace. The root is the
+    scheduler-bound task workspace, not an LLM path or a conflicting
+    result.workspace. Tail-matching an accepted absolute path is not enough:
+    a same-named file outside the workspace is rejected, as are
+    parent-directory links and junctions.
     """
     deps = [str(x).strip() for x in (task.get("depends_on") or []) if str(x).strip()]
     by_id = {str(row.get("task_id") or ""): row for row in siblings if isinstance(row, Mapping)}
@@ -184,7 +280,7 @@ def collect_direct_dep_artifacts(
         if not declared:
             continue
         result = src_task.get("result") if isinstance(src_task.get("result"), Mapping) else {}
-        workspace = _workspace_root(result.get("workspace") or src_task.get("workspace"))
+        workspace = _dependency_workspace(src_task, workspaces_root=workspaces_root)
         accepted_ok: set[str] = set()
         for raw in result.get("artifacts") or []:
             if not str(raw).strip():
@@ -302,8 +398,12 @@ def handoff_direct_dependency_artifacts(
     task: Mapping[str, Any],
     siblings: Sequence[Mapping[str, Any]],
     dest_root: Path,
+    workspaces_root: str | os.PathLike[str] | None = None,
 ) -> list[dict[str, Any]]:
-    return stage_handoff_files(collect_direct_dep_artifacts(task, siblings), dest_root)
+    return stage_handoff_files(
+        collect_direct_dep_artifacts(task, siblings, workspaces_root=workspaces_root),
+        dest_root,
+    )
 
 
 __all__ = [
@@ -315,5 +415,7 @@ __all__ = [
     "credential_like",
     "handoff_direct_dependency_artifacts",
     "safe_relative_name",
+    "scheduler_task_workspace",
     "stage_handoff_files",
+    "workspace_paths_match",
 ]

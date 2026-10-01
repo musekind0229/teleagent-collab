@@ -33,6 +33,49 @@ def _need_human_fields(error: str) -> dict:
     return {"need_human": True, "failure_reason": reason}
 
 
+def _mirror_outputs_to_scheduler(job: Mapping[str, Any], root: Path, present: list[str]) -> None:
+    """Copy declared outputs into the scheduler directory passed to start_run.
+
+    TeleAgent keeps its own UUID workspace. Handoff only trusts the scheduler
+    directory, so the accepted artifact path has to live there too. Failures
+    are ignored: collect_result still reports the controller outcome.
+    """
+    raw = str(job.get("scheduler_directory") or "").strip()
+    if not raw:
+        return
+    stage = Path(raw)
+    try:
+        if stage.resolve() == root.resolve():
+            return
+    except OSError:
+        return
+    names: list[str] = []
+    for rel in [str(x) for x in (job.get("charter") or {}).get("artifacts", [])]:
+        src = root / rel
+        try:
+            linked = src.is_symlink() or bool(hasattr(src, "is_junction") and src.is_junction())
+        except OSError:
+            continue
+        if src.is_file() and not linked:
+            names.append(rel)
+    if not names:
+        return
+    try:
+        copied = copy_staged_inputs(root, stage, names)
+    except (HandoffError, OSError, ValueError):
+        return
+    for rel in copied:
+        dest = stage / rel
+        try:
+            linked = dest.is_symlink() or bool(hasattr(dest, "is_junction") and dest.is_junction())
+        except OSError:
+            continue
+        if dest.is_file() and not linked:
+            text = str(dest)
+            if text not in present:
+                present.append(text)
+
+
 class WindowsSupervisedExecutionBackend(ExecutionBackendABC):
     backend_id = "teleagent.windows.supervised_v1"
     capability_kind = "teleagent_windows"
@@ -190,6 +233,13 @@ class WindowsSupervisedExecutionBackend(ExecutionBackendABC):
                 charter=charter,
             )
             job = engine.submit(built)
+            with store.transaction():
+                job = store.get(job["id"])
+                # Scheduler directory passed into start_run. Outputs are mirrored
+                # back here at collect time; the TeleAgent UUID workspace stays
+                # the worker root and is not the handoff root.
+                job["scheduler_directory"] = str(Path(directory))
+                store.save(job)
             names = [str(x) for x in (built.get("input_files") or [])]
             try:
                 copied = copy_staged_inputs(Path(directory), Path(job["workspace"]), names)
@@ -277,6 +327,7 @@ class WindowsSupervisedExecutionBackend(ExecutionBackendABC):
             expected = [str(x) for x in (job.get("charter") or {}).get("artifacts", [])]
             present = [str(root / rel) for rel in expected if (root / rel).is_file()]
             missing = [rel for rel in expected if not (root / rel).is_file()]
+            _mirror_outputs_to_scheduler(job, root, present)
             ok = state == "passed" and not missing
             err = job.get("error") or ""
             nh = _need_human_fields(err)

@@ -46,13 +46,38 @@ from pathlib import Path
 argv_path = os.environ.get("AGY_FAKE_ARGV", "")
 if argv_path:
     Path(argv_path).write_text(json.dumps(sys.argv), encoding="utf-8")
-art = os.environ.get("AGY_FAKE_ARTIFACT", "")
-if art:
-    p = Path(art)
-    if not p.is_absolute():
-        p = Path.cwd() / p
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(os.environ.get("AGY_FAKE_ARTIFACT_BODY", "hello from agy fake\n"), encoding="utf-8")
+
+def _truthy(value):
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+def _write_rel(name, body):
+    path = Path(name)
+    if path.is_absolute() or ".." in path.parts:
+        return
+    dest = Path.cwd() / path
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(body, encoding="utf-8")
+
+# Handoff mode: A writes AGY_FAKE_A_NAME; B reads that file from cwd and writes B.
+# cwd + env, not the full --print prompt (the Windows .cmd shim truncates it).
+if _truthy(os.environ.get("AGY_FAKE_HANDOFF")):
+    a_name = os.environ.get("AGY_FAKE_A_NAME", "a.txt") or "a.txt"
+    b_name = os.environ.get("AGY_FAKE_B_NAME", "b.txt") or "b.txt"
+    a_body = os.environ.get("AGY_FAKE_A_BODY", "alpha-from-A\n")
+    b_prefix = os.environ.get("AGY_FAKE_B_PREFIX", "beta:")
+    a_path = Path.cwd() / a_name
+    if a_path.is_file() and not a_path.is_symlink():
+        _write_rel(b_name, b_prefix + a_path.read_text(encoding="utf-8"))
+    else:
+        _write_rel(a_name, a_body)
+else:
+    art = os.environ.get("AGY_FAKE_ARTIFACT", "")
+    if art:
+        p = Path(art)
+        if not p.is_absolute():
+            p = Path.cwd() / p
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(os.environ.get("AGY_FAKE_ARTIFACT_BODY", "hello from agy fake\n"), encoding="utf-8")
 payload = {
     "conversation_id": "conv_contract",
     "status": "ok",
