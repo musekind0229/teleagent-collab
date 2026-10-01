@@ -62,7 +62,8 @@ class AcceptanceStatusTests(unittest.TestCase):
     def test_missing_artifacts_reported(self):
         tasks = [{"status": "failed", "result": {"ok": False, "missing": ["a.txt", "b.txt"]}}]
         view = acceptance_status_view("failed", tasks, {})
-        self.assertEqual(view["artifacts"], "incomplete")
+        # Nothing was produced at all: "none", not "incomplete" (round 3, #12).
+        self.assertEqual(view["artifacts"], "none")
         self.assertEqual(view["missing_artifacts"], ["a.txt", "b.txt"])
 
 

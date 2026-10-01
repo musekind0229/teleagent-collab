@@ -8,6 +8,7 @@ passes acceptance.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -25,6 +26,7 @@ from urllib.parse import unquote, urlparse
 
 from execution_backend.base import (
     REQUIRED_CAPABILITY_NAMES,
+    PROMPT_ONLY_INPUTS_WARNING,
     SKIP_PERMISSIONS_WARNING,
     BackendError,
     ExecutionBackend,
@@ -330,6 +332,8 @@ def goal_status_warnings(snap: Mapping[str, Any], caps: Mapping[str, Any]) -> li
 
             _append_unique(out, seen, ACCEPTANCE_UNVERIFIED_WARNING)
     for item in caps.get("warnings") or []:
+        if item == PROMPT_ONLY_INPUTS_WARNING and not goal.get("external_inputs"):
+            continue
         _append_unique(out, seen, item)
     return out
 
@@ -540,6 +544,19 @@ def goal_acceptance_applies(
     depended = {str(d) for r in rows for d in (r.get("depends_on") or [])}
     sinks = [str(r.get("task_id") or "") for r in rows if str(r.get("task_id") or "") not in depended]
     return me in sinks
+
+
+def backend_error_text(prefix: str, exc: BaseException) -> str:
+    """``prefix: Type: reason``. The reason is redacted and bounded.
+
+    A bare exception class name (``BackendError``) tells the caller nothing
+    about why a run could not be resumed or observed (#12).
+    """
+    name = type(exc).__name__
+    detail = sanitize_reason(str(exc))[:300]
+    if not detail or detail == name:
+        return f"{prefix}: {name}"
+    return f"{prefix}: {name}: {detail}"
 
 
 def worker_charter_for_task(
@@ -1033,6 +1050,17 @@ def validate_plan(plan: Any, request: Mapping[str, Any]) -> dict[str, Any]:
     for row in clean:
         if any(dep not in seen or dep == row["task_key"] for dep in row["depends_on"]):
             raise AppError("task dependency references an unknown/self task", code="invalid_plan")
+    # Every artifact the Goal's acceptance names must be produced by some task;
+    # otherwise the Goal could "complete" without the file the caller asked for.
+    criteria = request.get("acceptance_criteria") if isinstance(request.get("acceptance_criteria"), Mapping) else {}
+    wanted = [str(a).strip() for a in (criteria.get("artifacts") or []) if isinstance(a, str) and str(a).strip()]
+    delivered = {str(a).strip() for row in clean for a in (row.get("artifacts") or [])}
+    undelivered = [a for a in wanted if a not in delivered]
+    if undelivered:
+        raise AppError(
+            "lead plan does not deliver goal acceptance artifacts: " + ", ".join(undelivered[:8]),
+            code="invalid_plan",
+        )
     return {
         "application_id": str(plan["application_id"]),
         "context_summary": str(plan["context_summary"]),
@@ -1107,6 +1135,42 @@ def _candidate_artifacts(task: Mapping[str, Any] | None) -> list[str]:
     return found
 
 
+def _open_phase(holder: Mapping[str, Any] | None) -> str:
+    """Name of the phase still open on a task/goal timeline, else ""."""
+    rows = holder.get("phases") if isinstance(holder, Mapping) else None
+    if isinstance(rows, list) and rows and isinstance(rows[-1], Mapping) and rows[-1].get("ended_at") is None:
+        return str(rows[-1].get("phase") or "")
+    return ""
+
+
+def _failed_phase(holder: Mapping[str, Any] | None) -> str:
+    rows = holder.get("phases") if isinstance(holder, Mapping) else None
+    for row in reversed(rows if isinstance(rows, list) else []):
+        if isinstance(row, Mapping) and row.get("outcome") == "failed":
+            return str(row.get("phase") or "")
+    return ""
+
+
+def phase_timeline(snap: Mapping[str, Any], *, limit: int = 48) -> list[dict[str, Any]]:
+    """Goal planning + every task's phases, oldest first. Time windows per phase (#10)."""
+    out: list[dict[str, Any]] = []
+    for row in snap.get("phases") or []:
+        if isinstance(row, Mapping):
+            out.append({"task_id": "", "title": "", **{k: row.get(k) for k in ("phase", "started_at", "ended_at", "duration_sec", "outcome", "detail") if k in row}})
+    for task in snap.get("tasks") or []:
+        if not isinstance(task, Mapping):
+            continue
+        for row in task.get("phases") or []:
+            if isinstance(row, Mapping):
+                out.append({
+                    "task_id": str(task.get("task_id") or ""),
+                    "title": str(task.get("title") or ""),
+                    **{k: row.get(k) for k in ("phase", "started_at", "ended_at", "duration_sec", "outcome", "detail") if k in row},
+                })
+    out.sort(key=lambda r: str(r.get("started_at") or ""))
+    return out[-limit:]
+
+
 def _annotate_task_failure(brief: dict[str, Any], task: Mapping[str, Any] | None) -> None:
     """Stage, unreviewed candidate presence and review status on a task failure (#12/#2)."""
     brief.setdefault("stage", "worker")
@@ -1122,6 +1186,17 @@ def _annotate_task_failure(brief: dict[str, Any], task: Mapping[str, Any] | None
             review = task.get("review")
     status = review.get("status") if isinstance(review, Mapping) else None
     brief["review_status"] = str(status or "not_requested")
+    # Which phase failed, and whether anything was produced (#5): "candidate
+    # produced, CLI finalization failed" must not read like "no output".
+    phase = _failed_phase(task)
+    if brief.get("source") in {"worker_timeout"} or "no_progress" in str(brief.get("error") or ""):
+        phase = "executing"  # the wall/no-progress clock ran out while it worked
+    brief["failed_phase"] = phase or "unknown"
+    brief["outcome"] = "candidate_produced" if present else "no_output"
+    brief["outcome_summary"] = (
+        f"{'candidate produced (not accepted)' if present else 'no output produced'}; "
+        f"failed during {brief['failed_phase']}"
+    )
 
 
 def acceptance_status_view(
@@ -1150,22 +1225,58 @@ def acceptance_status_view(
         execution = "cancelled"
     else:
         execution = "in_progress"
+    # Per task: what was delivered, what exists but is unaccepted (candidate),
+    # what is missing. A failed goal must not collapse to "unknown" (#12).
     missing: list[str] = []
-    finished = 0
+    delivered: list[str] = []
+    candidates: list[str] = []
+    by_task: list[dict[str, Any]] = []
+    pending_tasks = 0
     for t in rows:
+        status = str(t.get("status") or "")
         result = t.get("result") if isinstance(t.get("result"), Mapping) else None
-        if result is None:
-            continue
-        finished += 1
-        for item in result.get("missing") or result.get("missing_artifacts") or []:
-            if isinstance(item, str) and item not in missing:
-                missing.append(item)
-    if missing:
+        expected = [str(x) for x in (t.get("expected_artifacts") or []) if isinstance(x, str) and x.strip()]
+        present = _candidate_artifacts(t)
+        reported_missing = [
+            str(x) for x in ((result or {}).get("missing") or (result or {}).get("missing_artifacts") or [])
+            if isinstance(x, str)
+        ]
+        row_missing = [x for x in expected if x not in present]
+        for item in reported_missing:
+            if item not in row_missing and item not in present:
+                row_missing.append(item)
+        row: dict[str, Any] = {"task_id": str(t.get("task_id") or ""), "status": status}
+        if status == "succeeded":
+            row["delivered"] = present
+            delivered.extend(x for x in present if x not in delivered)
+        elif result is not None or status in {"failed", "cancelled"}:
+            row["candidates"] = present
+            candidates.extend(x for x in present if x not in candidates)
+        elif execution == "in_progress":
+            pending_tasks += 1
+            row["pending"] = expected
+            row_missing = []
+        else:
+            # Goal is terminal and this task never ran: its files are missing.
+            row["not_run"] = True
+        row["missing"] = row_missing
+        missing.extend(x for x in row_missing if x not in missing)
+        by_task.append(row)
+    produced = bool(delivered or candidates)
+    if execution == "succeeded":
+        artifacts = "incomplete" if missing else "complete"
+    elif execution == "in_progress":
+        artifacts = "pending"
+    elif not rows:
+        artifacts = "not_started"  # failed/cancelled before any task existed
+    elif not produced:
+        artifacts = "none"
+    elif missing:
         artifacts = "incomplete"
-    elif rows and finished == len(rows) and execution == "succeeded":
-        artifacts = "complete"
+    elif candidates:
+        artifacts = "candidates_only"  # every expected file exists, not accepted
     else:
-        artifacts = "unknown"
+        artifacts = "complete"
     reviews = []
     for t in rows:
         result = t.get("result") if isinstance(t.get("result"), Mapping) else {}
@@ -1189,6 +1300,9 @@ def acceptance_status_view(
         "execution": execution,
         "artifacts": artifacts,
         "missing_artifacts": missing[:32],
+        "delivered_artifacts": delivered[:32],
+        "candidate_artifacts": candidates[:32],
+        "artifacts_by_task": by_task[:32],
         "independent_checks": independent,
         "technical_review": technical,
         "business_acceptance": "not_performed",
@@ -1370,6 +1484,13 @@ class AppCoordinator:
         self.stale_after_sec = stale if stale > 0 else 120.0
         # goal_id -> epoch seconds while a planner call is in flight (in-memory only).
         self._planning_since: dict[str, float] = {}
+        # goal_id -> in-flight planner call on its own thread. The coordinator
+        # lock is never held while a lead plans, so one slow lead cannot stall
+        # every other Goal's tick (process_all is serial under the lock).
+        self._planning_jobs: dict[str, dict[str, Any]] = {}
+        # A fast planner (deterministic, in-process stubs) still finishes inside
+        # the same tick; only a call slower than this is left running.
+        self.plan_inline_wait_sec = 1.0
         self._clock = clock or time.time
         # Claims whose start_run is in progress in this process. A running
         # task with no run_id is "dispatch in progress" only while its token
@@ -1382,6 +1503,24 @@ class AppCoordinator:
 
     def now(self) -> float:
         return float(self._clock())
+
+    def _phase(
+        self,
+        goal_id: str,
+        phase: str = "",
+        *,
+        task_id: str = "",
+        outcome: str = "",
+        detail: str = "",
+    ) -> None:
+        """Durable phase timeline (#5/#10). Best effort; never fails a tick."""
+        fn = getattr(self.layer, "record_phase", None)
+        if not callable(fn) or not goal_id:
+            return
+        try:
+            fn(goal_id, phase, task_id=task_id, at=self.now(), outcome=outcome, detail=sanitize_reason(detail)[:200])
+        except Exception:  # noqa: BLE001
+            return
 
     def _service_caps(self) -> dict[str, Any]:
         fn = getattr(self.backend, "capabilities", None)
@@ -1416,6 +1555,26 @@ class AppCoordinator:
             view["source"] = "coordinator"
             view["planning_started_at"] = utc_iso(started)
             view["recent_events"] = ["phase planning (lead call in flight; no worker started)"]
+            return view
+        # Coordinator phases the runner cannot see: staging before spawn,
+        # CLI finalization/collect, acceptance checks, lead/TeleAgent review (#5).
+        order = {"reviewing": 4, "testing": 3, "finalizing": 2, "preparing": 1}
+        best: tuple[int, str, str] | None = None
+        for task in snap.get("tasks") or []:
+            if not isinstance(task, Mapping) or str(task.get("status") or "") not in IN_FLIGHT:
+                continue
+            rows = task.get("phases") if isinstance(task.get("phases"), list) else []
+            name = _open_phase(task)
+            if name in order and rows:
+                cand = (order[name], name, str(rows[-1].get("started_at") or ""))
+                if best is None or cand[0] > best[0]:
+                    best = cand
+        if best is not None and view.get("state") not in {"stale", "done"}:
+            view = dict(view)
+            view["phase"] = best[1]
+            view["phase_started_at"] = best[2]
+            if view.get("state") != "waiting_decision":
+                view["state"] = {"finalizing": "delivering"}.get(best[1], best[1])
         return view
 
     def process_all(self) -> dict[str, Any]:
@@ -1465,14 +1624,32 @@ class AppCoordinator:
                 "backend_cancellations": outcomes,
             }
         if snap.get("state") in {"completed", "failed", "cancelled"}:
+            self._planning_jobs.pop(goal_id, None)
+            self._planning_since.pop(goal_id, None)
             return {"ok": True, "goal_id": goal_id, "state": snap.get("state"), "action": "terminal"}
         tasks = [dict(t) for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
         if not tasks:
-            self._planning_since[goal_id] = time.time()
+            outcome = self._plan_off_lock(goal_id, snap)
+            if outcome is None:
+                return {
+                    "ok": True,
+                    "goal_id": goal_id,
+                    "state": str(snap.get("state") or "queued"),
+                    "action": "planning_in_progress",
+                }
+            plan, plan_error = outcome
+            # The goal may have been cancelled or failed while the lead planned.
+            current = self.layer.get_goal(goal_id)
+            if not current.get("ok"):
+                return current
+            snap = current["goal"]
+            if snap.get("state") in {"completed", "failed", "cancelled", "cancel_requested"} or snap.get("tasks"):
+                self._phase(goal_id, outcome="discarded")
+                return {"ok": True, "goal_id": goal_id, "state": snap.get("state"), "action": "plan_discarded"}
             try:
-                plan = self.planner.plan(snap)
+                if plan_error is not None:
+                    raise plan_error
             except Exception as e:
-                self._planning_since.pop(goal_id, None)
                 detail = f"planner failed: {type(e).__name__}"
                 failure_extra: dict[str, Any] = {"source": "planner", "code": "planner_error"}
                 if isinstance(e, AppError):
@@ -1481,6 +1658,7 @@ class AppCoordinator:
                     lead_status = e.extra.get("lead_status") if isinstance(e.extra, Mapping) else None
                     if lead_status:
                         failure_extra["lead_status"] = str(lead_status)
+                self._phase(goal_id, outcome="failed", detail=detail)
                 failed = self.layer.fail_goal(
                     goal_id,
                     phase="planning",
@@ -1488,7 +1666,7 @@ class AppCoordinator:
                     extra=failure_extra,
                 )
                 return {**failed, "action": "planning_failed"}
-            self._planning_since.pop(goal_id, None)
+            self._phase(goal_id, outcome="ok")
             key_to_id = {row["task_key"]: _task_id(goal_id, row["task_key"]) for row in plan["tasks"]}
             for row in plan["tasks"]:
                 added = self.layer.add_child_task(
@@ -1515,6 +1693,48 @@ class AppCoordinator:
             tasks = [dict(t) for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
 
         return self._advance_goal(goal_id)
+
+    def _plan_off_lock(
+        self, goal_id: str, snap: Mapping[str, Any]
+    ) -> tuple[Any, BaseException | None] | None:
+        """Run ``planner.plan`` on a worker thread; never under the coordinator lock.
+
+        Returns ``(plan, error)`` once the call has finished, or ``None`` while
+        it is still running (the next tick picks the result up). The first tick
+        waits up to ``plan_inline_wait_sec`` with the lock released so a fast
+        planner keeps the old one-tick behaviour.
+        """
+        job = self._planning_jobs.get(goal_id)
+        fresh = job is None
+        if job is None:
+            job = {"done": threading.Event(), "plan": None, "error": None}
+            self._planning_jobs[goal_id] = job
+            self._planning_since[goal_id] = time.time()
+            self._phase(goal_id, "planning")
+            frozen = copy.deepcopy(dict(snap))
+
+            def _run() -> None:
+                try:
+                    job["plan"] = self.planner.plan(frozen)
+                except Exception as exc:  # noqa: BLE001 — surfaced on the next tick
+                    job["error"] = exc
+                finally:
+                    job["done"].set()
+
+            threading.Thread(target=_run, name=f"collab-plan-{goal_id}", daemon=True).start()
+        if fresh and not job["done"].is_set() and self.plan_inline_wait_sec > 0:
+            self._lock.release()
+            try:
+                job["done"].wait(self.plan_inline_wait_sec)
+            finally:
+                self._lock.acquire()
+        if not job["done"].is_set():
+            return None
+        self._planning_jobs.pop(goal_id, None)
+        self._planning_since.pop(goal_id, None)
+        if job["plan"] is None and job["error"] is None:
+            return None, RuntimeError("planner thread ended without a plan")
+        return job["plan"], job["error"]
 
     _PREFERRED_TICK_ACTIONS = frozenset(
         {"decision_required", "decision_resolved", "backend_gate_unprojected"}
@@ -2069,6 +2289,7 @@ class AppCoordinator:
         }
 
     def _fail_task(self, goal_id: str, task_id: str, result: Mapping[str, Any]) -> dict[str, Any]:
+        self._phase(goal_id, task_id=task_id, outcome="failed", detail=str(result.get("error") or ""))
         finished = self.layer.finish_task(
             goal_id,
             task_id,
@@ -2200,14 +2421,19 @@ class AppCoordinator:
             workspace=str(task.get("workspace") or ""),
         )
         if not observation.get("busy"):
+            # Worker process is done; harvest output, CLI JSON, usage, artifacts.
+            self._phase(goal_id, "finalizing", task_id=task_id)
             try:
                 result = self.backend.collect_result(run_id)
             except Exception as exc:
-                result = {"ok": False, "run_id": run_id, "error": f"{observe_error}: {type(exc).__name__}"}
+                result = {"ok": False, "run_id": run_id, "error": backend_error_text(observe_error, exc)}
             fresh = self.layer.get_goal(goal_id)
             if fresh.get("ok") and isinstance(fresh.get("goal"), Mapping):
                 snap = fresh["goal"]
             return self._finish_gated(snap, task, result)
+        if _open_phase(task) not in {"executing", ""} or not task.get("phases"):
+            # Back from a review/decision (or a run bound before phases existed).
+            self._phase(goal_id, "executing", task_id=task_id)
         enforced = self._enforce_budgets(goal_id, task_id)
         if enforced is not None:
             return enforced
@@ -2225,7 +2451,7 @@ class AppCoordinator:
             result = {
                 "ok": False,
                 "run_id": run_id,
-                "error": f"backend observation failed: {type(exc).__name__}",
+                "error": backend_error_text("backend observation failed", exc),
             }
             return self._finish_gated(snap, task, result)
         return self._after_observe(snap, task, observation, observe_error="backend observation failed")
@@ -2351,6 +2577,8 @@ class AppCoordinator:
                     scope_summary = None
                 if scope_summary:
                     decision_details["summary"] = scope_summary
+            if backend_kind == "review":
+                self._phase(goal_id, "reviewing", task_id=task_id)
             opened = self.layer.open_decision(
                 goal_id,
                 kind=public_kind,
@@ -2381,7 +2609,7 @@ class AppCoordinator:
             result = {
                 "ok": False,
                 "run_id": run_id,
-                "error": f"backend resume failed: {type(e).__name__}",
+                "error": backend_error_text("backend resume failed", e),
             }
             return self._finish_gated(snap, task, result)
         return self._after_observe(snap, task, observation, observe_error="backend resume failed")
@@ -2399,6 +2627,8 @@ class AppCoordinator:
             claimed = self.layer.claim_task_dispatch(goal_id, task_id, claim=token)
             if not claimed.get("ok"):
                 return None
+            # Handoff, manifest staging, contract render, account select, spawn.
+            self._phase(goal_id, "preparing", task_id=task_id)
             task = dict(claimed.get("task") or {})
             current = self.layer.get_goal(goal_id)
             snap = current.get("goal") if current.get("ok") else {}
@@ -2489,6 +2719,7 @@ class AppCoordinator:
             if not bound.get("ok"):
                 return {"_return": bound}
             self.layer.mark_run_started(goal_id, task_id, started_at=self.now())
+            self._phase(goal_id, "executing", task_id=task_id)
             bound_task = bound.get("task") if isinstance(bound.get("task"), Mapping) else {}
             if bound_task.get("workspace"):
                 task["workspace"] = bound_task.get("workspace")
@@ -2595,14 +2826,26 @@ class AppCoordinator:
         reviewer checked is a warning, not a pass. Contamination still runs
         when the result is otherwise ok.
         """
+        goal_id = str(snap.get("goal_id") or "")
+        task_id = str(task.get("task_id") or "")
+        if isinstance(result, Mapping) and result.get("ok"):
+            # Worker finished cleanly: artifact presence, acceptance, contamination.
+            self._phase(goal_id, "testing", task_id=task_id)
         result = self._with_trusted_workspace(task, result)
         result = self._apply_agy_acceptance(snap, task, result)
         result = _gate_backend_result(snap, task, result)
         result = self._attach_usage_report(result)
         parked = self._post_hoc_budget(snap, task, result)
         if parked is not None:
+            self._phase(goal_id, task_id=task_id, outcome="checkpoint")
             return parked
-        goal_id = str(snap.get("goal_id") or "")
+        ok = bool(isinstance(result, Mapping) and result.get("ok"))
+        self._phase(
+            goal_id,
+            task_id=task_id,
+            outcome="ok" if ok else "failed",
+            detail="" if ok or not isinstance(result, Mapping) else str(result.get("error") or ""),
+        )
         if isinstance(result, Mapping):
             warns = [
                 str(item).strip()
@@ -3369,6 +3612,9 @@ class CollabApplication:
         if input_manifest:
             goal["input_manifest"] = input_manifest
         submit_warnings: list[str] = []
+        external_caps = caps.get("external_inputs") if isinstance(caps.get("external_inputs"), Mapping) else {}
+        if external_inputs and external_caps.get("enforcement") == "prompt_only":
+            submit_warnings.append(PROMPT_ONLY_INPUTS_WARNING)
         if external_inputs and prompt_only_skip_blocked(caps) and acknowledge_prompt_only:
             submit_warnings.append(SKIP_PERMISSIONS_WARNING)
         for text in budget_warnings:
@@ -3398,6 +3644,7 @@ class CollabApplication:
             "created": bool(result.get("created")),
             "duplicate": bool(result.get("duplicate")),
             "status_url": f"/v1/requests/{result['goal_id']}",
+            "warnings": list(submit_warnings),
         }
 
     def _publish_pending(self, rows: Any) -> tuple[list[dict[str, Any]], dict[str, int]]:
@@ -3455,6 +3702,7 @@ class CollabApplication:
         raw_budget_status = snap.get("budget_status")
         out["budget_status"] = dict(raw_budget_status) if isinstance(raw_budget_status, Mapping) else {}
         out["progress"] = self.coordinator.goal_progress_view(snap, out["scheduler"], caps)
+        out["phase_timeline"] = phase_timeline(snap)
         out["acceptance_status"] = acceptance_status_view(
             str(out.get("state") or ""), tasks if isinstance(tasks, list) else [], caps
         )

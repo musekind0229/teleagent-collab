@@ -1634,6 +1634,7 @@ def project_progress(payload: Mapping[str, Any], *, now: float | None = None) ->
         "phase": phase,
         "heartbeat_age_sec": _progress_age_sec(progress, "last_heartbeat_at", clock),
         "progress_age_sec": _progress_age_sec(progress, "last_progress_at", clock),
+        "phase_age_sec": _progress_age_sec(progress, "phase_started_at", clock),
         "recent_events": events,
     }
 
@@ -1743,6 +1744,11 @@ def _primary_failure_summary(raw: Any, cut: _Cut) -> dict[str, Any] | None:
             ]
     if isinstance(raw.get("review_status"), str) and raw["review_status"].strip():
         out["review_status"] = cut.text(raw["review_status"].strip(), _SUMMARY_TEXT_CAP)
+    # Failed phase and produced/not-produced (#5).
+    for key in ("failed_phase", "outcome", "outcome_summary"):
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            out[key] = cut.text(value.strip(), _SUMMARY_TEXT_CAP)
     return out
 
 
@@ -1889,6 +1895,18 @@ def summarize_status(payload: dict[str, Any]) -> dict[str, Any]:
     budget_status = _pick(payload, "budget_status")
     if isinstance(budget_status, dict):
         summary["budget_status"] = _cap_usage(budget_status, cut)
+    timeline = _pick(payload, "phase_timeline")
+    if isinstance(timeline, list) and timeline:
+        # One short line per phase window: "<title>:<phase> <secs>s <outcome>".
+        lines: list[str] = []
+        for row in timeline[-16:]:
+            if not isinstance(row, dict):
+                continue
+            dur = row.get("duration_sec")
+            secs = f"{float(dur):.1f}s" if isinstance(dur, (int, float)) and not isinstance(dur, bool) else "open"
+            label = str(row.get("title") or "goal")
+            lines.append(cut.text(f"{label}:{row.get('phase')} {secs} {row.get('outcome') or 'running'}".strip(), _SUMMARY_TEXT_CAP))
+        summary["phases"] = lines
     acceptance_status = _pick(payload, "acceptance_status")
     if isinstance(acceptance_status, dict):
         # Execution / artifacts / checks / review / business acceptance stay separate (#2).

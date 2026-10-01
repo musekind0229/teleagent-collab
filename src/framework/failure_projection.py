@@ -250,6 +250,9 @@ def goal_level_failure_brief(failure: Any) -> dict[str, Any] | None:
         value = failure.get(key)
         if isinstance(value, str) and value.strip():
             brief[key] = _one_line(value, limit=60)
+    brief["failed_phase"] = "planning" if stage == "planning" else stage
+    brief["outcome"] = "no_output"
+    brief["outcome_summary"] = f"no output produced; failed during {brief['failed_phase']}"
     return brief
 
 

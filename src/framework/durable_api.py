@@ -185,6 +185,24 @@ def _iso(ts: float | None = None) -> str:
     return datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _close_open_phase(holder: dict[str, Any], outcome: str, *, detail: str = "", at: float | None = None) -> bool:
+    """Close the open phase entry of a task/goal timeline in place."""
+    rows = holder.get("phases")
+    if not isinstance(rows, list) or not rows or not isinstance(rows[-1], Mapping):
+        return False
+    last = dict(rows[-1])
+    if last.get("ended_at") is not None:
+        return False
+    stamp = _utc_now() if at is None else float(at)
+    last["ended_at"] = _iso(stamp)
+    last["duration_sec"] = round(max(0.0, stamp - float(last.get("started_epoch") or stamp)), 3)
+    last["outcome"] = outcome
+    if detail:
+        last["detail"] = str(detail)[:200]
+    holder["phases"] = list(rows[:-1]) + [last]
+    return True
+
+
 def persist_dir(root: str | Path) -> Path:
     return Path(root) / DURABLE_DIRNAME
 
@@ -1512,6 +1530,71 @@ class DurableLayer:
                 self._persist_unlocked()
             return {"ok": True, "reason": REASON_READY, "task_id": tid, "run_started_at": found.get("run_started_at")}
 
+    PHASE_NAMES = frozenset(
+        {"planning", "preparing", "executing", "finalizing", "testing", "reviewing"}
+    )
+    MAX_PHASES = 24
+
+    def record_phase(
+        self,
+        goal_id: str,
+        phase: str = "",
+        *,
+        task_id: str = "",
+        at: float,
+        outcome: str = "",
+        detail: str = "",
+    ) -> dict[str, Any]:
+        """Phase timeline on a task (or on the goal for planning). No history row.
+
+        ``phase`` set: close the open entry (outcome ``ok`` unless given) and
+        open ``phase``; re-entering the open phase is a no-op. ``phase`` empty:
+        only close the open entry with ``outcome``. Bounded to MAX_PHASES.
+        """
+        gid = _norm_key(goal_id)
+        tid = _norm_key(task_id) if task_id else ""
+        name = str(phase or "").strip()
+        if name and name not in self.PHASE_NAMES:
+            return {"ok": False, "reason": "bad_phase", "error": f"unknown phase {name!r}"}
+        try:
+            stamp = float(at)
+        except (TypeError, ValueError):
+            return {"ok": False, "reason": "bad_clock", "error": "at must be a number"}
+        with self._rmw():
+            snap = self.goals.get(gid)
+            if snap is None:
+                return {"ok": False, "reason": REASON_UNKNOWN_GOAL, "error": f"unknown goal_id {gid!r}"}
+            tasks = [dict(t) for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
+            holder: dict[str, Any]
+            if tid:
+                found = next((t for t in tasks if t.get("task_id") == tid), None)
+                if found is None:
+                    return {"ok": False, "reason": "unknown_task", "error": f"unknown task_id {tid!r}"}
+                holder = found
+            else:
+                holder = snap
+            rows = [dict(r) for r in (holder.get("phases") or []) if isinstance(r, Mapping)]
+            open_row = rows[-1] if rows and rows[-1].get("ended_at") is None else None
+            if name and open_row is not None and open_row.get("phase") == name:
+                return {"ok": True, "reason": REASON_READY, "phase": name, "changed": False}
+            if not name and open_row is None:
+                return {"ok": True, "reason": REASON_READY, "changed": False}
+            iso = _iso(stamp)
+            if open_row is not None:
+                open_row["ended_at"] = iso
+                open_row["duration_sec"] = round(max(0.0, stamp - float(open_row.get("started_epoch") or stamp)), 3)
+                open_row["outcome"] = (outcome if not name else (outcome or "ok")) or "ok"
+                if detail and not name:
+                    open_row["detail"] = str(detail)[:200]
+            if name:
+                rows.append({"phase": name, "started_at": iso, "started_epoch": round(stamp, 3), "ended_at": None, "outcome": ""})
+            holder["phases"] = rows[-self.MAX_PHASES:]
+            if tid:
+                snap["tasks"] = tasks
+            self._touch(snap)
+            self._persist_unlocked()
+            return {"ok": True, "reason": REASON_READY, "phase": name, "changed": True}
+
     def record_task_progress(self, goal_id: str, task_id: str, progress: Mapping[str, Any]) -> dict[str, Any]:
         """Replace one task's progress snapshot. Does not append history."""
         gid = _norm_key(goal_id)
@@ -1784,6 +1867,13 @@ class DurableLayer:
                     return {"ok": False, "reason": REASON_ILLEGAL_STATE, "error": str(e)}
             found["status"] = dst
             found.pop("dispatch_claim", None)
+            # Every task-ending path (gates, budgets, checkpoints) closes the
+            # phase window it was in, so the timeline never stays "open".
+            _close_open_phase(
+                found,
+                "ok" if succeeded else "failed",
+                detail="" if succeeded or not isinstance(result, Mapping) else str(result.get("error") or ""),
+            )
             stored_result = None
             if isinstance(result, Mapping):
                 stored_result = enrich_result_for_need_human(result) or dict(result)
@@ -2032,6 +2122,7 @@ class DurableLayer:
                     if isinstance(value, str) and value.strip():
                         failure[key] = _norm_key(value)[:60]
             snap["failure"] = failure
+            _close_open_phase(snap, "failed", detail=failure["error"])
             self._append_history(snap, "fail_goal", **failure)
             self._touch(snap)
             self._persist_unlocked()
@@ -2770,6 +2861,10 @@ class DurableLayer:
                     "cancelled": False,
                 }
             now = _utc_now()
+            _close_open_phase(snap, "cancelled", at=now)
+            for row in snap.get("tasks") or []:
+                if isinstance(row, dict):
+                    _close_open_phase(row, "cancelled", at=now)
             self._set_state(snap, "cancelled")
             snap["cancelled"] = True
             snap["cancelled_at"] = now

@@ -178,7 +178,7 @@ TeleAgent `review` 若产物自带 `contamination.contaminated`，投影出的�
 多 Task 的 Goal 上，Goal 级「PATH must contain exactly BODY」只门禁 expected_artifacts 里有 PATH 的那个 Task；没有 Task 声明 PATH 时落到汇点 Task（没人依赖的那些），不会静默丢掉。普通文字验收仍然发给每个 Task。
 | `acceptance.lead_review` | 本进程规划器会审 **并且** 后端扛得住组长审查时才是 true |
 | `acceptance.executable_checks` | 当前为 false |
-| `progress.available` | 有真实、便宜的观察才是 true。agy 是进程心跳 + 工作区文件名/大小/mtime（`heartbeat=runner_process`）。in-process 看自己的状态机（`heartbeat` 为 false，不每拍刷新）。监督后端看作业状态（`heartbeat=engine`）。没有这些信号的一次性后端是 false，并且 **`percent` 永远是 false**，不编百分比 |
+| `progress.available` | 有真实、便宜的观察才是 true。agy 是**活动心跳**（`heartbeat=runner_activity`，2026-10-02 起）：取 stdout/stderr 增长、工作区文件 mtime、该 run 的 HOME（Windows 为 USERPROFILE）下 `.gemini/antigravity-cli/{conversations,log,brain}` 的 mtime 中最新的一个；只 stat，不读内容。进程还活着**不再**刷新心跳，所以卡住不动的 agy 超过 `--stale-after` 会显示 `state=stale`。多个 run 共用一个 HOME（没配账号池）时，会话文件信号是按 HOME 而不是按 run 的。`recent_events` 里的 `last_activity output|workspace|session|none` 说明最近一次活动来自哪里。in-process 看自己的状态机（`heartbeat` 为 false，不每拍刷新）。监督后端看作业状态（`heartbeat=engine`）。没有这些信号的一次性后端是 false，并且 **`percent` 永远是 false**，不编百分比 |
 | `progress.subagent_observability` | `false` 或 `"unknown"`。不会假装观察到 0 个子代理 |
 | `progress.artifact_checkpoint` | 能否给出产物清单（名字、大小、mtime，无正文） |
 | `metering.live_usage` / `usage_at_end` / `tool_calls` | 是否有跑中用量、结束时用量、工具调用次数。没有就不要当成有 |
@@ -188,7 +188,7 @@ TeleAgent `review` 若产物自带 `contamination.contaminated`，投影出的�
 | `budget_enforcement.max_tool_calls` | 同上三档。agy 没有工具次数，是 `unsupported`。agy 的 token 只在 CLI JSON 结束时出现，是 `post_hoc` |
 | `budget_enforcement.no_progress_sec` | `enforced`（用进度里的 `last_progress_at`，没有则用 run 开始时间）或 `unsupported` |
 | `usage.source` | agy 为 `worker_self_reported`（CLI JSON 自报）；其它为 `unknown` |
-| `warnings` | 人话。agy 且 skip-permissions 时为：`backend runs with skip-permissions: no permission gate; pinned external inputs are prompt-only` |
+| `warnings` | 人话。agy 恒有 `pinned external inputs are prompt-only: the worker is told which files it may read, but nothing enforces it (no OS sandbox, no access audit)`（与是否 skip-permissions 无关）；skip-permissions 时再加 `backend runs with skip-permissions: no permission gate; pinned external inputs are prompt-only`。带外部输入的 Goal 在提交响应 `warnings` 和 status `warnings` 里出现同一句；不带外部输入的 Goal 不显示 prompt-only 那句 |
 | `concurrency.max_parallel_per_goal` | 服务参数，默认 2 |
 | `concurrency.max_parallel_global` | 服务参数，默认 4 |
 | `concurrency.backend_max_runs` | 后端声明的 `max_runs`（整数或 `unknown`）。与后端文档里的 `concurrency.max_runs` 不是同一个对象：这里是给调用方的合成结果 |
@@ -289,6 +289,8 @@ TeleAgent `review` 若产物自带 `contamination.contaminated`，投影出的�
 | `retryable` | 布尔。保守，普通失败为 false |
 | `next_step` | 短的安全提示，不含密钥和产物正文。`worker_timeout`：`raise budget.wall_sec or split the task; open a NEW request citing this request_id`。`spawn`：`check collab-service --ready` |
 
+任务失败的短记录另有 `failed_phase`（`planning` / `preparing` / `executing` / `finalizing` / `testing` / `reviewing`；墙钟或无进展超时记为 `executing`）、`outcome`（`candidate_produced` / `no_output`）与一行 `outcome_summary`，用来区分「有候选、CLI 收尾失败」（`finalizing` + `candidate_produced`）和「什么都没产出」。Goal 级规划失败为 `failed_phase=planning`、`outcome=no_output`。
+
 任务失败的短记录另有（2026-10-02 起）：`stage`（任务失败为 `worker`）、`candidate_available` / `candidate_artifacts`（期望产物里哪些作为普通文件仍在受信任务目录里；只做 stat，不读正文，跳过 symlink 和越界路径）、`review_status`。**文件还在不等于执行成功，也没被审查**；run 仍是 failed，不会被改写。
 
 Goal 在任何 Task 结果之前就失败（规划失败、预算/协调失败）时，`failures` 只有一条 Goal 级短记录：`task_id` / `run_id` 为空串（不编造），`stage` 取 `failure.phase`（如 `planning`、`budget`），`source` 为 `planner` 或 `coordination`，可选 `code`（如 `lead_unavailable`、`invalid_plan`、`stale_plan`）与 `lead_status`（组长适配器的 `timeout` / `call_failed` / `error`）。`failure_reason` 同时填上，不再是空串。规划失败时没有任何工人被启动，也不会自动重试。
@@ -300,13 +302,23 @@ Goal 在任何 Task 结果之前就失败（规划失败、预算/协调失败�
 | 键 | 取值 |
 | --- | --- |
 | `execution` | `succeeded` / `failed` / `timeout` / `cancelled` / `in_progress` |
-| `artifacts` | `complete` / `incomplete`（附 `missing_artifacts`）/ `unknown` |
+| `artifacts` | `complete` / `incomplete`（有产出但还缺）/ `candidates_only`（期望文件都在，但所在 Task 失败，未被接受）/ `none`（什么都没产出）/ `not_started`（还没有 Task 就失败，如规划失败）/ `pending`（还在跑）。另给 `delivered_artifacts`（成功 Task 交付的）、`candidate_artifacts`（失败/取消 Task 留下的文件，只 stat）、`missing_artifacts`（含从没跑到的 Task 的期望产物）、`artifacts_by_task` |
 | `independent_checks` | `passed` / `failed` / `not_run`（目前只有 agy「must contain exactly」字面核对算） |
 | `technical_review` | `via_lead_gate`（后端把结果交组长审）/ `not_concluded` / `unsupported`（要了散文验收但没人核）/ `not_available`（后端没有组长审查通道，例如 agy） |
 | `business_acceptance` | 恒为 `not_performed`：服务从不做业务验收 |
 | `deployed` | 恒为 `not_tracked` |
 
 `acceptance` 对象只接受 `artifacts`、`text`、`allow_aigc_marks`；其他键 400，不会在派工前被悄悄丢掉。`required_capabilities` 里的 `lead_review` 需要 planner 能审 **且** 后端把结果交给它（`capabilities.acceptance.lead_review`）；agy 上会 409。
+
+### 阶段时间线（`phase_timeline`，2026-10-02 起）
+
+status 带 `phase_timeline`：Goal 的 `planning` 加每个 Task 的 `preparing`（依赖交接、清单拷贝、合同渲染、选账号、起进程）→ `executing` → `finalizing`（进程已退出，收 CLI JSON、用量、产物）→ `testing`（产物在不在、精确内容核对、污染扫描）→ `reviewing`（TeleAgent / 组长审查 decision）。每段有 `started_at`、`ended_at`、`duration_sec`、`outcome`（`ok` / `failed` / `cancelled` / `checkpoint` / `discarded`，失败带脱敏 `detail`）。`progress.phase` / `progress.state` 在这些协调器阶段进行中时显示 `preparing` / `delivering`（finalizing）/ `testing` / `reviewing`，并带 `phase_started_at`；客户端 `progress` 多一个 `phase_age_sec`，摘要多一个 `phases` 列表。`finalizing` / `testing` 通常只有几毫秒，主要靠时间线事后看。
+
+规划不再占着协调锁：组长规划在单独线程里跑，第一拍最多等 1 秒，慢的就留到之后的拍子取结果，其它 Goal 照常推进。规划结束时 Goal 已被取消或已有 Task，结果丢弃（`outcome=discarded`）。组长计划必须交付 Goal 验收里列出的每个产物，漏了就是 `invalid_plan`（`lead plan does not deliver goal acceptance artifacts: …`），不派工人。
+
+### 服务重启与 agy 孤儿进程（2026-10-02 起）
+
+agy 后端把每个 worker 的 pid、进程组、启动时间令牌（防 pid 复用）、所属服务进程记在 `<persist>/agy-runs.json`（不记 argv / prompt / 环境）。服务收到 SIGTERM / Ctrl-C（Windows 还有 SIGBREAK）时先停掉还活着的 worker；被 `kill -9` 等方式直接杀掉时，下次启动会把上一个服务留下的 worker 整棵停掉：POSIX 杀 worker 的进程组、会话和后代，外加轮询时记下的子进程（agy 的 shell 工具命令在自己的进程组里，只杀 worker 的组会漏掉它；子进程按启动时间令牌校验后才会动；观测事件里有 `child_processes N`）；Windows 用 `taskkill /F /T /PID`。worker 正常退出但留下还在跑的工具子进程时，收结果时也会把它们停掉。pid 已被别的进程复用时不动它。这些 Task 的失败原因写明是哪种情况，例如 `backend resume failed: BackendError: agy run agy_… (pid N) belonged to a previous service process; its worker process tree was stopped when the service restarted. …`；工作区里已有的文件只是候选。仍然不会自动重派。
 
 `start_run` 抛错时，任务结果的 `error` 是 `backend dispatch failed: <异常类型>: <脱敏后的短原因>`（原因最多 300 字）。异常信息为空时仍只写类型名，不留一个空的冒号。
 
