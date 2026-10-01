@@ -539,7 +539,13 @@ class Issue13ReproTests(unittest.TestCase):
             self.assertIn("max_reworks", status["failure"]["error"])
             self.assertNotIn("wall", status["failure"]["error"])
             self.assertEqual(_statuses(app, goal_id)["A"], "queued")
-            self.assertNotIn("primary_failure", status)
+            # No task failed; the goal-level budget stop is projected without
+            # inventing a task id (#12/#16).
+            primary = status["primary_failure"]
+            self.assertEqual(primary["task_id"], "")
+            self.assertEqual(primary["stage"], "budget")
+            self.assertEqual(primary["source"], "coordination")
+            self.assertIn("max_reworks", primary["error"])
 
     def test_task_question_does_not_block_an_unrelated_ready_task(self) -> None:
         with tempfile.TemporaryDirectory() as td:

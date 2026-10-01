@@ -47,10 +47,11 @@ from framework.input_manifest import (
     project_input_manifest,
     snapshot_metadata,
 )
-from framework.failure_projection import project_failed_tasks
+from framework.failure_projection import goal_level_failure_brief, project_failed_tasks
 from framework.need_human import goal_need_human_view, sanitize_reason
 from framework.concurrency import (
     IN_FLIGHT,
+    occupies_run_slot,
     as_limit,
     budget_block_reason,
     directory_key,
@@ -879,6 +880,8 @@ def planning_response_schema() -> dict[str, Any]:
 
 
 _DONE_WHEN_KEYS = frozenset({"artifacts", "text"})
+# Goal-level acceptance keys the service actually reads.
+GOAL_ACCEPTANCE_KEYS = frozenset({"artifacts", "text", "allow_aigc_marks"})
 
 
 def _validate_done_when(row: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -952,7 +955,11 @@ def validate_plan(plan: Any, request: Mapping[str, Any]) -> dict[str, Any]:
         done = _validate_done_when(row)
         has_row_artifacts = "artifacts" in row and row.get("artifacts") is not None
         if has_row_artifacts:
-            artifacts = _safe_artifacts(row.get("artifacts"))
+            try:
+                artifacts = _safe_artifacts(row.get("artifacts"))
+            except AppError as exc:
+                # Planner output problems are invalid_plan, same as done_when (#11).
+                raise AppError(str(exc), code="invalid_plan") from exc
         elif done is not None and "artifacts" in done:
             # No row artifacts: the validated done_when list becomes the artifacts.
             artifacts = list(done["artifacts"])
@@ -1025,6 +1032,143 @@ class DeterministicPlanner:
         return validate_plan(raw, request)
 
 
+def _candidate_artifacts(task: Mapping[str, Any] | None) -> list[str]:
+    """Expected artifacts that exist as regular files in the task's bound workspace.
+
+    Read-only stat. Unsafe names, symlinks and anything resolving outside the
+    workspace are skipped. Existence is not acceptance.
+    """
+    if not isinstance(task, Mapping):
+        return []
+    ws = str(task.get("workspace") or "").strip()
+    if not ws:
+        return []
+    root = Path(ws)
+    try:
+        root_resolved = root.resolve()
+    except OSError:
+        return []
+    found: list[str] = []
+    for name in list(task.get("expected_artifacts") or [])[:64]:
+        rel = str(name or "").strip()
+        if not rel or Path(rel).is_absolute() or ".." in Path(rel).parts or "\\" in rel:
+            continue
+        cand = root / rel
+        try:
+            if cand.is_symlink() or not cand.is_file():
+                continue
+            cand.resolve().relative_to(root_resolved)
+        except (OSError, ValueError):
+            continue
+        found.append(rel)
+    return found
+
+
+def _annotate_task_failure(brief: dict[str, Any], task: Mapping[str, Any] | None) -> None:
+    """Stage, unreviewed candidate presence and review status on a task failure (#12/#2)."""
+    brief.setdefault("stage", "worker")
+    present = _candidate_artifacts(task)
+    brief["candidate_available"] = bool(present)
+    brief["candidate_artifacts"] = present
+    review = None
+    if isinstance(task, Mapping):
+        result = task.get("result")
+        if isinstance(result, Mapping) and isinstance(result.get("review"), Mapping):
+            review = result.get("review")
+        elif isinstance(task.get("review"), Mapping):
+            review = task.get("review")
+    status = review.get("status") if isinstance(review, Mapping) else None
+    brief["review_status"] = str(status or "not_requested")
+
+
+def acceptance_status_view(
+    state: str, tasks: list[Any], caps: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Separate execution, artifacts, independent checks, technical review,
+    business acceptance and deployment (#2). Never claims what was not checked.
+
+    ``completed`` means execution finished and every gate the backend can run
+    passed. It is not business acceptance; the service never performs that.
+    """
+    rows = [t for t in tasks if isinstance(t, Mapping)]
+    state = str(state or "")
+    if state == "completed":
+        execution = "succeeded"
+    elif state == "failed":
+        execution = "failed"
+        for t in rows:
+            if str(t.get("status") or "") == "failed":
+                from framework.failure_projection import failure_brief
+
+                if failure_brief(t).get("source") == "worker_timeout":
+                    execution = "timeout"
+                    break
+    elif state == "cancelled":
+        execution = "cancelled"
+    else:
+        execution = "in_progress"
+    missing: list[str] = []
+    finished = 0
+    for t in rows:
+        result = t.get("result") if isinstance(t.get("result"), Mapping) else None
+        if result is None:
+            continue
+        finished += 1
+        for item in result.get("missing") or result.get("missing_artifacts") or []:
+            if isinstance(item, str) and item not in missing:
+                missing.append(item)
+    if missing:
+        artifacts = "incomplete"
+    elif rows and finished == len(rows) and execution == "succeeded":
+        artifacts = "complete"
+    else:
+        artifacts = "unknown"
+    reviews = []
+    for t in rows:
+        result = t.get("result") if isinstance(t.get("result"), Mapping) else {}
+        review = result.get("review") if isinstance(result.get("review"), Mapping) else None
+        if review is not None:
+            reviews.append(review)
+    exact = [r for r in reviews if r.get("source") == "agy_exact_content"]
+    if not exact:
+        independent = "not_run"
+    elif all(r.get("status") == "passed" for r in exact):
+        independent = "passed"
+    else:
+        independent = "failed"
+    acceptance_caps = caps.get("acceptance") if isinstance(caps.get("acceptance"), Mapping) else {}
+    unsupported = any(r.get("status") == "unsupported" for r in reviews)
+    if acceptance_caps.get("lead_review") is not True:
+        technical = "unsupported" if unsupported else "not_available"
+    else:
+        technical = "via_lead_gate" if execution == "succeeded" else "not_concluded"
+    return {
+        "execution": execution,
+        "artifacts": artifacts,
+        "missing_artifacts": missing[:32],
+        "independent_checks": independent,
+        "technical_review": technical,
+        "business_acceptance": "not_performed",
+        "deployed": "not_tracked",
+        "note": "completed is not business acceptance; read the artifacts before accepting",
+    }
+
+
+def _lead_failure_of(parsed: Any) -> tuple[str, str] | None:
+    """(status, message) for a safe_failure envelope, else None."""
+    if not isinstance(parsed, Mapping):
+        return None
+    status = parsed.get("_lead_status")
+    if not status:
+        return None
+    from framework.need_human import sanitize_reason
+
+    status_text = sanitize_reason(str(status), max_len=40) or "error"
+    # Adapter errors can carry CLI stderr: redact secret-looking text, one line.
+    message = sanitize_reason(str(parsed.get("error") or status_text), max_len=300)
+    return status_text, message
+
+
 class LeadAdapterPlanner:
     """Use any existing LeadAdapter to turn a Goal into a bounded task graph."""
 
@@ -1043,12 +1187,20 @@ class LeadAdapterPlanner:
             cwd=self.cwd,
             timeout_sec=self.timeout_sec,
         )
-        parsed = unwrap_structured(parsed)
-        if isinstance(parsed, Mapping) and parsed.get("_lead_status"):
+        # Read the adapter's canonical failure envelope BEFORE unwrapping:
+        # unwrap_structured() returns None for {_lead_status, error}, which used
+        # to turn timeout/call_failed/error into a generic invalid_plan (#16).
+        failure = _lead_failure_of(parsed)
+        if failure is None:
+            parsed = unwrap_structured(parsed)
+            failure = _lead_failure_of(parsed)
+        if failure is not None:
+            lead_status, message = failure
             raise AppError(
-                f"lead planning failed: {parsed.get('error') or parsed.get('_lead_status')}",
+                f"lead planning failed [{lead_status}]: {message}",
                 status=503,
                 code="lead_unavailable",
+                extra={"lead_status": lead_status},
             )
         return validate_plan(parsed, request)
 
@@ -1173,6 +1325,8 @@ class AppCoordinator:
         except (TypeError, ValueError):
             stale = 120.0
         self.stale_after_sec = stale if stale > 0 else 120.0
+        # goal_id -> epoch seconds while a planner call is in flight (in-memory only).
+        self._planning_since: dict[str, float] = {}
         self._clock = clock or time.time
         # Claims whose start_run is in progress in this process. A running
         # task with no run_id is "dispatch in progress" only while its token
@@ -1203,13 +1357,23 @@ class AppCoordinator:
         caps: Mapping[str, Any],
     ) -> dict[str, Any]:
         progress_cap = caps.get("progress") if isinstance(caps.get("progress"), Mapping) else {}
-        return derive_goal_progress(
+        view = derive_goal_progress(
             snap,
             scheduler=scheduler,
             capability=progress_cap,
             stale_after_sec=self.stale_after_sec,
             now=self.now(),
         )
+        started = self._planning_since.get(str(snap.get("goal_id") or ""))
+        if started is not None and not (snap.get("tasks") or []):
+            # The lead is planning in this process; no worker exists yet (#5).
+            view = dict(view)
+            view["state"] = "planning"
+            view["phase"] = "planning"
+            view["source"] = "coordinator"
+            view["planning_started_at"] = utc_iso(started)
+            view["recent_events"] = ["phase planning (lead call in flight; no worker started)"]
+        return view
 
     def process_all(self) -> dict[str, Any]:
         with self._lock:
@@ -1261,18 +1425,27 @@ class AppCoordinator:
             return {"ok": True, "goal_id": goal_id, "state": snap.get("state"), "action": "terminal"}
         tasks = [dict(t) for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
         if not tasks:
+            self._planning_since[goal_id] = time.time()
             try:
                 plan = self.planner.plan(snap)
             except Exception as e:
+                self._planning_since.pop(goal_id, None)
                 detail = f"planner failed: {type(e).__name__}"
+                failure_extra: dict[str, Any] = {"source": "planner", "code": "planner_error"}
                 if isinstance(e, AppError):
                     detail = f"planner failed [{e.code}]: {str(e)[:300]}"
+                    failure_extra["code"] = e.code
+                    lead_status = e.extra.get("lead_status") if isinstance(e.extra, Mapping) else None
+                    if lead_status:
+                        failure_extra["lead_status"] = str(lead_status)
                 failed = self.layer.fail_goal(
                     goal_id,
                     phase="planning",
                     error=detail,
+                    extra=failure_extra,
                 )
                 return {**failed, "action": "planning_failed"}
+            self._planning_since.pop(goal_id, None)
             key_to_id = {row["task_key"]: _task_id(goal_id, row["task_key"]) for row in plan["tasks"]}
             for row in plan["tasks"]:
                 added = self.layer.add_child_task(
@@ -1908,7 +2081,9 @@ class AppCoordinator:
             for task in tasks:
                 if str(task.get("status") or "") not in IN_FLIGHT:
                     continue
-                count += 1
+                if occupies_run_slot(task):
+                    count += 1
+                # A parked checkpoint keeps its workspace claim for "continue".
                 key = directory_key(
                     dispatch_directory(task, workspaces_root=self.workspaces_root, goal_id=gid)
                 )
@@ -1944,7 +2119,7 @@ class AppCoordinator:
             for task in tasks:
                 if str(task.get("status") or "") not in IN_FLIGHT:
                     continue
-                if gid != goal_id:
+                if gid != goal_id and occupies_run_slot(task):
                     running_elsewhere += 1
                 key = directory_key(
                     dispatch_directory(task, workspaces_root=self.workspaces_root, goal_id=gid)
@@ -3075,6 +3250,11 @@ class CollabApplication:
             raise AppError("acceptance object is required")
         if "text" in acceptance and not isinstance(acceptance.get("text"), str):
             raise AppError("acceptance.text must be a string")
+        unknown_acceptance = sorted(str(k) for k in acceptance if k not in GOAL_ACCEPTANCE_KEYS)
+        if unknown_acceptance:
+            # An unknown criterion would be dropped before the worker and never
+            # checked; refuse it instead of pretending it is part of the contract.
+            raise AppError("acceptance has unknown keys: " + ", ".join(unknown_acceptance))
         acceptance_obj = dict(acceptance)
         acceptance_obj["artifacts"] = _safe_artifacts(acceptance.get("artifacts"))
         boundaries = payload.get("boundaries") if isinstance(payload.get("boundaries"), Mapping) else {}
@@ -3228,6 +3408,9 @@ class CollabApplication:
         raw_budget_status = snap.get("budget_status")
         out["budget_status"] = dict(raw_budget_status) if isinstance(raw_budget_status, Mapping) else {}
         out["progress"] = self.coordinator.goal_progress_view(snap, out["scheduler"], caps)
+        out["acceptance_status"] = acceptance_status_view(
+            str(out.get("state") or ""), tasks if isinstance(tasks, list) else [], caps
+        )
         # Pending decisions are not task failures. Observation-window timeouts
         # never reach this method; they are a client wait, not a goal state.
         if str(out.get("state") or "") == "failed" and not pending:
@@ -3236,8 +3419,23 @@ class CollabApplication:
                 # need_human already filled failure_reason; do not replace it.
                 if not str(out.get("failure_reason") or "").strip():
                     out["failure_reason"] = projected["failure_reason"]
+                by_id = {
+                    str(t.get("task_id") or ""): t
+                    for t in (tasks if isinstance(tasks, list) else [])
+                    if isinstance(t, Mapping)
+                }
+                for brief in projected["failures"]:
+                    _annotate_task_failure(brief, by_id.get(brief.get("task_id") or ""))
                 out["primary_failure"] = projected["primary_failure"]
                 out["failures"] = projected["failures"]
+            else:
+                goal_failure = goal_level_failure_brief(snap.get("failure"))
+                if goal_failure is not None:
+                    # Planning/coordination failed before any task result exists.
+                    if not str(out.get("failure_reason") or "").strip():
+                        out["failure_reason"] = goal_failure["error"]
+                    out["primary_failure"] = goal_failure
+                    out["failures"] = [goal_failure]
         return out
 
     def capabilities(self) -> dict[str, Any]:

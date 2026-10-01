@@ -1111,6 +1111,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         proc: subprocess.Popen | None = rec.get("proc")
         if proc is None or proc.poll() is not None:
             self._harvest(rec)
+            self._release_pool_lease_after_cancel(rec)
             if rec.get("cancelled"):
                 return 200, {"ok": True, "run_id": rec["run_id"], "state": "cancelled"}
             return 200, {
@@ -1126,7 +1127,36 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         rec["activity"] = "idle"
         rec["state"] = "cancelled"
         self._harvest(rec)
+        self._release_pool_lease_after_cancel(rec)
         return 200, {"ok": True, "run_id": rec["run_id"], "state": "cancelled"}
+
+    def _release_pool_lease_after_cancel(self, rec: dict[str, Any]) -> None:
+        """Free the busy pool lease of a run that will not be collected.
+
+        Budget/no-progress checkpoints and cancellations stop the child without
+        calling collect_result, which is where the lease used to be released;
+        the account then stayed busy until lease_until. Release-only (no error
+        classification) and guarded by lease_id, so a later collect or a lease
+        another run has since reserved is not disturbed.
+        """
+        spawn = rec.get("spawn_environ")
+        env: Mapping[str, str] = spawn if isinstance(spawn, Mapping) and spawn else self._env()
+        pool_path = str(env.get(ENV_POOL) or "").strip()
+        profile = str(rec.get("agy_profile") or env.get(ENV_PROFILE) or "").strip()
+        if not pool_path or not profile:
+            return
+        try:
+            finish_account_lease(
+                pool_path,
+                profile,
+                None,
+                lease_id=str(env.get(ENV_LEASE_ID) or "").strip() or None,
+                persist=self._persist_pool,
+                environ=env,
+                classify_result_state=False,
+            )
+        except Exception as exc:  # noqa: BLE001 — pool I/O must not fail cancel
+            _LOG.warning("agy account lease release after cancel failed (%s)", type(exc).__name__)
 
 
 

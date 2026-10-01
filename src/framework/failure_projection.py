@@ -22,6 +22,9 @@ FAILURE_SOURCES = (
 )
 _EXPLICIT_SOURCES = frozenset(FAILURE_SOURCES) - {"task_failed"}
 
+# Goal-level (no task result) failure sources; kept apart from task sources.
+GOAL_FAILURE_SOURCES = ("planner", "coordination")
+
 # Same wall-budget phrases the Hermes client already treats as a goal timeout.
 # A step budget (budget_exceeded steps) is intentionally not in this list.
 _WALL_MARKERS = (
@@ -55,6 +58,14 @@ _NEXT_STEP = {
     ),
     "cancelled": "open a NEW request citing this request_id if the work is still needed",
     "task_failed": "inspect the task error and open a NEW request citing this request_id",
+}
+
+_GOAL_NEXT_STEP = {
+    "planner": (
+        "no worker was started; check the lead (lead_status) and open a NEW request "
+        "citing this request_id"
+    ),
+    "coordination": "inspect the goal failure and open a NEW request citing this request_id",
 }
 
 _MISSING_CAP = 32
@@ -210,6 +221,36 @@ def failure_brief(task: Mapping[str, Any]) -> dict[str, Any]:
         "retryable": False,
         "next_step": _NEXT_STEP[source],
     }
+
+
+def goal_level_failure_brief(failure: Any) -> dict[str, Any] | None:
+    """Brief for a Goal that failed before any task result (planning, coordination).
+
+    Same shape as failure_brief plus ``stage`` and optional ``code``/``lead_status``.
+    No task_id/run_id is invented.
+    """
+    if not isinstance(failure, Mapping):
+        return None
+    error = sanitize_reason(str(failure.get("error") or ""))
+    stage = _one_line(failure.get("phase") or "coordination", limit=40)
+    source = str(failure.get("source") or "").strip()
+    if source not in GOAL_FAILURE_SOURCES:
+        source = "planner" if stage == "planning" else "coordination"
+    brief: dict[str, Any] = {
+        "task_id": "",
+        "run_id": "",
+        "stage": stage,
+        "error": error or "goal failed",
+        "source": source,
+        "missing_artifacts": [],
+        "retryable": False,
+        "next_step": _GOAL_NEXT_STEP[source],
+    }
+    for key in ("code", "lead_status"):
+        value = failure.get(key)
+        if isinstance(value, str) and value.strip():
+            brief[key] = _one_line(value, limit=60)
+    return brief
 
 
 def project_failed_tasks(tasks: Sequence[Any]) -> dict[str, Any] | None:

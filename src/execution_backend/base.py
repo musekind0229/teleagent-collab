@@ -198,7 +198,11 @@ def capability_met(caps: Mapping[str, Any], name: str) -> bool:
     if name == "no_skip_permissions":
         return caps.get("skip_permissions") is False
     if name == "lead_review":
-        return _planner(caps).get("lead_review") is True
+        # The planner being able to review is not enough: the backend must route
+        # results to that lead (acceptance.lead_review is already planner AND
+        # backend). agy has no review channel, so its output is never lead-reviewed.
+        acceptance = caps.get("acceptance") if isinstance(caps.get("acceptance"), Mapping) else {}
+        return _planner(caps).get("lead_review") is True and acceptance.get("lead_review") is True
     if name == "decomposition":
         return _planner(caps).get("decomposes") is True
     return False

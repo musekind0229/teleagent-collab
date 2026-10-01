@@ -1,7 +1,7 @@
 ---
 name: teleagent-collab
 description: "Delegate work to local collab-service workers (agy/antigravity pool) via bin/hermes-collab-request.py: open, wait, report. Use when the user asks to have 'the worker'/'collab'/'agy' do a task or produce a file."
-version: 0.2.14
+version: 0.2.15
 author: teleagent-collab
 license: MIT
 platforms: [windows, linux, macos]
@@ -102,6 +102,7 @@ collab-service 是本机常驻的派工服务（Application API，默认 `http:/
 ## 进度与预算
 
 - 要看慢但还活着、在等决定、还是没心跳：`python bin/hermes-collab-request.py progress <request_id>`。它只给 `state`、`phase`、心跳/进度年龄（秒）和最近几条事件。没有进度就是 `unknown`。**不要编百分比**。
+- `phase=planning` 表示组长还在出计划，没有工人在跑。
 - 一次性后端 `progress.available` 为 false。agy 的进程是否还在、以及产物清单（文件名、大小、mtime，没有正文）是真的。`subagent_observability` 只有 `false` 或 `unknown`，不会假装是 0。
 - 预算旗标：`--wall-sec`、`--max-tokens`、`--max-tool-calls`、`--no-progress-sec`、`--on-no-progress checkpoint|fail`、`--budget-report-only`。这个后端标成 unsupported 的字段会被拒绝（退出码 1，`code=capability_unavailable`，`missing` 里有 `budget:<字段>`），除非用户明确要求 `--budget-report-only`。不要为了过提交自己拿掉限制。
 - `post_hoc` 表示跑完才核对，中途停不了。用量是工人自报，**不是账单**，不要把它说成费用。
@@ -114,14 +115,16 @@ collab-service 是本机常驻的派工服务（Application API，默认 `http:/
 - `--planner lead` / `--planner grok` 由 **collab-service 启动参数** 决定：组长会拆解并审查。客户端不能选择 planner。
 - 复杂工作拆成多张单，按阶段推进：源覆盖核对 → 一份可审查的样例 → 实现 + 独立测试 → dry-run → 操作者批准后再安装。
 - 约束写在 `--must` / `--must-not` / `--acceptance-text`，不要把长约束塞进 `--goal`。
-- `state=completed` 之后读真实产物；completed 不等于业务验收通过。
+- `state=completed` 之后读真实产物；completed 不等于业务验收通过。status 里的 `acceptance_status` 把 `execution`、`artifacts`、`independent_checks`、`technical_review`、`business_acceptance`（服务从不做，恒为 `not_performed`）、`deployed` 分开写；照原样转述，不要合并成「已验收」。
+- agy 后端没有组长审查通道：`--require-capability lead_review` 在 agy 上会被拒（409），即使 planner 是组长。
+- `acceptance` 里只认 `artifacts`、`text`、`allow_aigc_marks`；其他键会被 400 拒绝，不会被悄悄丢掉。
 - 后续修订是一张 **新** request，并在 goal 里写上上一张 `request_id`。失败的单不要静默重新 open。
 
 ## 停下问用户（不要自己重试）
 
 出现以下任一情况，**立即停止**，把 `request_id`、`state`、`failure` / `failure_reason` / `need_human` 原因原样（去掉任何密钥）告诉用户，等用户决定：
 
-- `state=failed` 或 `cancelled`；
+- `state=failed` 或 `cancelled`；转述 `primary_failure` 的 `stage`（`planning` / `worker` / `budget` 等）、`source`、`lead_status`（组长 timeout / call_failed / error）。`candidate_available: true` 只表示文件还在（`candidate_artifacts`），**不是**成功也没被审查；不要因此把失败说成完成，也不要自动重派。
 - 决策 `summary` 以 `CONTAMINATED` 开头，或失败结果的 `error` 以 `artifact_contaminated` 开头：这是失败/不安全的产物（AIGC 水印或不可见字符）。把这段原文告诉用户，不要批准。
 - 任何层级出现 `need_human: true`（顶层、`failure`、`tasks[].result`），或 `error` 以 `need_human:` 开头；
 - `pending_decisions` 非空（服务在等人拍板）；

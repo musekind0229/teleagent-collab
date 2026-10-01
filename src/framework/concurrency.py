@@ -107,8 +107,26 @@ def goal_has_progress(tasks: Sequence[Any]) -> bool:
     return False
 
 
+def occupies_run_slot(task: Mapping[str, Any]) -> bool:
+    """In flight AND holding a live worker run.
+
+    A budget/no-progress checkpoint parks the task in awaiting_decision after
+    its run was collected or cancelled. Waiting for that human verdict must not
+    eat a backend slot, or one parked checkpoint blocks every other Goal (#10/#13).
+    The marker only counts while the task is still blocked on that same decision.
+    """
+    status = task_status(task)
+    if status not in IN_FLIGHT:
+        return False
+    if status == "awaiting_decision" and task.get("run_parked") is True:
+        parked = str(task.get("parked_decision") or "")
+        if parked and parked == str(task.get("blocked_on_decision") or ""):
+            return False
+    return True
+
+
 def count_inflight(tasks: Sequence[Any]) -> int:
-    return sum(1 for task in tasks if isinstance(task, Mapping) and task_status(task) in IN_FLIGHT)
+    return sum(1 for task in tasks if isinstance(task, Mapping) and occupies_run_slot(task))
 
 
 def decision_is_global(decision: Mapping[str, Any]) -> bool:

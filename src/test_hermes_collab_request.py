@@ -2551,5 +2551,46 @@ class HermesCollabRequestTests(unittest.TestCase):
         )
 
 
+class RetestSummaryFieldsTests(unittest.TestCase):
+    """#16/#12/#2: summary keeps failure identity, candidate presence and acceptance_status."""
+
+    def test_summary_keeps_failure_identity_and_acceptance_status(self) -> None:
+        payload = {
+            "ok": True,
+            "request_id": "g",
+            "state": "failed",
+            "failure_reason": "planner failed [lead_unavailable]: lead planning failed [timeout]: t",
+            "primary_failure": {
+                "task_id": "", "run_id": "", "title": "", "error": "e", "source": "planner",
+                "missing_artifacts": [], "retryable": False, "next_step": "n",
+                "stage": "planning", "code": "lead_unavailable", "lead_status": "timeout",
+                "candidate_available": True, "candidate_artifacts": ["out.txt"],
+                "review_status": "not_requested", "stdout": "SHOULD_NOT_APPEAR",
+            },
+            "failures": [{}],
+            "tasks": [],
+            "acceptance_status": {"execution": "timeout", "artifacts": "unknown", "missing_artifacts": [],
+                                  "business_acceptance": "not_performed"},
+        }
+        out = HCR.summarize_status(payload)
+        primary = out["primary_failure"]
+        self.assertEqual(primary["stage"], "planning")
+        self.assertEqual(primary["code"], "lead_unavailable")
+        self.assertEqual(primary["lead_status"], "timeout")
+        self.assertIs(primary["candidate_available"], True)
+        self.assertEqual(primary["candidate_artifacts"], ["out.txt"])
+        self.assertEqual(primary["review_status"], "not_requested")
+        self.assertNotIn("SHOULD_NOT_APPEAR", json.dumps(out))
+        self.assertEqual(out["acceptance_status"]["execution"], "timeout")
+        self.assertEqual(out["acceptance_status"]["business_acceptance"], "not_performed")
+
+    def test_old_server_brief_has_no_invented_fields(self) -> None:
+        payload = {"ok": True, "request_id": "g", "state": "failed", "failure_reason": "x",
+                   "primary_failure": {"task_id": "t", "error": "x", "source": "task_failed"}, "tasks": []}
+        primary = HCR.summarize_status(payload)["primary_failure"]
+        for key in ("stage", "lead_status", "candidate_available", "review_status"):
+            self.assertNotIn(key, primary)
+
+
 if __name__ == "__main__":
     unittest.main()

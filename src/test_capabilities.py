@@ -586,5 +586,38 @@ class AgyAcceptanceGateApiTests(unittest.TestCase):
             self.assertIn(ACCEPTANCE_UNVERIFIED, public.get("warnings") or [])
 
 
+class LeadReviewRequirementTests(unittest.TestCase):
+    """#2: a lead that can review is not a review gate unless the backend routes results to it."""
+
+    def test_agy_with_lead_planner_does_not_satisfy_lead_review(self) -> None:
+        caps = default_capabilities(backend_id="antigravity.cli_v1")
+        caps["planner"] = {"name": "lead_adapter.plan_v1", "decomposes": True, "lead_review": True}
+        caps["acceptance"]["lead_review"] = False
+        self.assertEqual(unmet_capabilities(caps, ["lead_review"]), ["lead_review"])
+        self.assertEqual(unmet_capabilities(caps, ["decomposition"]), [])
+
+    def test_supervised_with_lead_planner_satisfies_lead_review(self) -> None:
+        caps = default_capabilities(backend_id="teleagent.windows_supervised_v1")
+        caps["planner"] = {"name": "lead_adapter.plan_v1", "decomposes": True, "lead_review": True}
+        caps["acceptance"]["lead_review"] = True
+        self.assertEqual(unmet_capabilities(caps, ["lead_review"]), [])
+
+    def test_open_requiring_lead_review_on_agy_is_409(self) -> None:
+        from framework.app_service import LeadAdapterPlanner
+        from test_app_service import _FakeLead, _request
+
+        with tempfile.TemporaryDirectory() as td:
+            backend = AntigravityCliExecutionBackend(bin_path=sys.executable)
+            app = CollabApplication(td, planner=LeadAdapterPlanner(_FakeLead(), cwd=td), backend=backend)
+            self.assertIs(app.capabilities()["planner"]["lead_review"], True)
+            self.assertIs(app.capabilities()["acceptance"]["lead_review"], False)
+            body = _request()
+            body["required_capabilities"] = ["lead_review"]
+            with self.assertRaises(AppError) as cm:
+                app.submit(body)
+            self.assertEqual(cm.exception.status, 409)
+            self.assertEqual(cm.exception.extra.get("missing"), ["lead_review"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1234,6 +1234,11 @@ def inject_agy_pool_into_backend_kwargs(kwargs: Mapping[str, Any] | None) -> dic
     # Fail-closed at wiring: pool must load and have a currently available id.
     # Selection + reserve happen later in start_run (per-dispatch).
     pool = load_pool(path)
+    # A previous service that died (crash, kill, restart) leaves busy leases
+    # with a future lease_until. start_run reclaims those (dead pid + free HOME
+    # lock); the startup probe must see them the same way or the service can
+    # never come back up. In-memory only: nothing is persisted here.
+    reclaim_dead_leases(pool, environ=env_map)
     probe = select_account(pool, precheck=None, persist=False, environ=env_map)
     if probe is None:
         states = {a.id: a.state for a in pool.accounts}

@@ -1718,7 +1718,7 @@ def _primary_failure_summary(raw: Any, cut: _Cut) -> dict[str, Any] | None:
         for item in missing_raw:
             if isinstance(item, str) and item.strip():
                 missing.append(cut.text(item.strip(), _SUMMARY_TEXT_CAP))
-    return {
+    out = {
         "task_id": cut.text("" if raw.get("task_id") is None else raw.get("task_id"), _SUMMARY_TEXT_CAP),
         "run_id": cut.text("" if raw.get("run_id") is None else raw.get("run_id"), _SUMMARY_TEXT_CAP),
         "title": cut.text(raw.get("title") or "", _SUMMARY_TEXT_CAP),
@@ -1728,6 +1728,22 @@ def _primary_failure_summary(raw: Any, cut: _Cut) -> dict[str, Any] | None:
         "retryable": _as_bool(raw.get("retryable"), default=False),
         "next_step": cut.text(raw.get("next_step") or "", _SUMMARY_TEXT_CAP),
     }
+    # Optional identity: failure stage, error code, lead adapter status (#16),
+    # and whether a reviewable candidate exists despite the failure (#12).
+    for key in ("stage", "code", "lead_status"):
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            out[key] = cut.text(value.strip(), _SUMMARY_TEXT_CAP)
+    if "candidate_available" in raw:
+        out["candidate_available"] = _as_bool(raw.get("candidate_available"), default=False)
+        cands = raw.get("candidate_artifacts")
+        if isinstance(cands, list):
+            out["candidate_artifacts"] = [
+                cut.text(c.strip(), _SUMMARY_TEXT_CAP) for c in cands[:32] if isinstance(c, str) and c.strip()
+            ]
+    if isinstance(raw.get("review_status"), str) and raw["review_status"].strip():
+        out["review_status"] = cut.text(raw["review_status"].strip(), _SUMMARY_TEXT_CAP)
+    return out
 
 
 def _failure_count(payload: dict[str, Any], primary: dict[str, Any] | None) -> int:
@@ -1873,6 +1889,15 @@ def summarize_status(payload: dict[str, Any]) -> dict[str, Any]:
     budget_status = _pick(payload, "budget_status")
     if isinstance(budget_status, dict):
         summary["budget_status"] = _cap_usage(budget_status, cut)
+    acceptance_status = _pick(payload, "acceptance_status")
+    if isinstance(acceptance_status, dict):
+        # Execution / artifacts / checks / review / business acceptance stay separate (#2).
+        summary["acceptance_status"] = {
+            k: (cut.text(v, _SUMMARY_TEXT_CAP) if isinstance(v, str) else
+                [cut.text(x, _SUMMARY_TEXT_CAP) for x in v[:32] if isinstance(x, str)] if isinstance(v, list) else None)
+            for k, v in acceptance_status.items()
+            if isinstance(k, str) and isinstance(v, (str, list))
+        }
     if failure_code:
         # Insert beside failure_reason without inventing an empty code.
         ordered = {

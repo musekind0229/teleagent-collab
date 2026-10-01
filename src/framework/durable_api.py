@@ -1612,6 +1612,10 @@ class DurableLayer:
             found.pop("dispatch_claim", None)
             did = new_decision_id()
             found["blocked_on_decision"] = did
+            # Callers open a checkpoint only after the run was collected or
+            # cancelled: no live worker holds a backend slot while parked.
+            found["run_parked"] = True
+            found["parked_decision"] = did
             snap["tasks"] = tasks
             rid = _norm_key(run_id) or _norm_key(found.get("run_id"))
             _store, _own, coordinator, own_ver = _live_ownership(self.persist_root, gid)
@@ -2022,6 +2026,11 @@ class DurableLayer:
                 for key in ("elapsed", "last_progress_at", "artifacts_checkpoint"):
                     if key in extra:
                         failure[key] = extra[key]
+                # Short identity strings only (stage source / error code / lead status).
+                for key in ("source", "code", "lead_status"):
+                    value = extra.get(key)
+                    if isinstance(value, str) and value.strip():
+                        failure[key] = _norm_key(value)[:60]
             snap["failure"] = failure
             self._append_history(snap, "fail_goal", **failure)
             self._touch(snap)

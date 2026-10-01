@@ -287,6 +287,25 @@ TeleAgent `review` 若产物自带 `contamination.contaminated`，投影出的�
 | `retryable` | 布尔。保守，普通失败为 false |
 | `next_step` | 短的安全提示，不含密钥和产物正文。`worker_timeout`：`raise budget.wall_sec or split the task; open a NEW request citing this request_id`。`spawn`：`check collab-service --ready` |
 
+任务失败的短记录另有（2026-10-02 起）：`stage`（任务失败为 `worker`）、`candidate_available` / `candidate_artifacts`（期望产物里哪些作为普通文件仍在受信任务目录里；只做 stat，不读正文，跳过 symlink 和越界路径）、`review_status`。**文件还在不等于执行成功，也没被审查**；run 仍是 failed，不会被改写。
+
+Goal 在任何 Task 结果之前就失败（规划失败、预算/协调失败）时，`failures` 只有一条 Goal 级短记录：`task_id` / `run_id` 为空串（不编造），`stage` 取 `failure.phase`（如 `planning`、`budget`），`source` 为 `planner` 或 `coordination`，可选 `code`（如 `lead_unavailable`、`invalid_plan`、`stale_plan`）与 `lead_status`（组长适配器的 `timeout` / `call_failed` / `error`）。`failure_reason` 同时填上，不再是空串。规划失败时没有任何工人被启动，也不会自动重试。
+
+### 验收分层（`acceptance_status`）
+
+每次 status 都带 `acceptance_status`，把几件事分开，不合并成「已验收」：
+
+| 键 | 取值 |
+| --- | --- |
+| `execution` | `succeeded` / `failed` / `timeout` / `cancelled` / `in_progress` |
+| `artifacts` | `complete` / `incomplete`（附 `missing_artifacts`）/ `unknown` |
+| `independent_checks` | `passed` / `failed` / `not_run`（目前只有 agy「must contain exactly」字面核对算） |
+| `technical_review` | `via_lead_gate`（后端把结果交组长审）/ `not_concluded` / `unsupported`（要了散文验收但没人核）/ `not_available`（后端没有组长审查通道，例如 agy） |
+| `business_acceptance` | 恒为 `not_performed`：服务从不做业务验收 |
+| `deployed` | 恒为 `not_tracked` |
+
+`acceptance` 对象只接受 `artifacts`、`text`、`allow_aigc_marks`；其他键 400，不会在派工前被悄悄丢掉。`required_capabilities` 里的 `lead_review` 需要 planner 能审 **且** 后端把结果交给它（`capabilities.acceptance.lead_review`）；agy 上会 409。
+
 `start_run` 抛错时，任务结果的 `error` 是 `backend dispatch failed: <异常类型>: <脱敏后的短原因>`（原因最多 300 字）。异常信息为空时仍只写类型名，不留一个空的冒号。
 
 ### 验收审查状态（`review`）
