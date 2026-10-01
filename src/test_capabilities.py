@@ -76,7 +76,8 @@ def _goal(**overrides) -> dict:
 
 
 def _pin() -> dict:
-    return {"path": "/tmp/pinned-input.txt", "sha256": "ab" * 32}
+    # Absolute on every OS (a POSIX "/tmp/..." is not absolute on Windows).
+    return {"path": str(Path(tempfile.gettempdir()).resolve() / "pinned-input.txt"), "sha256": "ab" * 32}
 
 
 def _agy_env(*, body: str, auto: bool) -> dict[str, str]:

@@ -165,6 +165,7 @@ def _job(state_dir: Path, run_id: str) -> dict:
 
 
 class LinuxDiscoveryTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "POSIX-only: Linux discovery path; Windows client inspects real PIDs")
     def test_client_import_rejects_userinfo_without_echoing_it(self):
         self.assertIn("ctypes", sys.modules)
         with self.assertRaises(ValueError) as caught:
@@ -428,6 +429,7 @@ class LinuxDiscoveryTests(unittest.TestCase):
 
 
 class LinuxPathTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "POSIX-only: symlinks need privilege on Windows")
     def test_posix_external_directory_bounds_and_contained(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -895,6 +897,7 @@ class LinuxServiceTests(unittest.TestCase):
 
 
 class LinuxDesktopLockTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "POSIX-only: flock lock backend")
     def test_posix_flock_and_lock_root_fallback(self):
         from platform_services import get_file_lock, get_platform_services
 

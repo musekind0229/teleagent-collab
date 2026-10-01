@@ -519,6 +519,7 @@ class TestApplicationContract(unittest.TestCase):
             self.assertNotIn("TEXT_B", json.dumps(by_title["A"]["done_when"]))
             self.assertNotIn("TEXT_A", json.dumps(by_title["B"]["done_when"]))
 
+    @unittest.skipIf(os.name == "nt", "fake agy is a .cmd shim; cmd.exe cuts multi-line %* argv (real agy.exe is not affected)")
     def test_agy_application_prompt_carries_contract(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
