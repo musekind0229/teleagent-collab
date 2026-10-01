@@ -35,6 +35,7 @@ from execution_backend.inprocess_v1 import InProcessExecutionBackend
 from framework import contract_render
 from framework.artifact_contamination import scan_file, summarize
 from framework.artifact_handoff import HandoffError, handoff_direct_dependency_artifacts
+from framework.failure_projection import project_failed_tasks
 from framework.need_human import goal_need_human_view, sanitize_reason
 from framework.durable_api import DurableLayer
 from lead_adapter.schema import context_summary_of, unwrap_structured
@@ -1371,7 +1372,14 @@ class AppCoordinator:
             except contract_render.ContractRenderError as exc:
                 launched = {"ok": False, "error": f"contract_render_error: {exc}"}
             except Exception as e:
-                launched = {"ok": False, "error": f"backend dispatch failed: {type(e).__name__}"}
+                # Keep the type, and a short redacted reason when the message
+                # is non-empty. An empty message stays type-only.
+                detail = sanitize_reason(str(e))[:300]
+                if detail:
+                    error = f"backend dispatch failed: {type(e).__name__}: {detail}"
+                else:
+                    error = f"backend dispatch failed: {type(e).__name__}"
+                launched = {"ok": False, "error": error, "error_source": "spawn"}
             run_id = str(launched.get("run_id") or launched.get("native_handle") or "")
             if not launched.get("ok") or not run_id:
                 return self.layer.finish_task(goal_id, str(task["task_id"]), succeeded=False, result=launched)
@@ -2250,6 +2258,16 @@ class CollabApplication:
             "backend": str(backend.get("id") or ""),
             "planner": str(planner.get("name") or ""),
         }
+        # Pending decisions are not task failures. Observation-window timeouts
+        # never reach this method; they are a client wait, not a goal state.
+        if str(out.get("state") or "") == "failed" and not pending:
+            projected = project_failed_tasks(tasks if isinstance(tasks, list) else [])
+            if projected is not None:
+                # need_human already filled failure_reason; do not replace it.
+                if not str(out.get("failure_reason") or "").strip():
+                    out["failure_reason"] = projected["failure_reason"]
+                out["primary_failure"] = projected["primary_failure"]
+                out["failures"] = projected["failures"]
         return out
 
     def capabilities(self) -> dict[str, Any]:

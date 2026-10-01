@@ -74,12 +74,12 @@ python bin/hermes-collab-request.py decide <request_id> <decision_id> --verdict 
 | --- | --- | --- |
 | 0 | `completed` | `state=completed` |
 | 1 | （无；传输/API 错误仍是原始错误 JSON） | HTTP / 传输 / 非法 JSON，或响应 `ok=false` |
-| 2 | `task_failed` 或 `task_cancelled` | `state=failed` 或 `cancelled`。失败文本是目标自己的墙钟预算时，另有 `wait.task_timeout=true` |
+| 2 | `task_failed` 或 `task_cancelled` | `state=failed` 或 `cancelled`。失败文本是目标自己的墙钟预算时，或 `wait.kind=task_failed` 且 `primary_failure.source` 为 `worker_timeout` 时，另有 `wait.task_timeout=true` |
 | 3 | `observation_timeout` | 观察窗口到点。非终态时 `wait.task_still_running=true`。`wait.resume` 是下一条 `python bin/hermes-collab-request.py wait <id> --timeout <N>`。`wait.note` 写明这不是任务失败，禁止 re-open / retry |
 | 4 | `need_human` | 需要人拍板，立即返回 |
 | 5 | — | 仅 `decide`：服务拒绝（HTTP 409） |
 
-`wait.task_timeout` 只在退出码 2、且失败/错误文本里已经出现服务端写好的墙钟标记时为 true。对照 `win_collab.budget_exceeded_reason`（`budget_exceeded wall` / `wall_s=`）以及章程 `timeout_sec` 记成的 `timed_out`、`deadline exhausted`、`wall clock`、`budget_exhausted`。步数预算（`budget_exceeded steps`）**不会**置这个标志。不要自己编一个百分比或超时。
+`wait.task_timeout` 只在退出码 2 时可能为 true：失败/错误文本里已经出现服务端写好的墙钟标记，或者 `wait.kind=task_failed` 且顶层 `primary_failure.source` 为 `worker_timeout`（工人结果 `error` 就是 `timeout` 时走这条，不必再猜一句墙钟文案）。对照 `win_collab.budget_exceeded_reason`（`budget_exceeded wall` / `wall_s=`）以及章程 `timeout_sec` 记成的 `timed_out`、`deadline exhausted`、`wall clock`、`budget_exhausted`。步数预算（`budget_exceeded steps`）**不会**置这个标志。观察窗口到点（退出码 3）不是任务失败，不会置 `task_timeout`。不要自己编一个百分比或超时。
 
 exit 4 在原 status 上追加字段（`ok` 保持服务端原值）。默认打出的是 SUMMARY，其中 `wait` 仍是下面这个对象（并多一个 `kind`）；`--full` 才把整份原始 status 和这个 `wait` 一起打出。
 
@@ -131,7 +131,9 @@ exit 4 在原 status 上追加字段（`ok` 保持服务端原值）。默认打
 | `state` | 目标状态 |
 | `terminal` | `state` 是否为 `completed` / `failed` / `cancelled` |
 | `need_human` | 顶层布尔；没有该键时再看 `failure` 和 task result |
-| `failure_reason` | 失败原因，自由文本最多 300 字 |
+| `failure_reason` | 失败原因，自由文本最多 300 字。顶层为空时回退到 `primary_failure.error` |
+| `primary_failure` | 服务端失败投影的短记录：`task_id`、`run_id`、`title`、`error`、`source`、`missing_artifacts`、`retryable`、`next_step`。没有则为 `null`。不复制 stdout / stderr，也不复制 Goal 合同 |
+| `failure_count` | `failures` 里的条数。没有该列表时，有 `primary_failure` 则为 1，否则 0。多 Task 失败不会被收成一个原因 |
 | `failure_code` | 仅当有 `failure_code` / `error_class` / `failure.code` 时出现 |
 | `pending_decisions` | 决策摘要：`awaiting`、`summary`、`kind`、`decision_id`（以及 title / task_id / status / reason） |
 | `awaiting_lead_count` / `awaiting_human_count` | 服务端计数；没有则按行上的 `awaiting` 统计（缺 `awaiting` 的旧行算 human） |
@@ -145,7 +147,7 @@ exit 4 在原 status 上追加字段（`ok` 保持服务端原值）。默认打
 | `full_hint` | 固定 `"rerun with --full"` |
 | `wait` | 仅 `wait` 子命令：上面的观察窗口 / 终态 / need_human 块 |
 
-自由文本（失败原因、任务标题、error、警告、路径、进度里的字符串）按字段截到 300 字；被截到才把 `truncated` 设为 true。决策 `summary` 仍是原来的单行 200 字。
+自由文本（失败原因、`primary_failure` 里的标题 / error / next_step / 缺失产物名、任务标题、error、警告、路径、进度里的字符串）按字段截到 300 字；被截到才把 `truncated` 设为 true。决策 `summary` 仍是原来的单行 200 字。
 
 ### 一行示例
 

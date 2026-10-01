@@ -195,6 +195,32 @@ TeleAgent `review` 若产物自带 `contamination.contaminated`，投影出的�
 - `warnings`：与本 Goal 相关的能力警告、承认降级、以及「验收文本没有被独立核对」
 - `capabilities_ref`：`{"backend": "<id>", "planner": "<name>"}`
 
+### 失败投影（`state=failed`）
+
+`state=failed` 且**没有**待决 decision 时，顶层多三个字段，把失败 Task 抬上来。`awaiting_decision` / `pending_decisions` 非空不是失败，这三项不出现。客户端观察窗口到点（`wait.kind=observation_timeout`）也不是任务失败，服务端不因此改 Goal 状态。
+
+`need_human` 的语义不变。`failure` 在已经写下时原样返回（need_human 时含 `need_human` / `failure_reason` / `phase=worker` / `task_id`）。普通任务失败的 `failure` 仍常常是 `null`。不要把普通任务失败读成 need_human，也不要靠这些新字段去 `POST …/retry`（那条只给 need_human）。
+
+| 字段 | 含义 |
+| --- | --- |
+| `failure` | 与今天相同。已设置时原样返回，不改写成下面的短记录 |
+| `failure_reason` | 一行摘要，已脱敏。need_human 时仍是原来的短原因；否则取计划顺序里**第一个失败 Task** 的错误。不会把多个 Task 的原因拼成一句 |
+| `primary_failure` | 那个失败 Task 的短记录 |
+| `failures` | **每一个**失败 Task 的同样短记录，按计划顺序。多 Task 失败时有几条算几条，不合成一个原因 |
+
+`primary_failure` 与 `failures[]` 只有这些键（不含 stdout / stderr，也不复制 Goal 合同）：
+
+| 键 | 含义 |
+| --- | --- |
+| `task_id` / `run_id` / `title` | 任务标识。派发还没绑上 run 时 `run_id` 为空串 |
+| `error` | 脱敏后的一行错误，最多 300 字 |
+| `source` | `worker_timeout`（`error` 就是 `timeout`，或墙钟/预算标记，**不是** `budget_exceeded steps`）、`spawn`（`start_run` 抛错，结果带 `error_source: "spawn"`）、`contract_render`、`acceptance`、`contamination`、`cancelled`、`task_failed` |
+| `missing_artifacts` | 该次结果里列出的缺失产物名字；没有则 `[]` |
+| `retryable` | 布尔。保守，普通失败为 false |
+| `next_step` | 短的安全提示，不含密钥和产物正文。`worker_timeout`：`raise budget.wall_sec or split the task; open a NEW request citing this request_id`。`spawn`：`check collab-service --ready` |
+
+`start_run` 抛错时，任务结果的 `error` 是 `backend dispatch failed: <异常类型>: <脱敏后的短原因>`（原因最多 300 字）。异常信息为空时仍只写类型名，不留一个空的冒号。
+
 ### 验收审查状态（`review`）
 
 工人结果上的 `review`：
@@ -280,7 +306,7 @@ Windows 监督后端在 TeleAgent 重启 / 端口或凭据实例变化 / 会话�
 
 1. `GET /v1/requests/{id}` 顶层：
    - `need_human`: bool
-   - `failure_reason`: 短原因摘要（已脱敏）
+   - `failure_reason`: 短原因摘要（已脱敏）。need_human 时仍是这条原因；非 need_human 的任务失败另见「失败投影」
    - `failure`: 若为 need_human，含 `need_human` / `failure_reason` / `phase=worker` / `task_id`
    - `tasks[].result.need_human` / `tasks[].result.failure_reason` / `tasks[].result.error`
 2. `GET /v1/requests/{id}/events`：历史里 `finish_task` 在 need_human 时带 `need_human=true`、`failure_reason`、`event_kind=need_human`，可按这些字段检索。（与 status 对齐露出 pending_decisions）

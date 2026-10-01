@@ -39,7 +39,9 @@ Exit codes:
   1  EXIT_ERROR            HTTP/transport/API error, or payload ok=false
   2  EXIT_FAILED           wait ended in failed or cancelled
                             (wait.kind task_failed or task_cancelled;
-                            wait.task_timeout when the goal wall budget fired)
+                            wait.task_timeout when the goal wall budget fired,
+                            or task_failed and primary_failure.source is
+                            worker_timeout)
   3  EXIT_TIMEOUT          wait hit the client observation window
                             (wait.kind observation_timeout; not a task failure)
   4  EXIT_NEED_HUMAN       a human decision is required (lead-owned rows keep polling)
@@ -1139,6 +1141,10 @@ def cmd_wait(args: argparse.Namespace) -> dict[str, Any]:
             terminal_wait: dict[str, Any] = {"terminal": True, "state": state, "kind": kind}
             if state not in SUCCESS_STATES and _goal_wall_budget(last):
                 terminal_wait["task_timeout"] = True
+            # A worker result whose error is exactly "timeout" is not a wall-budget
+            # phrase. The server labels that primary_failure.source worker_timeout.
+            if kind == "task_failed" and _primary_failure_source(last) == "worker_timeout":
+                terminal_wait["task_timeout"] = True
             last["wait"] = terminal_wait
             if state not in SUCCESS_STATES:
                 raise ClientError(last, exit_code=EXIT_FAILED)
@@ -1503,6 +1509,49 @@ def _need_human_flag(payload: dict[str, Any], tasks: list[dict[str, Any]]) -> bo
     return False
 
 
+def _primary_failure_source(payload: dict[str, Any]) -> str:
+    """Server source label, if a primary_failure brief is present."""
+    for layer in _layers(payload):
+        primary = layer.get("primary_failure")
+        if not isinstance(primary, dict):
+            continue
+        source = primary.get("source")
+        if isinstance(source, str) and source.strip():
+            return source.strip()
+    return ""
+
+
+def _primary_failure_summary(raw: Any, cut: _Cut) -> dict[str, Any] | None:
+    """Copy the server brief. Drop stdout and any other extra keys."""
+    if not isinstance(raw, dict):
+        return None
+    missing_raw = raw.get("missing_artifacts")
+    missing: list[str] = []
+    if isinstance(missing_raw, list):
+        for item in missing_raw:
+            if isinstance(item, str) and item.strip():
+                missing.append(cut.text(item.strip(), _SUMMARY_TEXT_CAP))
+    return {
+        "task_id": cut.text("" if raw.get("task_id") is None else raw.get("task_id"), _SUMMARY_TEXT_CAP),
+        "run_id": cut.text("" if raw.get("run_id") is None else raw.get("run_id"), _SUMMARY_TEXT_CAP),
+        "title": cut.text(raw.get("title") or "", _SUMMARY_TEXT_CAP),
+        "error": cut.text(raw.get("error") or "", _SUMMARY_TEXT_CAP),
+        "source": cut.text(raw.get("source") or "", _SUMMARY_TEXT_CAP),
+        "missing_artifacts": missing,
+        "retryable": _as_bool(raw.get("retryable"), default=False),
+        "next_step": cut.text(raw.get("next_step") or "", _SUMMARY_TEXT_CAP),
+    }
+
+
+def _failure_count(payload: dict[str, Any], primary: dict[str, Any] | None) -> int:
+    raw = _pick(payload, "failures")
+    if isinstance(raw, list):
+        return sum(1 for item in raw if isinstance(item, dict))
+    if primary is not None:
+        return 1
+    return 0
+
+
 def _failure_fields(payload: dict[str, Any], cut: _Cut) -> tuple[str, str]:
     reason = ""
     code = ""
@@ -1574,6 +1623,11 @@ def summarize_status(payload: dict[str, Any]) -> dict[str, Any]:
     request_id_text = "" if request_id is None else str(request_id)
     ok_value = _pick(payload, "ok")
     reason, failure_code = _failure_fields(payload, cut)
+    primary_failure = _primary_failure_summary(_pick(payload, "primary_failure"), cut)
+    # Top-level failure_reason wins. Fall back to the primary task error.
+    if not reason and primary_failure is not None:
+        reason = primary_failure.get("error") or ""
+    failure_count = _failure_count(payload, primary_failure)
     briefs: list[dict[str, Any]] = []
     for row in rows:
         brief = _decision_brief(row)
@@ -1619,6 +1673,8 @@ def summarize_status(payload: dict[str, Any]) -> dict[str, Any]:
         "terminal": state in TERMINAL_STATES,
         "need_human": _need_human_flag(payload, tasks),
         "failure_reason": reason,
+        "primary_failure": primary_failure,
+        "failure_count": failure_count,
         "pending_decisions": briefs,
         "awaiting_lead_count": lead_count,
         "awaiting_human_count": human_count,
@@ -1637,6 +1693,8 @@ def summarize_status(payload: dict[str, Any]) -> dict[str, Any]:
             "need_human": summary["need_human"],
             "failure_reason": summary["failure_reason"],
             "failure_code": failure_code,
+            "primary_failure": summary["primary_failure"],
+            "failure_count": summary["failure_count"],
         }
         for key, value in summary.items():
             if key not in ordered:
