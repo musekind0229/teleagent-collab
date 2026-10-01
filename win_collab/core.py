@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import time
 import uuid
 from pathlib import Path, PureWindowsPath
@@ -1003,31 +1004,194 @@ def _path_within(candidate, root):
         return False
 
 
+def _unique_regular_file(path):
+    """True when ``path`` is a non-link regular file with ``st_nlink == 1``."""
+    try:
+        if _is_link(path):
+            return False
+        st = Path(path).lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) and st.st_nlink == 1
+
+
+def _isolated_copy_has_hardlink(index_dir):
+    """True when a direct child is a regular file with ``st_nlink > 1``.
+
+    Symlink children are not followed. Stat errors fail closed.
+    """
+    try:
+        children = list(Path(index_dir).iterdir())
+    except OSError:
+        return True
+    for child in children:
+        try:
+            if _is_link(child):
+                continue
+            st = child.lstat()
+        except OSError:
+            return True
+        if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
+            return True
+    return False
+
+
 def _external_input_copy_dir(raw):
     """Parent of an isolated pin at ``.../external-inputs/<job>/<index>/<file>``.
 
     A POSIX pattern such as ``/home/u/.../external-inputs/<job>/0/*`` is bounded
     to that per-file directory. An ordinary pin (the caller's original file)
-    does not authorize a wildcard of its parent. Links fail closed.
+    does not authorize a wildcard of its parent. The external-inputs root, the
+    job directory, the index directory, and the file are checked as given —
+    ``resolve()`` is not allowed to hide a symlink that lands on another tree
+    of the same shape. A regular file with ``st_nlink > 1`` in that directory
+    does not authorize it.
     """
     if not isinstance(raw, str) or not raw.strip():
         return None
     try:
-        resolved = Path(raw).resolve()
+        lexical = Path(raw)
+    except (TypeError, ValueError):
+        return None
+    if not lexical.is_absolute():
+        return None
+    parts = lexical.parts
+    if len(parts) < 5 or any(part in {'.', '..'} for part in parts):
+        return None
+    index_name = parts[-2]
+    job_name = parts[-3]
+    if parts[-4] != _EXTERNAL_INPUTS_DIR:
+        return None
+    if not re.fullmatch(r'[0-9]+', index_name):
+        return None
+    if _safe_job_dirname(job_name) is None:
+        return None
+    inputs_root = Path(*parts[:-3])
+    job_dir = inputs_root / job_name
+    index_dir = job_dir / index_name
+    file_path = index_dir / parts[-1]
+    if (_is_link(inputs_root) or _is_link(job_dir) or _is_link(index_dir)
+            or _is_link(file_path)):
+        return None
+    try:
+        if not (inputs_root.is_dir() and job_dir.is_dir() and index_dir.is_dir()):
+            return None
+        if not _unique_regular_file(file_path):
+            return None
+        resolved_index = index_dir.resolve()
+        resolved_file = file_path.resolve()
+        if resolved_file.parent != resolved_index:
+            return None
+        if (resolved_index.name != index_name or resolved_index.parent.name != job_name
+                or resolved_index.parent.parent.name != _EXTERNAL_INPUTS_DIR):
+            return None
+        if _isolated_copy_has_hardlink(index_dir):
+            return None
     except (OSError, ValueError):
         return None
-    index_dir = resolved.parent
-    job_dir = index_dir.parent
-    inputs_root = job_dir.parent
-    if inputs_root.name != _EXTERNAL_INPUTS_DIR:
-        return None
-    if not re.fullmatch(r'[0-9]+', index_dir.name):
-        return None
-    if _safe_job_dirname(job_dir.name) is None:
-        return None
-    if _is_link(index_dir) or _is_link(job_dir) or _is_link(inputs_root):
-        return None
     return index_dir
+
+
+def _copy_roots(external_inputs):
+    roots = []
+    if not isinstance(external_inputs, (list, tuple)):
+        return roots
+    for item in external_inputs:
+        if not isinstance(item, dict):
+            continue
+        copy_dir = _external_input_copy_dir(item.get('path'))
+        if copy_dir is not None:
+            roots.append(copy_dir)
+    return roots
+
+
+def _lexical_external_inputs_shape(raw):
+    """True when the path, as given, ends in ``external-inputs/<job>/<index>/<file>``."""
+    try:
+        parts = Path(raw).parts
+    except (TypeError, ValueError):
+        return False
+    return len(parts) >= 5 and parts[-4] == _EXTERNAL_INPUTS_DIR
+
+
+def _filepath_matches_pin(target, external_inputs):
+    """True when ``target`` is a resolved, unlinked, unique pin with a matching hash.
+
+    A path that claims the isolated copy layout must pass ``_external_input_copy_dir``
+    first, so a symlink that resolves onto a real copy does not count as the pin.
+    """
+    if not isinstance(external_inputs, (list, tuple)):
+        return False
+    for item in external_inputs:
+        if not isinstance(item, dict):
+            continue
+        raw = item.get('path')
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        declared = Path(raw)
+        if _is_link(declared):
+            continue
+        if _lexical_external_inputs_shape(raw) and _external_input_copy_dir(raw) is None:
+            continue
+        try:
+            allowed = declared.resolve()
+            if target != allowed or not _unique_regular_file(allowed) or credential_like(allowed):
+                continue
+            actual = hashlib.sha256(allowed.read_bytes()).hexdigest()
+            expected = item['sha256']
+            if hmac.compare_digest(actual.lower(), str(expected).lower()):
+                return True
+        except (OSError, ValueError, KeyError, AttributeError, TypeError):
+            continue
+    return False
+
+
+def _pattern_targets(pattern):
+    """Return ``(legacy, strict)`` resolved bounds, or a reject reason.
+
+    ``legacy`` is the path before the first wildcard (workspace patterns keep
+    this historical check). ``strict`` is the directory a copy-dir wildcard may
+    widen: a glob that does not follow a separator, such as ``.../0*``, is
+    bounded to the parent of that partial component so it cannot match siblings.
+    Relative patterns and ``~`` are unbounded.
+    """
+    if not isinstance(pattern, str) or not pattern.strip():
+        return 'External-directory request contains an invalid path pattern'
+    if pattern.lstrip().startswith('~'):
+        return 'External-directory request is not bounded to the job workspace'
+    match = re.search(r'[?*\[]', pattern)
+    if match:
+        raw_prefix = pattern[:match.start()]
+        open_component = not raw_prefix.endswith(('/', '\\'))
+    else:
+        raw_prefix = pattern
+        open_component = False
+    prefix = raw_prefix.rstrip('/\\')
+    if not prefix:
+        return 'External-directory request is not bounded to the job workspace'
+    path = Path(prefix)
+    if not path.is_absolute():
+        return 'External-directory request is not bounded to the job workspace'
+    strict_path = path.parent if open_component else path
+    if not strict_path.is_absolute():
+        return 'External-directory request is not bounded to the job workspace'
+    try:
+        return path.resolve(), strict_path.resolve()
+    except (OSError, ValueError):
+        return 'External-directory request path cannot be verified'
+
+
+def _pattern_escape_reason(pattern, workspace, copy_roots):
+    """None when ``pattern`` stays inside the workspace or one copy directory."""
+    found = _pattern_targets(pattern)
+    if isinstance(found, str):
+        return found
+    legacy, strict = found
+    if _path_within(legacy, workspace):
+        return None
+    if any(_path_within(strict, root) for root in copy_roots):
+        return None
+    return 'External-directory request escapes the assigned job workspace'
 
 
 def hard_reject(p, workspace=None, external_inputs=()):
@@ -1036,47 +1200,39 @@ def hard_reject(p, workspace=None, external_inputs=()):
     if credential_like(text):
         return 'Credential-like target is outside this preview task contract'
     if workspace and p.get('permission') == 'external_directory':
-        root = Path(workspace).resolve()
+        try:
+            root = Path(workspace).resolve()
+        except (OSError, ValueError):
+            return 'External-directory request path cannot be verified'
         filepath = (p.get('metadata') or {}).get('filepath')
+        filepath_ok = False
         if isinstance(filepath, str) and filepath:
             try:
-                target = Path(filepath).resolve()
-                if target.is_relative_to(root):
-                    return None
-                for item in external_inputs:
-                    allowed = Path(item['path']).resolve()
-                    if target == allowed and allowed.is_file() and not credential_like(allowed):
-                        actual = hashlib.sha256(allowed.read_bytes()).hexdigest()
-                        if hmac.compare_digest(actual.lower(), item['sha256'].lower()):
-                            return None
-                return 'External-directory request targets a file not pinned by the charter'
-            except (OSError, ValueError, KeyError):
-                return 'External-directory request path cannot be verified'
-        patterns = p.get('patterns')
-        if not isinstance(patterns, list) or not patterns:
-            return 'External-directory request has no bounded path patterns'
-        allowed_roots = [root]
-        if isinstance(external_inputs, (list, tuple)):
-            for item in external_inputs:
-                if not isinstance(item, dict):
-                    continue
-                copy_dir = _external_input_copy_dir(item.get('path'))
-                if copy_dir is not None:
-                    allowed_roots.append(copy_dir)
-        for pattern in patterns:
-            if not isinstance(pattern, str) or not pattern.strip():
-                return 'External-directory request contains an invalid path pattern'
-            # A wildcard may only widen descendants of the job workspace or of one
-            # isolated external-inputs copy directory (POSIX ``.../0/*`` included).
-            prefix = re.split(r'[?*\[]', pattern, maxsplit=1)[0].rstrip('/\\')
-            if not prefix:
-                return 'External-directory request is not bounded to the job workspace'
-            try:
-                candidate = Path(prefix).resolve()
+                declared = Path(filepath)
+                target = declared.resolve()
             except (OSError, ValueError):
                 return 'External-directory request path cannot be verified'
-            if not any(_path_within(candidate, allowed) for allowed in allowed_roots):
-                return 'External-directory request escapes the assigned job workspace'
+            if target.is_relative_to(root):
+                filepath_ok = True
+            elif _is_link(declared) or not _unique_regular_file(target):
+                return 'External-directory request path cannot be verified'
+            elif _filepath_matches_pin(target, external_inputs):
+                filepath_ok = True
+            else:
+                return 'External-directory request targets a file not pinned by the charter'
+        patterns = p.get('patterns')
+        if not isinstance(patterns, list) or not patterns:
+            if filepath_ok:
+                return None
+            return 'External-directory request has no bounded path patterns'
+        # A wildcard may only widen descendants of the job workspace or of one
+        # isolated external-inputs copy directory (POSIX ``.../0/*`` included).
+        # A matching metadata.filepath does not skip this check.
+        copy_roots = _copy_roots(external_inputs)
+        for pattern in patterns:
+            reason = _pattern_escape_reason(pattern, root, copy_roots)
+            if reason:
+                return reason
     return None
 
 
