@@ -25,6 +25,7 @@ from urllib.parse import unquote, urlparse
 
 from execution_backend.base import BackendError, ExecutionBackend
 from execution_backend.inprocess_v1 import InProcessExecutionBackend
+from framework import contract_render
 from framework.artifact_contamination import scan_file, summarize
 from framework.artifact_handoff import HandoffError, handoff_direct_dependency_artifacts
 from framework.need_human import goal_need_human_view, sanitize_reason
@@ -153,13 +154,21 @@ def _strings(value: Any, *, field: str, required: bool = False) -> list[str]:
 
 
 def _safe_artifacts(value: Any) -> list[str]:
+    """Relative workspace paths only.
+
+    Backslash and drive-letter forms are rejected on Linux as well as Windows.
+    ``pathlib`` on POSIX does not treat ``\\\\`` as a separator, so ``..\\\\x``
+    would otherwise look like a single filename.
+    """
     artifacts = _strings(value, field="acceptance.artifacts", required=True)
     out: list[str] = []
     for raw in artifacts:
-        path = Path(raw)
-        if path.is_absolute() or ".." in path.parts or not path.name:
-            raise AppError(f"artifact must be a relative path inside the task workspace: {raw!r}")
-        out.append(path.as_posix())
+        try:
+            out.append(contract_render.safe_relative_artifact(raw))
+        except contract_render.ContractRenderError as exc:
+            raise AppError(
+                f"artifact must be a relative path inside the task workspace: {raw!r}"
+            ) from exc
     return out
 
 
@@ -294,14 +303,27 @@ def worker_charter_for_task(
     boundaries = goal_obj.get("boundaries") if isinstance(goal_obj.get("boundaries"), Mapping) else {}
     instruction = str((task.get("inputs") or {}).get("instruction") or task.get("title") or "").strip()
     budget = goal_obj.get("budget") if isinstance(goal_obj.get("budget"), Mapping) else {}
+    raw_done = task.get("done_when")
+    if isinstance(raw_done, Mapping):
+        done_when: Any = dict(raw_done)
+    else:
+        done_when = raw_done or {}
     charter: dict[str, Any] = {
         "goal": instruction,
         "must": [str(x) for x in (boundaries.get("must") or [])],
         "must_not": [str(x) for x in (boundaries.get("must_not") or [])],
-        "done_when": task.get("done_when") or {},
+        "done_when": done_when,
         "timeout_sec": budget.get("wall_sec"),
         "max_redos": budget.get("max_reworks"),
     }
+    acceptance_src = goal_obj.get("acceptance")
+    if isinstance(acceptance_src, Mapping) and "text" in acceptance_src:
+        acc_text = acceptance_src.get("text")
+        if not isinstance(acc_text, str):
+            raise AppError("acceptance.text must be a string")
+        charter["acceptance"] = acc_text
+    elif isinstance(acceptance_src, str):
+        charter["acceptance"] = acceptance_src
     raw_forbidden = goal_obj.get("forbidden_tools")
     if isinstance(raw_forbidden, list):
         forbidden = [str(x).strip() for x in raw_forbidden if str(x).strip()]
@@ -644,6 +666,56 @@ def planning_response_schema() -> dict[str, Any]:
     }
 
 
+_DONE_WHEN_KEYS = frozenset({"artifacts", "text"})
+
+
+def _validate_done_when(row: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Validate per-task ``done_when``. Absent means the row has none.
+
+    Only a mapping with ``artifacts`` (safe relative paths) and/or ``text``
+    (string) is legal. Strings, lists, numbers, and unknown keys are
+    ``invalid_plan``. ``done_when.artifacts`` is always passed through
+    ``_safe_artifacts`` and must not replace the row's artifacts unsafely.
+    """
+    if "done_when" not in row or row.get("done_when") is None:
+        return None
+    done = row.get("done_when")
+    if not isinstance(done, Mapping):
+        raise AppError(
+            "done_when must be an object with keys 'artifacts' and/or 'text'",
+            code="invalid_plan",
+        )
+    unknown = sorted(str(key) for key in done.keys() if key not in _DONE_WHEN_KEYS)
+    if unknown:
+        raise AppError(
+            "done_when has unknown keys: " + ", ".join(unknown),
+            code="invalid_plan",
+        )
+    out: dict[str, Any] = {}
+    if "artifacts" in done:
+        try:
+            out["artifacts"] = _safe_artifacts(done.get("artifacts"))
+        except AppError as exc:
+            raise AppError(str(exc), code="invalid_plan") from exc
+    if "text" in done:
+        text = done.get("text")
+        if not isinstance(text, str):
+            raise AppError("done_when.text must be a string", code="invalid_plan")
+        out["text"] = text
+    return out
+
+
+def _task_done_when(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep artifacts from the validated plan row and copy ``text`` when it is a string."""
+    done_when: dict[str, Any] = {"artifacts": list(row.get("artifacts") or [])}
+    row_done = row.get("done_when")
+    if isinstance(row_done, Mapping):
+        text = row_done.get("text")
+        if isinstance(text, str):
+            done_when["text"] = text
+    return done_when
+
+
 def validate_plan(plan: Any, request: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(plan, Mapping):
         raise AppError("lead did not return a plan object", code="invalid_plan")
@@ -665,15 +737,37 @@ def validate_plan(plan: Any, request: Mapping[str, Any]) -> dict[str, Any]:
         if not key or key in seen or not title or not instruction:
             raise AppError("plan task keys must be unique and task fields non-empty", code="invalid_plan")
         seen.add(key)
-        clean.append(
-            {
-                "task_key": key,
-                "title": title,
-                "instruction": instruction,
-                "depends_on": _strings(row.get("depends_on") or [], field="task.depends_on"),
-                "artifacts": _safe_artifacts(row.get("artifacts")),
-            }
-        )
+        done = _validate_done_when(row)
+        has_row_artifacts = "artifacts" in row and row.get("artifacts") is not None
+        if has_row_artifacts:
+            artifacts = _safe_artifacts(row.get("artifacts"))
+        elif done is not None and "artifacts" in done:
+            # No row artifacts: the validated done_when list becomes the artifacts.
+            artifacts = list(done["artifacts"])
+        else:
+            artifacts = _safe_artifacts(row.get("artifacts"))
+        if done is not None and "artifacts" in done:
+            allowed = set(artifacts)
+            if any(item not in allowed for item in done["artifacts"]):
+                raise AppError(
+                    "done_when.artifacts must be a subset of task artifacts",
+                    code="invalid_plan",
+                )
+        clean_row: dict[str, Any] = {
+            "task_key": key,
+            "title": title,
+            "instruction": instruction,
+            "depends_on": _strings(row.get("depends_on") or [], field="task.depends_on"),
+            "artifacts": list(artifacts),
+        }
+        if done is not None:
+            stored_done: dict[str, Any] = {}
+            if "artifacts" in done:
+                stored_done["artifacts"] = list(done["artifacts"])
+            if "text" in done:
+                stored_done["text"] = done["text"]
+            clean_row["done_when"] = stored_done
+        clean.append(clean_row)
     for row in clean:
         if any(dep not in seen or dep == row["task_key"] for dep in row["depends_on"]):
             raise AppError("task dependency references an unknown/self task", code="invalid_plan")
@@ -694,6 +788,12 @@ class DeterministicPlanner:
         goal = goal_snapshot.get("goal") if isinstance(goal_snapshot.get("goal"), Mapping) else {}
         acceptance = goal.get("acceptance") if isinstance(goal.get("acceptance"), Mapping) else {}
         artifacts = _safe_artifacts(acceptance.get("artifacts"))
+        done_when: dict[str, Any] = {"artifacts": list(artifacts)}
+        if "text" in acceptance:
+            acc_text = acceptance.get("text")
+            if not isinstance(acc_text, str):
+                raise AppError("acceptance.text must be a string")
+            done_when["text"] = acc_text
         request = build_planning_request(goal_snapshot)
         raw = {
             "application_id": request["application_id"],
@@ -706,6 +806,7 @@ class DeterministicPlanner:
                     "instruction": str(goal.get("desired_outcome") or "Complete the requested outcome"),
                     "depends_on": [],
                     "artifacts": artifacts,
+                    "done_when": done_when,
                 }
             ],
         }
@@ -930,7 +1031,7 @@ class AppCoordinator:
                             "planner": self.planner.name,
                         },
                         "expected_artifacts": row["artifacts"],
-                        "done_when": {"artifacts": row["artifacts"]},
+                        "done_when": _task_done_when(row),
                         "assignee_role": "executor",
                         "backend_requirement": getattr(self.backend, "backend_id", ""),
                     },
@@ -1122,17 +1223,38 @@ class AppCoordinator:
                 inputs = dict(task.get("inputs") or {})
                 inputs["input_files"] = [row["relative"] for row in staged]
                 task["inputs"] = inputs
+            goal_obj = snap.get("goal") if isinstance(snap.get("goal"), Mapping) else {}
+            try:
+                charter = worker_charter_for_task(goal=goal_obj, task=task)
+            except AppError as exc:
+                return self.layer.finish_task(
+                    goal_id,
+                    str(task["task_id"]),
+                    succeeded=False,
+                    result={"ok": False, "error": str(exc)},
+                )
+            # Fail closed before dispatch. A patched or corrupt renderer must
+            # not start the worker on a goal-only prompt.
+            try:
+                normalized = contract_render.normalize_worker_contract(charter)
+                contract_render.render_contract_section(normalized)
+            except contract_render.ContractRenderError as exc:
+                return self.layer.finish_task(
+                    goal_id,
+                    str(task["task_id"]),
+                    succeeded=False,
+                    result={"ok": False, "error": f"contract_render_error: {exc}"},
+                )
             try:
                 launched = self.backend.start_run(
                     title=str(task.get("title") or task["task_id"]),
                     directory=str(root),
                     instruction=str((task.get("inputs") or {}).get("instruction") or ""),
                     artifacts=[str(x) for x in (task.get("expected_artifacts") or [])],
-                    charter=worker_charter_for_task(
-                        goal=snap.get("goal") if isinstance(snap.get("goal"), Mapping) else {},
-                        task=task,
-                    ),
+                    charter=charter,
                 )
+            except contract_render.ContractRenderError as exc:
+                launched = {"ok": False, "error": f"contract_render_error: {exc}"}
             except Exception as e:
                 launched = {"ok": False, "error": f"backend dispatch failed: {type(e).__name__}"}
             run_id = str(launched.get("run_id") or launched.get("native_handle") or "")
@@ -1830,6 +1952,8 @@ class CollabApplication:
         acceptance = payload.get("acceptance")
         if not isinstance(acceptance, Mapping):
             raise AppError("acceptance object is required")
+        if "text" in acceptance and not isinstance(acceptance.get("text"), str):
+            raise AppError("acceptance.text must be a string")
         acceptance_obj = dict(acceptance)
         acceptance_obj["artifacts"] = _safe_artifacts(acceptance.get("artifacts"))
         boundaries = payload.get("boundaries") if isinstance(payload.get("boundaries"), Mapping) else {}

@@ -347,10 +347,22 @@ def build_instruction(charter: dict) -> str:
         lines.append("")
         lines.append(f"Done when: {done.strip()}")
 
-    if charter.get("acceptance"):
-        lines.append("")
-        lines.append("Acceptance:")
-        lines.append(charter["acceptance"].strip())
+    acc = charter.get("acceptance")
+    if isinstance(acc, str):
+        if acc.strip():
+            lines.append("")
+            lines.append("Acceptance:")
+            lines.append(acc.strip())
+    elif acc:
+        # Mapping acceptance carries text. Never call str methods on a non-str.
+        from framework.contract_render import normalize_worker_contract
+
+        normalized = normalize_worker_contract({"acceptance": acc})
+        text = normalized.get("acceptance")
+        if isinstance(text, str) and text.strip():
+            lines.append("")
+            lines.append("Acceptance:")
+            lines.append(text.strip())
 
     # 条5: surface authorization spine (prompt constraint + mechanical hints)
     try:

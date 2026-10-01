@@ -33,6 +33,7 @@ from execution_backend.agy_account_pool import (
     prepare_antigravity_environ_from_pool,
 )
 from execution_backend.base import BackendError, BackendStatus, ExecutionBackendABC, unsupported
+from framework import contract_render
 
 _LOG = logging.getLogger(__name__)
 
@@ -138,28 +139,58 @@ def build_agy_prompt(
     charter: dict | None = None,
     artifacts: list[str] | None = None,
 ) -> str:
+    """Title, instruction (or charter goal), contract, artifacts, and a tail.
+
+    The contract section is rendered strictly. A bad charter raises
+    ``ContractRenderError``; callers must not catch that and continue with a
+    goal-only prompt. Prompt text is not an OS sandbox.
+    """
+    normalized = contract_render.normalize_worker_contract(charter)
     chunks: list[str] = []
     if title and str(title).strip():
-        chunks.append(f"Job title: {title.strip()}")
+        chunks.append(f"Job title: {str(title).strip()}")
     instr = (instruction or "").strip()
+    if not instr:
+        goal = normalized.get("goal")
+        if isinstance(goal, str) and goal.strip():
+            instr = goal.strip()
     if instr:
         chunks.append(instr)
-    elif isinstance(charter, dict) and charter.get("goal"):
-        try:
-            from charter import build_instruction
-
-            chunks.append(build_instruction(charter))
-        except Exception:
-            chunks.append(str(charter.get("goal") or "").strip())
+    section = contract_render.render_contract_section(normalized)
+    if section:
+        chunks.append(section)
     arts = [str(a).strip() for a in (artifacts or []) if str(a).strip()]
     if arts:
         chunks.append("Create these artifacts in the current working directory, then stop:")
         for a in arts:
             chunks.append(f"- {a}")
-    chunks.append(
-        "Stay inside the working directory. When finished, stop. Do not wait for further input."
-    )
+    if normalized.get("external_inputs"):
+        chunks.append(
+            "Write only inside the working directory. Outside it, you may only read the pinned "
+            "external inputs listed above. When finished, stop. Do not wait for further input."
+        )
+    else:
+        chunks.append(
+            "Stay inside the working directory. When finished, stop. Do not wait for further input."
+        )
     return "\n\n".join(chunks)
+
+
+def _contract_meta(charter: dict | None) -> dict[str, Any]:
+    normalized = contract_render.normalize_worker_contract(charter)
+    return {
+        "contract_sha256": contract_render.contract_fingerprint(normalized),
+        "contract_fields": contract_render.contract_fields_present(normalized),
+    }
+
+
+def _apply_contract_meta(payload: dict[str, Any], rec: Mapping[str, Any]) -> dict[str, Any]:
+    digest = rec.get("contract_sha256")
+    if isinstance(digest, str) and digest:
+        payload["contract_sha256"] = digest
+        fields = rec.get("contract_fields")
+        payload["contract_fields"] = list(fields) if isinstance(fields, list) else []
+    return payload
 
 
 def parse_agy_json(stdout: str = "", stderr: str = "") -> dict[str, Any] | None:
@@ -348,7 +379,6 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         charter: dict | None = None,
     ) -> dict[str, Any]:
         root = Path(directory)
-        root.mkdir(parents=True, exist_ok=True)
         raw_arts = artifacts_from_charter(charter, artifacts)
         arts: list[str] = []
         errors: list[str] = []
@@ -360,6 +390,31 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             if cleaned:
                 arts.append(cleaned)
 
+        # Render before the account lock and before any process spawn. A bad
+        # contract must not start a degraded goal-only run.
+        try:
+            prompt = build_agy_prompt(
+                title=title,
+                instruction=instruction,
+                charter=charter,
+                artifacts=arts,
+            )
+            contract_meta = _contract_meta(charter)
+        except contract_render.ContractRenderError as exc:
+            msg = f"contract_render_error: {exc}"
+            return {
+                "ok": False,
+                "backend": self.backend_id,
+                "state": "failed",
+                "error": msg,
+                "errors": [msg],
+                "artifacts_written": [],
+                "skip_permissions": False,
+                "argv_flags": [],
+                "contract_version": "contract.v0.1-draft",
+            }
+
+        root.mkdir(parents=True, exist_ok=True)
         # Account switch critical section (pool-global cross-process lock):
         # select+reserve → keyring clear → HOME/USERPROFILE env → Popen.
         # Released once the child has its env and is started; the agy run
@@ -370,6 +425,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             rec, failed = self._start_run_locked(
                 title=title, root=root, instruction=instruction,
                 arts=arts, errors=errors, charter=charter,
+                prompt=prompt, contract_meta=contract_meta,
             )
         if failed is not None:
             return failed
@@ -387,20 +443,18 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         arts: list[str],
         errors: list[str],
         charter: dict | None,
+        prompt: str,
+        contract_meta: Mapping[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         """Bind env + clear keyring + Popen (caller holds the switch lock).
 
-        Returns ``(rec, failure_payload)``; failure_payload is None on spawn."""
+        Returns ``(rec, failure_payload)``; failure_payload is None on spawn.
+        The prompt is already rendered; this method does not rebuild it.
+        """
         spawn_env = self._bind_pool_environ_for_dispatch()
 
         skip = agy_auto_approve_enabled(charter, spawn_env)
         model = resolve_agy_model(explicit=self.model, environ=spawn_env, charter=charter)
-        prompt = build_agy_prompt(
-            title=title,
-            instruction=instruction,
-            charter=charter,
-            artifacts=arts,
-        )
         cmd = build_agy_argv(
             bin_path=self.bin_path,
             model=model,
@@ -448,6 +502,8 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             "path_errors": errors,
             "spawn_environ": dict(spawn_env),
             "agy_profile": profile,
+            "contract_sha256": str(contract_meta.get("contract_sha256") or ""),
+            "contract_fields": list(contract_meta.get("contract_fields") or []),
         }
         self._runs[run_id] = rec
         self._runs[handle] = rec
@@ -498,7 +554,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         profile = self._agy_profile(rec)
         if profile:
             payload["agy_profile"] = profile
-        return payload
+        return _apply_contract_meta(payload, rec)
 
     def _get(self, run_id: str) -> dict[str, Any]:
         rec = self._runs.get(run_id)
@@ -798,7 +854,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         profile = self._agy_profile(rec)
         if profile:
             out["agy_profile"] = profile
-        return out
+        return _apply_contract_meta(out, rec)
 
     def collect_result(self, run_id: str) -> dict[str, Any]:
         rec = self._get(run_id)
@@ -850,6 +906,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         profile = self._agy_profile(rec)
         if profile:
             out["agy_profile"] = profile
+        _apply_contract_meta(out, rec)
         self._attach_spawn_output(out, rec)
         self._persist_pool_after_collect(out, rec)
         return out
