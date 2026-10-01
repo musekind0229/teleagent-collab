@@ -1,0 +1,8 @@
+# Runtime: the collab service and the Linux supervised backend use the
+# Python standard library only. PyYAML is optional; src/charter.py falls
+# back to a small reader when it is not installed.
+#
+# jsonschema is imported by tests, not by collab-service. --ready reports
+# missing_dependency and "pip install -r requirements.txt" when it is
+# absent. That check does not block dispatch.
+jsonschema>=4

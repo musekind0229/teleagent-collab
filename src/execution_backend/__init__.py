@@ -202,4 +202,13 @@ def get_execution_backend(name: str | None = None, **kwargs):
         from execution_backend.windows_supervised_v1 import WindowsSupervisedExecutionBackend
 
         return WindowsSupervisedExecutionBackend(**kwargs)
+    if key in (
+        "teleagent-linux",
+        "teleagent_linux",
+        "teleagent.linux.supervised_v1",
+        "linux-supervised",
+    ):
+        from execution_backend.linux_supervised_v1 import LinuxSupervisedExecutionBackend
+
+        return LinuxSupervisedExecutionBackend(**kwargs)
     raise BackendError(BackendStatus.UNSUPPORTED, f"unknown execution backend={name!r}", capability="get_execution_backend")

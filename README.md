@@ -78,7 +78,23 @@ python bin/collab-service.py --persist .collab-app --port 8765 `
 
 普通权限与产物验收由 Grok 自动处理；Question、系统动作和组长失败会出现在 decision API。普通桌面路径已通过两步真实文件依赖任务，见 [2026-09-20 实机验收](docs/WINDOWS-LIVE-20260920.zh-CN.md)。
 
-`--teleagent-stdin-wrap` 仅诊断兼容：可建真实 session，但 GUI 模型授权复用仍会 `HTTP 401 / invalid token`，**未完成产物闭环，不是生产入口**。重新登录后发消息不是规定步骤，也不能修复该问题。
+`--teleagent-stdin-wrap` 仅诊断兼容：可建真实 session，但 GUI 模型授权复用仍会 `HTTP 401 / invalid token`，**未完成产物闭环，不是生产入口**。重新登录后发消息不是规定步骤，也不能修复该问题。Linux 不要使用 stdin_wrap。
+
+## Linux
+
+监督工人用 `--backend teleagent-linux`（别名 `teleagent_linux`），复用 Windows 那套 Engine/Store（外部输入隔离、污染门、权限范围、验收决定、桌面锁），状态目录是 `persist/linux-controller`。TeleAgent GUI 登录之后才在本机 `127.0.0.1:4399` 监听。服务可以在 GUI 未登录时启动，`/health` 和 `--ready` 用来说明卡在哪一步；真正派工时才去发现凭据。
+
+```bash
+python3 bin/collab-service.py --ready
+python3 bin/collab-service.py --persist /var/lib/teleagent-collab --port 8765 \
+  --backend teleagent-linux --planner deterministic
+```
+
+在 Linux 上 `--ready` 和 `--check-gui` 都走 Linux 门禁，退出码与 Windows `--ready` 相同：只有 `ready` 且 `dispatch_allowed` 才是 0。说明见 [Linux 说明](docs/LINUX.zh-CN.md)。systemd 单元只放在仓库里，见 [deploy/systemd/README.md](deploy/systemd/README.md)，不会在开发机上安装。
+
+## 依赖
+
+`bin/collab-service.py` 和 Linux 监督后端的运行时只用 Python 标准库。`PyYAML` 可选：`src/charter.py` 在没安装时使用内置的小 YAML 读取器。测试需要 `jsonschema>=4`，写在 [`requirements.txt`](requirements.txt)（[`requirements-dev.txt`](requirements-dev.txt) 再包含它）。没装 `jsonschema` 时 `--ready` 会给出 `missing_dependency`，下一步是 `pip install -r requirements.txt`；这一项本身不阻止派工。
 
 1. TeleAgent 桌面已登录，本地 worker 端口已监听，且 `python bin/collab-service.py --ready` 退出码为 0（发现顺序 4399→4397→4398；`--check-gui` 只做 doctor）。
 2. 安装并登录可插拔组长（默认 Grok Build CLI）。

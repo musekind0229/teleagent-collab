@@ -4,6 +4,9 @@ Windows discovery reads only the environment block of verified TeleAgent
 runtime processes, using normal OS read permissions.
 It does not elevate or dump process memory.
 The three local API values can alternatively be supplied by environment variables.
+
+Linux discovery is ``discover_linux`` (implemented in ``linux_discovery``):
+loopback ``:4399`` and ``/proc/<pid>/environ`` of verified TeleAgent images only.
 """
 from __future__ import annotations
 
@@ -239,6 +242,12 @@ def discover() -> tuple[str, dict]:
     if len(set(ports)) != 1:
         raise RuntimeError('Cannot identify unique TeleAgent API listener in 4390..4410')
     return os.environ.get('TELEAGENT_URL', f'http://127.0.0.1:{ports[0]}'), creds
+
+
+def discover_linux(**kwargs):
+    """Linux loopback discovery. See ``win_collab.linux_discovery``."""
+    from .linux_discovery import discover_linux as _discover_linux
+    return _discover_linux(**kwargs)
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):

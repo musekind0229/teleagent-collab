@@ -1,0 +1,25 @@
+[Unit]
+Description=teleagent-collab local Goal API (Linux TeleAgent worker)
+After=network.target
+
+[Service]
+# Run as the TeleAgent GUI user so /proc/<pid>/environ is readable.
+# Delete User= and Group= to run as root instead. Do not use a third account.
+User=teleagent
+Group=teleagent
+WorkingDirectory=/opt/collab/teleagent-collab
+EnvironmentFile=-/etc/teleagent-collab/collab-service.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 bin/collab-service.py --persist /var/lib/teleagent-collab --port 8765 --backend teleagent-linux --planner deterministic
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+# full: /usr, /boot, and /etc read-only. /proc stays visible. /var/lib stays writable.
+# Do NOT set ProtectProc=invisible (hides environ) or ProtectHome= (hides
+# ~/.local/share/TeleAgent). Do NOT switch this to ProtectSystem=strict
+# without ReadWritePaths for the persist directory.
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

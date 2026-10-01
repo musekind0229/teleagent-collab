@@ -2197,6 +2197,14 @@ class CollabApplication:
         # Non-TeleAgent backends (in-process fakes) need no GUI doctor.
         if "teleagent" not in backend_id and "windows" not in backend_id:
             return {"ok": True, "status": "ok", "reason": ""}
+        if "linux" in backend_id:
+            report = assess_linux_gui_readiness()
+            ok = bool(report.get("ready") and report.get("dispatch_allowed"))
+            if ok:
+                return {"ok": True, "status": "ok", "reason": ""}
+            hints = report.get("hints") or report.get("reasons") or []
+            reason = sanitize_reason("; ".join(str(item) for item in hints) or "linux gui not ready")
+            return {"ok": False, "status": "not_ready", "reason": reason}
         # Prefer GUI doctor; never invent stdin_wrap readiness here.
         return probe_win_gui_connection()
 
@@ -2597,4 +2605,12 @@ __all__ = [
     "TASK_REVIEW_HINT",
     "GOAL_HTTP_TERMINAL",
     "TASK_HTTP_TERMINAL",
+    "assess_linux_gui_readiness",
 ]
+
+
+def assess_linux_gui_readiness(**kwargs):
+    """Linux daily gate. Implemented in ``framework.linux_ready`` (lazy import)."""
+    from framework.linux_ready import assess_linux_gui_readiness as _impl
+
+    return _impl(**kwargs)

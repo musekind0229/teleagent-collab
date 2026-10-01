@@ -994,6 +994,42 @@ def safe_assistant_error(error):
     return '; '.join(values[:8])
 
 
+def _path_within(candidate, root):
+    """True when resolved ``candidate`` is ``root`` or a descendant of it."""
+    try:
+        allowed = Path(root).resolve()
+        return candidate == allowed or candidate.is_relative_to(allowed)
+    except (OSError, ValueError):
+        return False
+
+
+def _external_input_copy_dir(raw):
+    """Parent of an isolated pin at ``.../external-inputs/<job>/<index>/<file>``.
+
+    A POSIX pattern such as ``/home/u/.../external-inputs/<job>/0/*`` is bounded
+    to that per-file directory. An ordinary pin (the caller's original file)
+    does not authorize a wildcard of its parent. Links fail closed.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        resolved = Path(raw).resolve()
+    except (OSError, ValueError):
+        return None
+    index_dir = resolved.parent
+    job_dir = index_dir.parent
+    inputs_root = job_dir.parent
+    if inputs_root.name != _EXTERNAL_INPUTS_DIR:
+        return None
+    if not re.fullmatch(r'[0-9]+', index_dir.name):
+        return None
+    if _safe_job_dirname(job_dir.name) is None:
+        return None
+    if _is_link(index_dir) or _is_link(job_dir) or _is_link(inputs_root):
+        return None
+    return index_dir
+
+
 def hard_reject(p, workspace=None, external_inputs=()):
     """Conservative secret prefilter only. All other requests go to the lead."""
     text = json.dumps(p, ensure_ascii=True)
@@ -1019,19 +1055,28 @@ def hard_reject(p, workspace=None, external_inputs=()):
         patterns = p.get('patterns')
         if not isinstance(patterns, list) or not patterns:
             return 'External-directory request has no bounded path patterns'
+        allowed_roots = [root]
+        if isinstance(external_inputs, (list, tuple)):
+            for item in external_inputs:
+                if not isinstance(item, dict):
+                    continue
+                copy_dir = _external_input_copy_dir(item.get('path'))
+                if copy_dir is not None:
+                    allowed_roots.append(copy_dir)
         for pattern in patterns:
             if not isinstance(pattern, str) or not pattern.strip():
                 return 'External-directory request contains an invalid path pattern'
-            # A wildcard may only widen descendants inside the exact job workspace.
+            # A wildcard may only widen descendants of the job workspace or of one
+            # isolated external-inputs copy directory (POSIX ``.../0/*`` included).
             prefix = re.split(r'[?*\[]', pattern, maxsplit=1)[0].rstrip('/\\')
             if not prefix:
                 return 'External-directory request is not bounded to the job workspace'
             try:
                 candidate = Path(prefix).resolve()
-                if not candidate.is_relative_to(root):
-                    return 'External-directory request escapes the assigned job workspace'
             except (OSError, ValueError):
                 return 'External-directory request path cannot be verified'
+            if not any(_path_within(candidate, allowed) for allowed in allowed_roots):
+                return 'External-directory request escapes the assigned job workspace'
     return None
 
 

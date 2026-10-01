@@ -270,7 +270,9 @@ class ReadyGateTests(unittest.TestCase):
             "simulated": False,
         }
         buf = io.StringIO()
-        with mock.patch(
+        with mock.patch.object(
+            service, "_use_linux_readiness", return_value=False
+        ), mock.patch(
             "framework.app_service.probe_win_gui_connection",
             return_value=probe,
         ) as probed, mock.patch(
@@ -298,7 +300,9 @@ class ReadyGateTests(unittest.TestCase):
             "occupancy": {"state": "busy"},
             "reasons": ["DO NOT DISPATCH", "不要派工"],
         }
-        with mock.patch(
+        with mock.patch.object(
+            service, "_use_linux_readiness", return_value=False
+        ), mock.patch(
             "framework.app_service.assess_win_gui_readiness",
             return_value=idle,
         ), mock.patch.object(
@@ -310,7 +314,9 @@ class ReadyGateTests(unittest.TestCase):
             with redirect_stdout(buf):
                 self.assertEqual(service.main(["--ready"]), 0)
         self.assertTrue(json.loads(buf.getvalue())["dispatch_allowed"])
-        with mock.patch(
+        with mock.patch.object(
+            service, "_use_linux_readiness", return_value=False
+        ), mock.patch(
             "framework.app_service.assess_win_gui_readiness",
             return_value=busy,
         ):
@@ -466,7 +472,9 @@ class ReadyGateTests(unittest.TestCase):
     def test_ready_passes_persist_tip_path_and_does_not_write(self):
         service = _load_collab_service()
         with tempfile.TemporaryDirectory() as td:
-            with mock.patch(
+            with mock.patch.object(
+                service, "_use_linux_readiness", return_value=False
+            ), mock.patch(
                 "framework.app_service.assess_win_gui_readiness",
                 return_value={"ready": True, "dispatch_allowed": True},
             ) as assess, mock.patch.object(

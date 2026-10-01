@@ -152,6 +152,12 @@ def _backend(
             state_dir=persist / "windows-controller",
             stdin_wrap=teleagent_stdin_wrap,
         )
+    if name in ("teleagent-linux", "teleagent_linux"):
+        # Lazy client: constructing the backend does not dial :4399.
+        # stdin_wrap is a Windows diagnostic and is not used here.
+        from execution_backend.linux_supervised_v1 import LinuxSupervisedExecutionBackend
+
+        return LinuxSupervisedExecutionBackend(state_dir=persist / "linux-controller")
     if name in ("antigravity", "agy"):
         # Reuse run-job pool path (quota / 503 cooldown / mutex). Account is
         # selected+reserved per start_run (per-dispatch); collect_result applies
@@ -171,6 +177,28 @@ def _backend(
         except AccountPoolError as e:
             raise ValueError(f"antigravity account pool unavailable: {e}") from e
     raise ValueError(f"unknown backend {name!r}")
+
+
+def _use_linux_readiness(args) -> bool:
+    """Linux assessor on Linux, or when the worker backend is teleagent-linux.
+
+    ``--backend teleagent-windows`` on Linux still uses the Linux assessor,
+    because ``sys.platform`` is linux. Windows uses the Windows assessor unless
+    ``--backend teleagent-linux`` (or ``teleagent_linux``) is set.
+    """
+    backend = str(getattr(args, "backend", "") or "")
+    if backend in ("teleagent-linux", "teleagent_linux"):
+        return True
+    return sys.platform.startswith("linux")
+
+
+def _emit_json(payload) -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+    print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -205,10 +233,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--backend",
-        choices=("inprocess", "teleagent-windows", "antigravity", "agy"),
+        choices=(
+            "inprocess",
+            "teleagent-windows",
+            "teleagent-linux",
+            "teleagent_linux",
+            "antigravity",
+            "agy",
+        ),
         default="inprocess",
         help=(
-            "Worker backend. antigravity/agy reuses run-job pool + CLI worker; "
+            "Worker backend. teleagent-linux reuses the supervised controller "
+            "against loopback TeleAgent :4399 (no stdin_wrap). "
+            "antigravity/agy reuses run-job pool + CLI worker; "
             "in-memory run handles are not recoverable after service restart; "
             "reply_permission is 501 (unlike teleagent-windows supervision)."
         ),
@@ -238,8 +275,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "read-only daily gate: GUI doctor plus /session/status occupancy "
             "and lock-holder metadata. Exit 0 only when ready and "
-            "dispatch_allowed. Does not start the HTTP service, stdin_wrap, "
-            "a session, or the desktop lock"
+            "dispatch_allowed. On Linux (or --backend teleagent-linux) this is "
+            "assess_linux_gui_readiness; otherwise the Windows gate. "
+            "Does not start the HTTP service, stdin_wrap, a session, or the desktop lock"
         ),
     )
     parser.add_argument(
@@ -248,7 +286,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "doctor-only probe of desktop GUI TeleAgent ports (4399/4397/4398) "
             "and exit; does not read session occupancy, start the HTTP service, "
-            "or use stdin_wrap. Daily dispatch gate is --ready"
+            "or use stdin_wrap. On Linux this runs the Linux readiness report "
+            "(same exit rule as --ready). Daily dispatch gate is --ready"
         ),
     )
     parser.add_argument("--token-env", default="COLLAB_API_TOKEN")
@@ -260,18 +299,18 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.ready:
-        from framework.app_service import assess_win_gui_readiness
+    linux_ready = _use_linux_readiness(args)
+    if args.ready or (args.check_gui and linux_ready):
+        tip_path = Path(args.persist).resolve() / "running_tip.json"
+        if linux_ready:
+            from framework.app_service import assess_linux_gui_readiness
 
-        result = assess_win_gui_readiness(
-            tip_path=Path(args.persist).resolve() / "running_tip.json",
-        )
-        if hasattr(sys.stdout, "reconfigure"):
-            try:
-                sys.stdout.reconfigure(encoding="utf-8")
-            except Exception:
-                pass
-        print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+            result = assess_linux_gui_readiness(tip_path=tip_path)
+        else:
+            from framework.app_service import assess_win_gui_readiness
+
+            result = assess_win_gui_readiness(tip_path=tip_path)
+        _emit_json(result)
         return 0 if result.get("ready") and result.get("dispatch_allowed") else 1
 
     if args.check_gui:
