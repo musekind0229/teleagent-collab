@@ -428,7 +428,7 @@ def describe_reaped(run_id: str, entry: Mapping[str, Any]) -> str:
         "pid_reused_left_alone": "its pid now belongs to another process, which was left alone",
         "kill_failed": "stopping its worker failed; it may still be running",
     }.get(outcome, outcome)
-    cause = f" ({_PREVIOUS_EXIT_NOTE})" if _PREVIOUS_EXIT_NOTE and outcome != "stopped_at_shutdown" else ""
+    cause = f" ({_PREVIOUS_EXIT_NOTE})" if _PREVIOUS_EXIT_NOTE else ""
     return (
         f"agy run {run_id} (pid {pid}) belonged to a previous service process{cause}; {text}. "
         "Its result was not collected; artifacts already in the workspace are candidates only"

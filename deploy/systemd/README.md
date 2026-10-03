@@ -73,6 +73,9 @@ MemoryHigh=700M
 MemoryMax=900M
 MemorySwapMax=0
 OOMScoreAdjust=1000
+# 默认 OOMPolicy=stop：cgroup 里任一进程被 OOM 杀掉，systemd 就会停掉整个服务（再由 Restart= 拉起），
+# 其他在跑的单也会一起被收割。改成 continue 后只死超限的 worker，服务把那一单如实报成 OOM。
+OOMPolicy=continue
 ```
 
 - 服务拉起的 worker（agy/grok/codex）、组长和它们的工具子进程都继承 `collab-service.service` 的 cgroup（`setsid` 不换 cgroup），一起受这个上限约束。

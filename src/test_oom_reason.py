@@ -114,8 +114,14 @@ class OomKilledServiceIsReportedAfterRestart(unittest.TestCase):
             self.assertEqual(row["service_result"], "oom-kill")
             self.assertIsNone(consume_previous_exit(tmp), "record is consumed once")
             set_previous_exit_note(previous_exit_note(row))
-            text = describe_reaped("agy_x", {"pid": 7, "outcome": "already_exited"})
-            self.assertIn("killed by OOM (cgroup memory limit", text)
+            for outcome in ("already_exited", "stopped_at_shutdown", "killed"):
+                text = describe_reaped("agy_x", {"pid": 7, "outcome": outcome})
+                self.assertIn("killed by OOM (cgroup memory limit)", text, outcome)
+            from framework.failure_projection import project_failed_tasks
+
+            reaped = {"ok": False, "error": "backend resume failed: BackendError: " + text}
+            proj = project_failed_tasks([{"task_id": "t1", "status": "failed", "result": reaped}])
+            self.assertEqual(proj["primary_failure"]["source"], "oom")
 
     def test_normal_stop_adds_nothing(self):
         from framework.service_exit import previous_exit_note

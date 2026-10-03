@@ -151,7 +151,7 @@ def classify_failure_source(task: Mapping[str, Any], result: Mapping[str, Any], 
     if explicit in _EXPLICIT_SOURCES:
         return explicit
     lowered = _collapsed(error)
-    if lowered.startswith("killed by oom"):
+    if lowered.startswith("killed by oom") or "killed by oom (cgroup memory limit)" in lowered:
         return "oom"
     if _is_worker_timeout(lowered, result):
         return "worker_timeout"

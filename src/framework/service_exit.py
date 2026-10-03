@@ -61,7 +61,10 @@ def previous_exit_note(row: Mapping[str, Any] | None) -> str:
         return ""
     result = str(row.get("service_result") or "")
     if result == "oom-kill":
-        return "the previous service process was killed by OOM (cgroup memory limit; systemd result oom-kill)"
+        return (
+            "killed by OOM (cgroup memory limit): the previous service process ended with systemd result "
+            "oom-kill (the OOM killer killed a process in the service cgroup)"
+        )
     if result in {"", "success"}:
         return ""
     detail = "/".join(x for x in (str(row.get("exit_code") or ""), str(row.get("exit_status") or "")) if x)
