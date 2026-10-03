@@ -1,0 +1,18 @@
+I'll start by reading how the collab-service planner is wired today and how lead adapters are selected, so `--planner lead` can use any adapter without changing `deterministic` or `grok`.The service currently hard-codes Grok for `--planner grok` and never reads `COLLAB_LEAD_ADAPTER`. I'll add a `lead` planner that uses the factory, and refuse `inprocess` (including the `codex` alias) because this HTTP process has no dialogue to answer those asks.Refusing `inprocess` only after `get_lead_adapter()` returns it, and pointing that adapter at a throwaway directory so a refusal cannot write the file-protocol exchange into the repo.The help text is correct; argparse was wrapping the line, and the temp directory was already gone when the tests checked it. I'll fix those assertions.`--planner lead` now plans through whatever `COLLAB_LEAD_ADAPTER` resolves to, so a Codex CLI lead can plan and auto-decide routine permission and review gates. `deterministic` and `grok` are unchanged.
+
+- **`--planner lead`** builds `LeadAdapterPlanner(get_lead_adapter(), cwd=persist/"lead-work", timeout_sec=...)`. The factory default is still `grok_cli`.
+- **`inprocess` is refused** (including the `codex` alias, which is still dialogue-as-lead). The process exits 2 with: use `COLLAB_LEAD_ADAPTER=codex_cli` for the Codex CLI. The HTTP service has no dialogue to answer file-protocol asks.
+- **`--lead-timeout`** is a float, default 180, must be greater than 0. Both `grok` and `lead` use it.
+- **Startup stderr** is one line, `lead planner: adapter=<name> timeout=<sec>s`. For `codex_cli` it may add `bin=<filename>` only, never a directory.
+- The lead decides the plan and routine permission/review gates. Anything it cannot decide stays a pending human decision. Retryable lead errors get at most `MAX_LEAD_ATTEMPTS_PER_DECISION=2` tries. Non-retryable errors go to a human immediately.
+
+Windows, environment only on the service process:
+
+```bat
+set COLLAB_LEAD_ADAPTER=codex_cli
+set COLLAB_CODEX_LEAD_BIN=C:\Users\Admin\.local\share\TeleAgent\runtimes\node\codex.cmd
+python bin/collab-service.py --planner lead --backend teleagent-windows ...
+```
+
+`src/test_collab_service_planner.py`, `src/test_collab_service_antigravity.py`, and `tests/test_win_gui_ready.py` passed. Nothing was committed.
+exit=0

@@ -1,0 +1,7 @@
+我先看 `bin/hermes-collab-request.py`、现有单测和两份文档，再按默认 ASCII JSON 改输出并补测试。默认改成 ASCII JSON，这样 PowerShell 任意代码页和 Hermes 的 UTF-8 解码都能读到正确中文。接下来改脚本、单测和两处文档。`bin/hermes-collab-request.py` 现在默认打一行纯 ASCII JSON。中文变成 `\uXXXX`，`ConvertFrom-Json` / `json.loads` 之后仍是原文。`cd src && python3 -m unittest test_hermes_collab_request -v`：35 项全部通过。
+
+- **`bin/hermes-collab-request.py`**：`_emit` 默认 `ensure_ascii=True`（`default=str` 保留）。`--unicode`（子命令前）或 `COLLAB_JSON_UNICODE=1|true|yes|on` 时先把 stdout 设成 UTF-8（有 `reconfigure` 才调，失败忽略），再原样输出。`main()` 开头对 stdout/stderr 只设 `errors="backslashreplace"`。`KeyboardInterrupt` 也走 `_emit`。
+- **`src/test_hermes_collab_request.py`**：默认与 HTTP 404 中文错误为纯 ASCII；`--unicode` 与环境变量开关；cp936 / ascii 流；`StringIO` 无 `reconfigure` 不报错。
+- **`docs/hermes-collab-min-client.zh-CN.md`**：新增「输出编码 / PowerShell」。
+- **`integrations/hermes/skills/teleagent-collab/SKILL.md`**：Pitfalls 补 ASCII 转义说明，version `0.2.2`。
+exit=0

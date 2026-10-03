@@ -58,7 +58,7 @@ from framework.progress_budget import (
     utc_iso,
 )
 from framework import contract_render
-from platform_services import win_job
+from platform_services import cgroup_oom, win_job
 
 _LOG = logging.getLogger(__name__)
 
@@ -682,6 +682,11 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             return rec, self._start_payload(rec, ok=False)
         # Windows: kill-on-close Job Object (no-op elsewhere; 未在 Win 实测).
         win_job.attach(proc)
+        # cgroup v2 oom_kill baseline: a later SIGKILL can then be told apart
+        # from an OOM kill by the service's memory limit (Linux only).
+        oom_dir = cgroup_oom.cgroup_dir(proc.pid) or cgroup_oom.cgroup_dir()
+        rec["_oom_cgroup"] = str(oom_dir) if oom_dir else ""
+        rec["_oom_kill_before"] = cgroup_oom.oom_kill_count(oom_dir)
         rec["proc"] = proc
         return rec, None
 
@@ -949,6 +954,14 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             rec["assistant_error"] = rec.get("assistant_error") or "timeout"
             return
         rc = rec.get("returncode")
+        oom = cgroup_oom.oom_note(rec.get("_oom_cgroup"), rec.get("_oom_kill_before"), rc)
+        if oom is not None and (parsed is None or not _status_ok(str(status) if status is not None else None, rc)):
+            rec["finish"] = "error"
+            rec["state"] = "failed"
+            rec["error_source"] = "oom"
+            tail = (rec.get("stderr") or "").strip()[-300:]
+            rec["assistant_error"] = (oom + (f"; stderr tail: {tail}" if tail else ""))[:2000]
+            return
         if parsed is None:
             rec["finish"] = "error"
             rec["state"] = "failed"
@@ -1248,6 +1261,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             "artifacts": present,
             "missing": missing,
             "error": rec.get("assistant_error") or "",
+            **({"error_source": rec["error_source"]} if rec.get("error_source") else {}),
             "response": rec.get("response") if rec.get("response") is not None else parsed.get("response"),
             "usage": rec.get("usage") if rec.get("usage") is not None else parsed.get("usage"),
             "skip_permissions": bool(rec.get("skip_permissions")),

@@ -1,0 +1,2 @@
+WS=/workspace/teleagent-collab/jobs/workspaces/p2-st-reinstall-20260913T052710Z
+PID=3062669

@@ -1,0 +1,84 @@
+# v0.2 P2 live goal: real TeleAgent reinstalls the SillyTavern sandbox.
+# Upper: 幕僚长. Do not treat this as inprocess/dry-run.
+name: p2-st-reinstall
+task_kind: system_install
+goal: >
+  Uninstall the existing SillyTavern sandbox at /home/box/SillyTavern, then
+  reinstall SillyTavern release plus four extensions, and prove http://127.0.0.1:8000
+  returns HTTP 200. Stop when proven. This is the whole delegated goal.
+
+must:
+  - "Stop any process listening on 127.0.0.1:8000 that belongs to this sandbox"
+  - "Delete /home/box/SillyTavern completely (this install only; it is a fresh clone). rm -rf of install_roots is in-charter, not an unsafe workaround."
+  - "git clone --depth 1 --branch release https://github.com/SillyTavern/SillyTavern /home/box/SillyTavern"
+  - "npm install --omit=dev in that directory"
+  - "Clone Extension-PromptInspector, SillyTavern-Character-Creator, SillyTavern-Custom-Scenario, Extension-CodeRunner into public/scripts/extensions/third-party/"
+  - "Start node server.js from /home/box/SillyTavern"
+  - "Prove curl -sI http://127.0.0.1:8000/ is HTTP 200"
+  - "Write p2-st-reinstall-evidence.txt in the collab job workspace with checkout SHA, extension directory names, and the HTTP status line"
+  - "Lead must allow install_execute under install_roots (stop :8000, rm, git, npm, start). Verdict allow or once. Do not map these to demand_safe_path."
+
+must_not:
+  - "Touch the user's Windows machine (海景房) or C:\\Users\\tyy20\\SillyTavern"
+  - "Touch the user's production SillyTavern on any remote server"
+  - "Use inprocess backend or complete the install from 工坊/幕僚长 shell and then mark the TeleAgent run success"
+  - "Read or copy credentials, tokens, cookies, or secret files"
+  - "Use always-approve / yolo / global auto-approve"
+  - "apt/yum or install system packages; Node and git are already on the machine"
+  - "sudo, systemd, firewall, or bind a non-localhost listen"
+  - "Change config.yaml listen/whitelist to expose the service beyond 127.0.0.1"
+  - "Start P3/P4 or build the prompt-harness product"
+
+allow_secret_globs: []
+allow_paths:
+  - "/home/box/SillyTavern"
+  - "/home/box/SillyTavern/**"
+allow_keys: []
+
+network_allow:
+  - github.com
+  - "*.github.com"
+  - objects.githubusercontent.com
+  - registry.npmjs.org
+  - "*.npmjs.org"
+  - registry.npmjs.com
+  - nodejs.org
+
+install_roots:
+  - /home/box/SillyTavern
+
+lead_review_steps:
+  - install_execute
+  - permission_grey
+  - job_end
+
+user_gate_permissions:
+  - sudo
+  - systemd_unit_install
+  - firewall_change
+  - credential_store_write
+
+allowed_surfaces:
+  - workspace_fs
+  - install_roots
+  - lead_approved_tools
+
+done_when:
+  artifacts:
+    - p2-st-reinstall-evidence.txt
+
+acceptance: |
+  /home/box/SillyTavern exists as a release checkout (not empty leftover).
+  The four extension directories exist under public/scripts/extensions/third-party/.
+  http://127.0.0.1:8000/ returns HTTP 200.
+  p2-st-reinstall-evidence.txt records checkout SHA, extension names, and the status line.
+  The worker that performed the uninstall/reinstall was TeleAgent, not 工坊/幕僚长 shell.
+
+rollback: |
+  Stop the 8000 process if this run started it. Leave /home/box/SillyTavern as
+  whatever the last successful release checkout was; do not delete it on a
+  failed mid-reinstall without writing the evidence file explaining the stop.
+
+timeout_sec: 1800
+force_lead_review: true
+max_reworks: 1

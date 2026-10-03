@@ -11,6 +11,9 @@ WorkingDirectory=/opt/collab/teleagent-collab
 EnvironmentFile=-/etc/teleagent-collab/collab-service.env
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/usr/bin/python3 bin/collab-service.py --persist /var/lib/teleagent-collab --port 8765 --backend teleagent-linux --planner deterministic
+# Record why this process ended (systemd passes $SERVICE_RESULT, e.g. oom-kill);
+# the next start reports it in orphan-reap / resume reasons.
+ExecStopPost=/usr/bin/python3 bin/collab-service.py --record-exit --persist /var/lib/teleagent-collab
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=yes

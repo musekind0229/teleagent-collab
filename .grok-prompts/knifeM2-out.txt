@@ -1,0 +1,17 @@
+I'll start by locating the lead auto-resolution predicate and the wait/status paths so `wait` keeps polling while the lead is about to decide.The predicate and the public status rows are in a few places. I'll read those next so the helper and the `awaiting` field stay one source of truth.The lead can already resolve permission and review decisions, but `wait` treats every pending row as human. I'll share that predicate and keep polling while the row is still the lead's.The predicate and the client filter are in place. Next I’ll run the new cases, then the suites that cover status and `wait`.The new cases passed. I’ll run the full app-service suite and the `tests/` package next.`wait` no longer exits 4 while the lead is about to decide. It keeps polling lead-owned rows and only stops for a real human decision.
+
+The same check the coordinator already used now lives in `AppCoordinator.lead_will_decide`. A row is `awaiting: "lead"` only when the planner has `decide_action`, the backend has `resolve_decision`, `details.backend_kind` is `permission` or `review`, and the lead is not exhausted. Anything else, including `question`, `system_action`, and a non-retryable or used-up `lead_error`, is `awaiting: "human"`. `_continue_pending_decision` calls that helper, so the tick behavior is unchanged.
+
+`status`, `list_decisions`, `events`, and `get_decision` tag each public pending row and add `awaiting_lead_count` and `awaiting_human_count`. `pending_decisions`, `pending_decision_count`, and `awaiting_decision` are unchanged.
+
+`need_human_view` treats that as follows:
+
+- Every row `awaiting == "lead"`, or no rows but `awaiting_human_count == 0` and `awaiting_lead_count > 0`: keep polling.
+- Mixed rows: exit 4 with only the human rows, and `lead_pending_ids` for the rest. Briefs include `awaiting` when the server sent it.
+- Rows without `awaiting` (old server): the previous behavior.
+- `--timeout` still ends in exit 3. After the lead fails and the row flips to `human`, `wait` exits 4 as before.
+
+`docs/lead-adapter.md` explains this under「在 collab-service 里用 Codex 组长」. The Hermes skill is now 0.2.9, with one rule: do not ask the user about `awaiting: "lead"` rows.
+
+Tests: `src/test_app_service.py` (42), `src/test_hermes_collab_request.py`, `src/test_public_pending_decisions.py`, and `tests/` (138, 1 skipped) all passed. Nothing was committed.
+exit=0

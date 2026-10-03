@@ -19,6 +19,7 @@ FAILURE_SOURCES = (
     "contamination",
     "task_failed",
     "cancelled",
+    "oom",
 )
 _EXPLICIT_SOURCES = frozenset(FAILURE_SOURCES) - {"task_failed"}
 
@@ -57,6 +58,10 @@ _NEXT_STEP = {
         "open a NEW request citing this request_id"
     ),
     "cancelled": "open a NEW request citing this request_id if the work is still needed",
+    "oom": (
+        "the worker hit the service memory limit (cgroup MemoryMax); split the task or "
+        "raise the limit, then open a NEW request citing this request_id"
+    ),
     "task_failed": "inspect the task error and open a NEW request citing this request_id",
 }
 
@@ -146,6 +151,8 @@ def classify_failure_source(task: Mapping[str, Any], result: Mapping[str, Any], 
     if explicit in _EXPLICIT_SOURCES:
         return explicit
     lowered = _collapsed(error)
+    if lowered.startswith("killed by oom"):
+        return "oom"
     if _is_worker_timeout(lowered, result):
         return "worker_timeout"
     if lowered.startswith("backend dispatch failed"):

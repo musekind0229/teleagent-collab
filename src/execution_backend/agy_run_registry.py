@@ -408,6 +408,15 @@ class AgyRunRegistry:
         return rows
 
 
+_PREVIOUS_EXIT_NOTE = ""
+
+
+def set_previous_exit_note(note: str) -> None:
+    """Why the previous service process ended (e.g. OOM); appended to reap reasons."""
+    global _PREVIOUS_EXIT_NOTE
+    _PREVIOUS_EXIT_NOTE = str(note or "").strip()
+
+
 def describe_reaped(run_id: str, entry: Mapping[str, Any]) -> str:
     """One line for the task failure. No paths, argv or env."""
     outcome = str(entry.get("outcome") or "unknown")
@@ -419,8 +428,9 @@ def describe_reaped(run_id: str, entry: Mapping[str, Any]) -> str:
         "pid_reused_left_alone": "its pid now belongs to another process, which was left alone",
         "kill_failed": "stopping its worker failed; it may still be running",
     }.get(outcome, outcome)
+    cause = f" ({_PREVIOUS_EXIT_NOTE})" if _PREVIOUS_EXIT_NOTE and outcome != "stopped_at_shutdown" else ""
     return (
-        f"agy run {run_id} (pid {pid}) belonged to a previous service process; {text}. "
+        f"agy run {run_id} (pid {pid}) belonged to a previous service process{cause}; {text}. "
         "Its result was not collected; artifacts already in the workspace are candidates only"
     )
 
@@ -430,6 +440,7 @@ __all__ = [
     "ENV_RUN_REGISTRY",
     "descendant_pids",
     "describe_reaped",
+    "set_previous_exit_note",
     "kill_process_tree",
     "process_start_token",
 ]

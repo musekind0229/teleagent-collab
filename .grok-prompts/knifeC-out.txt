@@ -1,0 +1,7 @@
+我先看决策公开行和客户端摘要的现有实现，再按最小改动把 `reason` 透出并同步文档与测试。公开行和摘要逻辑已经定位。我先试一下 `framework.app_service` 在当前环境下能不能直接导入。导入没问题。接下来改公开决策行、摘要取值顺序，并补上对应测试和文档。`wait` 在 `title` 只是种类名时，摘要会改用人类可读的 `reason`。`cd src && python3 -m unittest test_hermes_collab_request test_public_pending_decisions -v`：30 项全部通过。
+
+- `src/framework/app_service.py`：`public_pending_decisions` 公开行增加 `reason`（缺省 `""`），其它字段不变。
+- `bin/hermes-collab-request.py`：`decisions[]` 增加 `reason`。`summary` 改为：有意义的 `title`（非空且不等于 `kind`）→ `details.summary` / `message` / `reason` / `question` → 行上的 `reason` → `lead_error.message` → `title` → `kind`，仍压成单行并截断到 200。
+- `docs/hermes-collab-min-client.zh-CN.md`：exit 4 的取值说明和示例已同步。
+- `integrations/hermes/skills/teleagent-collab/SKILL.md`：原文没有写 summary 的取值顺序，只把 version 升到 `0.2.2`。
+- 测试：`src/test_hermes_collab_request.py` 覆盖 `title==kind` 取 `reason`、有 `details.summary` 时取摘要、有意义的 `title` 仍优先、只有 `kind` 时用 `kind`，以及 `decisions[].reason`；新建 `src/test_public_pending_decisions.py`。

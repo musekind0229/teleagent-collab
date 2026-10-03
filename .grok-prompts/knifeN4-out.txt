@@ -1,0 +1,14 @@
+I'll project task failures up to the Goal status, keep a sanitized dispatch reason, and cover it with tests. First I'm reading how dispatch errors and goal `failure` / `failure_reason` are built today.Dispatch currently keeps only the exception type, and goal status leaves `failure_reason` empty. I'll attach a sanitized spawn reason and project every failed task onto the goal.The new tests passed. Next I’ll run both full suites the change has to keep green.Failed tasks now show up on the goal, and a dispatch exception keeps a short redacted reason instead of only the type name.
+
+**Dispatch.** If `start_run` raises, the task result is `backend dispatch failed: RuntimeError: …` with `error_source: "spawn"`. The reason is passed through `sanitize_reason` and cut at 300 characters. An empty message stays the old type-only string.
+
+**Goal status** (`GET /v1/requests/{id}`), only when `state` is `failed` and there is no pending decision:
+
+- `failure_reason` is a one-line summary from the first failed task in plan order. An existing need_human reason is left as it is.
+- `primary_failure` and `failures` are the same short brief for the first failed task and for every failed task. `source` is `worker_timeout` when the error is `timeout` or a wall-budget marker (not a step budget), `spawn` for this dispatch path, or `contract_render`, `acceptance`, `contamination`, `cancelled`, or `task_failed`.
+- `failure` is unchanged when it is already set. The brief does not include stdout or the goal contract. `retryable` is false. A pending decision is not treated as a failure.
+
+**Client summary** adds `primary_failure` and `failure_count`. If `failure_reason` is empty, it uses `primary_failure.error`. `wait` kind `task_failed` sets `wait.task_timeout` when `primary_failure.source` is `worker_timeout`, including a bare `"timeout"`. An observation-window timeout is still not a task failure.
+
+`tests/` passed (138 tests, 1 skipped). The `src` suite’s only error is the known Windows-only `test_prepare_injects_configured_proxy_and_userprofile`. Nothing was committed.
+exit=0

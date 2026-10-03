@@ -284,7 +284,7 @@ TeleAgent `review` 若产物自带 `contamination.contaminated`，投影出的�
 | --- | --- |
 | `task_id` / `run_id` / `title` | 任务标识。派发还没绑上 run 时 `run_id` 为空串 |
 | `error` | 脱敏后的一行错误，最多 300 字 |
-| `source` | `worker_timeout`（`error` 就是 `timeout`，或墙钟/预算标记，**不是** `budget_exceeded steps`）、`spawn`（`start_run` 抛错，结果带 `error_source: "spawn"`）、`contract_render`、`acceptance`、`contamination`、`cancelled`、`task_failed` |
+| `source` | `worker_timeout`（`error` 就是 `timeout`，或墙钟/预算标记，**不是** `budget_exceeded steps`）、`spawn`（`start_run` 抛错，结果带 `error_source: "spawn"`）、`contract_render`、`acceptance`、`contamination`、`cancelled`、`oom`（Linux：worker 以 SIGKILL 结束且本服务 cgroup 的 `memory.events` 里 `oom_kill` 计数增加，`error` 以 `killed by OOM (cgroup memory limit)` 开头；计数是整个服务 cgroup 共享的，并发多个 run 时不能精确到哪一个 run）、`task_failed` |
 | `missing_artifacts` | 该次结果里列出的缺失产物名字；没有则 `[]` |
 | `retryable` | 布尔。保守，普通失败为 false |
 | `next_step` | 短的安全提示，不含密钥和产物正文。`worker_timeout`：`raise budget.wall_sec or split the task; open a NEW request citing this request_id`。`spawn`：`check collab-service --ready` |

@@ -222,6 +222,24 @@ def _emit_json(payload) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
 
 
+def _note_previous_exit(persist: Path) -> str:
+    """Log why the previous service process ended and feed it to reap reasons."""
+    from execution_backend.agy_run_registry import set_previous_exit_note
+    from framework.service_exit import consume_previous_exit, previous_exit_note
+
+    row = consume_previous_exit(persist)
+    note = previous_exit_note(row)
+    if row is not None:
+        print(
+            f"previous service process ended: result={row.get('service_result') or '?'} "
+            f"code={row.get('exit_code') or '?'} status={row.get('exit_status') or '?'}",
+            file=sys.stderr,
+            flush=True,
+        )
+    set_previous_exit_note(note)
+    return note
+
+
 def _install_lead_registry(persist: Path) -> list[dict]:
     """Record lead (planner / decision) processes in ``<persist>/lead-runs.json``.
 
@@ -389,12 +407,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--token-env", default="COLLAB_API_TOKEN")
     parser.add_argument("--once", action="store_true", help="process all queued Goals once and exit")
+    parser.add_argument(
+        "--record-exit",
+        action="store_true",
+        help=(
+            "for systemd ExecStopPost: write $SERVICE_RESULT/$EXIT_CODE/$EXIT_STATUS to "
+            "<persist>/last-exit.json; the next start reports e.g. an OOM kill in reap reasons"
+        ),
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.record_exit:
+        # systemd ExecStopPost: remember why this service process ended.
+        from framework.service_exit import record_exit
+
+        row = record_exit(Path(args.persist).resolve())
+        print(f"recorded service exit: result={row.get('service_result')}", file=sys.stderr, flush=True)
+        return 0
 
     linux_ready = _use_linux_readiness(args)
     if args.ready or (args.check_gui and linux_ready):
@@ -435,6 +469,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     persist = Path(args.persist).resolve()
+    _note_previous_exit(persist)
     _install_lead_registry(persist)
     try:
         planner = _planner(args.planner, persist, args.lead_timeout)
