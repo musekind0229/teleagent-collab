@@ -43,6 +43,26 @@ sudo -u teleagent python3 /opt/collab/teleagent-collab/bin/collab-service.py \
 
 `--ready` 不启动 HTTP，也不创建 TeleAgent session。
 
+## 用 venv 和只绑本机（drop-in，2026-10-04 在 mde 上用的做法）
+
+仓库里的单元不改，另加一个 drop-in 覆盖 `ExecStart`：
+
+```bash
+python3 -m venv /opt/collab/venv
+/opt/collab/venv/bin/pip install -r /opt/collab/teleagent-collab/requirements.txt
+sudo install -d -m 0755 /etc/systemd/system/collab-service.service.d
+sudo tee /etc/systemd/system/collab-service.service.d/override.conf >/dev/null <<'EOF2'
+[Service]
+ExecStart=
+ExecStart=/opt/collab/venv/bin/python bin/collab-service.py --host 127.0.0.1 --port 8765 --persist /var/lib/teleagent-collab --backend teleagent-linux --planner deterministic
+EOF2
+sudo systemctl daemon-reload && sudo systemctl restart collab-service
+```
+
+checkout 归 root、服务以 TeleAgent 用户跑是正常配置：服务读 `HEAD` 时只对这个 checkout 加 `-c safe.directory=<仓库>`，不需要改全局 git 配置。旧版本（61e410c 及以前）在这种配置下读不到 `HEAD`，每次开单都会 409 `running_tip_mismatch`。
+
+更新代码后要 `systemctl restart collab-service`，否则 `--ready` 报运行 tip 与 `HEAD` 不一致（这是有意的）。
+
 ## 卸载
 
 ```bash

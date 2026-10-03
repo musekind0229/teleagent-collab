@@ -6,3 +6,7 @@
 # missing_dependency and "pip install -r requirements.txt" when it is
 # absent. That check does not block dispatch.
 jsonschema>=4
+
+# Windows only: teleagent_adapter/windows_gui_model_reuse.py encrypts the GUI
+# model auth state with AES-GCM. Linux/macOS never import it at runtime.
+cryptography>=41; sys_platform == "win32"

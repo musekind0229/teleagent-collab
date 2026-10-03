@@ -1,1 +1,3 @@
 -r requirements.txt
+# Tests exercise the Windows GUI model auth encryption on every platform.
+cryptography>=41

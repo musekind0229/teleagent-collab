@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import os
 import tempfile
 import time
 import unittest
@@ -200,7 +201,11 @@ class TestLeadAdapter(unittest.TestCase):
             self.assertEqual(parsed["verdict"], "fail")
 
     def test_factory_and_grok_is_one_backend(self):
-        ad = get_lead_adapter("grok_cli")
+        # Do not depend on a real grok binary on this host (clean HOME/PATH).
+        with tempfile.NamedTemporaryFile(suffix="-grok") as fake_bin, mock.patch.dict(
+            os.environ, {"COLLAB_LEAD_BIN": fake_bin.name}
+        ):
+            ad = get_lead_adapter("grok_cli")
         self.assertIsInstance(ad, GrokCliLeadAdapter)
         ad2 = get_lead_adapter("inprocess", exchange_dir=tempfile.mkdtemp())
         self.assertIsInstance(ad2, InProcessLeadAdapter)

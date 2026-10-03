@@ -3311,7 +3311,12 @@ def read_git_head(repo_root: str | Path | None = None) -> str:
     if os.name == "nt":
         run_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        proc = subprocess.run(["git", "rev-parse", "HEAD"], **run_kwargs)
+        # The service user often differs from the checkout owner (root-owned
+        # /opt checkout, service runs as the TeleAgent user). Git then refuses
+        # with "dubious ownership" and every dispatch fails as a tip mismatch.
+        # Trust exactly this checkout for this one read-only command.
+        safe = str(root.resolve()).replace("\\", "/")
+        proc = subprocess.run(["git", "-c", f"safe.directory={safe}", "rev-parse", "HEAD"], **run_kwargs)
     except (OSError, subprocess.SubprocessError, UnicodeError):
         return ""
     if proc.returncode != 0:

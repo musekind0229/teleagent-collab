@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -105,7 +106,11 @@ class TestLeadStubs(unittest.TestCase):
         self.assertEqual(ad.name, "inprocess")
 
     def test_grok_factory(self):
-        ad = get_lead_adapter("grok_cli")
+        # Do not depend on a real grok binary on this host (clean HOME/PATH).
+        with tempfile.NamedTemporaryFile(suffix="-grok") as fake_bin, mock.patch.dict(
+            os.environ, {"COLLAB_LEAD_BIN": fake_bin.name}
+        ):
+            ad = get_lead_adapter("grok_cli")
         self.assertIsInstance(ad, GrokCliLeadAdapter)
 
 
