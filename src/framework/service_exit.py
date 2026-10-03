@@ -29,6 +29,15 @@ def record_exit(persist: str | Path, environ: Mapping[str, str] | None = None) -
     env = environ if environ is not None else os.environ
     row = {k.lower(): _clean(env.get(k)) for k in _KEYS}
     row["recorded_at"] = time.time()
+    try:  # ExecStopPost still runs inside the unit's cgroup
+        from platform_services import cgroup_oom
+
+        d = cgroup_oom.cgroup_dir("self")
+        row["oom_kill_total"] = cgroup_oom.oom_kill_count(d)
+        row["oom_kill_unexplained"] = cgroup_oom.unexplained_oom_kills(persist, d)
+        row["memory_max"] = cgroup_oom.memory_max(d)
+    except Exception:  # pragma: no cover - never block the stop path
+        pass
     path = Path(persist) / FILE_NAME
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{FILE_NAME}.{os.getpid()}.tmp")
@@ -51,8 +60,19 @@ def consume_previous_exit(persist: str | Path) -> dict[str, Any] | None:
     return row if isinstance(row, dict) else None
 
 
+def _main_sigkilled_by_oom(row: Mapping[str, Any]) -> bool:
+    status = str(row.get("exit_status") or "").upper()
+    try:
+        unexplained = int(row.get("oom_kill_unexplained") or 0)
+    except (TypeError, ValueError):
+        unexplained = 0
+    return status in {"KILL", "9"} and unexplained > 0
+
+
 def was_oom(row: Mapping[str, Any] | None) -> bool:
-    return isinstance(row, Mapping) and str(row.get("service_result") or "") == "oom-kill"
+    if not isinstance(row, Mapping):
+        return False
+    return str(row.get("service_result") or "") == "oom-kill" or _main_sigkilled_by_oom(row)
 
 
 def previous_exit_note(row: Mapping[str, Any] | None) -> str:
@@ -64,6 +84,14 @@ def previous_exit_note(row: Mapping[str, Any] | None) -> str:
         return (
             "killed by OOM (cgroup memory limit): the previous service process ended with systemd result "
             "oom-kill (the OOM killer killed a process in the service cgroup)"
+        )
+    if _main_sigkilled_by_oom(row):
+        limit = str(row.get("memory_max") or "")
+        return (
+            "killed by OOM (cgroup memory limit): the previous service main process got SIGKILL "
+            f"(systemd result {result or '?'}) while its cgroup's oom_kill rose by "
+            f"{row.get('oom_kill_unexplained')} beyond the worker OOMs it had reported"
+            + (f" (memory.max={limit})" if limit else "")
         )
     if result in {"", "success"}:
         return ""

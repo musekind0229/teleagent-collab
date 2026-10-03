@@ -123,6 +123,51 @@ class OomKilledServiceIsReportedAfterRestart(unittest.TestCase):
             proj = project_failed_tasks([{"task_id": "t1", "status": "failed", "result": reaped}])
             self.assertEqual(proj["primary_failure"]["source"], "oom")
 
+    def _events(self, d: Path, n: int) -> None:
+        (d / "memory.events").write_text(f"low 0\nhigh 0\nmax 9\noom 3\noom_kill {n}\n")
+        (d / "memory.max").write_text("157286400\n")
+
+    def test_main_sigkill_under_oompolicy_continue_is_oom_when_unexplained(self):
+        # OOMPolicy=continue: systemd says result=signal, not oom-kill.
+        from framework.service_exit import previous_exit_note, record_exit, was_oom
+
+        with tempfile.TemporaryDirectory() as tmp:
+            persist, cg = Path(tmp) / "p", Path(tmp) / "cg"
+            cg.mkdir()
+            self._events(cg, 1)  # left over from before this process started
+            self.addCleanup(setattr, cgroup_oom, "_LEDGER", None)
+            self.assertEqual(cgroup_oom.start_ledger(persist, cg)["explained_upto"], 1)
+            self._events(cg, 2)  # a worker OOM, reported by the backend
+            cgroup_oom.mark_explained(2)
+            self._events(cg, 3)  # the main process
+            env = {"SERVICE_RESULT": "signal", "EXIT_CODE": "killed", "EXIT_STATUS": "KILL"}
+            with mock.patch.object(cgroup_oom, "cgroup_dir", lambda pid="self", **kw: cg):
+                row = record_exit(persist, env)
+            self.assertEqual(row["oom_kill_unexplained"], 1)
+            self.assertTrue(was_oom(row))
+            note = previous_exit_note(row)
+            self.assertTrue(note.startswith("killed by OOM (cgroup memory limit)"), note)
+            self.assertIn("result signal", note)
+
+    def test_main_sigkill_without_unexplained_oom_is_not_called_oom(self):
+        from framework.service_exit import previous_exit_note, record_exit, was_oom
+
+        with tempfile.TemporaryDirectory() as tmp:
+            persist, cg = Path(tmp) / "p", Path(tmp) / "cg"
+            cg.mkdir()
+            self._events(cg, 0)
+            self.addCleanup(setattr, cgroup_oom, "_LEDGER", None)
+            cgroup_oom.start_ledger(persist, cg)
+            self._events(cg, 1)  # the only OOM was a worker, already reported
+            cgroup_oom.mark_explained(1)
+            env = {"SERVICE_RESULT": "signal", "EXIT_CODE": "killed", "EXIT_STATUS": "KILL"}
+            with mock.patch.object(cgroup_oom, "cgroup_dir", lambda pid="self", **kw: cg):
+                row = record_exit(persist, env)
+            self.assertEqual(row["oom_kill_unexplained"], 0)
+            self.assertFalse(was_oom(row))
+            self.assertNotIn("OOM", previous_exit_note(row))
+            self.assertIn("ended abnormally", previous_exit_note(row))
+
     def test_normal_stop_adds_nothing(self):
         from framework.service_exit import previous_exit_note
 

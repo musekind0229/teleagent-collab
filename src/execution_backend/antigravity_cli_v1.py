@@ -959,6 +959,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             rec["finish"] = "error"
             rec["state"] = "failed"
             rec["error_source"] = "oom"
+            cgroup_oom.mark_explained(cgroup_oom.oom_kill_count(rec.get("_oom_cgroup")))
             tail = (rec.get("stderr") or "").strip()[-300:]
             rec["assistant_error"] = (oom + (f"; stderr tail: {tail}" if tail else ""))[:2000]
             return

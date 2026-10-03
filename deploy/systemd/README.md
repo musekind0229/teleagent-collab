@@ -82,7 +82,7 @@ OOMPolicy=continue
 - 先确认 cgroup v2 memory 控制器真正生效：`cat /sys/fs/cgroup/system.slice/collab-service.service/memory.max` 应为 `943718400`。不是的话，限制是空的。
 - `OOMScoreAdjust` 取 1000，不是 500：oom_score ≈ RSS 占比×1000 + adj。在 mde 上 TeleAgent 渲染进程是 adj 300、score 约 1018，服务取 500 时 score 约 1000，仍然比它低。取 1000 才能保证全局 OOM 时服务先被杀。
 - worker 被 cgroup OOM 杀掉时，失败 `source` 是 `oom`，`failure_reason` 以 `killed by OOM (cgroup memory limit)` 开头。
-- 服务主进程被 OOM 杀掉后，systemd 会重启并给一个新的 cgroup（`oom_kill` 计数归零）。所以单元里的 `ExecStopPost=… --record-exit` 会把 `$SERVICE_RESULT`（`oom-kill`）写到 `<persist>/last-exit.json`。下次启动时日志会打 `previous service process ended: result=oom-kill`，被收割的 run 的原因后面会加上 OOM 说明。
+- 服务主进程被 OOM 杀掉后，systemd 会重启并给一个新的 cgroup（`oom_kill` 计数归零）。所以单元里的 `ExecStopPost=… --record-exit` 会把 `$SERVICE_RESULT`（`oom-kill`）写到 `<persist>/last-exit.json`。在 `OOMPolicy=continue` 下，主进程被 OOM 杀掉时 systemd 报的是 `result=signal`（不是 `oom-kill`）。所以 ExecStopPost 还会读同一个 cgroup 的 `memory.events`，再和主进程记在 `<persist>/oom-ledger.json` 里、已经算到 worker 头上的 `oom_kill` 做比较：SIGKILL 且有没被解释的增量，就判为 OOM。下次启动时日志会打 `previous service process ended: result=…`，被收割的 run 的原因后面会加上 OOM 说明。
 
 ## 卸载
 

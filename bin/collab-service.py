@@ -237,6 +237,12 @@ def _note_previous_exit(persist: Path) -> str:
             flush=True,
         )
     set_previous_exit_note(note)
+    try:  # baseline for ExecStopPost: oom_kills from here on are this process's to explain
+        from platform_services import cgroup_oom
+
+        cgroup_oom.start_ledger(persist)
+    except Exception as exc:  # noqa: BLE001 - diagnostics must not block startup
+        print(f"oom ledger unavailable: {exc}", file=sys.stderr, flush=True)
     return note
 
 

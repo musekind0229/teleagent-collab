@@ -12,8 +12,10 @@ v1 return None everywhere (no claim is made).
 
 from __future__ import annotations
 
+import json
 import os
 import signal
+import threading
 from pathlib import Path
 
 OOM_REASON = "killed by OOM (cgroup memory limit)"
@@ -88,8 +90,90 @@ def oom_note(directory: str | Path | None, before: int | None, returncode: int |
     )
 
 
+# ---- ledger: which oom_kill increases the main process already explained ----
+# A service main process killed by the OOM killer cannot report itself, and
+# systemd only says result=oom-kill under OOMPolicy=stop (under continue it is
+# result=signal). ExecStopPost runs in the same cgroup before it is removed, so
+# it can compare memory.events with what the main process already attributed
+# to OOM-killed workers. Only the unexplained remainder points at the main one.
+LEDGER_NAME = "oom-ledger.json"
+_LEDGER: Path | None = None
+_LEDGER_LOCK = threading.Lock()
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        row = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return row if isinstance(row, dict) else {}
+
+
+def _write_json(path: Path, row: dict) -> None:
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(row), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def start_ledger(persist: str | Path, directory: str | Path | None = None) -> dict | None:
+    """Main process start: everything counted so far is not ours to explain."""
+    global _LEDGER
+    d = directory if directory is not None else cgroup_dir("self")
+    count = oom_kill_count(d)
+    if count is None:
+        _LEDGER = None
+        return None
+    path = Path(persist) / LEDGER_NAME
+    row = {"cgroup": str(d), "explained_upto": count, "pid": os.getpid()}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_json(path, row)
+    except OSError:
+        _LEDGER = None
+        return None
+    _LEDGER = path
+    return row
+
+
+def mark_explained(count: int | None) -> None:
+    """A worker OOM was reported for every oom_kill up to ``count``."""
+    if _LEDGER is None or count is None:
+        return
+    with _LEDGER_LOCK:
+        row = _read_json(_LEDGER)
+        if int(row.get("explained_upto") or 0) >= count:
+            return
+        row["explained_upto"] = count
+        try:
+            _write_json(_LEDGER, row)
+        except OSError:
+            pass
+
+
+def unexplained_oom_kills(persist: str | Path, directory: str | Path | None = None) -> int | None:
+    """oom_kill increases in this cgroup that no worker OOM report accounted for."""
+    d = directory if directory is not None else cgroup_dir("self")
+    now = oom_kill_count(d)
+    if now is None:
+        return None
+    row = _read_json(Path(persist) / LEDGER_NAME)
+    base = int(row.get("explained_upto") or 0) if row.get("cgroup") == str(d) else 0
+    return max(0, now - base)
+
+
 def is_linux() -> bool:
     return os.name == "posix" and Path("/proc/self/cgroup").exists()
 
 
-__all__ = ["OOM_REASON", "cgroup_dir", "oom_kill_count", "memory_max", "killed_by_sigkill", "oom_note"]
+__all__ = [
+    "OOM_REASON",
+    "LEDGER_NAME",
+    "cgroup_dir",
+    "oom_kill_count",
+    "memory_max",
+    "killed_by_sigkill",
+    "oom_note",
+    "start_ledger",
+    "mark_explained",
+    "unexplained_oom_kills",
+]
