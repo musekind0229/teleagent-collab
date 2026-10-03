@@ -178,7 +178,7 @@ TeleAgent `review` 若产物自带 `contamination.contaminated`，投影出的�
 多 Task 的 Goal 上，Goal 级「PATH must contain exactly BODY」只门禁 expected_artifacts 里有 PATH 的那个 Task；没有 Task 声明 PATH 时落到汇点 Task（没人依赖的那些），不会静默丢掉。普通文字验收仍然发给每个 Task。
 | `acceptance.lead_review` | 本进程规划器会审 **并且** 后端扛得住组长审查时才是 true |
 | `acceptance.executable_checks` | 当前为 false |
-| `progress.available` | 有真实、便宜的观察才是 true。agy 是**活动心跳**（`heartbeat=runner_activity`，2026-10-02 起）：取 stdout/stderr 增长、工作区文件 mtime、该 run 的 HOME（Windows 为 USERPROFILE）下 `.gemini/antigravity-cli/{conversations,log,brain}` 的 mtime 中最新的一个；只 stat，不读内容。进程还活着**不再**刷新心跳，所以卡住不动的 agy 超过 `--stale-after` 会显示 `state=stale`。会话文件必须能归属到这个 run 才算心跳（2026-10-02 第二版）：① 该 run 的进程树正打开着它（Linux 读 `/proc/<pid>/fd`，归属 `open_handle`），按会话 uuid / 日志文件认领，之后句柄关了也算；② 退一步：run 启动后只新出现了一个会话、本服务没有别的 run 共用这个 HOME、也没有别的进程开着它（归属 `new_file`）。其余一律不用，原因写在 `progress.heartbeat_signals.session`（`{used, attribution, reason}`，客户端 `progress` 里是 `session_signal`），例如 `the only new session file is held open by another process`、`ambiguous: 2 runs of this service share this HOME`。`conversation_summaries.db` 这类共享文件从不算。`recent_events` 里的 `last_activity output|workspace|session|none` 说明最近一次活动来自哪里。in-process 看自己的状态机（`heartbeat` 为 false，不每拍刷新）。监督后端看作业状态（`heartbeat=engine`）。没有这些信号的一次性后端是 false，并且 **`percent` 永远是 false**，不编百分比 |
+| `progress.available` | 有真实、便宜的观察才是 true。agy 是**活动心跳**（`heartbeat=runner_activity`，2026-10-02 起）：取 stdout/stderr 增长、工作区文件 mtime、该 run 的 HOME（Windows 为 USERPROFILE）下 `.gemini/antigravity-cli/{conversations,log,brain}` 的 mtime 中最新的一个；只 stat，不读内容。进程还活着**不再**刷新心跳，所以卡住不动的 agy 超过 `--stale-after` 会显示 `state=stale`。会话文件必须能归属到这个 run 才算心跳（2026-10-02 第二版）：① 该 run 的进程树正打开着它（Linux 读 `/proc/<pid>/fd`，归属 `open_handle`），按会话 uuid / 日志文件认领，之后句柄关了也算；② 退一步：run 启动后只新出现了一个会话、本服务没有别的 run 共用这个 HOME、也没有别的进程开着它（归属 `new_file`）。其余一律不用，原因写在 `progress.heartbeat_signals.session`（`{used, attribution, reason}`，客户端 `progress` 里是 `session_signal`），例如 `the only new session file is held open by another process`、`ambiguous: 2 runs of this service share this HOME`。`conversation_summaries.db` 这类共享文件从不算。2026-10-03 起再加两条：③ `log_start_time`：没有 fd 扫描（Windows、macOS）时，`log/cli-YYYYMMDD_HHMMSS.log` 的文件名（agy 本地启动时间）落在本 run 启动 ±2 秒内、且只有这一个，就归给它；有两个以上则写 `ambiguous: N agy logs started within 2s of this run`。`new_file` 只认 run 启动后 30 秒内**创建**的会话（有创建时间就用创建时间，否则用第一次看到的时间），晚出现的写 `no session file created within 30s of this run's start…`。run 结束时拿 agy 报的 `conversation_id` 核对认领，`heartbeat_signals.session.verified` 为 `match` / `mismatch`（mismatch 记 warning）。④ `tool_cpu`（仅 Linux `/proc`）：agy **之下**的工具子进程（不含 agy 本身）两次轮询之间用了至少 50ms CPU，算一次活动，`heartbeat_signals.tool_cpu = {used, processes}`，客户端 `progress` 里是 `tool_cpu_signal`；忙但不出声的编译/测试不会再被判 stale，`sleep` 这种不吃 CPU 的仍会 stale。`recent_events` 里的 `last_activity output|workspace|session|tool_cpu|none` 说明最近一次活动来自哪里。in-process 看自己的状态机（`heartbeat` 为 false，不每拍刷新）。监督后端看作业状态（`heartbeat=engine`）。没有这些信号的一次性后端是 false，并且 **`percent` 永远是 false**，不编百分比 |
 | `progress.subagent_observability` | `false` 或 `"unknown"`。不会假装观察到 0 个子代理 |
 | `progress.artifact_checkpoint` | 能否给出产物清单（名字、大小、mtime，无正文） |
 | `metering.live_usage` / `usage_at_end` / `tool_calls` | 是否有跑中用量、结束时用量、工具调用次数。没有就不要当成有 |
@@ -289,11 +289,13 @@ TeleAgent `review` 若产物自带 `contamination.contaminated`，投影出的�
 | `retryable` | 布尔。保守，普通失败为 false |
 | `next_step` | 短的安全提示，不含密钥和产物正文。`worker_timeout`：`raise budget.wall_sec or split the task; open a NEW request citing this request_id`。`spawn`：`check collab-service --ready` |
 
-任务失败的短记录另有 `failed_phase`（`planning` / `preparing` / `executing` / `finalizing` / `testing` / `reviewing`；墙钟或无进展超时记为 `executing`）、`outcome`（`candidate_produced` / `no_output`）与一行 `outcome_summary`，用来区分「有候选、CLI 收尾失败」（`finalizing` + `candidate_produced`）和「什么都没产出」。Goal 级规划失败为 `failed_phase=planning`、`outcome=no_output`。
+任务失败的短记录另有 `failed_phase`（`planning` / `preparing` / `executing` / `finalizing` / `testing` / `reviewing`；墙钟或无进展超时记为 `executing`）、`outcome`（`candidate_produced` / `other_output` / `no_output`）与一行 `outcome_summary`，用来区分「有候选、CLI 收尾失败」（`finalizing` + `candidate_produced`）、「工作区里有别的文件，但没有要的产物」（`other_output`，2026-10-03 起；依赖交接和清单拷进来的输入文件不算）和「什么都没产出」。工人没报错、但验收知道缺哪些文件时，顶层 `failure_reason` 是 `required artifacts missing: delivery.md`，不再是空泛的 `task failed`（#12）。Goal 级规划失败为 `failed_phase=planning`、`outcome=no_output`。
 
 任务失败的短记录另有（2026-10-02 起）：`stage`（任务失败为 `worker`）、`candidate_available` / `candidate_artifacts`（期望产物里哪些作为普通文件仍在受信任务目录里；只做 stat，不读正文，跳过 symlink 和越界路径）、`review_status`。**文件还在不等于执行成功，也没被审查**；run 仍是 failed，不会被改写。
 
 Goal 在任何 Task 结果之前就失败（规划失败、预算/协调失败）时，`failures` 只有一条 Goal 级短记录：`task_id` / `run_id` 为空串（不编造），`stage` 取 `failure.phase`（如 `planning`、`budget`），`source` 为 `planner` 或 `coordination`，可选 `code`（如 `lead_unavailable`、`invalid_plan`、`stale_plan`）与 `lead_status`（组长适配器的 `timeout` / `call_failed` / `error`）。`failure_reason` 同时填上，不再是空串。规划失败时没有任何工人被启动，也不会自动重试。
+
+**顶层 `artifacts`（2026-10-03 起）**：status 原始载荷（`--full`）顶层多一个 `artifacts: [{task_id, path}]`，每个 Task 的产物各列一次，`path` 相对该 Task 工作区、用 `/` 分隔（与客户端摘要同一种写法）；工作区外的绝对路径原样保留。`tasks[].result.artifacts` 不变。
 
 ### 验收分层（`acceptance_status`）
 
@@ -316,11 +318,15 @@ status 带 `phase_timeline`：Goal 的 `planning` 加每个 Task 的 `preparing`
 
 规划不再占着协调锁：组长规划在单独线程里跑，第一拍最多等 1 秒，慢的就留到之后的拍子取结果，其它 Goal 照常推进。规划结束时 Goal 已被取消或已有 Task，结果丢弃（`outcome=discarded`）。组长计划必须交付 Goal 验收里列出的每个产物，漏了就是 `invalid_plan`（`lead plan does not deliver goal acceptance artifacts: missing b.txt; plan delivers a.txt`），不派工人。比较前两边都规范化：`./a.txt` 与 `a.txt`、`sub\b.txt` 与 `sub/b.txt` 视为同一个。
 
-**取消时停掉组长**：规划中的 Goal 被取消（或在规划中变成 failed、服务收到 SIGTERM/Ctrl-C）时，立刻停掉规划线程正在等的组长进程树，不等组长超时：组长在自己的进程组里启动，POSIX 先 SIGTERM 整个进程组、1.5 秒后 SIGKILL；Windows 用 `taskkill /F /T /PID`。停完在事件（`GET /v1/requests/{id}/events`）里记一条 `planner_stopped`（`reason`、`lead_processes[{pid, method, result}]`、`planner_thread`、`planning_sec`），status 里也有 `planner_stopped`。服务被 `kill -9` 时组长不在 `agy-runs.json` 里，靠它自己的超时结束。
+**取消时停掉组长**：规划中的 Goal 被取消（或在规划中变成 failed、服务收到 SIGTERM/Ctrl-C）时，立刻停掉规划线程正在等的组长进程树，不等组长超时：组长在自己的进程组里启动，POSIX 先 SIGTERM 整个进程组、1.5 秒后 SIGKILL；Windows 用 `taskkill /F /T /PID`。停完在事件（`GET /v1/requests/{id}/events`）里记一条 `planner_stopped`（`reason`、`lead_processes[{pid, method, result}]`、`planner_thread`、`planning_sec`），status 里也有 `planner_stopped`。**服务被 `kill -9` 时的组长（2026-10-03 起）**：每个组长进程（规划、permission / review 决策都算）启动时记进 `<persist>/lead-runs.json`（pid、进程组、启动时间令牌、所属服务进程；不记 argv / prompt），调用结束就删掉。下次启动时把上一个已经死掉的服务留下的组长整组停掉，stderr 打一行 `lead orphan from previous service: run=lead_… pid=N outcome=killed`；pid 已被别的进程复用（令牌不同）时不动它（`pid_reused_left_alone`）。
+
+**决策调用也走进程组（2026-10-03 起）**：permission / review 决策（没有 Goal 取消范围的调用）和规划一样走 `lead_adapter/cancel.py` 的进程组路径，grok、deepseek、codex 三个适配器都是。超时时停掉整个组长进程树，而不是只杀直接子进程；以前组长派生的孙进程会在超时后继续跑。
 
 ### 服务重启与 agy 孤儿进程（2026-10-02 起）
 
 agy 后端把每个 worker 的 pid、进程组、启动时间令牌（防 pid 复用）、所属服务进程记在 `<persist>/agy-runs.json`（不记 argv / prompt / 环境）。服务收到 SIGTERM / Ctrl-C（Windows 还有 SIGBREAK）时先停掉还活着的 worker；被 `kill -9` 等方式直接杀掉时，下次启动会把上一个服务留下的 worker 整棵停掉：POSIX 杀 worker 的进程组、会话和后代，外加轮询时记下的子进程（agy 的 shell 工具命令在自己的进程组里，只杀 worker 的组会漏掉它；子进程按启动时间令牌校验后才会动；观测事件里有 `child_processes N`）；Windows 用 `taskkill /F /T /PID`。worker 正常退出但留下还在跑的工具子进程时，收结果时也会把它们停掉。pid 已被别的进程复用时不动它。这些 Task 的失败原因写明是哪种情况，例如 `backend resume failed: BackendError: agy run agy_… (pid N) belonged to a previous service process; its worker process tree was stopped when the service restarted. …`；工作区里已有的文件只是候选。仍然不会自动重派。
+
+**Windows Job Object（2026-10-03 起，未在 Win 实测）**：Windows 上组长和 agy worker 启动后放进一个带 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Job Object，句柄由服务进程持有：服务无论怎么死，系统关句柄时会杀掉 Job 里的全部进程。主动停止时先 `TerminateJobObject`，再照旧 `taskkill /F /T /PID` 兜底。任一步失败都静默退回 taskkill。已知缺口：`Popen` 返回到加入 Job 之间派生的子进程不在 Job 里（Popen 不能挂起启动），所以 taskkill 仍然保留。只在 Linux 上用 mock 测过 kernel32 调用顺序。
 
 `start_run` 抛错时，任务结果的 `error` 是 `backend dispatch failed: <异常类型>: <脱敏后的短原因>`（原因最多 300 字）。异常信息为空时仍只写类型名，不留一个空的冒号。
 
@@ -358,6 +364,16 @@ agy 后端把每个 worker 的 pid、进程组、启动时间令牌（防 pid �
 2. **实现 + 测试**：新开一单，要求实现和独立测试产物，不要在这一步安装。
 3. **dry-run**：再开一单只做演练，不改系统。
 4. **操作者批准**：人看过 dry-run 之后才开安装单。Hermes 不自行批准 decision。
+
+### 组长技术评审与角色边界（#15，2026-10-03 现状）
+
+现状：agy 后端**没有**组长技术评审通道。agy 的 worker 结果不会交给组长审，`acceptance_status.technical_review` 恒为 `not_available`，`--require-capability lead_review` 在 agy 上 409。组长（`--planner lead` / `grok`）在 agy 上只做两件事：出计划，以及裁决后端交上来的 permission / review decision。agy 本身不发 permission 请求（`channels.permission=false`），所以实际只剩出计划。
+
+边界：
+
+- 服务只做机械验收：产物在不在、agy「must contain exactly」字面核对、AIGC 污染扫描。这些都不是技术评审，也不是业务验收（`business_acceptance` 恒为 `not_performed`）。
+- 技术评审（读代码/产物、跑独立测试、判断是否可合入）由调用方或人做。按「样例 → 实现 + 测试 → dry-run → 操作者批准」分单推进，每一单的结论由人或调用方在下一单里引用。
+- 本轮没有加 agy 上的组长评审开关：#15 最新评论要求先暂停功能扩展、先把最短链路验通，老板也还没拍板。需要时会做成默认关闭的开关。
 
 ## 查询和控制
 

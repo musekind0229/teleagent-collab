@@ -272,7 +272,12 @@ def project_failed_tasks(tasks: Sequence[Any]) -> dict[str, Any] | None:
     if not briefs:
         return None
     primary = briefs[0]
-    reason = primary["error"] or "task failed"
+    reason = primary["error"]
+    if not reason and primary.get("missing_artifacts"):
+        # No worker error, but acceptance knows what is missing (#12): say so
+        # instead of a bare "task failed".
+        reason = "required artifacts missing: " + ", ".join(primary["missing_artifacts"][:8])
+    reason = reason or "task failed"
     return {
         "failure_reason": reason,
         "primary_failure": primary,

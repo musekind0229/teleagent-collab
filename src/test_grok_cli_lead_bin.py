@@ -256,12 +256,15 @@ class TestGrokCliAdapterDefaults(unittest.TestCase):
             return P()
 
         ad = GrokCliLeadAdapter(bin_path="/bin/echo")
-        with mock.patch("lead_adapter.grok_cli.subprocess.run", fake_run):
+        with mock.patch("lead_adapter.grok_cli.run_cancellable", fake_run):
             raw, parsed = ad.decide(req, schema={"type": "object"}, cwd="/tmp")
         self.assertEqual(len(calls), 1)
         self.assertIn("--disallowed-tools", calls[0])
-        self.assertEqual(run_kwargs.get("encoding"), "utf-8")
-        self.assertEqual(run_kwargs.get("errors"), "replace")
+        self.assertIn("timeout", run_kwargs)
+        # run_cancellable decodes lead output as utf-8 with replacement.
+        cancel_src = (Path(__file__).resolve().parent / "lead_adapter" / "cancel.py").read_text(encoding="utf-8")
+        self.assertIn('encoding="utf-8"', cancel_src)
+        self.assertIn('errors="replace"', cancel_src)
         self.assertEqual((parsed or {}).get("_lead_status"), "call_failed")
         src = Path(__file__).resolve().parent / "lead_adapter" / "grok_cli.py"
         text = src.read_text(encoding="utf-8")

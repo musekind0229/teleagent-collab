@@ -22,10 +22,56 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Iterator, Sequence
 from typing import Any
 
+from platform_services import win_job
+
 CREATE_NEW_PROCESS_GROUP = 0x00000200
+
+# Service-wide record of live lead processes (``<persist>/lead-runs.json``),
+# so a service killed with SIGKILL can stop leftover lead trees on restart.
+_REGISTRY: Any = None
+_REGISTRY_LOCK = threading.Lock()
+
+
+def set_process_registry(registry: Any) -> None:
+    """Install (or clear with None) the registry lead processes are recorded in.
+
+    Any object with ``record(run_id, pid=...)`` and ``forget(run_id)`` works;
+    the service uses ``AgyRunRegistry`` on its own file (pid, process group,
+    start token, owning service) so pid reuse is never killed by mistake.
+    """
+    global _REGISTRY
+    with _REGISTRY_LOCK:
+        _REGISTRY = registry
+
+
+def register_process(proc: subprocess.Popen) -> str | None:
+    with _REGISTRY_LOCK:
+        registry = _REGISTRY
+    if registry is None:
+        return None
+    key = f"lead_{uuid.uuid4().hex[:12]}"
+    try:
+        registry.record(key, pid=int(proc.pid))
+    except Exception:  # noqa: BLE001 — bookkeeping must never break a lead call
+        return None
+    return key
+
+
+def unregister_process(key: str | None) -> None:
+    if not key:
+        return
+    with _REGISTRY_LOCK:
+        registry = _REGISTRY
+    if registry is None:
+        return
+    try:
+        registry.forget(key)
+    except Exception:  # noqa: BLE001
+        pass
 _POLL_SEC = 0.2
 _GRACE_SEC = 1.5
 
@@ -55,6 +101,8 @@ def stop_process_tree(
         return row
     if _is_windows(platform):
         row["method"] = "taskkill /F /T"
+        if win_job.terminate(proc):
+            row["job_object"] = "terminated"
         try:
             done = subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
@@ -184,10 +232,14 @@ def communicate(
     ``subprocess.TimeoutExpired`` (tree stopped) like ``subprocess.run`` would.
     """
     deadline = time.monotonic() + float(timeout)
+    pending_input = input_text
     while True:
         remaining = deadline - time.monotonic()
         try:
-            out, err = proc.communicate(input=input_text, timeout=max(0.0, min(_POLL_SEC, remaining)))
+            # Input goes in on the first call only; CPython keeps feeding it on
+            # retries and raises ValueError if it is passed again.
+            send, pending_input = pending_input, None
+            out, err = proc.communicate(input=send, timeout=max(0.0, min(_POLL_SEC, remaining)))
             if scope is not None and scope.cancelled:
                 raise LeadCancelled(scope.reason)
             return out or "", err or ""
@@ -234,6 +286,9 @@ def run_cancellable(
         cwd=cwd,
         **popen_group_kwargs(platform),
     )
+    # Windows: kill-on-close Job Object, so a dead service takes the tree with it.
+    win_job.attach(proc, platform)
+    key = register_process(proc)
     if scope is not None:
         scope.attach(proc, platform)
     try:
@@ -241,6 +296,8 @@ def run_cancellable(
     finally:
         if scope is not None:
             scope.detach(proc)
+        unregister_process(key)
+        win_job.close(proc)
     return subprocess.CompletedProcess(list(cmd), proc.returncode, out, err)
 
 
@@ -250,6 +307,9 @@ __all__ = [
     "communicate",
     "current_scope",
     "popen_group_kwargs",
+    "register_process",
+    "set_process_registry",
+    "unregister_process",
     "run_cancellable",
     "stop_process_tree",
     "use_scope",

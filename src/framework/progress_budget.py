@@ -250,22 +250,32 @@ def tool_call_total(payload: Mapping[str, Any] | None) -> int | None:
     return None
 
 
-SESSION_ATTRIBUTIONS = frozenset({"open_handle", "new_file", "none"})
+SESSION_ATTRIBUTIONS = frozenset({"open_handle", "log_start_time", "new_file", "none"})
 
 
 def heartbeat_signals_view(raw: Any) -> dict[str, Any]:
     """Which heartbeat inputs were used, and why one was not. Bounded, no paths."""
-    if not isinstance(raw, Mapping) or not isinstance(raw.get("session"), Mapping):
+    if not isinstance(raw, Mapping):
         return {}
+    out: dict[str, Any] = {}
+    cpu = raw.get("tool_cpu")
+    if isinstance(cpu, Mapping):
+        procs = _int(cpu.get("processes"))
+        out["tool_cpu"] = {"used": bool(cpu.get("used")), "processes": procs if procs and procs > 0 else 0}
+    if not isinstance(raw.get("session"), Mapping):
+        return out
     note = raw["session"]
     attribution = str(note.get("attribution") or "none")
     if attribution not in SESSION_ATTRIBUTIONS:
         attribution = "none"
     row: dict[str, Any] = {"used": bool(note.get("used")), "attribution": attribution}
+    if note.get("verified") in {"match", "mismatch"}:
+        row["verified"] = note["verified"]
     reason = sanitize_event(str(note.get("reason") or ""), limit=200) if note.get("reason") else ""
     if reason:
         row["reason"] = reason[:200]
-    return {"session": row}
+    out["session"] = row
+    return out
 
 
 def bound_task_progress(raw: Mapping[str, Any] | None) -> dict[str, Any]:

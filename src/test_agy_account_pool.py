@@ -1188,8 +1188,14 @@ class TestWindowsAccountSwitch(unittest.TestCase):
         payload["accounts"][0]["http_proxy"] = "http://acct.example:8"
         with tempfile.TemporaryDirectory() as td:
             path = _write_pool_file(td, payload)
-            with patch("execution_backend.agy_account_pool.os.name", "nt"), patch(
-                "execution_backend.agy_account_pool.sys.platform", "win32"
+            # sys.platform alone selects the Windows branch (_is_windows); patching
+            # the global os.name would make pathlib build WindowsPath on POSIX.
+            # The machine lock uses this host's real lock implementation.
+            import platform_services
+
+            host_lock = platform_services.get_file_lock(platform=sys.platform)
+            with patch("execution_backend.agy_account_pool.sys.platform", "win32"), patch(
+                "platform_services.get_file_lock", lambda **_kw: host_lock
             ):
                 prepared = prepare_antigravity_environ_from_pool(
                     path,

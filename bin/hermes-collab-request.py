@@ -1674,13 +1674,21 @@ def project_progress(payload: Mapping[str, Any], *, now: float | None = None) ->
 def _session_signal_view(progress: dict[str, Any]) -> dict[str, Any]:
     """Whether agy session files fed the heartbeat, and why not (only when reported)."""
     signals = progress.get("heartbeat_signals")
+    out: dict[str, Any] = {}
+    cpu = signals.get("tool_cpu") if isinstance(signals, dict) else None
+    if isinstance(cpu, dict):
+        # Tool processes under agy used CPU since the last poll (Linux only).
+        out["tool_cpu_signal"] = {"used": bool(cpu.get("used"))}
     note = signals.get("session") if isinstance(signals, dict) else None
     if not isinstance(note, dict):
-        return {}
+        return out
     row: dict[str, Any] = {"used": bool(note.get("used")), "attribution": str(note.get("attribution") or "none")[:32]}
     if isinstance(note.get("reason"), str) and note["reason"].strip():
         row["reason"] = note["reason"].strip()[:200]
-    return {"session_signal": row}
+    if note.get("verified") in ("match", "mismatch"):
+        row["verified"] = note["verified"]
+    out["session_signal"] = row
+    return out
 
 
 def _task_review(task: dict[str, Any], result: dict[str, Any] | None, cut: _Cut) -> dict[str, str]:

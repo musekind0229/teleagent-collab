@@ -36,6 +36,7 @@ from execution_backend.base import (
 from execution_backend.inprocess_v1 import InProcessExecutionBackend
 from framework import contract_render
 from framework.artifact_contamination import scan_file, summarize
+from framework.artifact_index import goal_artifact_index
 from framework.artifact_handoff import (
     HandoffError,
     handoff_direct_dependency_artifacts,
@@ -1155,6 +1156,36 @@ def _candidate_artifacts(task: Mapping[str, Any] | None) -> list[str]:
     return found
 
 
+def _workspace_has_files(task: Mapping[str, Any] | None, *, limit: int = 256) -> bool:
+    """True when the task workspace holds any regular file (bounded walk, no symlinks)."""
+    if not isinstance(task, Mapping):
+        return False
+    ws = str(task.get("workspace") or "").strip()
+    if not ws:
+        return False
+    # Files the service staged in (dependency handoff, manifest inputs) are
+    # not the worker's output.
+    inputs = task.get("inputs") if isinstance(task.get("inputs"), Mapping) else {}
+    staged = {str(x).replace("\\", "/").strip("/") for x in (inputs.get("input_files") or []) if str(x).strip()}
+    seen = 0
+    try:
+        for _dir, dirs, files in os.walk(ws, followlinks=False):
+            dirs[:] = [d for d in dirs if not d.startswith(".collab")]
+            for name in files:
+                seen += 1
+                if seen > limit:
+                    return False
+                path = Path(_dir) / name
+                rel = os.path.relpath(path, ws).replace(os.sep, "/")
+                if rel in staged:
+                    continue
+                if not path.is_symlink() and path.is_file():
+                    return True
+    except OSError:
+        return False
+    return False
+
+
 def _open_phase(holder: Mapping[str, Any] | None) -> str:
     """Name of the phase still open on a task/goal timeline, else ""."""
     rows = holder.get("phases") if isinstance(holder, Mapping) else None
@@ -1212,11 +1243,14 @@ def _annotate_task_failure(brief: dict[str, Any], task: Mapping[str, Any] | None
     if brief.get("source") in {"worker_timeout"} or "no_progress" in str(brief.get("error") or ""):
         phase = "executing"  # the wall/no-progress clock ran out while it worked
     brief["failed_phase"] = phase or "unknown"
-    brief["outcome"] = "candidate_produced" if present else "no_output"
-    brief["outcome_summary"] = (
-        f"{'candidate produced (not accepted)' if present else 'no output produced'}; "
-        f"failed during {brief['failed_phase']}"
-    )
+    if present:
+        brief["outcome"], what = "candidate_produced", "candidate produced (not accepted)"
+    elif _workspace_has_files(task):
+        # Files exist, just not the required ones: not "nothing produced" (#12).
+        brief["outcome"], what = "other_output", "other files produced, required artifacts missing"
+    else:
+        brief["outcome"], what = "no_output", "no output produced"
+    brief["outcome_summary"] = f"{what}; failed during {brief['failed_phase']}"
 
 
 def acceptance_status_view(
@@ -3787,6 +3821,9 @@ class CollabApplication:
                 for k in ("at_iso", "reason", "planner_thread", "planning_sec", "lead_processes")
                 if k in last
             }
+        # Normalized, deduplicated file list for raw/--full readers; task
+        # results keep their raw artifacts unchanged.
+        out["artifacts"] = goal_artifact_index(tasks)
         out["acceptance_status"] = acceptance_status_view(
             str(out.get("state") or ""), tasks if isinstance(tasks, list) else [], caps
         )

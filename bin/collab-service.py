@@ -222,6 +222,33 @@ def _emit_json(payload) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
 
 
+def _install_lead_registry(persist: Path) -> list[dict]:
+    """Record lead (planner / decision) processes in ``<persist>/lead-runs.json``.
+
+    A service killed with SIGKILL leaves its lead behind (it runs in its own
+    process group). On the next start, every lead recorded by a dead service
+    is stopped with its whole group (Windows: ``taskkill /F /T``); a pid that
+    now belongs to another process (start token differs) is left alone.
+    """
+    from execution_backend.agy_run_registry import AgyRunRegistry
+    from lead_adapter.cancel import set_process_registry
+
+    registry = AgyRunRegistry(persist / "lead-runs.json")
+    rows: list[dict] = []
+    try:
+        rows = registry.reap_orphans()
+    except Exception as exc:  # noqa: BLE001 — never block startup on bookkeeping
+        print(f"lead orphan reap failed: {type(exc).__name__}", file=sys.stderr, flush=True)
+    for row in rows:
+        print(
+            f"lead orphan from previous service: run={row.get('run_id')} pid={row.get('pid')} outcome={row.get('outcome')}",
+            file=sys.stderr,
+            flush=True,
+        )
+    set_process_registry(registry)
+    return rows
+
+
 def _install_stop_signals() -> None:
     """SIGTERM (and SIGBREAK on Windows) take the same finally path as Ctrl-C.
 
@@ -408,6 +435,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     persist = Path(args.persist).resolve()
+    _install_lead_registry(persist)
     try:
         planner = _planner(args.planner, persist, args.lead_timeout)
     except ValueError as exc:

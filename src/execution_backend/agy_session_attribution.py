@@ -9,9 +9,18 @@ heartbeat only when it can be tied to that run:
 1. ``open_handle``: the run's process tree holds the file open
    (``/proc/<pid>/fd``; Linux only). The conversation uuid / log file is then
    claimed for that run and keeps counting after the handle closes.
-2. ``new_file``: exactly one conversation appeared after the run started, no
-   other run of this service uses the same HOME, and no other process holds
-   it open (checked where ``/proc`` exists).
+2. ``log_start_time``: agy names its log ``log/cli-YYYYMMDD_HHMMSS.log`` after
+   its own start time (local clock). Exactly one unclaimed log named within
+   ``LOG_START_WINDOW_SEC`` of this run's spawn is tied to it; two agy
+   processes started in the same window are ambiguous.
+3. ``new_file``: exactly one conversation appeared after the run started and
+   was created within ``NEW_FILE_WINDOW_SEC`` of the spawn (birth time where
+   the OS has one, else when this service first saw it), no other run of this
+   service uses the same HOME, and no other process holds it open (checked
+   where ``/proc`` exists).
+
+When agy finally reports its ``conversation_id`` the claim is checked
+(``verified``: ``match`` / ``mismatch``); a mismatch is reported, never hidden.
 
 Anything else is not used and the reason is reported. Only names, mtimes and
 fd link targets are read, never file contents. Shared files such as
@@ -20,12 +29,17 @@ fd link targets are read, never file contents. Shared files such as
 from __future__ import annotations
 
 import os
+import re
 import threading
+import time
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
 _MAX_ENTRIES = 400
+LOG_START_WINDOW_SEC = 2.0
+NEW_FILE_WINDOW_SEC = 30.0
+_LOG_NAME_RE = re.compile(r"^cli-(\d{8}_\d{6})\.log$")
 _MAX_PROCS = 4000
 _PROC = Path("/proc")
 
@@ -99,6 +113,48 @@ def stem_mtime(base: Path, stem: str) -> float | None:
         if latest is None or mtime > latest:
             latest = mtime
     return latest
+
+
+def log_names_near(base: Path, started_at: float, window: float = LOG_START_WINDOW_SEC) -> list[str]:
+    """``log/cli-*.log`` whose name (agy's local start time) is within ``window`` of ``started_at``."""
+    out: list[str] = []
+    try:
+        entries = list(os.scandir(base / "log"))[:_MAX_ENTRIES]
+    except OSError:
+        return out
+    for entry in entries:
+        match = _LOG_NAME_RE.match(entry.name)
+        if not match:
+            continue
+        try:
+            stamp = time.mktime(time.strptime(match.group(1), "%Y%m%d_%H%M%S"))
+        except (ValueError, OverflowError):
+            continue
+        # Names have one-second resolution; allow the truncated second too.
+        if started_at - window - 1.0 <= stamp <= started_at + window:
+            out.append("log/" + entry.name)
+    return sorted(out)
+
+
+def birth_time(base: Path, stem: str) -> float | None:
+    """Creation time of a conversation where the OS records one (Windows, macOS)."""
+    best: float | None = None
+    try:
+        entries = list(os.scandir(base / "conversations"))[:_MAX_ENTRIES]
+    except OSError:
+        entries = []
+    paths = [Path(e.path) for e in entries if e.name.split(".", 1)[0] == stem] + [base / "brain" / stem]
+    for path in paths:
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        born = getattr(st, "st_birthtime", None)
+        if born is None and os.name == "nt":
+            born = st.st_ctime  # creation time on Windows
+        if isinstance(born, (int, float)) and (best is None or born < best):
+            best = float(born)
+    return best
 
 
 def fd_scan_available() -> bool:
@@ -193,14 +249,39 @@ class SessionAttributor:
                     claimed.append(stem)
                     rec["_session_attribution"] = "open_handle"
         reason = ""
+        started = rec.get("started_at")
+        started_at = float(started) if isinstance(started, (int, float)) and not isinstance(started, bool) else None
+        if not claimed and started_at is not None:
+            logs = [n for n in log_names_near(base, started_at) if self._owner(home, n) in (None, run_id)]
+            if len(logs) == 1 and self._claim(home, logs[0], run_id):
+                claimed.append(logs[0])
+                rec["_session_attribution"] = "log_start_time"
+            elif len(logs) > 1:
+                reason = f"ambiguous: {len(logs)} agy logs started within {LOG_START_WINDOW_SEC:g}s of this run"
         if not claimed:
             baseline = set(rec.get("_session_baseline") or [])
-            fresh = sorted(
-                s for s in list_stems(base) if s not in baseline and self._owner(home, s) in (None, run_id)
-            )
+            seen = rec.setdefault("_session_first_seen", {})
+            now = time.time()
+            fresh = []
+            for s in sorted(list_stems(base)):
+                if s in baseline or self._owner(home, s) not in (None, run_id):
+                    continue
+                born = birth_time(base, s)
+                first = seen.setdefault(s, now)
+                created = born if born is not None else first
+                if started_at is not None and not (started_at - 1.0 <= created <= started_at + NEW_FILE_WINDOW_SEC):
+                    continue  # appeared too long after this run started to be its own
+                fresh.append(s)
+            if len(seen) > 64:
+                for key in list(seen)[:-64]:
+                    seen.pop(key, None)
             held_note = " and none is held open by this run" if self.fd_scan else ""
-            if not fresh:
-                reason = "no session file created since this run started" + held_note
+            if reason:
+                pass  # ambiguous logs already explained
+            elif not fresh:
+                reason = (
+                    f"no session file created within {NEW_FILE_WINDOW_SEC:g}s of this run's start" + held_note
+                )
             elif runs_sharing_home > 1:
                 reason = (
                     f"ambiguous: {runs_sharing_home} runs of this service share this HOME" + held_note
@@ -222,7 +303,21 @@ class SessionAttributor:
         note = {"used": latest is not None, "attribution": str(rec.get("_session_attribution") or "none")}
         if latest is None:
             note["reason"] = "claimed session files are gone"
+        check = rec.get("_session_claim_check")
+        if check in {"match", "mismatch"}:
+            note["verified"] = check
         return latest, note
+
+    @staticmethod
+    def check_conversation(rec: dict[str, Any], conversation_id: str) -> str | None:
+        """Compare the claim with agy's reported conversation id (end of run)."""
+        conv = str(conversation_id or "").strip()
+        stems = [s for s in rec.get("_session_stems") or [] if not str(s).startswith("log/")]
+        if not conv or not stems:
+            return None
+        result = "match" if conv in stems else "mismatch"
+        rec["_session_claim_check"] = result
+        return result
 
 
 __all__ = ["SessionAttributor", "session_base", "stem_of", "list_stems", "stem_mtime", "fd_scan_available"]

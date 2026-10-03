@@ -178,11 +178,11 @@ class TestDeepSeekDecideSim(unittest.TestCase):
 
         def fake_run(cmd, **kwargs):
             captured["cmd"] = cmd
-            captured["input"] = kwargs.get("input")
+            captured["input"] = kwargs.get("input_text")
             return _Proc(stdout=json.dumps(body))
 
         ad = DeepSeekHarnessLeadAdapter(bin_path="/bin/echo")
-        with mock.patch("lead_adapter.deepseek_harness.subprocess.run", fake_run):
+        with mock.patch("lead_adapter.deepseek_harness.run_cancellable", fake_run):
             raw, parsed = ad.decide(
                 req, schema=lead_permission_response_schema(), cwd="/tmp"
             )
@@ -212,7 +212,7 @@ class TestDeepSeekDecideSim(unittest.TestCase):
             return _Proc(stdout=json.dumps(body))
 
         ad = DeepSeekHarnessLeadAdapter(bin_path="/bin/echo")
-        with mock.patch("lead_adapter.deepseek_harness.subprocess.run", fake_run):
+        with mock.patch("lead_adapter.deepseek_harness.run_cancellable", fake_run):
             raw, parsed = ad.decide(
                 req, schema=lead_review_response_schema(), cwd="/tmp"
             )
@@ -227,7 +227,7 @@ class TestDeepSeekDecideSim(unittest.TestCase):
             return _Proc(stdout="not-json {{{", returncode=0)
 
         ad = DeepSeekHarnessLeadAdapter(bin_path="/bin/echo")
-        with mock.patch("lead_adapter.deepseek_harness.subprocess.run", fake_run):
+        with mock.patch("lead_adapter.deepseek_harness.run_cancellable", fake_run):
             raw, parsed = ad.decide(
                 req, schema=lead_permission_response_schema(), cwd="/tmp"
             )
@@ -243,7 +243,7 @@ class TestDeepSeekDecideSim(unittest.TestCase):
             raise subprocess.TimeoutExpired(cmd=cmd, timeout=1)
 
         ad = DeepSeekHarnessLeadAdapter(bin_path="/bin/echo")
-        with mock.patch("lead_adapter.deepseek_harness.subprocess.run", fake_run):
+        with mock.patch("lead_adapter.deepseek_harness.run_cancellable", fake_run):
             raw, parsed = ad.decide(
                 req, schema=lead_review_response_schema(), cwd="/tmp", timeout_sec=1
             )
@@ -261,7 +261,7 @@ class TestDeepSeekDecideSim(unittest.TestCase):
             raise OSError("no such file")
 
         ad = DeepSeekHarnessLeadAdapter(bin_path="/no/such/deepseek-wrapper")
-        with mock.patch("lead_adapter.deepseek_harness.subprocess.run", fake_run):
+        with mock.patch("lead_adapter.deepseek_harness.run_cancellable", fake_run):
             raw, parsed = ad.decide(
                 req, schema=lead_permission_response_schema(), cwd="/tmp"
             )
@@ -278,7 +278,7 @@ class TestDeepSeekDecideSim(unittest.TestCase):
             return _Proc(stdout="", stderr="harness exploded", returncode=2)
 
         ad = DeepSeekHarnessLeadAdapter(bin_path="/bin/echo")
-        with mock.patch("lead_adapter.deepseek_harness.subprocess.run", fake_run):
+        with mock.patch("lead_adapter.deepseek_harness.run_cancellable", fake_run):
             raw, parsed = ad.decide(
                 req, schema=lead_permission_response_schema(), cwd="/tmp"
             )
@@ -296,7 +296,7 @@ class TestDeepSeekDecideSim(unittest.TestCase):
             return _Proc(stdout=json.dumps(body))
 
         ad = DeepSeekHarnessLeadAdapter(bin_path="/bin/echo")
-        with mock.patch("lead_adapter.deepseek_harness.subprocess.run", fake_run):
+        with mock.patch("lead_adapter.deepseek_harness.run_cancellable", fake_run):
             raw, parsed = ad.decide(
                 req, schema=lead_permission_response_schema(), cwd="/tmp"
             )
@@ -313,7 +313,7 @@ class TestDeepSeekDecideSim(unittest.TestCase):
             return _Proc(stdout=json.dumps(body))
 
         ad = DeepSeekHarnessLeadAdapter(bin_path="/bin/echo")
-        with mock.patch("lead_adapter.deepseek_harness.subprocess.run", fake_run):
+        with mock.patch("lead_adapter.deepseek_harness.run_cancellable", fake_run):
             raw, parsed = ad.decide(
                 req, schema=lead_review_response_schema(), cwd="/tmp"
             )
@@ -326,12 +326,12 @@ class TestDeepSeekDecideSim(unittest.TestCase):
         captured = {}
 
         def fake_run(cmd, **kwargs):
-            captured["input"] = kwargs.get("input")
+            captured["input"] = kwargs.get("input_text")
             return _Proc(stdout=json.dumps(_ok_review(req)))
 
         ad = DeepSeekHarnessLeadAdapter(bin_path="/bin/echo")
         schema = lead_review_response_schema()
-        with mock.patch("lead_adapter.deepseek_harness.subprocess.run", fake_run):
+        with mock.patch("lead_adapter.deepseek_harness.run_cancellable", fake_run):
             ad.decide(req, schema=schema, cwd="/tmp")
         expected = pin_lead_response_schema(schema, req)
         got = json.loads(captured["input"])["schema"]
@@ -350,7 +350,7 @@ class TestDeepSeekDecideSim(unittest.TestCase):
 
         def fake_run(cmd, **kwargs):
             captured["cmd"] = cmd
-            captured["input"] = kwargs.get("input")
+            captured["input"] = kwargs.get("input_text")
             idx = cmd.index("--request-file")
             captured["path"] = cmd[idx + 1]
             captured["exists_during_run"] = os.path.isfile(captured["path"])
@@ -358,7 +358,7 @@ class TestDeepSeekDecideSim(unittest.TestCase):
             return _Proc(stdout=json.dumps(body))
 
         ad = DeepSeekHarnessLeadAdapter(bin_path="/bin/echo", io_mode="file")
-        with mock.patch("lead_adapter.deepseek_harness.subprocess.run", fake_run):
+        with mock.patch("lead_adapter.deepseek_harness.run_cancellable", fake_run):
             raw, parsed = ad.decide(
                 req, schema=lead_permission_response_schema(), cwd="/tmp"
             )

@@ -525,7 +525,8 @@ class TestLiveGrokEchoAndUnwrap(unittest.TestCase):
             return P()
 
         ad = GrokCliLeadAdapter(bin_path="/bin/echo")
-        with mock.patch("lead_adapter.grok_cli.subprocess.run", fake_run):
+        # Decisions go through the process-group seam (run_cancellable).
+        with mock.patch("lead_adapter.grok_cli.run_cancellable", fake_run):
             ad.decide(req, schema=lead_review_response_schema(), cwd="/tmp")
         self.assertEqual(
             captured["schema"]["properties"]["application_id"]["const"],

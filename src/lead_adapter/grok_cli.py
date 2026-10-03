@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from lead_adapter.base import LeadAdapterABC, safe_failure
-from lead_adapter.cancel import LeadCancelled, current_scope, run_cancellable
+from lead_adapter.cancel import LeadCancelled, run_cancellable
 from lead_adapter.schema import format_lead_request_prompt, pin_lead_response_schema
 
 LEGACY_LINUX_LEAD_BIN = "/workspace/run-grok.sh"
@@ -148,19 +148,9 @@ class GrokCliLeadAdapter(LeadAdapterABC):
         ]
         # Intentionally NO retry that drops --disallowed-tools (条3: delete that degradation).
         try:
-            if current_scope() is not None:
-                # Planner thread: own process group + cancel scope, so a
-                # cancelled Goal stops the whole lead tree right away.
-                proc = run_cancellable(cmd, timeout=float(timeout_sec))
-            else:
-                proc = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=float(timeout_sec),
-                )
+            # Own process group (planning and permission/review decisions):
+            # timeout or a cancelled Goal stops the whole lead tree.
+            proc = run_cancellable(cmd, timeout=float(timeout_sec))
         except LeadCancelled as exc:
             return safe_failure("call_failed", f"grok_cli stopped: {exc}")
         except subprocess.TimeoutExpired:

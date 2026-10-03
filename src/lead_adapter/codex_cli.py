@@ -27,7 +27,14 @@ from pathlib import Path
 from typing import Any
 
 from lead_adapter.base import LeadAdapterABC, safe_failure
-from lead_adapter.cancel import LeadCancelled, communicate as _cancellable_communicate, current_scope
+from lead_adapter.cancel import (
+    LeadCancelled,
+    communicate as _cancellable_communicate,
+    current_scope,
+    register_process,
+    unregister_process,
+)
+from platform_services import win_job
 from lead_adapter.schema import format_lead_request_prompt, pin_lead_response_schema
 
 # codex-cli 0.155.0 on DESKTOP-TBB531F. Documentation / error hint only.
@@ -390,6 +397,7 @@ def _read_last_message(path: str) -> str | None:
 def _kill_process_tree(proc: subprocess.Popen, platform: str) -> None:
     """Kill the lead process and its children. Never raise."""
     if str(platform).startswith("win"):
+        win_job.terminate(proc)
         try:
             subprocess.run(
                 ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
@@ -575,16 +583,16 @@ class CodexCliLeadAdapter(LeadAdapterABC):
             )
 
         scope = current_scope()
+        win_job.attach(proc, plat)
+        lead_key = register_process(proc)
         if scope is not None:
             scope.attach(proc, plat)
         try:
             try:
-                if scope is None:
-                    stdout, stderr = proc.communicate(input=prompt, timeout=timeout_sec)
-                else:
-                    stdout, stderr = _cancellable_communicate(
-                        proc, timeout=timeout_sec, input_text=prompt, platform=plat, scope=scope
-                    )
+                # Group-aware wait: timeout or a cancelled Goal stops the tree.
+                stdout, stderr = _cancellable_communicate(
+                    proc, timeout=timeout_sec, input_text=prompt, platform=plat, scope=scope
+                )
             except LeadCancelled as exc:
                 return safe_failure("call_failed", redact_secrets(f"codex_cli stopped: {exc}"))
             except subprocess.TimeoutExpired:
@@ -606,6 +614,8 @@ class CodexCliLeadAdapter(LeadAdapterABC):
         finally:
             if scope is not None:
                 scope.detach(proc)
+            unregister_process(lead_key)
+            win_job.close(proc)
 
         # Non-zero is never a decision, even if last.json / stdout is valid JSON.
         code = proc.returncode

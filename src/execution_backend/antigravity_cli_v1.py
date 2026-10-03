@@ -58,6 +58,7 @@ from framework.progress_budget import (
     utc_iso,
 )
 from framework import contract_render
+from platform_services import win_job
 
 _LOG = logging.getLogger(__name__)
 
@@ -303,6 +304,25 @@ def _status_ok(status: str | None, returncode: int | None) -> bool:
         return returncode in (0, None)
     return key in _OK_STATUS or key not in _FAIL_STATUS
 
+
+
+# Minimum descendant CPU growth per poll that counts as tool activity (#5 #10).
+# 5 ticks = 50 ms at USER_HZ=100: filters idle helper wakeups.
+TOOL_CPU_MIN_TICKS = 5
+
+
+def proc_cpu_ticks(pid: int) -> int | None:
+    """utime+stime of ``pid`` from /proc/<pid>/stat, or None (gone / not Linux)."""
+    try:
+        with open(f"/proc/{int(pid)}/stat", encoding="ascii", errors="replace") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    rest = raw.rsplit(")", 1)[-1].split()
+    try:
+        return int(rest[11]) + int(rest[12])
+    except (IndexError, ValueError):
+        return None
 
 class AntigravityCliExecutionBackend(ExecutionBackendABC):
     """Spawn `agy --print=` under the job directory. Ledger remains collab."""
@@ -660,6 +680,8 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             rec["harvested"] = True
             rec["path_errors"] = errors + [rec["assistant_error"]]
             return rec, self._start_payload(rec, ok=False)
+        # Windows: kill-on-close Job Object (no-op elsewhere; 未在 Win 实测).
+        win_job.attach(proc)
         rec["proc"] = proc
         return rec, None
 
@@ -771,6 +793,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         return killed or proc.poll() is not None
 
     def _kill_proc_tree_windows(self, proc: subprocess.Popen) -> bool:
+        win_job.terminate(proc)
         kwargs: dict[str, Any] = {
             "capture_output": True,
             "text": True,
@@ -874,6 +897,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             return
         # Child has exited; finish draining (already streaming, no communicate deadlock).
         self._stop_leftover_children(rec)
+        win_job.close(proc)
         self._forget_run(rec)
         self._join_drainers(rec, timeout=5.0)
         try:
@@ -908,6 +932,8 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             if conv:
                 rec["conversation_id"] = conv
                 self._runs[conv] = rec
+                if self._session.check_conversation(rec, conv) == "mismatch":
+                    _LOG.warning("agy session claim for run %s did not match its conversation", rec.get("run_id"))
             rec["response"] = parsed.get("response") if parsed.get("response") is not None else ""
             rec["usage"] = parsed.get("usage")
             status = parsed.get("status")
@@ -1080,6 +1106,25 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         del seen[:-64]
         return kids
 
+    @staticmethod
+    def _tool_cpu_delta(rec: dict[str, Any], kids: list[int]) -> int | None:
+        """CPU ticks (utime+stime) the worker's descendants used since the last poll.
+
+        Only tool processes under agy count, never agy itself, so a model that is
+        merely waiting does not look busy; a ``sleep`` uses no CPU and still goes
+        stale. Linux /proc only: None elsewhere (no signal, not an error).
+        """
+        now: dict[int, int] = {}
+        for pid in kids:
+            ticks = proc_cpu_ticks(pid)
+            if ticks is not None:
+                now[pid] = ticks
+        if not now and not os.path.isdir("/proc/self"):
+            return None
+        prev = rec.get("_tool_cpu_ticks") if isinstance(rec.get("_tool_cpu_ticks"), dict) else {}
+        rec["_tool_cpu_ticks"] = now
+        return sum(max(0, ticks - int(prev.get(pid, 0))) for pid, ticks in now.items())
+
     def _runner_progress(self, rec: dict[str, Any]) -> dict[str, Any]:
         """Activity-based heartbeat, byte counts, and workspace names. No stream text."""
         proc = rec.get("proc")
@@ -1125,13 +1170,23 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             signals["workspace"] = float(latest)
         if session_at is not None:
             signals["session"] = float(session_at)
+        cpu_note: dict[str, Any] | None = None
+        if alive and kids:
+            delta = self._tool_cpu_delta(rec, kids)
+            if delta is not None:
+                if delta >= TOOL_CPU_MIN_TICKS:
+                    rec["_tool_cpu_at"] = time.time()
+                cpu_note = {"used": delta >= TOOL_CPU_MIN_TICKS, "processes": len(kids)}
+        cpu_at = rec.get("_tool_cpu_at")
+        if isinstance(cpu_at, (int, float)) and not isinstance(cpu_at, bool):
+            signals["tool_cpu"] = float(cpu_at)
         progress_epoch = max(signals.values()) if signals else None
         hb_epoch = progress_epoch if progress_epoch is not None else started_at
         if progress_epoch is not None and started_at is not None:
             hb_epoch = max(progress_epoch, started_at)
         heartbeat = utc_iso(float(hb_epoch)) if hb_epoch is not None else None
-        if alive and phase == "starting" and session_at is not None:
-            phase = "executing"
+        if alive and phase == "starting" and (session_at is not None or "tool_cpu" in signals):
+            phase = "executing"  # session activity or a busy tool child means work started
         source_name = max(signals, key=signals.get) if signals else "none"
         events = [
             sanitize_event(f"phase {phase}"),
@@ -1151,7 +1206,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             "events": [item for item in events if item][:5],
             "source": "runner",
             "artifacts_checkpoint": entries,
-            "heartbeat_signals": {"session": session_note},
+            "heartbeat_signals": {"session": session_note, **({"tool_cpu": cpu_note} if cpu_note else {})},
         }
 
     def collect_result(self, run_id: str) -> dict[str, Any]:
