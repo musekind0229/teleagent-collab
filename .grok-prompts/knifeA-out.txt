@@ -1,8 +1,0 @@
-我先看 `cmd_wait`、现有单测和两份文档，只改你点名的文件，让 wait 在需要人工决策时立刻以退出码 4 返回。`cmd_wait` 目前只认终态，待决策会一直轮询到超时。接下来会加上退出码 4，并在第一次看到需要人工决策时立刻返回。`wait` 遇到待人工决策会立刻以退出码 4 返回，不再轮询到超时。`cd src && python3 -m unittest test_hermes_collab_request -v` 共 17 项全部通过（环境里没有 `python` 命令，用的是 `python3`）。
-
-改动：
-
-- **`bin/hermes-collab-request.py`**：退出码常量 `EXIT_OK/ERROR/FAILED/TIMEOUT/NEED_HUMAN`（0–4）。新增 `need_human_view`。`cmd_wait` 在终态判断之后检查待决策；`pending_decisions`、`awaiting_decision` / `pending_decision_count>0`、任务 `awaiting_decision` 都会带 `code=need_human` 退出。后两种若没有决策行，会再 GET 一次 `/decisions`（失败忽略）。`completed` → 0、`failed`/`cancelled` → 2、超时 → 3 不变，终态优先于待决策。
-- **`src/test_hermes_collab_request.py`**：覆盖 exit 4 的三种 reason、`/decisions` 成功与 HTTP 500、任务 `task_ids`、先 running 再 completed、completed 但带决策行仍 exit 0，以及 summary 截断/回退。
-- **`docs/hermes-collab-min-client.zh-CN.md`**：`wait` 退出码表和 exit 4 的 JSON 形状。
-- **`integrations/hermes/skills/teleagent-collab/SKILL.md`**：退出码增加 4；exit 4 时转述 `request_id`、`wait.reason`、`decision_ids` 和每条 summary，禁止自己批准或拒绝。version `0.2.0`。

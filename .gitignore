@@ -49,3 +49,8 @@ jobs/agy_account_pool.json
 windows/local/
 # local installer cache; never commit vendor binaries
 .downloads/
+
+# local scratch (never commit)
+.grok-prompts/
+logs/
+jobs/p2-st-reinstall.charter.yaml
