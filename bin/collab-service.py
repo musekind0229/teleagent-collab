@@ -213,6 +213,10 @@ def _use_linux_readiness(args) -> bool:
     return sys.platform.startswith("linux")
 
 
+def _uses_agy_backend(args) -> bool:
+    return str(getattr(args, "backend", "") or "") in ("antigravity", "agy")
+
+
 def _emit_json(payload) -> None:
     if hasattr(sys.stdout, "reconfigure"):
         try:
@@ -367,7 +371,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "read-only daily gate: GUI doctor plus /session/status occupancy "
             "and lock-holder metadata. Exit 0 only when ready and "
-            "dispatch_allowed. On Linux (or --backend teleagent-linux) this is "
+            "dispatch_allowed. With --backend antigravity/agy this is the agy gate "
+            "(agy binary, version, signed-in account via `agy models`, running tip). "
+            "Otherwise on Linux (or --backend teleagent-linux) this is "
             "assess_linux_gui_readiness; otherwise the Windows gate. "
             "Does not start the HTTP service, stdin_wrap, a session, or the desktop lock"
         ),
@@ -435,6 +441,14 @@ def main(argv: list[str] | None = None) -> int:
         row = record_exit(Path(args.persist).resolve())
         print(f"recorded service exit: result={row.get('service_result')}", file=sys.stderr, flush=True)
         return 0
+
+    if args.ready and _uses_agy_backend(args):
+        # agy workers need agy itself, not TeleAgent :4399 / GUI credentials.
+        from framework.agy_ready import assess_agy_readiness
+
+        result = assess_agy_readiness(tip_path=Path(args.persist).resolve() / "running_tip.json")
+        _emit_json(result)
+        return 0 if result.get("ready") and result.get("dispatch_allowed") else 1
 
     linux_ready = _use_linux_readiness(args)
     if args.ready or (args.check_gui and linux_ready):
