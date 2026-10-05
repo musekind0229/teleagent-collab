@@ -63,6 +63,58 @@ def classify_login(returncode: int | None, output: str) -> dict[str, str]:
     return {"state": "unknown", "detail": _short(output) or f"agy models exit={returncode}"}
 
 
+def _assess_pool_logins(
+    agy: str,
+    env: Mapping[str, str],
+    pool_file: str,
+    run: Runner,
+    timeout: float,
+) -> tuple[dict[str, str], list[dict[str, Any]], dict[str, Any]]:
+    """Probe ``agy models`` for every ``available`` pool account (its own HOME/environ).
+
+    Ready when at least one available account is signed in. Accounts in other
+    states are listed but not probed (busy = a run holds that HOME).
+    """
+    from execution_backend.agy_account_pool import account_environ, load_pool
+
+    try:
+        pool = load_pool(pool_file)
+    except Exception as exc:  # noqa: BLE001 - report, do not crash the gate
+        detail = f"account pool unreadable ({type(exc).__name__}: {_short(str(exc), 160)})"
+        login = {"state": "unknown", "detail": detail}
+        return login, [], _check(
+            "agy_account_pool", False, blocks=True, detail=detail,
+            next_step=f"fix the pool JSON at {pool_file}", code="pool_unreadable",
+        )
+    rows: list[dict[str, Any]] = []
+    for acc in pool.accounts:
+        row: dict[str, Any] = {"id": acc.id, "home": acc.home, "state": acc.state}
+        if acc.state == "available":
+            rc, out = run([agy, "models"], account_environ(acc, env, pool=pool), timeout)
+            probe = classify_login(rc, out)
+            row["login"] = probe["state"]
+            if probe["state"] != "logged_in":
+                row["detail"] = probe["detail"]
+        else:
+            row["login"] = "not_checked"
+        rows.append(row)
+    ok_ids = [r["id"] for r in rows if r.get("login") == "logged_in"]
+    summary = ", ".join(f"{r['id']}={r['login'] if r['state'] == 'available' else r['state']}" for r in rows) or "no accounts"
+    if ok_ids:
+        login = {"state": "logged_in", "detail": f"pool: {len(ok_ids)} signed-in available account(s) ({summary})"}
+    elif any(r.get("login") == "not_logged_in" for r in rows):
+        login = {"state": "not_logged_in", "detail": f"no available pool account is signed in ({summary})"}
+    else:
+        login = {"state": "unknown", "detail": f"no available pool account could be confirmed ({summary})"}
+    pool_check = _check(
+        "agy_account_pool",
+        True,
+        blocks=False,
+        detail=f"{pool_file}: {len(rows)} account(s), {sum(r['state'] == 'available' for r in rows)} available; {summary}",
+    )
+    return login, rows, pool_check
+
+
 def assess_agy_readiness(
     *,
     environ: Mapping[str, str] | None = None,
@@ -74,6 +126,7 @@ def assess_agy_readiness(
     running_tip_fn: Callable[[], Any] | None = None,
     head_tip_fn: Callable[[], Any] | None = None,
     timeout: float = 30.0,
+    pool_path: str | Path | None = None,
 ) -> dict[str, Any]:
     from execution_backend.antigravity_cli_v1 import resolve_agy_bin
     from framework.app_service import assess_tip_consistency, tip_mismatch_lines
@@ -100,6 +153,10 @@ def assess_agy_readiness(
 
     version = ""
     login = {"state": "unknown", "detail": "agy binary missing"}
+    accounts: list[dict[str, Any]] = []
+    from execution_backend.agy_account_pool import resolve_pool_path
+
+    pool_file = resolve_pool_path(explicit=pool_path, environ=env)
     if bin_ok:
         rc, out = run([resolved, "--version"], env, 15.0)
         version = _short(out, 80) if rc == 0 else ""
@@ -112,8 +169,13 @@ def assess_agy_readiness(
                 code="" if rc == 0 else "agy_version_failed",
             )
         )
-        rc, out = run([resolved, "models"], env, float(timeout))
-        login = classify_login(rc, out)
+        if pool_file:
+            # Dispatch uses the pool HOMEs, never this process's HOME.
+            login, accounts, pool_check = _assess_pool_logins(resolved, env, pool_file, run, float(timeout))
+            checks.append(pool_check)
+        else:
+            rc, out = run([resolved, "models"], env, float(timeout))
+            login = classify_login(rc, out)
     logged_in = login["state"] == "logged_in"
     if bin_ok:
         step = "" if logged_in else (LOGIN_STEP if login["state"] == "not_logged_in" else "run `agy models` as the service user and check the error")
@@ -125,16 +187,6 @@ def assess_agy_readiness(
                 detail=f"{login['state']}: {login['detail']}" if not logged_in else login["detail"],
                 next_step=step,
                 code="" if logged_in else ("not_logged_in" if login["state"] == "not_logged_in" else "login_unknown"),
-            )
-        )
-    pool = str(env.get("COLLAB_AGY_ACCOUNT_POOL") or "").strip()
-    if pool:
-        checks.append(
-            _check(
-                "agy_account_pool",
-                True,
-                blocks=False,
-                detail="account pool configured; login above is for this process HOME only, each pool HOME signs in separately",
             )
         )
 
@@ -174,7 +226,8 @@ def assess_agy_readiness(
         "ready": dispatch_allowed,
         "dispatch_allowed": dispatch_allowed,
         "backend": "antigravity.cli_v1",
-        "agy": {"bin": resolved or agy, "version": version, "login": login["state"]},
+        "agy": {"bin": resolved or agy, "version": version, "login": login["state"], "pool": pool_file or ""},
+        "accounts": accounts,
         "tip_ok": bool(tip["ok"]),
         "running_tip": tip["running_tip"],
         "head_tip": tip["head_tip"],

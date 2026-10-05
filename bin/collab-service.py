@@ -446,7 +446,10 @@ def main(argv: list[str] | None = None) -> int:
         # agy workers need agy itself, not TeleAgent :4399 / GUI credentials.
         from framework.agy_ready import assess_agy_readiness
 
-        result = assess_agy_readiness(tip_path=Path(args.persist).resolve() / "running_tip.json")
+        result = assess_agy_readiness(
+            tip_path=Path(args.persist).resolve() / "running_tip.json",
+            pool_path=args.agy_account_pool or None,
+        )
         _emit_json(result)
         return 0 if result.get("ready") and result.get("dispatch_allowed") else 1
 
