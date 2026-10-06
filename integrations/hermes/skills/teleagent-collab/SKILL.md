@@ -1,7 +1,7 @@
 ---
 name: teleagent-collab
 description: "Delegate work to local collab-service workers (agy/antigravity pool) via bin/hermes-collab-request.py: open, wait, report. Use when the user asks to have 'the worker'/'collab'/'agy' do a task or produce a file."
-version: 0.2.18
+version: 0.2.19
 author: teleagent-collab
 license: MIT
 platforms: [windows, linux, macos]
@@ -97,6 +97,7 @@ collab-service 是本机常驻的派工服务（Application API，默认 `http:/
 - `isolation.prompt_constraints` / 合同里的 must、must_not **不是**操作系统沙箱。`isolation.os_sandbox` 当前为 false。
 - 任务会碰到私人或敏感数据时停下，把上述字段告诉用户。只有用户/操作者明确接受降级时才继续，开单加 `--ack-prompt-only-inputs`。不要自己设 `AGY_AUTO_APPROVE`。
 - `--require-capability NAME` 可重复（例如 `permission_gate`、`no_skip_permissions`）。服务不满足则退出码 1，`code=capability_unavailable`，stdout 有 `missing`。不要改口重试把要求拿掉，除非用户同意。
+- 换模型：只有用户点名要某个模型时才加 `--model NAME`（例如 `claude-opus-4-6-thinking`），只影响这一单。名字必须在 `ping` 的 `capabilities.models.known` 里；不在则退出码 1、`code=unknown_model`、stdout 有 `known_models`：把列表告诉用户，让用户选，不要自己挑一个相近的重开。没有 Claude Opus 5.5 这类列表外的模型。不加 `--model` 就是服务默认（`capabilities.models.default`）。不要去改服务的 `AGY_MODEL`。
 - agy 上**没有组长技术评审**（#15）：`acceptance_status.technical_review=not_available`，组长只出计划。文件在不在、字面核对、污染扫描都不是技术评审。需要评审时按分阶段交付另开一单，或交给人；不要说「组长已审」。
 - 任务 `review.status` 为 `unsupported` 时，**不要**说审查已通过。验收文本没有被独立核对；文件在不在是另一件事。`passed` 才是真有检查并且过了，`failed` 是没过。
 

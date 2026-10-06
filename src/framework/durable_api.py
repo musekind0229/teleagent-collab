@@ -692,6 +692,7 @@ def _default_goal_body(
         "forbidden_tools",
         "external_inputs",
         "input_manifest",
+        "model",
     ):
         if extra_key in src:
             body[extra_key] = src[extra_key]

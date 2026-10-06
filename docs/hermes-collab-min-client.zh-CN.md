@@ -28,6 +28,7 @@ HTTP 401/403 的 stdout JSON 带 `auth.token_source`（`env` / `dotenv` / `none`
 python bin/hermes-collab-request.py ping
 python bin/hermes-collab-request.py open --goal "…" [--title …] [--backend antigravity|teleagent-windows]
 python bin/hermes-collab-request.py open --goal "…" --require-capability NAME   # 可重复
+python bin/hermes-collab-request.py open --goal "…" --model claude-opus-4-6-thinking   # 只这一单换模型
 python bin/hermes-collab-request.py open --goal "…" --external-input PATH --ack-prompt-only-inputs
 python bin/hermes-collab-request.py open --goal "…" --external-input PATH   # 可重复，与快照合计算最多 8 个
 python bin/hermes-collab-request.py open --goal "…" --input-manifest manifest.json
@@ -51,6 +52,7 @@ python bin/hermes-collab-request.py decide <request_id> <decision_id> --verdict 
 - `--file-snapshot FILE` 只复制打开时 `stat` 到的前缀（避免追加写把快照撕开）。`.jsonl` 会丢掉末尾不完整的一行。钉的是副本，`metadata.kind=file_snapshot`。
 - 快照留在本机，成功或失败的 stdout 在 `snapshots` 里给出路径，由调用方删除。`snapshots-clean` 只删除快照根目录下、修改时间早于 N 小时（默认 24）的子目录，不跟着符号链接出去删。
 - `--require-capability NAME` 可重复，写入 `required_capabilities`。服务不满足时 HTTP 409，`code=capability_unavailable`，stdout 带 `missing`（以及能力快照），退出码 **1**（不是 `decide` 的 5）。未知名字是 400 `invalid_request`，同样退出码 1。两种都不会建 Goal。
+- `--model NAME` 写入 `model`：只这一张单用这个工人模型（agy），不改服务默认（`AGY_MODEL`）。可选名字看 `ping` 输出里的 `capabilities.models.known`（`default` 是服务默认）。名字不在列表里：HTTP 400，`code=unknown_model`，stdout 带 `known_models`，退出码 **1**，不建 Goal。非 agy 后端带 `--model`：409 `capability_unavailable`，`missing=["model_selection"]`。跑完后 status 里 Task 的 `result.model`（`--full`）是实际用的模型。
 - `--ack-prompt-only-inputs` 写入 `acknowledge_prompt_only_inputs: true`。只用于操作者承认「钉住的外部输入在 skip-permissions 后端上只是提示词」。它不满足显式的 `--require-capability external_input_enforcement`。
 - 预算旗标：`--wall-sec`（默认 300）、`--max-reworks`（默认 1）、`--max-tokens`、`--max-tool-calls`、`--no-progress-sec`、`--on-no-progress checkpoint|fail`、`--budget-report-only`。没写的可选项不会出现在请求里。后端 `budget_enforcement` 为 `unsupported` 的字段会被 409 拒绝（`missing` 含 `budget:<字段>`），除非加了 `--budget-report-only`。`post_hoc` 可以提交，但跑完才核对，中途停不了。用量数字是工人自报，**不是账单**。
 - 检查点决策（`kind=checkpoint`）表示停下来问用户：`continue` 或 `stop`。不要自己选 continue，也不要因为没进度就重新 open。`continue` 会计入 `max_reworks`。

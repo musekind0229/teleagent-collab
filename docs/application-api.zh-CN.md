@@ -172,6 +172,7 @@ TeleAgent `review` 若产物自带 `contamination.contaminated`，投影出的�
 | `isolation.prompt_constraints` | true 只表示合同文本里有约束，**不是**操作系统沙箱 |
 | `skip_permissions` | bool 或 `unknown`。agy 上等于本后端环境里 `agy_auto_approve_enabled(charter=None)`（`AGY_AUTO_APPROVE` / `COLLAB_AGY_AUTO_APPROVE`） |
 | `resume` | bool 或 `unknown`。监督后端为 true（同一 state 目录上 `Engine.tick` 能续跑；TeleAgent 实例变了会 fail-closed）。agy / inprocess 句柄只在本进程内存，为 false |
+| `models` | 仅 agy（2026-10-06 起）：`{selectable, default, known, source, checked_at}`。`default` 是服务默认模型（`AGY_MODEL`，未设时内置 `gemini-3.8-flash-low`）；`known` 是可用于 Goal `model` 的模型 id；`source` 为 `agy_models`（服务启动后在后台用池里账号的 HOME 跑 `agy models`，30 分钟刷新，失败保留上次结果）或 `builtin`（还没拿到 / 一直拿不到时用的内置列表）；`checked_at` 是上次成功刷新的 UTC 时间。其它后端没有此字段（= 不能按 Goal 选模型） |
 | `acceptance.artifact_presence` | 文件在不在。当前实现为 true |
 | `acceptance.exact_content` | 能否核对「path must contain exactly BODY」。只有 agy 门禁为 true |
 
@@ -236,6 +237,18 @@ TeleAgent `review` 若产物自带 `contamination.contaminated`，投影出的�
 工人合同里的 `input_files` 只增加这些工作区内的相对路径（提示词会列出它们）。这不是把 manifest root 加进外部读取权限。哈希不能当成隔离。
 
 活动 SQLite 与还在增长的 JSONL 由**客户端**做一致快照后再钉成 `external_inputs`（仍受最多 8 个的限制），不要把 db 和 `-wal`/`-shm` 当成一对外部输入。快照条目可以带 `metadata`：`kind` 为 `sqlite_snapshot` 或 `file_snapshot`，`source` 只有文件名，`taken_at` 为 UTC `YYYY-MM-DDTHH:MM:SSZ`。工人合同仍只抄 `path` 和 `sha256`。
+
+### 按 Goal 选模型（`model`，2026-10-06 起）
+
+`POST /v1/requests` 可选 `model`：工人模型 id，只对这一个 Goal 生效（它的所有 Task）。优先级：Goal 的 `model` > 服务环境 `AGY_MODEL` > 内置默认 `gemini-3.8-flash-low`。不改服务默认。
+
+- 不是字符串、空串、含空格或超过 80 字符 → **400** `invalid_request`。
+- 后端不能选模型（`GET /v1/capabilities` 没有 `models.selectable=true`，即非 agy）→ **409** `capability_unavailable`，`missing` 为 `["model_selection"]`。
+- 不在 `models.known` 里 → **400** `unknown_model`，`error` 写明 `unknown model '<名>'; known models: …`，响应另带 `known_models`、`models_source`、`default_model`。
+- 以上都在建 Goal 之前判，不占 idempotency key。`model` 进入 Goal 内容指纹：同一 key 换模型是 409。
+- 通过后 Goal 上记 `goal.model`，工人合同带 `agy_model`，agy 以 `--model=<名>` 启动；`GET /v1/requests/{id}` 里 Task 的 `result.model` 是这次 run 实际用的模型（默认模型的 run 也有）。
+
+模型列表来自 `agy models`，不是硬编码承诺：账号能用哪些模型以 `known` 为准。改服务默认：改 `/etc/teleagent-collab/collab-service.env` 的 `AGY_MODEL=` 后重启服务。
 
 ### 调用方要求的能力
 
@@ -383,7 +396,7 @@ agy 后端把每个 worker 的 pid、进程组、启动时间令牌（防 pid �
 | --- | --- | --- |
 | `GET` | `/health` | 健康检查。另含 `backend` id 与 `planner` name，无密钥 |
 | `GET` | `/v1/capabilities` | 本进程能力快照（要登录，与其它 `/v1` 相同） |
-| `POST` | `/v1/requests` | 提交高层目标。可选 `required_capabilities`、`acknowledge_prompt_only_inputs` |
+| `POST` | `/v1/requests` | 提交高层目标。可选 `model`、`required_capabilities`、`acknowledge_prompt_only_inputs` |
 | `GET` | `/v1/requests` | 列出请求摘要 |
 | `GET` | `/v1/requests/{id}` | 查询 Goal、Task、待决定、失败信息、`warnings`、`capabilities_ref`、`scheduler` |
 | `GET` | `/v1/requests/{id}/events` | 查询持久化事件 |（与 status 对齐露出 pending_decisions）

@@ -529,6 +529,14 @@ def main(argv: list[str] | None = None) -> int:
     token = (os.environ.get(args.token_env) or "").strip()
     server = CollabHttpServer((args.host, args.port), app, api_token=token)
     write_running_tip(persist / "running_tip.json")
+    # agy: refresh GET /v1/capabilities models.known from `agy models` in the
+    # background (built-in list until then); per-Goal `model` is checked against it.
+    enable_probe = getattr(app.coordinator.backend, "enable_model_probe", None)
+    if callable(enable_probe):
+        try:
+            enable_probe()
+        except Exception as exc:  # noqa: BLE001 - never block startup on the model list
+            print(f"agy model list probe unavailable: {type(exc).__name__}", file=sys.stderr, flush=True)
     loop = CoordinatorLoop(app)
     loop.start()
     auth = f"Bearer token required from {args.token_env}" if token else "loopback only; no bearer token configured"

@@ -40,6 +40,7 @@ from execution_backend.base import (
     default_capabilities,
     unsupported,
 )
+from execution_backend.agy_models import AgyModelCatalog, parse_agy_models_output
 from execution_backend.agy_session_attribution import SessionAttributor, session_base
 from execution_backend.agy_run_registry import (
     ENV_RUN_REGISTRY,
@@ -104,17 +105,22 @@ def resolve_agy_model(
     environ: Mapping[str, str] | None = None,
     charter: dict | None = None,
 ) -> str:
+    """Model for one spawn: per-Goal charter > explicit (constructor) > AGY_MODEL > default.
+
+    The charter is the per-Goal choice (``model`` on ``POST /v1/requests``,
+    rendered as ``agy_model``), so it must win over service-wide settings.
+    """
+    if isinstance(charter, dict):
+        for key in ("agy_model", "model"):
+            val = charter.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
     if explicit and str(explicit).strip():
         return str(explicit).strip()
     env = environ if environ is not None else os.environ
     raw = str(env.get("AGY_MODEL") or "").strip()
     if raw:
         return raw
-    if isinstance(charter, dict):
-        for key in ("agy_model", "model"):
-            val = charter.get(key)
-            if isinstance(val, str) and val.strip():
-                return val.strip()
     return DEFAULT_AGY_MODEL
 
 
@@ -388,7 +394,41 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         # The prompt-only warning holds with or without skip-permissions; the
         # status view shows it only on Goals that actually pin inputs.
         caps["warnings"] = [PROMPT_ONLY_INPUTS_WARNING] + ([SKIP_PERMISSIONS_WARNING] if skip else [])
+        known, source = self._model_catalog.known()
+        caps["models"] = {
+            "selectable": True,
+            "default": self.model,
+            "known": known,
+            "source": source,
+            "checked_at": self._model_catalog.checked_at(),
+        }
         return caps
+
+    # -- models ---------------------------------------------------------
+    def enable_model_probe(self) -> None:
+        """Service start: refresh the known-model list from ``agy models`` in the background."""
+        self._model_catalog.enable_auto_refresh()
+
+    def _probe_models(self) -> list[str] | None:
+        """``agy models`` under a pool account HOME (else the base env). None on failure."""
+        from framework.agy_ready import _run
+
+        env: Mapping[str, str] = self._base_env()
+        if self._account_pool_path:
+            try:
+                from execution_backend.agy_account_pool import account_environ, load_pool
+
+                pool = load_pool(self._account_pool_path)
+                ordered = sorted(pool.accounts, key=lambda a: 0 if a.state == "available" else 1)
+                if ordered:
+                    env = account_environ(ordered[0], self._base_env(), pool=pool)
+            except Exception as exc:  # noqa: BLE001
+                _LOG.warning("agy models probe: pool unreadable (%s)", type(exc).__name__)
+                return None
+        rc, out = _run([self.bin_path, "models"], env, 30.0)
+        if rc != 0:
+            return None
+        return parse_agy_models_output(out) or None
 
     # -- pool leases at start --------------------------------------------
     def _reclaim_pool_leases_at_start(self) -> list[dict[str, Any]]:
@@ -444,7 +484,12 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         self._persist_pool = bool(persist_pool)
         self._precheck = precheck
         self.bin_path = resolve_agy_bin(explicit=bin_path, environ=self._base_env())
-        self.model = resolve_agy_model(explicit=model, environ=self._base_env())
+        # Constructor override only. ``self.model`` is the service default
+        # (display / capabilities); each spawn resolves again so a per-Goal
+        # charter model is not shadowed by the value pinned here.
+        self._model_override = (str(model).strip() if model else "") or None
+        self.model = resolve_agy_model(explicit=self._model_override, environ=self._base_env())
+        self._model_catalog = AgyModelCatalog(probe=self._probe_models)
         self.timeout_sec = 300.0 if timeout_sec is None else float(timeout_sec)
         self.poll_sec = float(poll_sec)
         self._runs: dict[str, dict[str, Any]] = {}
@@ -620,7 +665,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         spawn_env = self._bind_pool_environ_for_dispatch()
 
         skip = agy_auto_approve_enabled(charter, spawn_env)
-        model = resolve_agy_model(explicit=self.model, environ=spawn_env, charter=charter)
+        model = resolve_agy_model(explicit=self._model_override, environ=spawn_env, charter=charter)
         cmd = build_agy_argv(
             bin_path=self.bin_path,
             model=model,
@@ -726,6 +771,8 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             "argv_flags": list(rec.get("argv_flags") or []),
             "contract_version": "contract.v0.1-draft",
         }
+        if rec.get("model"):
+            payload["model"] = str(rec["model"])
         profile = self._agy_profile(rec)
         if profile:
             payload["agy_profile"] = profile
@@ -1294,6 +1341,8 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
                 for k in ("activity", "finish_successful", "cancelled", "errored", "busy")
             },
         }
+        if rec.get("model"):
+            out["model"] = str(rec["model"])  # the --model= this run was spawned with
         profile = self._agy_profile(rec)
         if profile:
             out["agy_profile"] = profile

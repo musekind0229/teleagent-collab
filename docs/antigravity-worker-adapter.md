@@ -98,7 +98,7 @@ agy --output-format=json --model=gemini-3.8-flash-low --dangerously-skip-permiss
 | --- | --- |
 | `COLLAB_EXECUTION_BACKEND=antigravity.cli_v1` | 选工人（CLI `--backend` 优先） |
 | `AGY_BIN` | agy 可执行文件 |
-| `AGY_MODEL` | 模型，默认 `gemini-3.8-flash-low` |
+| `AGY_MODEL` | 服务默认模型，未设时内置 `gemini-3.8-flash-low`（mde 生产 2026-10-06 起设为 `gemini-3.8-flash-high`）。单个 Goal 可用 `POST /v1/requests` 的 `model`（客户端 `open --model`）覆盖，优先级 Goal > `AGY_MODEL` > 内置默认 |
 | `AGY_AUTO_APPROVE` / `COLLAB_AGY_AUTO_APPROVE` | 仅 `true` 时才加 `--dangerously-skip-permissions` |
 | `COLLAB_AGY_LIVE=1` | 打开可选 live smoke（单测默认 skip） |
 | `COLLAB_AGY_ACCOUNT_POOL` | 外围账号池 JSON；见 [agy-account-pool.md](./agy-account-pool.md) |

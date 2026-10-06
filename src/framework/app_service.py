@@ -244,6 +244,48 @@ def compose_capabilities(
     return caps
 
 
+def parse_requested_model(payload: Mapping[str, Any], caps: Mapping[str, Any]) -> str | None:
+    """Per-Goal worker model from ``POST /v1/requests`` ``model``. None when absent.
+
+    400 ``invalid_request`` for a non-string / malformed id, 409
+    ``capability_unavailable`` (missing ``model_selection``) on a backend that
+    cannot pick a model, 400 ``unknown_model`` (with ``known_models``) when the
+    backend's known list does not contain it. Checked before submit_goal, so a
+    refusal binds no idempotency key.
+    """
+    from execution_backend.agy_models import valid_model_id
+
+    if "model" not in payload or payload.get("model") is None:
+        return None
+    raw = payload.get("model")
+    if not valid_model_id(raw):
+        raise AppError(
+            "model must be a model id string such as gemini-3.8-flash-high "
+            "(letters, digits, . _ : -; at most 80 characters)",
+        )
+    model = str(raw)
+    models = caps.get("models") if isinstance(caps.get("models"), Mapping) else {}
+    if not models.get("selectable"):
+        raise AppError(
+            "this backend cannot select a worker model per Goal",
+            status=409,
+            code="capability_unavailable",
+            extra={"missing": ["model_selection"]},
+        )
+    known = [str(m) for m in (models.get("known") or []) if isinstance(m, str)]
+    if known and model not in known:
+        raise AppError(
+            f"unknown model {model!r}; known models: {', '.join(known)}",
+            code="unknown_model",
+            extra={
+                "known_models": known,
+                "models_source": str(models.get("source") or ""),
+                "default_model": str(models.get("default") or ""),
+            },
+        )
+    return model
+
+
 def parse_required_capabilities(payload: Mapping[str, Any]) -> list[str]:
     """Fixed vocabulary. Unknown names are ``invalid_request`` before any Goal exists."""
     if "required_capabilities" not in payload or payload.get("required_capabilities") is None:
@@ -627,6 +669,10 @@ def worker_charter_for_task(
             charter["external_inputs"] = pinned
     if allows_aigc_marks(goal_obj, task):
         charter["allow_aigc_marks"] = True
+    goal_model = goal_obj.get("model")
+    if isinstance(goal_model, str) and goal_model.strip():
+        # Per-Goal model choice; the agy backend spawns --model=<this>.
+        charter["agy_model"] = goal_model.strip()
     raw_inputs = (task.get("inputs") or {}).get("input_files") if isinstance(task.get("inputs"), Mapping) else None
     if isinstance(raw_inputs, list) and raw_inputs:
         names: list[str] = []
@@ -3687,6 +3733,7 @@ class CollabApplication:
         # Capability refusals happen before submit_goal so a 409 does not bind
         # the idempotency key or leave a Goal to dispatch.
         caps = self.capabilities()
+        requested_model = parse_requested_model(payload, caps)
         missing = unmet_capabilities(caps, required)
         if missing:
             raise AppError(
@@ -3722,6 +3769,8 @@ class CollabApplication:
         }
         if forbidden_tools:
             goal["forbidden_tools"] = forbidden_tools
+        if requested_model:
+            goal["model"] = requested_model
         if external_inputs:
             goal["external_inputs"] = external_inputs
         if input_manifest:
@@ -4488,6 +4537,7 @@ __all__ = [
     "project_external_inputs",
     "validate_plan",
     "worker_charter_for_task",
+    "parse_requested_model",
     "allows_aigc_marks",
     "gate_collected_artifacts",
     "review_contamination_summary",

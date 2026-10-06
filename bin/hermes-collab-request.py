@@ -440,6 +440,11 @@ def cmd_open(args: argparse.Namespace) -> dict[str, Any]:
         body["budget"]["budget_mode"] = "report_only"
     if args.idempotency_key:
         body["idempotency_key"] = args.idempotency_key
+    model = str(getattr(args, "model", "") or "").strip()
+    if model:
+        # Per-Goal worker model. The server checks it against
+        # GET /v1/capabilities models.known (400 unknown_model otherwise).
+        body["model"] = model
     # Backend is selected when collab-service starts. Optional flag is a
     # caller annotation only (server ignores unknown fields today).
     if args.backend:
@@ -2177,6 +2182,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="boundaries.must_not (repeatable)",
+    )
+    p_open.add_argument(
+        "--model",
+        default="",
+        help=(
+            "worker model for this Goal only (agy backend), e.g. claude-opus-4-6-thinking. "
+            "Default: the service's AGY_MODEL. Must be in GET /v1/capabilities models.known "
+            "(see `ping`); an unknown name exits 1 with code unknown_model and known_models"
+        ),
     )
     p_open.add_argument("--wall-sec", type=int, default=300, help="budget.wall_sec (enforced wall clock)")
     p_open.add_argument("--max-reworks", type=int, default=1, help="budget.max_reworks")
