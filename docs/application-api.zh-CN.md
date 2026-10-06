@@ -326,6 +326,8 @@ status 带 `phase_timeline`：Goal 的 `planning` 加每个 Task 的 `preparing`
 
 agy 后端把每个 worker 的 pid、进程组、启动时间令牌（防 pid 复用）、所属服务进程记在 `<persist>/agy-runs.json`（不记 argv / prompt / 环境）。服务收到 SIGTERM / Ctrl-C（Windows 还有 SIGBREAK）时先停掉还活着的 worker；被 `kill -9` 等方式直接杀掉时，下次启动会把上一个服务留下的 worker 整棵停掉：POSIX 杀 worker 的进程组、会话和后代，外加轮询时记下的子进程（agy 的 shell 工具命令在自己的进程组里，只杀 worker 的组会漏掉它；子进程按启动时间令牌校验后才会动；观测事件里有 `child_processes N`）；Windows 用 `taskkill /F /T /PID`。worker 正常退出但留下还在跑的工具子进程时，收结果时也会把它们停掉。pid 已被别的进程复用时不动它。这些 Task 的失败原因写明是哪种情况，例如 `backend resume failed: BackendError: agy run agy_… (pid N) belonged to a previous service process; its worker process tree was stopped when the service restarted. …`；工作区里已有的文件只是候选。仍然不会自动重派。
 
+**账号池租约（2026-10-06 起）**：服务启动时，在停掉孤儿 worker 之后，把池里 `busy` 但持有者已经不在的账号放回 `available`，不再一直占到 `lease_until`（以前 `kill -9` 后要等约一小时）。持有者不在 = `lease_pid` 已死，或该 pid 号的启动时间和租约里记的 `lease_proc_start` 不同（pid 被别的进程复用）；同时该 HOME 的租约文件锁必须空闲。活着的持有者不动；老租约没有 `lease_proc_start` 时只看 pid 是否活着（保守）。日志一行 `agy pool lease from dead holder reclaimed: account=… pid=… reason=pid_dead|pid_reused`。
+
 **Windows Job Object（2026-10-03 起，未在 Win 实测）**：Windows 上组长和 agy worker 启动后放进一个带 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Job Object，句柄由服务进程持有：服务无论怎么死，系统关句柄时会杀掉 Job 里的全部进程。主动停止时先 `TerminateJobObject`，再照旧 `taskkill /F /T /PID` 兜底。任一步失败都静默退回 taskkill。已知缺口：`Popen` 返回到加入 Job 之间派生的子进程不在 Job 里（Popen 不能挂起启动），所以 taskkill 仍然保留。只在 Linux 上用 mock 测过 kernel32 调用顺序。
 
 `start_run` 抛错时，任务结果的 `error` 是 `backend dispatch failed: <异常类型>: <脱敏后的短原因>`（原因最多 300 字）。异常信息为空时仍只写类型名，不留一个空的冒号。

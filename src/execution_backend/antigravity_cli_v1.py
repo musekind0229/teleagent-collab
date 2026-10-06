@@ -390,6 +390,23 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         caps["warnings"] = [PROMPT_ONLY_INPUTS_WARNING] + ([SKIP_PERMISSIONS_WARNING] if skip else [])
         return caps
 
+    # -- pool leases at start --------------------------------------------
+    def _reclaim_pool_leases_at_start(self) -> list[dict[str, Any]]:
+        """Free busy leases whose holder process is gone. Never raises."""
+        try:
+            from execution_backend.agy_account_pool import reclaim_pool_leases
+
+            rows = reclaim_pool_leases(self._account_pool_path or "", environ=self._base_env())
+        except Exception as exc:  # noqa: BLE001 - startup must not crash on pool bookkeeping
+            _LOG.warning("agy pool lease reclaim at start failed (%s)", type(exc).__name__)
+            return []
+        for row in rows:
+            _LOG.warning(
+                "agy pool lease from dead holder reclaimed: account=%s pid=%s reason=%s",
+                row.get("id"), row.get("lease_pid"), row.get("reason"),
+            )
+        return rows
+
     def _account_pool_run_limit(self) -> int:
         """Lease cap. Known pool size, otherwise one run. Never logs the pool."""
         path = self._account_pool_path
@@ -449,6 +466,12 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
                     "agy orphan from previous service: run=%s pid=%s outcome=%s",
                     row.get("run_id"), row.get("pid"), row.get("outcome"),
                 )
+        # After orphan workers are stopped: a lease whose holder died (e.g. the
+        # previous service was SIGKILLed) goes back to available now instead of
+        # staying busy until lease_until.
+        self.reclaimed_leases_at_start: list[dict[str, Any]] = []
+        if self._account_pool_path:
+            self.reclaimed_leases_at_start = self._reclaim_pool_leases_at_start()
 
     def _base_env(self) -> Mapping[str, str]:
         return self._base_environ if self._base_environ is not None else os.environ

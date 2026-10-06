@@ -41,6 +41,7 @@ from execution_backend.agy_error_classify import (
     classify,
     classify_result,
 )
+from execution_backend.agy_run_registry import process_start_token
 from execution_backend.base import BackendError, BackendStatus
 
 ENV_POOL = "COLLAB_AGY_ACCOUNT_POOL"
@@ -80,6 +81,7 @@ _KNOWN_ACCOUNT_KEYS = frozenset(
         "lease_pid",
         "lease_until",
         "lease_id",
+        "lease_proc_start",
     }
 )
 _SECRET_KEY_RE = re.compile(
@@ -114,6 +116,9 @@ class Account:
     lease_pid: int | None = None
     lease_until: str | None = None
     lease_id: str | None = None
+    # Start-time identity of lease_pid (agy_run_registry.process_start_token):
+    # a reused pid number is not mistaken for the live holder.
+    lease_proc_start: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -138,6 +143,8 @@ class Account:
             d["lease_until"] = self.lease_until
         if self.lease_id:
             d["lease_id"] = self.lease_id
+        if self.lease_proc_start:
+            d["lease_proc_start"] = self.lease_proc_start
         for k, v in self.extra.items():
             if k in d or k in _KNOWN_ACCOUNT_KEYS:
                 continue
@@ -243,6 +250,7 @@ def _account_from_obj(raw: Mapping[str, Any]) -> Account:
     until = raw.get("cooldown_until")
     lease_until = raw.get("lease_until")
     lease_id = raw.get("lease_id")
+    lease_proc_start = raw.get("lease_proc_start")
     lease_pid_raw = raw.get("lease_pid")
     lease_pid: int | None
     try:
@@ -259,6 +267,7 @@ def _account_from_obj(raw: Mapping[str, Any]) -> Account:
         lease_pid=lease_pid,
         lease_until=None if lease_until in (None, "") else str(lease_until),
         lease_id=None if lease_id in (None, "") else str(lease_id),
+        lease_proc_start=None if lease_proc_start in (None, "") else str(lease_proc_start),
         extra=extra,
     )
 
@@ -639,6 +648,25 @@ def _clear_lease_fields(acc: Account) -> None:
     acc.lease_pid = None
     acc.lease_until = None
     acc.lease_id = None
+    acc.lease_proc_start = None
+
+
+def lease_holder_gone(acc: Account) -> str | None:
+    """Why the busy lease's holder is gone (``pid_dead`` / ``pid_reused``), else None.
+
+    Conservative: no pid, or a live pid without a recorded start time, counts
+    as alive. A recorded start time that no longer matches means the pid
+    number now belongs to another process, so the holder is gone.
+    """
+    if acc.lease_pid is None:
+        return None
+    if not _pid_alive(acc.lease_pid):
+        return "pid_dead"
+    if acc.lease_proc_start and not _is_windows():
+        current = process_start_token(int(acc.lease_pid))
+        if current is not None and current != acc.lease_proc_start:
+            return "pid_reused"
+    return None
 
 
 def _home_lock_free(home: str | Path, *, environ: Mapping[str, str] | None = None) -> bool | None:
@@ -666,19 +694,42 @@ def reclaim_dead_leases(pool: AccountPool, *, environ: Mapping[str, str] | None 
     per-HOME lock (the kernel drops flock / LockFileEx when a holder exits).
     Call under ``account_switch_lock``. Returns reclaimed account ids.
     """
-    out: list[str] = []
+    return [row["id"] for row in _reclaim_dead_lease_rows(pool, environ=environ)]
+
+
+def _reclaim_dead_lease_rows(pool: AccountPool, *, environ: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
     me = os.getpid()
     for acc in pool.accounts:
         if acc.state != "busy" or acc.lease_pid is None or int(acc.lease_pid) == me:
             continue
-        if _pid_alive(acc.lease_pid):
+        reason = lease_holder_gone(acc)
+        if reason is None:
             continue
         if _home_lock_free(acc.home, environ=environ) is not True:
             continue
+        out.append({"id": acc.id, "lease_pid": acc.lease_pid, "reason": reason})
         acc.state = "available"
         _clear_lease_fields(acc)
-        out.append(acc.id)
     return out
+
+
+def reclaim_pool_leases(pool_path: str | Path, *, environ: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
+    """Service start: reclaim dead holders' leases in the pool file (under the switch lock).
+
+    Same rules as ``reclaim_dead_leases``: the holder pid must be dead (or its
+    pid number reused by another process) AND the per-HOME lock must be free.
+    Returns ``[{id, lease_pid, reason}]``; saves only when something changed.
+    """
+    path = str(pool_path or "").strip()
+    if not path or not Path(path).is_file():
+        return []
+    with account_switch_lock(path, environ=environ):
+        pool = load_pool(path)
+        rows = _reclaim_dead_lease_rows(pool, environ=environ)
+        if rows:
+            save_pool(path, pool)
+    return rows
 
 
 def _home_key(home: str | Path) -> str:
@@ -724,6 +775,7 @@ def reserve_account(
     account.lease_pid = int(os.getpid() if pid is None else pid)
     account.lease_until = _iso_now(t + max(1.0, sec))
     account.lease_id = uuid.uuid4().hex
+    account.lease_proc_start = process_start_token(account.lease_pid)
 
 
 def _owns_lease(acc: Account, lease_id: str | None) -> bool:
@@ -1324,6 +1376,8 @@ __all__ = [
     "account_switch_lock",
     "finish_account_lease",
     "reclaim_dead_leases",
+    "reclaim_pool_leases",
+    "lease_holder_gone",
     "switch_lock_held",
     "switch_lock_timeout_sec",
     "AccountPool",
