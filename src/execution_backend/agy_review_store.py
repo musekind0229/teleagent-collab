@@ -4,6 +4,11 @@
 path is a JSON document ``{"version": 1, "runs": {run_id: record}}`` replaced
 atomically (temp file in the same directory + ``os.replace``), mode 0600 on
 POSIX. An unreadable file is renamed aside and treated as empty.
+
+Path-backed mutations hold an exclusive OS lock on the sidecar ``<path>.lock``
+(``fcntl.flock`` on POSIX, ``msvcrt.locking`` on Windows) across the whole
+read-modify-write. The kernel drops that lock when the descriptor is closed,
+including when the process dies, so a leftover lock file does not block.
 """
 from __future__ import annotations
 
@@ -14,6 +19,8 @@ import os
 import tempfile
 import threading
 import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +29,8 @@ _LOG = logging.getLogger(__name__)
 STORE_VERSION = 1
 ENV_REVIEW_STORE = "COLLAB_AGY_REVIEW_STORE"
 _DEFAULT_NAME = "agy-reviews.json"
+# msvcrt locks a byte range. 1 byte at offset 0 is the whole protocol on Windows.
+_LOCK_NBYTES = 1
 
 
 def resolve_review_store_path(
@@ -47,11 +56,56 @@ def resolve_review_store_path(
     return str(Path(reg).parent / _DEFAULT_NAME)
 
 
+def _acquire_os_lock(fd: int) -> None:
+    """Block until this descriptor holds the exclusive OS lock.
+
+    Not a PID recorded in the lock file: the kernel releases ``flock`` and
+    ``msvcrt.locking`` when the descriptor is closed, including on process death.
+    """
+    if os.name == "posix":
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return
+    if os.name != "nt":
+        raise OSError(f"no cross-process review lock for os.name={os.name!r}")
+    import msvcrt
+
+    os.lseek(fd, 0, os.SEEK_SET)
+    msvcrt.locking(fd, msvcrt.LK_LOCK, _LOCK_NBYTES)
+
+
+def _release_os_lock(fd: int) -> None:
+    if os.name == "posix":
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return
+    if os.name != "nt":
+        return
+    import msvcrt
+
+    os.lseek(fd, 0, os.SEEK_SET)
+    msvcrt.locking(fd, msvcrt.LK_UNLCK, _LOCK_NBYTES)
+
+
 class AgyReviewStore:
     """JSON review records keyed by run_id. Memory-only when ``path`` is None.
 
-    A path-backed write builds the next mapping, writes that mapping, and only
-    then swaps it into ``_mem``. A failed write leaves ``_mem`` unchanged.
+    A path-backed write re-reads the disk file under the sidecar lock, applies
+    one operation to that fresh mapping, writes the mapping, and only then
+    swaps it into ``_mem``. A failed write leaves ``_mem`` unchanged. ``load``
+    and ``get`` keep returning this instance's memory until its next successful
+    write, which is when another instance's update becomes visible here.
+
+    The sidecar is ``<path>.lock``. The lock is ``fcntl.flock`` on POSIX and
+    ``msvcrt.locking`` of 1 byte at offset 0 on Windows. It is an OS lock on
+    the open descriptor, not a PID stored in the file, and the kernel releases
+    it when the descriptor closes — a lock file left by a dead process does
+    not block. The in-process ``threading.Lock`` is acquired first, then the
+    OS lock, so threads and other processes cannot deadlock each other or
+    lose a read-modify-write. ``path is None`` takes only the thread lock and
+    writes nothing.
     """
 
     def __init__(self, path: str | os.PathLike | None) -> None:
@@ -76,16 +130,24 @@ class AgyReviewStore:
         stored = copy.deepcopy(record)
         if stored.get("updated_at") is None:
             stored["updated_at"] = time.time()
-        with self._lock:
-            new_mem = dict(self._mem)
-            new_mem[str(run_id)] = stored
-            self._write_locked(new_mem)
-            self._mem = new_mem
+        key = str(run_id)
+
+        def apply(
+            fresh: dict[str, dict[str, Any]],
+        ) -> tuple[dict[str, dict[str, Any]] | None, None]:
+            new_mem = dict(fresh)
+            new_mem[key] = stored
+            return new_mem, None
+
+        self._commit(apply)
 
     def update(self, run_id: str, **fields: Any) -> dict[str, Any]:
         key = str(run_id)
-        with self._lock:
-            current = self._mem.get(key)
+
+        def apply(
+            fresh: dict[str, dict[str, Any]],
+        ) -> tuple[dict[str, dict[str, Any]] | None, dict[str, Any]]:
+            current = fresh.get(key)
             if not isinstance(current, dict):
                 raise KeyError(key)
             updated = copy.deepcopy(current)
@@ -93,22 +155,25 @@ class AgyReviewStore:
                 updated[name] = copy.deepcopy(value)
             if "updated_at" not in fields:
                 updated["updated_at"] = time.time()
-            new_mem = dict(self._mem)
+            new_mem = dict(fresh)
             new_mem[key] = updated
-            returned = copy.deepcopy(updated)
-            self._write_locked(new_mem)
-            self._mem = new_mem
-            return returned
+            return new_mem, copy.deepcopy(updated)
+
+        return self._commit(apply)
 
     def forget(self, run_id: str) -> None:
         key = str(run_id)
-        with self._lock:
-            if key not in self._mem:
-                return
-            new_mem = dict(self._mem)
+
+        def apply(
+            fresh: dict[str, dict[str, Any]],
+        ) -> tuple[dict[str, dict[str, Any]] | None, None]:
+            if key not in fresh:
+                return None, None
+            new_mem = dict(fresh)
             del new_mem[key]
-            self._write_locked(new_mem)
-            self._mem = new_mem
+            return new_mem, None
+
+        self._commit(apply)
 
     def prune(self, collected_older_than_sec: float = 7 * 86400, now: float | None = None) -> int:
         """Drop collected records whose timestamp is older than ``now - N``."""
@@ -118,8 +183,11 @@ class AgyReviewStore:
         except (TypeError, ValueError):
             window = 7 * 86400
         cutoff = moment - window
-        with self._lock:
-            new_mem = dict(self._mem)
+
+        def apply(
+            fresh: dict[str, dict[str, Any]],
+        ) -> tuple[dict[str, dict[str, Any]] | None, int]:
+            new_mem = dict(fresh)
             dropped = 0
             for run_id, rec in list(new_mem.items()):
                 if not isinstance(rec, dict) or rec.get("collected") is not True:
@@ -134,10 +202,61 @@ class AgyReviewStore:
                 if when < cutoff:
                     del new_mem[run_id]
                     dropped += 1
-            if dropped:
-                self._write_locked(new_mem)
-                self._mem = new_mem
-            return dropped
+            if not dropped:
+                return None, 0
+            return new_mem, dropped
+
+        return self._commit(apply)
+
+    def _commit(
+        self,
+        apply: Callable[
+            [dict[str, dict[str, Any]]],
+            tuple[dict[str, dict[str, Any]] | None, Any],
+        ],
+    ) -> Any:
+        """Re-read, apply one op, write, then publish. Memory moves only after the write."""
+        with self._locked_mutation():
+            if self.path is None:
+                base = self._mem
+            else:
+                base = self._read_disk()
+                if not self.path.is_file():
+                    # Missing, or just renamed aside as unreadable: keep this
+                    # instance's records instead of writing an empty store.
+                    base = self._mem
+            new_mem, result = apply(dict(base))
+            if new_mem is None:
+                return result
+            self._write_locked(new_mem)
+            self._mem = new_mem
+            return result
+
+    @contextmanager
+    def _locked_mutation(self) -> Iterator[None]:
+        """Thread lock, then the sidecar OS lock. Memory-only stores skip the file."""
+        with self._lock:
+            if self.path is None:
+                yield
+                return
+            lock_path = Path(f"{self.path}.lock")
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            flags = os.O_RDWR | os.O_CREAT
+            cloexec = getattr(os, "O_CLOEXEC", 0) or getattr(os, "O_NOINHERIT", 0)
+            if cloexec:
+                flags |= cloexec
+            fd = os.open(os.fspath(lock_path), flags, 0o600)
+            acquired = False
+            try:
+                _acquire_os_lock(fd)
+                acquired = True
+                yield
+            finally:
+                try:
+                    if acquired:
+                        _release_os_lock(fd)
+                finally:
+                    os.close(fd)
 
     def _read_disk(self) -> dict[str, dict[str, Any]]:
         path = self.path
