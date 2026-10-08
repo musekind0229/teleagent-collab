@@ -416,6 +416,8 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         caps["concurrency"] = {
             "max_runs": self._account_pool_run_limit() + parked_reviews,
             "limited_by": ["agy_account_pool"],
+            # Parked reviews only. rework_waiting is not included; max_runs is unchanged.
+            "pending_review_runs": parked_reviews,
         }
         # The prompt-only warning holds with or without skip-permissions; the
         # status view shows it only on Goals that actually pin inputs.
@@ -1113,6 +1115,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         rec = self._get(run_id)
         self._refresh(rec)
         self._review.on_exit(rec)
+        self._review.retry_waiting(rec)
         if rec.get("cancelled"):
             activity = "idle"
             fin = "cancelled"
@@ -1418,6 +1421,8 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         # agy print is one-shot. No permission channel — same as inprocess.
         if not self._lead_review and not self._review._has_review_rec():
             return 200, []
+        for rec in self._review.iter_records(session_id):
+            self._review.retry_waiting(rec)
         return self._review.pending_actions(session_id)
 
     def reply_permission(self, request_id: str, reply: str) -> tuple[int, Any]:
@@ -1495,6 +1500,8 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             rec = self._get(run_id)
         except BackendError as e:
             return 404, {"ok": False, "error": str(e)}
+        if self._review.cancel_waiting(rec):
+            return 200, {"ok": True, "run_id": rec["run_id"], "state": "cancelled"}
         proc: subprocess.Popen | None = rec.get("proc")
         if self._review.cancel_parked(rec):
             self._harvest(rec)

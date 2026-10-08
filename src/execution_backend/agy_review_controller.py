@@ -14,7 +14,13 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Mapping
 
-from execution_backend.agy_account_pool import ENV_POOL, ENV_PROFILE, account_switch_lock
+from execution_backend.agy_account_pool import (
+    ENV_POOL,
+    ENV_PROFILE,
+    AccountPoolError,
+    AccountSwitchLockTimeout,
+    account_switch_lock,
+)
 from execution_backend.agy_review import (
     build_payload,
     build_rework_prompt,
@@ -119,11 +125,12 @@ class AgyReviewController:
         except KeyError:
             pass
 
-    def pending_actions(self, session_id: str | None = None) -> tuple[int, list]:
+    def iter_records(self, session_id: str | None = None) -> list[dict[str, Any]]:
+        """Distinct run records, optionally one session (run id, handle, or conversation)."""
         seen: set[int] = set()
         chosen: list[dict[str, Any]] = []
         for rec in self._backend._runs.values():
-            if id(rec) in seen:
+            if not isinstance(rec, dict) or id(rec) in seen:
                 continue
             seen.add(id(rec))
             if session_id is not None:
@@ -135,14 +142,66 @@ class AgyReviewController:
                 ):
                     continue
             chosen.append(rec)
+        return chosen
+
+    def pending_actions(self, session_id: str | None = None) -> tuple[int, list]:
         rows: list[dict[str, Any]] = []
-        for rec in chosen:
+        for rec in self.iter_records(session_id):
             self._backend._refresh(rec)
             self._review_on_exit(rec)
             row = self._review_pending_row(rec)
             if row is not None:
                 rows.append(row)
         return 200, rows
+
+    def cancel_waiting(self, rec: dict[str, Any]) -> bool:
+        """Cancel a rework that holds no account lease. False if this is not that case.
+
+        Caller must not release a pool lease: none was taken.
+        """
+        review = rec.get("review") if isinstance(rec.get("review"), dict) else None
+        if review is None or review.get("state") != "rework_waiting" or self._proc_live(rec):
+            return False
+        with self._lock:
+            review = rec.get("review") if isinstance(rec.get("review"), dict) else None
+            if review is None or review.get("state") != "rework_waiting" or self._proc_live(rec):
+                return False
+            review["state"] = "cancelled"
+            rec["cancelled"] = True
+            rec["finish"] = "cancelled"
+            rec["activity"] = "idle"
+            rec["state"] = "cancelled"
+            self._forget_review(rec)
+        return True
+
+    def retry_waiting(self, rec: dict[str, Any]) -> None:
+        """Spawn a deferred rework once an account is free. No-op while a proc is live."""
+        with self._lock:
+            review = rec.get("review") if isinstance(rec.get("review"), dict) else None
+            if review is None or review.get("state") != "rework_waiting" or self._proc_live(rec):
+                return
+            try:
+                left = remaining_sec(review.get("deadline"), time.time())
+            except (TypeError, ValueError):
+                left = 0.0
+            if left < 30:
+                review["state"] = "rejected_final"
+                review["skip_reason"] = "rework skipped: no free agy account before deadline"
+                rec["activity"] = "idle"
+                rec["finish"] = "stop"
+                rec["state"] = "succeeded"
+                rec["harvested"] = True
+                self._persist_review(rec)
+                return
+            pending = review.get("pending_rework") if isinstance(review.get("pending_rework"), dict) else {}
+            reason = str(pending.get("reason") or "")
+            previous = pending.get("previous")
+            if not isinstance(previous, list):
+                previous = []
+            review["state"] = "running"
+            review["request_id"] = None
+            self._persist_review(rec)
+            self._spawn_or_wait(rec, review, reason, previous)
 
     def cancel_parked(self, rec: dict[str, Any]) -> bool:
         """Parked review with no live process becomes cancelled. False if not parked."""
@@ -343,17 +402,7 @@ class AgyReviewController:
             review["state"] = "running"
             review["request_id"] = None
             self._persist_review(rec)
-            err = self._spawn_rework(rec, review, reason_text, prior_fails)
-            if err:
-                review["state"] = "review_unavailable"
-                review["unavailable_reason"] = f"lead_review_unavailable: rework_spawn_failed: {err}"
-                review["error_source"] = "spawn"
-                rec["state"] = "failed"
-                rec["activity"] = "idle"
-                rec["finish"] = "error"
-                rec["harvested"] = True
-                rec["assistant_error"] = review["unavailable_reason"]
-                self._persist_review(rec)
+            self._spawn_or_wait(rec, review, reason_text, prior_fails, now=now)
             return
         if redos >= max_redos:
             review["skip_reason"] = f"rework budget exhausted ({redos}/{max_redos})"
@@ -416,7 +465,45 @@ class AgyReviewController:
         except Exception as exc:  # noqa: BLE001 — a failed rework is review_unavailable, not a raise
             if spawn_env is not None:
                 self._backend._release_pool_after_failed_spawn(spawn_env)
+            # No free account, before Popen: caller waits. A lock timeout is still a spawn failure.
+            # Any lease already taken was released above.
+            if isinstance(exc, AccountPoolError) and not isinstance(exc, AccountSwitchLockTimeout):
+                raise
             return self._one_line(str(exc) or type(exc).__name__)
+
+    def _spawn_or_wait(
+        self,
+        rec: dict[str, Any],
+        review: dict[str, Any],
+        reason_text: str,
+        prior_fails: list[str],
+        *,
+        now: float | None = None,
+    ) -> None:
+        """Spawn the counted rework. A busy pool waits; any other error fails the review."""
+        try:
+            err = self._spawn_rework(rec, review, reason_text, prior_fails)
+        except AccountPoolError:
+            review["state"] = "rework_waiting"
+            if not isinstance(review.get("waiting_since"), (int, float)) or isinstance(review.get("waiting_since"), bool):
+                review["waiting_since"] = time.time() if now is None else now
+            review["pending_rework"] = {"reason": reason_text, "previous": [str(item) for item in prior_fails]}
+            rec["state"] = "running"
+            rec["activity"] = "waiting_account"
+            rec["harvested"] = True
+            self._persist_review(rec)
+            return
+        if not err:
+            return
+        review["state"] = "review_unavailable"
+        review["unavailable_reason"] = f"lead_review_unavailable: rework_spawn_failed: {err}"
+        review["error_source"] = "spawn"
+        rec["state"] = "failed"
+        rec["activity"] = "idle"
+        rec["finish"] = "error"
+        rec["harvested"] = True
+        rec["assistant_error"] = review["unavailable_reason"]
+        self._persist_review(rec)
 
     def _reset_rec_for_round(
         self,
@@ -671,6 +758,8 @@ class AgyReviewController:
             "response": rec.get("response") if isinstance(rec.get("response"), str) else "",
             "contract_sha256": rec.get("contract_sha256") or "",
             "contract_fields": list(rec.get("contract_fields") or []),
+            "waiting_since": review.get("waiting_since"),
+            "pending_rework": review.get("pending_rework") if isinstance(review.get("pending_rework"), dict) else None,
         }
 
     def _restore_review_runs(self) -> None:
@@ -696,6 +785,7 @@ class AgyReviewController:
                 "review_unavailable",
                 "interrupted_worker",
                 "worker_failed",
+                "rework_waiting",
             }:
                 continue
             rec = self._rec_from_review_store(saved)
@@ -735,6 +825,10 @@ class AgyReviewController:
             "agy_err_class": saved.get("agy_err_class"),
             "skip_reason": saved.get("skip_reason"),
             "context_hash": saved.get("context_hash"),
+            "waiting_since": saved.get("waiting_since"),
+            "pending_rework": (
+                dict(saved["pending_rework"]) if isinstance(saved.get("pending_rework"), dict) else None
+            ),
         }
         if not review["acceptance_text"] and isinstance(review["payload"], dict):
             review["acceptance_text"] = str(review["payload"].get("acceptance_text") or "")
@@ -754,6 +848,9 @@ class AgyReviewController:
                 assistant_error = ""
         elif state == "awaiting_review":
             finish, run_state, activity = "stop", "succeeded", "idle"
+            assistant_error = ""
+        elif state == "rework_waiting":
+            finish, run_state, activity = "stop", "running", "waiting_account"
             assistant_error = ""
         elif state == "accepted":
             finish, run_state, activity = "stop", "succeeded", "idle"
@@ -842,6 +939,11 @@ class AgyReviewController:
             elif value is None or isinstance(value, bool):
                 copied[str(key)] = value
         return copied
+
+    @staticmethod
+    def _proc_live(rec: Mapping[str, Any]) -> bool:
+        proc = rec.get("proc")
+        return proc is not None and callable(getattr(proc, "poll", None)) and proc.poll() is None
 
     @staticmethod
     def _one_line(msg: str, limit: int = 300) -> str:

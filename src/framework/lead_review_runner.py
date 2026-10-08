@@ -8,6 +8,7 @@ to ``details.lead_review.events`` because ``record_goal_event`` cannot store the
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import os
 import re
@@ -26,6 +27,8 @@ _SECRET_RE = re.compile(
     r"(?i)(bearer\s+\S+|sk-[a-z0-9]{8,}|(?:api[_-]?key|token|secret|password)\s*[:=]\s*\S+)"
 )
 _KEEP = 10
+_EVENT_FIELD_CAP = 300
+_EVENTS_MAX_BYTES = 4096
 _LATE, _STALE = "lead_review_late_result", "lead_review_stale_result"
 _SUPERSEDED, _STOPPED = "lead_review_superseded", "lead_review_stopped"
 
@@ -40,6 +43,15 @@ def _iso(epoch: float) -> str:
 def _sanitize(text: Any, limit: int = 200) -> str:
     cleaned = " ".join(_SECRET_RE.sub("[redacted]", str(text or "")).split())
     return cleaned if len(cleaned) <= limit else cleaned[: limit - 3].rstrip() + "..."
+
+
+def _event_field(value: Any) -> Any:
+    """Redact and cap strings. Leave scalars. Anything else becomes a capped string."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if not isinstance(value, str):
+        value = str(value)
+    return _sanitize(value, _EVENT_FIELD_CAP)
 
 
 def _round_of(request_id: str) -> int:
@@ -442,9 +454,19 @@ class LeadReviewRunner:
             "request_id": fields.get("request_id", lead.get("request_id")),
         }
         row.update({key: value for key, value in fields.items() if key not in row})
+        row = {key: _event_field(value) for key, value in row.items()}
         events = [dict(item) for item in (lead.get("events") or []) if isinstance(item, Mapping)]
         events.append(row)
-        lead["events"] = events[-_KEEP:]
+        events = events[-_KEEP:]
+        while len(events) > 1:
+            try:
+                encoded = json.dumps(events)
+            except (TypeError, ValueError):
+                break
+            if len(encoded) <= _EVENTS_MAX_BYTES:
+                break
+            del events[0]
+        lead["events"] = events
 
     def _lead_state(self, decision: Mapping[str, Any]) -> dict[str, Any]:
         details = decision.get("details") if isinstance(decision.get("details"), Mapping) else {}
