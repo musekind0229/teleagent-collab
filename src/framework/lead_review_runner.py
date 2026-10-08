@@ -54,6 +54,139 @@ def _event_field(value: Any) -> Any:
     return _sanitize(value, _EVENT_FIELD_CAP)
 
 
+_CORE_EVENT_KEYS = ("event", "at", "at_iso", "job_id", "request_id")
+_EVENT_MARKER_KEYS = ("truncated", "dropped_fields")
+_DROP = object()
+
+
+def _json_len(value: Any) -> int:
+    try:
+        return len(json.dumps(value))
+    except (TypeError, ValueError):
+        return _EVENTS_MAX_BYTES + 1
+
+
+def _shrink_event_value(value: Any) -> Any:
+    """Return a strictly smaller JSON value, or ``_DROP`` to remove it."""
+    if isinstance(value, str):
+        if len(value) <= 16:
+            return _DROP
+        target = max(16, len(value) // 2)
+        shortened = value[: target - 3].rstrip() + "..."
+        if len(shortened) >= len(value):
+            return _DROP
+        return shortened
+    if isinstance(value, list):
+        if not value:
+            return _DROP
+        if len(value) == 1:
+            inner = _shrink_event_value(value[0])
+            if inner is _DROP:
+                return _DROP
+            return [inner]
+        return value[:-1]
+    if isinstance(value, dict):
+        if not value:
+            return _DROP
+        keys = list(value)
+        if len(keys) == 1:
+            inner = _shrink_event_value(value[keys[0]])
+            if inner is _DROP:
+                return _DROP
+            return {keys[0]: inner}
+        shrunk = dict(value)
+        shrunk.pop(keys[-1], None)
+        return shrunk
+    return _DROP
+
+
+def _bound_event(row: dict[str, Any]) -> dict[str, Any]:
+    """Drop or shorten non-core fields until ``json.dumps([row])`` fits in 4096.
+
+    Field capping at 300 characters still leaves one wide event over the events
+    budget. The last non-core field is shortened, then removed, until the row
+    fits. A row that already fits is returned unchanged, with no truncation marker.
+    """
+    if _json_len([row]) <= _EVENTS_MAX_BYTES:
+        return row
+    core = set(_CORE_EVENT_KEYS)
+    working = {key: value for key, value in row.items() if key not in _EVENT_MARKER_KEYS}
+    extras = [key for key in working if key not in core]
+    dropped = 0
+    shortened = False
+
+    def marked() -> dict[str, Any]:
+        probe = dict(working)
+        if dropped or shortened:
+            probe["truncated"] = True
+            if dropped:
+                probe["dropped_fields"] = dropped
+        return probe
+
+    guard = 0
+    while extras and _json_len([marked()]) > _EVENTS_MAX_BYTES:
+        guard += 1
+        key = extras[-1]
+        current = working.get(key)
+        shrunk = _shrink_event_value(current)
+        if guard > 4000 or shrunk is _DROP or _json_len(shrunk) >= _json_len(current):
+            working.pop(key, None)
+            extras.pop()
+            dropped += 1
+            continue
+        working[key] = shrunk
+        shortened = True
+    if _json_len([marked()]) > _EVENTS_MAX_BYTES:
+        for key in list(extras):
+            if key in working:
+                working.pop(key, None)
+                dropped += 1
+        extras.clear()
+    for key in ("request_id", "job_id", "at_iso"):
+        if _json_len([marked()]) <= _EVENTS_MAX_BYTES:
+            break
+        value = working.get(key)
+        if isinstance(value, str) and len(value) > 16:
+            nxt = value[:13].rstrip() + "..."
+            if len(nxt) < len(value):
+                working[key] = nxt
+                shortened = True
+    fitted = marked()
+    if _json_len([fitted]) > _EVENTS_MAX_BYTES:
+        fitted = {key: working[key] for key in _CORE_EVENT_KEYS if key in working}
+        fitted["truncated"] = True
+    row.clear()
+    row.update(fitted)
+    return row
+
+
+def _sanitize_process_value(value: Any, depth: int = 0) -> Any:
+    """Redact and cap one process value. Small lists and dicts keep their shape."""
+    if depth >= 6:
+        return _event_field(value)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _sanitize(value, _EVENT_FIELD_CAP)
+    if isinstance(value, Mapping):
+        out: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= 32:
+                break
+            text = str(key)[:80]
+            if not text or text in out:
+                continue
+            out[text] = _sanitize_process_value(item, depth + 1)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_process_value(item, depth + 1) for item in list(value)[:8]]
+    return _event_field(value)
+
+
+def _sanitize_processes(procs: list[Any]) -> list[Any]:
+    return [_sanitize_process_value(item) for item in list(procs)[:8]]
+
+
 def _round_of(request_id: str) -> int:
     match = _REQUEST_RE.match(str(request_id or ""))
     return int(match.group(2)) if match else 0
@@ -458,6 +591,7 @@ class LeadReviewRunner:
         }
         row.update({key: value for key, value in fields.items() if key not in row})
         row = {key: _event_field(value) for key, value in row.items()}
+        _bound_event(row)
         events = [dict(item) for item in (lead.get("events") or []) if isinstance(item, Mapping)]
         events.append(row)
         events = events[-_KEEP:]
@@ -469,6 +603,8 @@ class LeadReviewRunner:
             if len(encoded) <= _EVENTS_MAX_BYTES:
                 break
             del events[0]
+        if len(events) == 1 and _json_len(events) > _EVENTS_MAX_BYTES:
+            _bound_event(events[-1])
         lead["events"] = events
 
     def _lead_state(self, decision: Mapping[str, Any]) -> dict[str, Any]:
@@ -587,7 +723,8 @@ class LeadReviewRunner:
         lead = self._lead_state(pending)
         for item in reversed(lead.get("events") or []):
             if isinstance(item, dict) and item.get("event") == _STOPPED and str(item.get("job_id") or "") == job_id:
-                item["lead_processes"] = list(procs)[:8]
+                item["lead_processes"] = _sanitize_processes(procs)
+                _bound_event(item)
                 self._write(goal_id, decision_id, lead)
                 return
 
