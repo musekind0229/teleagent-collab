@@ -72,6 +72,7 @@ class LeadReviewRunner:
     MAX_ATTEMPTS = 2
     WATCHDOG_GRACE_SEC = 30.0
     MAX_CONCURRENT_REVIEWS = 4
+    STOPPER_JOIN_SEC = 5.0
 
     def __init__(
         self, *, layer: Any, planner: Any, backend: Any, actor_id: str = "app-coordinator",
@@ -88,6 +89,7 @@ class LeadReviewRunner:
         self._lock = threading.RLock()
         self._applying: str | None = None
         self._late_once: set[tuple[str, str]] = set()
+        self._stoppers: list[threading.Thread] = []
 
     @classmethod
     def for_coordinator(cls, coord: Any) -> LeadReviewRunner:
@@ -167,6 +169,7 @@ class LeadReviewRunner:
                 "request_id": job.get("request_id"), "job_id": job.get("job_id"),
                 "reason": str(reason or "")[:200], "lead_processes": list(procs)[:8],
             })
+        self._join_stoppers(float(self.STOPPER_JOIN_SEC))
         return rows
 
     def _on_backend_resolved(self, request_id: str, verdict: str, state: str) -> None:
@@ -607,7 +610,27 @@ class LeadReviewRunner:
             except Exception:
                 _LOG.info("lead_processes patch failed")
 
-        threading.Thread(target=_run, name=f"collab-review-stop-{job.get('job_id')}", daemon=True).start()
+        thread = threading.Thread(target=_run, name=f"collab-review-stop-{job.get('job_id')}", daemon=True)
+        with self._lock:
+            self._prune_stoppers_locked()
+            self._stoppers.append(thread)
+            thread.start()
+
+    def _prune_stoppers_locked(self) -> None:
+        self._stoppers = [thread for thread in self._stoppers if thread.is_alive()]
+
+    def _join_stoppers(self, timeout: float) -> None:
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            with self._lock:
+                self._prune_stoppers_locked()
+                pending = list(self._stoppers)
+            if not pending:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            pending[0].join(remaining)
 
 
 __all__ = ["LeadReviewRunner"]
