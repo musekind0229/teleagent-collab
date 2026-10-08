@@ -6,9 +6,13 @@ and collect-result projection live here so the backend hook stays a state machin
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+
+from execution_backend.agy_session_attribution import session_base
 
 _EXACT_CONTENT_RE = re.compile(
     r"(?P<path>\S+)\s+must\s+contain\s+exactly\s+(?P<body>.+)$",
@@ -34,6 +38,15 @@ _REWORK_TAIL = (
     "Modify the existing files in the current working directory so the acceptance is "
     "met, then stop. Do not wait for further input."
 )
+TOOL_EVIDENCE_UNAVAILABLE_NOTE = "agy provides no tool evidence for this run; judge by artifacts and output. Do not reject merely because tool evidence is empty."
+TOOL_EVIDENCE_SOURCE_NOTE = "tools are reconstructed from the agy session transcript (last 30 calls, outputs truncated)."
+_CONV_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+_EXIT_CODE_RE = re.compile(r"exited with code (\d+)")
+_SECRET_RE = re.compile(
+    r"Bearer\s+\S+|(?:api[_-]?key|token|secret|password)\s*[:=]\s*\S+|sk-[A-Za-z0-9_\-]+",
+    re.IGNORECASE,
+)
+_MAX_TRANSCRIPT_BYTES = 8 * 1024 * 1024
 
 
 def review_required(charter: dict | None, *, enabled: bool) -> bool:
@@ -150,12 +163,106 @@ def _hash_and_preview(path: Path, size: int) -> tuple[str, int, str, bool]:
     return hashlib.sha256(raw).hexdigest(), len(raw), text, truncated
 
 
+def read_tool_evidence(
+    environ: Mapping[str, Any] | None,
+    conversation_id: str,
+    *,
+    max_calls: int = 30,
+    output_cap: int = 2000,
+    input_cap: int = 1000,
+) -> list[dict[str, Any]] | None:
+    """Last tool rows from transcript_full.jsonl, or None if that log is unavailable. Never raises."""
+    try:
+        if (
+            not isinstance(conversation_id, str)
+            or conversation_id in {".", ".."}
+            or _CONV_ID_RE.fullmatch(conversation_id) is None
+        ):
+            return None
+        base = session_base(environ)
+        if base is None:
+            return None
+        path = base / "brain" / conversation_id / ".system_generated" / "logs" / "transcript_full.jsonl"
+        if not path.is_file() or path.stat().st_size > _MAX_TRANSCRIPT_BYTES:
+            return None
+        raw = path.read_bytes()
+        if len(raw) > _MAX_TRANSCRIPT_BYTES:
+            return None
+        return _calls_from_transcript(raw.decode("utf-8", errors="replace"), max_calls, output_cap, input_cap)
+    except Exception:
+        return None
+
+
+def _calls_from_transcript(text: str, max_calls: int, output_cap: int, input_cap: int) -> list[dict[str, Any]]:
+    """PLANNER_RESPONSE tool_calls paired FIFO with the following GENERIC steps."""
+    rows: list[dict[str, Any]] = []
+    waiting = 0
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            step = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(step, dict):
+            continue
+        kind = step.get("type")
+        if kind == "PLANNER_RESPONSE":
+            calls = step.get("tool_calls")
+            if not isinstance(calls, list):
+                continue
+            for call in calls:
+                if isinstance(call, dict):
+                    name = call.get("name")
+                    rows.append({
+                        "tool": name if isinstance(name, str) else ("" if name is None else str(name)),
+                        "status": "no_output",
+                        "input": _cap_args(call.get("args"), input_cap),
+                        "output": "",
+                    })
+        elif kind == "GENERIC" and waiting < len(rows):
+            _fill_call(rows[waiting], step, output_cap)
+            waiting += 1
+    keep = max_calls if isinstance(max_calls, int) and not isinstance(max_calls, bool) else 30
+    return rows[-keep:] if keep > 0 else []
+
+
+def _fill_call(row: dict[str, Any], step: dict[str, Any], output_cap: int) -> None:
+    content = step.get("content")
+    text = content if isinstance(content, str) else ("" if content is None else str(content))
+    match = _EXIT_CODE_RE.search(text)
+    code = int(match.group(1)) if match else None
+    row["status"] = "error" if step.get("status") != "DONE" or (code is not None and code != 0) else "completed"
+    redacted = _SECRET_RE.sub("[redacted]", text)
+    limit = output_cap if isinstance(output_cap, int) and not isinstance(output_cap, bool) and output_cap > 0 else 0
+    tail = redacted[-limit:] if limit else ""
+    row["output"] = redacted if len(redacted) <= limit else "\u2026" + tail
+    if code is not None:
+        row["exit_code"] = code
+
+
+def _cap_args(args: Any, cap: int) -> dict[str, Any]:
+    if not isinstance(args, dict):
+        return {}
+    limit = cap if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0 else 0
+    out: dict[str, Any] = {}
+    for key, value in args.items():
+        name = key if isinstance(key, str) else str(key)
+        if not isinstance(value, str):
+            out[name] = value
+            continue
+        text = _SECRET_RE.sub("[redacted]", value)
+        out[name] = text[:limit] if len(text) > limit else text
+    return out
+
+
 def build_payload(
     rec_review: dict[str, Any],
     snap: dict[str, Any],
     *,
     acceptance_text: str,
     response_excerpt: str,
+    tools: list | None = None,
 ) -> dict[str, Any]:
     history = rec_review.get("history") if isinstance(rec_review, dict) else None
     previous: list[str] = []
@@ -173,11 +280,21 @@ def build_payload(
         max_redos = 0
     excerpt = "" if response_excerpt is None else str(response_excerpt)
     artifacts = snap.get("artifacts") if isinstance(snap, dict) else {}
+    if isinstance(tools, list):
+        tool_rows: list = tools
+        tool_evidence = {"source": "agy_transcript", "calls": len(tools)}
+        review_note = TOOL_EVIDENCE_SOURCE_NOTE
+    else:
+        tool_rows = []
+        tool_evidence = {"source": "unavailable", "calls": 0}
+        review_note = TOOL_EVIDENCE_UNAVAILABLE_NOTE
     return {
         "artifacts": artifacts if isinstance(artifacts, dict) else {},
         "artifact_hash": str((snap or {}).get("artifact_hash") or ""),
         "artifact_error": None,
-        "tools": [],
+        "tools": tool_rows,
+        "tool_evidence": tool_evidence,
+        "review_note": review_note,
         "policy_violations": [],
         "finish": "stop",
         "backend": "antigravity.cli_v1",

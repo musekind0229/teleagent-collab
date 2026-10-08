@@ -23,6 +23,7 @@ from execution_backend.agy_review import (
     normalize_verdict,
     parse_request_id,
     project_outcome,
+    read_tool_evidence,
     remaining_sec,
     review_required,
     snapshot_artifacts,
@@ -554,6 +555,10 @@ class AgyReviewController:
                 snap,
                 acceptance_text=str(review.get("acceptance_text") or ""),
                 response_excerpt=excerpt[:2000],
+                tools=read_tool_evidence(
+                    rec.get("spawn_environ"),
+                    str(rec.get("conversation_id") or ""),
+                ),
             )
             rnd = int(review.get("round") or 1)
             review["request_id"] = f"agyrev:{rec.get('run_id')}:r{rnd}"
