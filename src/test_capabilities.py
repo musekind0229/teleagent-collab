@@ -606,20 +606,44 @@ class LeadReviewRequirementTests(unittest.TestCase):
         self.assertEqual(unmet_capabilities(caps, ["lead_review"]), [])
 
     def test_open_requiring_lead_review_on_agy_is_409(self) -> None:
+        """Contract flipped: asserts agy + a lead planner accepts required lead_review.
+        red on 49fa3a36: acceptance.lead_review is false and submit is 409.
+        """
         from framework.app_service import LeadAdapterPlanner
         from test_app_service import _FakeLead, _request
 
         with tempfile.TemporaryDirectory() as td:
             backend = AntigravityCliExecutionBackend(bin_path=sys.executable)
-            app = CollabApplication(td, planner=LeadAdapterPlanner(_FakeLead(), cwd=td), backend=backend)
-            self.assertIs(app.capabilities()["planner"]["lead_review"], True)
-            self.assertIs(app.capabilities()["acceptance"]["lead_review"], False)
-            body = _request()
-            body["required_capabilities"] = ["lead_review"]
-            with self.assertRaises(AppError) as cm:
-                app.submit(body)
-            self.assertEqual(cm.exception.status, 409)
-            self.assertEqual(cm.exception.extra.get("missing"), ["lead_review"])
+            try:
+                app = CollabApplication(td, planner=LeadAdapterPlanner(_FakeLead(), cwd=td), backend=backend)
+                self.assertIs(app.capabilities()["planner"]["lead_review"], True)
+                self.assertIs(app.capabilities()["acceptance"]["lead_review"], True)
+                body = _request()
+                body["required_capabilities"] = ["lead_review"]
+                opened = app.submit(body)
+                self.assertTrue(opened.get("ok"), opened)
+                self.assertTrue(opened.get("goal_id"), opened)
+            finally:
+                backend.close()
+
+
+class AgyDeterministicLeadReviewTests(unittest.TestCase):
+    def test_agy_deterministic_requiring_lead_review_is_409(self) -> None:
+        """T17: asserts agy + DeterministicPlanner returns 409 for required lead_review.
+        passes on 49fa3a36 and after the contract flip: deterministic does not enable the review channel.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            backend = AntigravityCliExecutionBackend(bin_path=sys.executable)
+            try:
+                app = CollabApplication(td, backend=backend)
+                self.assertIs(app.capabilities()["planner"]["lead_review"], False)
+                self.assertIs(app.capabilities()["acceptance"]["lead_review"], False)
+                with self.assertRaises(AppError) as cm:
+                    app.submit(_goal(required_capabilities=["lead_review"]))
+                self.assertEqual(cm.exception.status, 409)
+                self.assertEqual(cm.exception.extra.get("missing"), ["lead_review"])
+            finally:
+                backend.close()
 
 
 if __name__ == "__main__":
