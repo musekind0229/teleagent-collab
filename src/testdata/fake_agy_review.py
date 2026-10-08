@@ -9,8 +9,12 @@ Env:
   FAKE_AGY_LOG     jsonl, one object per invocation.
 
 Steps: {"do": "ok"|"exit1"|"sleep"|"hang"|"echo_reason", "write": {rel: text},
-"sec": N, "rel": "x.md"}. ``echo_reason`` writes the line after
-"Reason (verbatim):" into ``rel``.
+"sec": N, "rel": "x.md", "transcript": "<jsonl path>"|true}. ``echo_reason``
+writes the line after "Reason (verbatim):" into ``rel``. When ``transcript``
+is present, that file (or a one-call default when the value is true) is copied
+to ``$HOME/.gemini/antigravity-cli/brain/<conversation_id>/.system_generated/logs/transcript_full.jsonl``
+before the JSON result is printed, using the same conversation_id. Absent key:
+behaviour unchanged.
 """
 from __future__ import annotations
 
@@ -90,6 +94,76 @@ def _verbatim_reason(prompt: str) -> str:
     return ""
 
 
+def _default_transcript() -> str:
+    """One run_command plus its GENERIC output. Paths stay under /w/task."""
+    rows = [
+        {
+            "step_index": 0,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "status": "DONE",
+            "content": "<USER_REQUEST>work under /w/task</USER_REQUEST>",
+        },
+        {
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "tool_calls": [
+                {
+                    "name": "run_command",
+                    "args": {"CommandLine": "echo hello", "Cwd": "/w/task"},
+                }
+            ],
+        },
+        {
+            "step_index": 2,
+            "source": "MODEL",
+            "type": "GENERIC",
+            "status": "DONE",
+            "content": "The command exited with code 0.\nOutput:\nhello\n",
+        },
+        {
+            "step_index": 3,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "content": "done",
+        },
+    ]
+    return "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
+
+
+def _copy_transcript(step: dict, conversation_id: str) -> None:
+    """Copy a step transcript into the agy brain log for this conversation.
+
+    No-op when the step has no ``transcript`` key. ``true`` writes a one-call
+    default; any other value is a path to a jsonl file.
+    """
+    if "transcript" not in step:
+        return
+    home = (os.environ.get("HOME") or os.environ.get("USERPROFILE") or "").strip()
+    if not home or not conversation_id:
+        return
+    spec = step.get("transcript")
+    if spec is True or spec == "true":
+        text = _default_transcript()
+    else:
+        text = Path(str(spec)).read_text(encoding="utf-8")
+    dest = (
+        Path(home)
+        / ".gemini"
+        / "antigravity-cli"
+        / "brain"
+        / conversation_id
+        / ".system_generated"
+        / "logs"
+        / "transcript_full.jsonl"
+    )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(text, encoding="utf-8")
+
+
 def _emit(n: int, status: str, response: str = "worker-ok") -> None:
     payload = {
         "conversation_id": f"conv_{n}",
@@ -133,12 +207,14 @@ def main() -> None:
             "prompt": prompt,
         },
     )
+    conversation_id = f"conv_{n}"
     if do == "echo_reason":
         rel = str(step.get("rel") or "reason.txt")
         _write_map({rel: _verbatim_reason(prompt)})
-        _emit(n, "ok")
-        return
-    _write_map(step.get("write"))
+    else:
+        _write_map(step.get("write"))
+    # Before any JSON on stdout, including exit1. Hang never prints JSON.
+    _copy_transcript(step, conversation_id)
     if do == "hang":
         while True:
             time.sleep(3600)
