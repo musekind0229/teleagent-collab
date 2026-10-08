@@ -1,0 +1,385 @@
+"""Pure helpers for agy lead review. No process or store I/O.
+
+Artifact reads are the only filesystem access. Verdict strings, rework prompts,
+and collect-result projection live here so the backend hook stays a state machine.
+"""
+from __future__ import annotations
+
+import hashlib
+import re
+from pathlib import Path
+from typing import Any
+
+_EXACT_CONTENT_RE = re.compile(
+    r"(?P<path>\S+)\s+must\s+contain\s+exactly\s+(?P<body>.+)$",
+    re.IGNORECASE,
+)
+_REQUEST_RE = re.compile(r"^agyrev:(agy_[0-9a-f]{12}):r([1-9][0-9]*)$")
+_UNAVAILABLE_CODE_RE = re.compile(r"lead_review_unavailable:\s*([A-Za-z0-9_.-]+)")
+
+_PASS = frozenset({"pass", "approve", "allow", "once"})
+_FAIL = frozenset({"fail", "reject", "deny", "deny_job"})
+
+_PREVIEW_PER_FILE = 8000
+_PREVIEW_TOTAL = 24000
+_PREVIEW_FILES = 8
+_PREVIEW_BYTES_CAP = 512 * 1024
+
+NEXT_STEP = (
+    "check the lead CLI (login, quota, --lead-timeout) with collab-service --ready, "
+    "then open a NEW request citing this request_id"
+)
+INTERRUPTED_NEXT = "open a NEW request citing this request_id"
+_REWORK_TAIL = (
+    "Modify the existing files in the current working directory so the acceptance is "
+    "met, then stop. Do not wait for further input."
+)
+
+
+def review_required(charter: dict | None, *, enabled: bool) -> bool:
+    """Enabled, charter asks for a lead, and acceptance is not exact-content."""
+    if not enabled:
+        return False
+    from execution_backend.antigravity_cli_v1 import _charter_requests_lead_review
+
+    if not _charter_requests_lead_review(charter if isinstance(charter, dict) else None):
+        return False
+    if isinstance(charter, dict):
+        acc = charter.get("acceptance")
+        if isinstance(acc, str) and _EXACT_CONTENT_RE.match(acc.strip()):
+            return False
+    return True
+
+
+def max_redos_from_charter(charter: dict | None) -> int:
+    """``clamp(int(max_redos), 0, 3)``. Missing, None, or invalid → 1."""
+    if not isinstance(charter, dict) or "max_redos" not in charter:
+        return 1
+    raw = charter.get("max_redos")
+    if raw is None or isinstance(raw, bool):
+        return 1
+    try:
+        number = int(str(raw).strip()) if isinstance(raw, str) else int(raw)
+    except (TypeError, ValueError):
+        return 1
+    if number < 0:
+        return 0
+    if number > 3:
+        return 3
+    return number
+
+
+def parse_request_id(request_id: str) -> tuple[str, int] | None:
+    if not isinstance(request_id, str):
+        return None
+    match = _REQUEST_RE.match(request_id)
+    if not match:
+        return None
+    return match.group(1), int(match.group(2))
+
+
+def snapshot_artifacts(root: Path, artifacts: list[str]) -> dict[str, Any]:
+    """Hash and bounded text preview of the named artifacts.
+
+    Preview is utf-8 (errors replaced), at most 8000 chars per file, 24000 total,
+    and 8 files. A file over 512 KiB contributes sha256 and size only.
+    ``artifact_hash`` is sha256 over sorted ``name:sha256`` lines.
+    """
+    base = Path(root)
+    found: dict[str, dict[str, Any]] = {}
+    missing: list[str] = []
+    preview_chars = 0
+    preview_files = 0
+    for raw_name in artifacts or []:
+        name = str(raw_name)
+        path = Path(name)
+        if not path.is_absolute():
+            path = base / name
+        try:
+            if not path.is_file():
+                missing.append(name)
+                continue
+            size = path.stat().st_size
+        except OSError:
+            missing.append(name)
+            continue
+        digest, nbytes, preview, truncated = _hash_and_preview(path, size)
+        if preview and preview_files < _PREVIEW_FILES and preview_chars < _PREVIEW_TOTAL:
+            room = _PREVIEW_TOTAL - preview_chars
+            if len(preview) > room:
+                preview = preview[:room]
+                truncated = True
+            preview_chars += len(preview)
+            preview_files += 1
+        elif preview:
+            preview = ""
+            truncated = True
+        found[name] = {
+            "sha256": digest,
+            "bytes": nbytes,
+            "preview": preview,
+            "truncated": truncated,
+            "contamination": None,
+        }
+    lines = [f"{name}:{found[name]['sha256']}" for name in sorted(found)]
+    artifact_hash = hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+    return {"artifacts": found, "artifact_hash": artifact_hash, "missing": missing}
+
+
+def _hash_and_preview(path: Path, size: int) -> tuple[str, int, str, bool]:
+    if size > _PREVIEW_BYTES_CAP:
+        digest = hashlib.sha256()
+        total = 0
+        with path.open("rb") as fh:
+            while True:
+                chunk = fh.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                total += len(chunk)
+        return digest.hexdigest(), total, "", True
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        raw = b""
+    text = raw.decode("utf-8", errors="replace")
+    truncated = False
+    if len(text) > _PREVIEW_PER_FILE:
+        text = text[:_PREVIEW_PER_FILE]
+        truncated = True
+    return hashlib.sha256(raw).hexdigest(), len(raw), text, truncated
+
+
+def build_payload(
+    rec_review: dict[str, Any],
+    snap: dict[str, Any],
+    *,
+    acceptance_text: str,
+    response_excerpt: str,
+) -> dict[str, Any]:
+    history = rec_review.get("history") if isinstance(rec_review, dict) else None
+    previous: list[str] = []
+    if isinstance(history, list):
+        for item in history:
+            if isinstance(item, dict) and item.get("verdict") == "fail":
+                previous.append(str(item.get("reason") or ""))
+    try:
+        rnd = int(rec_review.get("round") or 1)
+    except (TypeError, ValueError):
+        rnd = 1
+    try:
+        max_redos = int(rec_review.get("max_redos") or 0)
+    except (TypeError, ValueError):
+        max_redos = 0
+    excerpt = "" if response_excerpt is None else str(response_excerpt)
+    artifacts = snap.get("artifacts") if isinstance(snap, dict) else {}
+    return {
+        "artifacts": artifacts if isinstance(artifacts, dict) else {},
+        "artifact_hash": str((snap or {}).get("artifact_hash") or ""),
+        "artifact_error": None,
+        "tools": [],
+        "policy_violations": [],
+        "finish": "stop",
+        "backend": "antigravity.cli_v1",
+        "round": rnd,
+        "max_round": 1 + max_redos,
+        "previous_rejections": previous,
+        "acceptance_text": "" if acceptance_text is None else str(acceptance_text),
+        "worker_response_excerpt": excerpt[:2000],
+    }
+
+
+def context_hash(artifact_hash: str, round: int) -> str:
+    return hashlib.sha256(f"{artifact_hash}:{round}".encode("utf-8")).hexdigest()
+
+
+def normalize_verdict(verdict: str) -> str:
+    key = str(verdict or "").strip().lower()
+    if key in _PASS:
+        return "pass"
+    if key in _FAIL:
+        return "fail"
+    if key == "unavailable":
+        return "unavailable"
+    raise ValueError(f"unsupported review verdict {verdict!r}")
+
+
+def build_rework_prompt(
+    base_prompt: str,
+    *,
+    k: int,
+    n: int,
+    reason: str,
+    previous: list[str] | None,
+) -> str:
+    """Original prompt plus a ``REWORK k/n`` section and the verbatim reason."""
+    base = "" if base_prompt is None else str(base_prompt)
+    lines = [
+        f"REWORK {k}/{n}",
+        "Lead review rejected the previous attempt. Reason (verbatim):",
+        "" if reason is None else str(reason),
+    ]
+    for item in previous or []:
+        lines.append("" if item is None else str(item))
+    lines.append(_REWORK_TAIL)
+    section = "\n".join(lines)
+    if not base:
+        return section
+    if base.endswith("\n"):
+        return base + "\n" + section
+    return base + "\n\n" + section
+
+
+def sum_usage(rounds: list[dict | None]) -> dict | None:
+    """Sum numeric fields key-wise. None when every round is None."""
+    totals: dict[str, int | float] = {}
+    saw = False
+    for item in rounds or []:
+        if not isinstance(item, dict):
+            continue
+        saw = True
+        for key, value in item.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            current = totals.get(str(key), 0)
+            totals[str(key)] = current + value
+    if not saw:
+        return None
+    out: dict[str, int | float] = {}
+    for key, value in totals.items():
+        if isinstance(value, float) and value.is_integer():
+            out[key] = int(value)
+        else:
+            out[key] = value
+    return out
+
+
+def remaining_sec(deadline: float, now: float) -> float:
+    return float(deadline) - float(now)
+
+
+def unavailable_code(reason: str) -> str:
+    match = _UNAVAILABLE_CODE_RE.search("" if reason is None else str(reason))
+    if not match:
+        return "unknown"
+    return match.group(1)
+
+
+def project_outcome(out: dict[str, Any], review: dict[str, Any]) -> dict[str, Any]:
+    """Project a terminal review record onto a collect_result payload. Mutates ``out``."""
+    if not isinstance(out, dict) or not isinstance(review, dict):
+        return out
+    state = str(review.get("state") or "")
+    redos = _as_int(review.get("redos"), 0)
+    max_redos = _as_int(review.get("max_redos"), 0)
+    rnd = _as_int(review.get("round"), 1)
+    history = list(review.get("history") or []) if isinstance(review.get("history"), list) else []
+
+    if state == "worker_failed":
+        if rnd > 1:
+            out["rework"] = {"used": redos, "max": max_redos, "rounds": rnd, "history": history}
+        return out
+
+    if state == "accepted":
+        _apply_common(out, review, redos, max_redos, rnd, history)
+        out["review"] = {
+            "status": "passed",
+            "source": "lead_review",
+            "evidence": _last_reason(history, "pass")[:240],
+        }
+        return out
+
+    if state == "rejected_final":
+        _apply_common(out, review, redos, max_redos, rnd, history)
+        skip = str(review.get("skip_reason") or f"rework budget exhausted ({redos}/{max_redos})")
+        error = (
+            "acceptance_failed: lead_review_rejected; "
+            + skip
+            + "; last reason: "
+            + _last_reason(history, "fail")[:200]
+        )
+        out["ok"] = False
+        out["state"] = "fail"
+        out["acceptance_failed"] = True
+        out["error_source"] = "acceptance"
+        out["error"] = error
+        out["review"] = {"status": "failed", "source": "lead_review", "evidence": error[:240]}
+        return out
+
+    if state == "review_unavailable":
+        _apply_common(out, review, redos, max_redos, rnd, history)
+        reason = str(review.get("unavailable_reason") or "")
+        code = unavailable_code(reason)
+        out["ok"] = False
+        out["state"] = "fail"
+        out["error"] = reason + "; next step: " + NEXT_STEP
+        if code == "rework_spawn_failed":
+            out["error_source"] = "spawn"
+        else:
+            out.pop("error_source", None)
+        out["review"] = {
+            "status": "failed",
+            "source": "lead_review",
+            "evidence": f"lead_review_unavailable: {code}",
+        }
+        out["lead_review"] = {
+            "outcome": "unavailable",
+            "code": code,
+            "next_step": NEXT_STEP,
+            "human_action_required": True,
+        }
+        return out
+
+    if state == "interrupted_worker":
+        _apply_common(out, review, redos, max_redos, rnd, history)
+        error = (
+            f"lead_review_interrupted: round {rnd} worker lost in "
+            f"service restart; used reworks {redos}/{max_redos} are kept"
+        )
+        out["ok"] = False
+        out["state"] = "fail"
+        out["error"] = error
+        out["review"] = {
+            "status": "failed",
+            "source": "lead_review",
+            "evidence": "lead_review_interrupted",
+        }
+        out["lead_review"] = {
+            "outcome": "interrupted",
+            "code": "lead_review_interrupted",
+            "next_step": INTERRUPTED_NEXT,
+            "human_action_required": True,
+        }
+        return out
+
+    return out
+
+
+def _apply_common(
+    out: dict[str, Any],
+    review: dict[str, Any],
+    redos: int,
+    max_redos: int,
+    rnd: int,
+    history: list,
+) -> None:
+    out["rework"] = {"used": redos, "max": max_redos, "rounds": rnd, "history": history}
+    usage = sum_usage(review.get("usage_rounds") if isinstance(review.get("usage_rounds"), list) else [])
+    if usage is not None:
+        out["usage"] = usage
+
+
+def _last_reason(history: list, verdict: str) -> str:
+    for item in reversed(history):
+        if isinstance(item, dict) and item.get("verdict") == verdict:
+            return str(item.get("reason") or "")
+    return ""
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        if isinstance(value, bool) or value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
