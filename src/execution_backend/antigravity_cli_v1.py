@@ -391,8 +391,30 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             max_tool_calls="unsupported",
             no_progress_sec="enforced",
         )
+        # Awaiting review has no live process: the account lease was released
+        # when the round exited. The coordinator still counts that task as a
+        # running slot, so add those parked runs or one review blocks every
+        # other Goal (loop T7). A still-live proc is not added.
+        parked_reviews = 0
+        seen_runs: set[int] = set()
+        try:
+            run_records = list(self._runs.values())
+        except RuntimeError:
+            run_records = []
+        for rec in run_records:
+            if not isinstance(rec, dict) or id(rec) in seen_runs:
+                continue
+            seen_runs.add(id(rec))
+            review = rec.get("review")
+            if not isinstance(review, dict) or review.get("state") != "awaiting_review":
+                continue
+            proc = rec.get("proc")
+            poll = getattr(proc, "poll", None)
+            if callable(poll) and poll() is None:
+                continue
+            parked_reviews += 1
         caps["concurrency"] = {
-            "max_runs": self._account_pool_run_limit(),
+            "max_runs": self._account_pool_run_limit() + parked_reviews,
             "limited_by": ["agy_account_pool"],
         }
         # The prompt-only warning holds with or without skip-permissions; the

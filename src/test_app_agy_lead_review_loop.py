@@ -324,6 +324,20 @@ class AgyLeadReviewLoopTests(unittest.TestCase):
             rows = self._agy()
         return rows
 
+    def _wait_reviews(self, count: int, timeout: float = 8.0) -> list[dict]:
+        """Wait until the fake lead has logged ``count`` review calls.
+
+        The runner persists ``lead_review.status=running`` before the lead
+        process is spawned, so a status predicate can be true before the log
+        line exists.
+        """
+        deadline = time.monotonic() + timeout
+        rows = self._reviews()
+        while len(rows) < count and time.monotonic() < deadline:
+            time.sleep(0.05)
+            rows = self._reviews()
+        return rows
+
     def _task(self, status: dict) -> dict:
         tasks = [row for row in (status.get("tasks") or []) if isinstance(row, dict)]
         self.assertEqual(len(tasks), 1, status)
@@ -603,7 +617,7 @@ class AgyLeadReviewLoopTests(unittest.TestCase):
             self._review_running(status),
             f"review did not stay running; state={status.get('state')} pending={status.get('pending_decisions')}",
         )
-        self.assertGreaterEqual(len(self._reviews()), 1, _jsonl(self.lead_log))
+        self.assertGreaterEqual(len(self._wait_reviews(1)), 1, _jsonl(self.lead_log))
         first_pid = int(self._reviews()[0]["pid"])
         app, _backend = self._restart()
         seen = self._spy_annotates(app)
@@ -658,13 +672,14 @@ class AgyLeadReviewLoopTests(unittest.TestCase):
             self._attempt_running(1)(status),
             f"attempt 1 never ran; state={status.get('state')} pending={status.get('pending_decisions')}",
         )
+        self.assertGreaterEqual(len(self._wait_reviews(1)), 1, _jsonl(self.lead_log))
         app, _backend = self._restart()
         status = self._drive(app, goal_id, self._attempt_running(2), timeout=8.0)
         self.assertTrue(
             self._attempt_running(2)(status),
             f"attempt 2 never ran; state={status.get('state')} lead={self._lead_review_of(status)}",
         )
-        self.assertEqual(len(self._reviews()), 2, _jsonl(self.lead_log))
+        self.assertEqual(len(self._wait_reviews(2)), 2, _jsonl(self.lead_log))
         app, _backend = self._restart()
         status = self._drive(app, goal_id, timeout=8.0)
         self.assertEqual(status["state"], "failed", status)
@@ -803,7 +818,7 @@ class AgyLeadReviewLoopTests(unittest.TestCase):
             self._review_running(status),
             f"review did not stay running; state={status.get('state')} pending={status.get('pending_decisions')}",
         )
-        self.assertGreaterEqual(len(self._reviews()), 1, _jsonl(self.lead_log))
+        self.assertGreaterEqual(len(self._wait_reviews(1)), 1, _jsonl(self.lead_log))
         pid = int(self._reviews()[-1]["pid"])
         self.assertTrue(_pid_alive(pid), pid)
         app.cancel(goal_id, "stop review")

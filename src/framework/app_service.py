@@ -1600,6 +1600,8 @@ class AppCoordinator:
         # coordination so a queued Task is dispatched at most once by this
         # service instance. Released only around start_run.
         self._lock = threading.RLock()
+        from framework.lead_review_runner import LeadReviewRunner
+        self._review_runner = LeadReviewRunner.for_coordinator(self)
 
     def now(self) -> float:
         return float(self._clock())
@@ -1694,6 +1696,7 @@ class AppCoordinator:
         snap = current["goal"]
         if snap.get("state") == "cancel_requested":
             self._stop_planning_async(goal_id, "goal cancelled")
+            self._review_runner.stop_goal(goal_id, "goal cancelled")
             active = [
                 t
                 for t in (snap.get("tasks") or [])
@@ -1727,6 +1730,7 @@ class AppCoordinator:
         if snap.get("state") in {"completed", "failed", "cancelled"}:
             # Failed/cancelled while the lead was still planning: stop it now.
             self._stop_planning_async(goal_id, f"goal {snap.get('state')}")
+            self._review_runner.stop_goal(goal_id, f"goal {snap.get('state')}")
             return {"ok": True, "goal_id": goal_id, "state": snap.get("state"), "action": "terminal"}
         tasks = [dict(t) for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
         if not tasks:
@@ -1878,6 +1882,7 @@ class AppCoordinator:
             row = self.stop_planning(goal_id, reason)
             if row is not None:
                 out.append({"goal_id": goal_id, **row})
+        out.extend(self._review_runner.stop_all(reason))
         return out
 
     def _stop_planning_async(self, goal_id: str, reason: str) -> None:
@@ -3066,6 +3071,8 @@ class AppCoordinator:
         decision: Mapping[str, Any],
         action: Mapping[str, Any],
     ) -> dict[str, Any]:
+        if self._review_runner.owns(action):
+            return self._review_runner.step(snap, task, decision=decision, action=action)
         lead_decider = getattr(self.planner, "decide_action", None)
         backend_resolver = getattr(self.backend, "resolve_decision", None)
         backend_kind = str(action.get("kind") or "")
