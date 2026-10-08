@@ -108,11 +108,14 @@ def snapshot_artifacts(root: Path, artifacts: list[str]) -> dict[str, Any]:
 
     Preview is utf-8 (errors replaced), at most 8000 chars per file, 24000 total,
     and 8 files. A file over 512 KiB contributes sha256 and size only.
-    ``artifact_hash`` is sha256 over sorted ``name:sha256`` lines.
+    ``artifact_hash`` is sha256 over sorted ``name:sha256`` lines of files that
+    were read. A file that exists but cannot be read is listed in ``unreadable``
+    and is not hashed as empty.
     """
     base = Path(root)
     found: dict[str, dict[str, Any]] = {}
     missing: list[str] = []
+    unreadable: list[str] = []
     preview_chars = 0
     preview_files = 0
     for raw_name in artifacts or []:
@@ -128,7 +131,11 @@ def snapshot_artifacts(root: Path, artifacts: list[str]) -> dict[str, Any]:
         except OSError:
             missing.append(name)
             continue
-        digest, nbytes, preview, truncated = _hash_and_preview(path, size)
+        try:
+            digest, nbytes, preview, truncated = _hash_and_preview(path, size)
+        except OSError:
+            unreadable.append(name)
+            continue
         if preview and preview_files < _PREVIEW_FILES and preview_chars < _PREVIEW_TOTAL:
             room = _PREVIEW_TOTAL - preview_chars
             if len(preview) > room:
@@ -148,31 +155,69 @@ def snapshot_artifacts(root: Path, artifacts: list[str]) -> dict[str, Any]:
         }
     lines = [f"{name}:{found[name]['sha256']}" for name in sorted(found)]
     artifact_hash = hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
-    return {"artifacts": found, "artifact_hash": artifact_hash, "missing": missing}
+    return {
+        "artifacts": found,
+        "artifact_hash": artifact_hash,
+        "missing": missing,
+        "unreadable": unreadable,
+    }
 
 
 def _hash_and_preview(path: Path, size: int) -> tuple[str, int, str, bool]:
+    """Hash ``path``. ``OSError`` propagates so the caller can fail closed."""
     if size > _PREVIEW_BYTES_CAP:
-        digest = hashlib.sha256()
-        total = 0
-        with path.open("rb") as fh:
-            while True:
-                chunk = fh.read(1024 * 1024)
-                if not chunk:
-                    break
-                digest.update(chunk)
-                total += len(chunk)
-        return digest.hexdigest(), total, "", True
-    try:
-        raw = path.read_bytes()
-    except OSError:
-        raw = b""
+        return _hash_over_cap(path)
+    raw = path.read_bytes()
     text = raw.decode("utf-8", errors="replace")
     truncated = False
     if len(text) > _PREVIEW_PER_FILE:
         text = text[:_PREVIEW_PER_FILE]
         truncated = True
     return hashlib.sha256(raw).hexdigest(), len(raw), text, truncated
+
+
+def _hash_over_cap(path: Path) -> tuple[str, int, str, bool]:
+    """Stream sha256 for a file over the preview cap. ``OSError`` propagates."""
+    digest = hashlib.sha256()
+    total = 0
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            total += len(chunk)
+    return digest.hexdigest(), total, "", True
+
+
+def _unreadable_names(snap: Mapping[str, Any] | None) -> list[str]:
+    if not isinstance(snap, Mapping):
+        return []
+    raw = snap.get("unreadable")
+    if not isinstance(raw, list):
+        return []
+    names: list[str] = []
+    for item in raw:
+        text = item if isinstance(item, str) else ("" if item is None else str(item))
+        if text:
+            names.append(text)
+    return names
+
+
+def _unreadable_reason(names: list[str]) -> str:
+    joined = ", ".join(names)
+    if joined:
+        return f"lead_review_unavailable: unreadable artifacts: {joined}"
+    return "lead_review_unavailable: unreadable artifacts"
+
+
+def _mark_unreadable_payload(payload: dict[str, Any], snap: Mapping[str, Any] | None) -> list[str]:
+    """Copy the snapshot's unreadable list onto the lead-review payload."""
+    names = _unreadable_names(snap)
+    payload["unreadable"] = names
+    if names:
+        payload["artifact_error"] = "unreadable artifacts: " + ", ".join(names)
+    return names
 
 
 def read_tool_evidence(
@@ -332,6 +377,7 @@ def build_payload(
         max_redos = 0
     excerpt = "" if response_excerpt is None else str(response_excerpt)
     artifacts = snap.get("artifacts") if isinstance(snap, dict) else {}
+    unreadable = _unreadable_names(snap if isinstance(snap, Mapping) else None)
     if isinstance(tools, list):
         tool_rows: list = tools
         tool_evidence = {"source": "agy_transcript", "calls": len(tools)}
@@ -343,7 +389,10 @@ def build_payload(
     return {
         "artifacts": artifacts if isinstance(artifacts, dict) else {},
         "artifact_hash": str((snap or {}).get("artifact_hash") or ""),
-        "artifact_error": None,
+        "unreadable": unreadable,
+        "artifact_error": (
+            "unreadable artifacts: " + ", ".join(unreadable) if unreadable else None
+        ),
         "tools": tool_rows,
         "tool_evidence": tool_evidence,
         "review_note": review_note,

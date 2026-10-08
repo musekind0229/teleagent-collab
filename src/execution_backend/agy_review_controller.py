@@ -22,6 +22,9 @@ from execution_backend.agy_account_pool import (
     account_switch_lock,
 )
 from execution_backend.agy_review import (
+    _mark_unreadable_payload,
+    _unreadable_names,
+    _unreadable_reason,
     build_payload,
     build_rework_prompt,
     context_hash,
@@ -426,8 +429,13 @@ class AgyReviewController:
 
     def _apply_pass_locked(self, rec: dict[str, Any], review: dict[str, Any]) -> None:
         snap = snapshot_artifacts(Path(str(rec.get("directory") or "")), list(rec.get("artifacts") or []))
+        unreadable = _unreadable_names(snap)
         changed = bool(snap.get("missing")) or snap.get("artifact_hash") != review.get("artifact_hash")
-        if changed:
+        if unreadable:
+            review["state"] = "review_unavailable"
+            review["unavailable_reason"] = _unreadable_reason(unreadable)
+            review["error_source"] = None
+        elif changed:
             review["state"] = "review_unavailable"
             review["unavailable_reason"] = "lead_review_unavailable: artifacts_changed_after_review"
             review["error_source"] = None
@@ -701,6 +709,7 @@ class AgyReviewController:
                     str(rec.get("conversation_id") or ""),
                 ),
             )
+            _mark_unreadable_payload(payload, snap)
             rnd = int(review.get("round") or 1)
             review["request_id"] = f"agyrev:{rec.get('run_id')}:r{rnd}"
             review["artifact_hash"] = snap.get("artifact_hash")
