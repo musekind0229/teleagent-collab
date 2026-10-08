@@ -1016,20 +1016,58 @@ def _decision_summary(row: dict[str, Any]) -> str:
     return _one_line(str(kind or ""))
 
 
+_AGY_OLD_REASON = "TeleAgent worker requires a bounded decision"
+_AGY_NEW_REASON = "agy run awaits a lead review decision"
+_AGY_TITLE_PREFIX = "TeleAgent "
+
+
+def _is_agy_decision(row: dict[str, Any]) -> bool:
+    """An agy row: payload.backend starts with antigravity. or an id starts with agyrev:."""
+    details = row.get("details") if isinstance(row.get("details"), dict) else {}
+    payload = details.get("payload") if isinstance(details.get("payload"), dict) else {}
+    backend = payload.get("backend")
+    if isinstance(backend, str) and backend.startswith("antigravity."):
+        return True
+    ids = (
+        row.get("backend_request_id"),
+        details.get("backend_request_id"),
+        row.get("request_id"),
+    )
+    return any(isinstance(item, str) and item.startswith("agyrev:") for item in ids)
+
+
+def _agy_display(text: str, *, field: str) -> str:
+    """Title drops a leading TeleAgent. Reason and summary map only the known strings."""
+    if field != "title" and text == _AGY_OLD_REASON:
+        return _AGY_NEW_REASON
+    if field == "reason" or (field == "summary" and not text.startswith("TeleAgent review")):
+        return text
+    if text.startswith(_AGY_TITLE_PREFIX):
+        return "agy " + text[len(_AGY_TITLE_PREFIX):]
+    return text
+
+
 def _decision_brief(row: dict[str, Any]) -> dict[str, Any]:
     def _text(value: Any) -> str:
         if value is None:
             return ""
         return str(value)
 
+    title = _text(row.get("title"))
+    reason = _text(row.get("reason"))
+    summary = _decision_summary(row)
+    if _is_agy_decision(row):
+        title = _agy_display(title, field="title")
+        reason = _agy_display(reason, field="reason")
+        summary = _agy_display(summary, field="summary")
     brief = {
         "decision_id": _text(row.get("decision_id")),
         "kind": _text(row.get("kind")),
-        "title": _text(row.get("title")),
+        "title": title,
         "task_id": _text(row.get("task_id")),
         "status": _text(row.get("status")),
-        "reason": _text(row.get("reason")),
-        "summary": _decision_summary(row),
+        "reason": reason,
+        "summary": summary,
     }
     if "awaiting" in row and row.get("awaiting") is not None:
         awaiting = str(row.get("awaiting"))
