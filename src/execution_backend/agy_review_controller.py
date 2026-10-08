@@ -34,7 +34,7 @@ from execution_backend.agy_review import (
     review_required,
     snapshot_artifacts,
 )
-from execution_backend.base import BackendError, BackendStatus
+from execution_backend.base import BackendError, BackendStatus, unsupported
 
 _LOG = logging.getLogger(__name__)
 
@@ -154,6 +154,64 @@ class AgyReviewController:
                 rows.append(row)
         return 200, rows
 
+    def cancel_run(self, rec: dict[str, Any]) -> tuple[int, Any] | None:
+        """Cancel a reviewed run. None when ``rec`` has no review.
+
+        The branch is chosen under ``self._lock``, re-reading state and ``proc``
+        there. A live review proc is killed and reaped before the account lease
+        is released, still holding the lock. ``rework_waiting`` does not release
+        a lease. Parked states do, after the re-check.
+
+        Lock order while this lock is held: review-store, session, run-registry,
+        then the account-switch file lock inside ``_release_pool_lease_after_cancel``.
+        None of those acquire this lock. ``start_run`` drops the account-switch
+        lock before ``arm`` takes this one. ``collect_result`` and rework spawn
+        already take this lock first, then the account-switch lock.
+        """
+        with self._lock:
+            review = rec.get("review") if isinstance(rec.get("review"), dict) else None
+            if review is None:
+                return None
+            if self._proc_live(rec):
+                return self._cancel_live_review_locked(rec, review)
+            state = review.get("state")
+            if state == "rework_waiting":
+                self._stamp_cancelled(rec, review)
+                self._forget_review(rec)
+                return self._cancelled_body(rec)
+            if state in _PARKED_REVIEW_STATES:
+                self._stamp_cancelled(rec, review)
+                self._forget_review(rec)
+                self._backend._harvest(rec)
+                self._backend._release_pool_lease_after_cancel(rec)
+                return self._cancelled_body(rec)
+            return None
+
+    def _cancel_live_review_locked(self, rec: dict[str, Any], review: dict[str, Any]) -> tuple[int, Any]:
+        """Caller holds ``self._lock``. Kill and wait for exit, then release."""
+        proc = rec.get("proc")
+        killed = bool(proc is not None and self._backend._kill_proc(proc, rec))
+        if not killed or proc is None or proc.poll() is None:
+            pid = getattr(proc, "pid", None)
+            return 501, unsupported("cancel", f"could not signal agy pid={pid}")
+        self._stamp_cancelled(rec, review)
+        self._backend._harvest(rec)
+        self._backend._release_pool_lease_after_cancel(rec)
+        self._forget_review(rec)
+        return self._cancelled_body(rec)
+
+    @staticmethod
+    def _stamp_cancelled(rec: dict[str, Any], review: dict[str, Any]) -> None:
+        review["state"] = "cancelled"
+        rec["cancelled"] = True
+        rec["finish"] = "cancelled"
+        rec["activity"] = "idle"
+        rec["state"] = "cancelled"
+
+    @staticmethod
+    def _cancelled_body(rec: Mapping[str, Any]) -> tuple[int, Any]:
+        return 200, {"ok": True, "run_id": rec["run_id"], "state": "cancelled"}
+
     def cancel_waiting(self, rec: dict[str, Any]) -> bool:
         """Cancel a rework that holds no account lease. False if this is not that case.
 
@@ -166,11 +224,7 @@ class AgyReviewController:
             review = rec.get("review") if isinstance(rec.get("review"), dict) else None
             if review is None or review.get("state") != "rework_waiting" or self._proc_live(rec):
                 return False
-            review["state"] = "cancelled"
-            rec["cancelled"] = True
-            rec["finish"] = "cancelled"
-            rec["activity"] = "idle"
-            rec["state"] = "cancelled"
+            self._stamp_cancelled(rec, review)
             self._forget_review(rec)
         return True
 
@@ -204,21 +258,21 @@ class AgyReviewController:
             self._spawn_or_wait(rec, review, reason, previous)
 
     def cancel_parked(self, rec: dict[str, Any]) -> bool:
-        """Parked review with no live process becomes cancelled. False if not parked."""
-        proc = rec.get("proc")
-        review = rec.get("review") if isinstance(rec.get("review"), dict) else None
-        if not (
-            review is not None
-            and review.get("state") in _PARKED_REVIEW_STATES
-            and (proc is None or proc.poll() is not None)
-        ):
-            return False
+        """Parked review with no live process becomes cancelled. False if not parked.
+
+        Re-checks under the lock. A rework that started since the caller looked
+        is left alone (``cancel_run`` kills that proc before releasing a lease).
+        """
         with self._lock:
-            review["state"] = "cancelled"
-            rec["cancelled"] = True
-            rec["finish"] = "cancelled"
-            rec["activity"] = "idle"
-            rec["state"] = "cancelled"
+            proc = rec.get("proc")
+            review = rec.get("review") if isinstance(rec.get("review"), dict) else None
+            if not (
+                review is not None
+                and review.get("state") in _PARKED_REVIEW_STATES
+                and (proc is None or proc.poll() is not None)
+            ):
+                return False
+            self._stamp_cancelled(rec, review)
             self._forget_review(rec)
         return True
 

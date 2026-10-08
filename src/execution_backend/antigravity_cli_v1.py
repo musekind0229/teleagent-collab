@@ -1498,13 +1498,11 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             rec = self._get(run_id)
         except BackendError as e:
             return 404, {"ok": False, "error": str(e)}
-        if self._review.cancel_waiting(rec):
-            return 200, {"ok": True, "run_id": rec["run_id"], "state": "cancelled"}
+        # Review decision, kill, wait, and lease release run under the controller lock.
+        reviewed = self._review.cancel_run(rec)
+        if reviewed is not None:
+            return reviewed
         proc: subprocess.Popen | None = rec.get("proc")
-        if self._review.cancel_parked(rec):
-            self._harvest(rec)
-            self._release_pool_lease_after_cancel(rec)
-            return 200, {"ok": True, "run_id": rec["run_id"], "state": "cancelled"}
         if proc is None or proc.poll() is not None:
             self._harvest(rec)
             self._release_pool_lease_after_cancel(rec)
