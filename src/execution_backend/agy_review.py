@@ -46,6 +46,18 @@ _SECRET_RE = re.compile(
     r"Bearer\s+\S+|(?:api[_-]?key|token|secret|password)\s*[:=]\s*\S+|sk-[A-Za-z0-9_\-]+",
     re.IGNORECASE,
 )
+# Wholesale replacement when a key contains one of these words (any case, _ or - optional).
+_SENSITIVE_KEY_RE = re.compile(
+    r"api[_-]?key|password|passwd|private[_-]?key|client[_-]?secret|"
+    r"access[_-]?token|refresh[_-]?token|authorization|token|cookie|"
+    r"credentials?|secret|auth",
+    re.IGNORECASE,
+)
+_REDACTED = "[redacted]"
+_ARGS_CAP_MARK = "[capped]"
+_ARGS_MAX_DEPTH = 12
+_ARGS_MAX_ITEMS = 64
+_ARGS_MAX_NODES = 256
 _MAX_TRANSCRIPT_BYTES = 8 * 1024 * 1024
 
 
@@ -242,18 +254,58 @@ def _fill_call(row: dict[str, Any], step: dict[str, Any], output_cap: int) -> No
 
 
 def _cap_args(args: Any, cap: int) -> dict[str, Any]:
+    """Redact and bound tool args. Sensitive keys are replaced at any depth."""
     if not isinstance(args, dict):
         return {}
     limit = cap if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0 else 0
+    return _cap_arg_mapping(args, limit, 0, [_ARGS_MAX_NODES])
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit]
+
+
+def _sensitive_arg_key(name: str) -> bool:
+    return _SENSITIVE_KEY_RE.search(name) is not None
+
+
+def _cap_arg_mapping(mapping: dict, limit: int, depth: int, budget: list[int]) -> dict[str, Any]:
     out: dict[str, Any] = {}
-    for key, value in args.items():
+    for key, value in mapping.items():
+        if len(out) >= _ARGS_MAX_ITEMS or budget[0] <= 0:
+            break
+        budget[0] -= 1
         name = key if isinstance(key, str) else str(key)
-        if not isinstance(value, str):
-            out[name] = value
+        if _sensitive_arg_key(name):
+            out[name] = _clip(_REDACTED, limit)
             continue
-        text = _SECRET_RE.sub("[redacted]", value)
-        out[name] = text[:limit] if len(text) > limit else text
+        out[name] = _cap_arg_value(value, limit, depth + 1, budget)
     return out
+
+
+def _cap_arg_sequence(values: list | tuple, limit: int, depth: int, budget: list[int]) -> list[Any]:
+    out: list[Any] = []
+    for value in values:
+        if len(out) >= _ARGS_MAX_ITEMS or budget[0] <= 0:
+            break
+        budget[0] -= 1
+        out.append(_cap_arg_value(value, limit, depth + 1, budget))
+    return out
+
+
+def _cap_arg_value(value: Any, limit: int, depth: int, budget: list[int]) -> Any:
+    if isinstance(value, str):
+        return _clip(_SECRET_RE.sub(_REDACTED, value), limit)
+    # bool is an int subclass; keep it as a JSON boolean.
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if depth >= _ARGS_MAX_DEPTH or budget[0] <= 0:
+        return _clip(_ARGS_CAP_MARK, limit)
+    if isinstance(value, dict):
+        return _cap_arg_mapping(value, limit, depth, budget)
+    if isinstance(value, (list, tuple)):
+        return _cap_arg_sequence(value, limit, depth, budget)
+    return _clip(_SECRET_RE.sub(_REDACTED, str(value)), limit)
 
 
 def build_payload(
