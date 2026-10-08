@@ -48,7 +48,11 @@ def resolve_review_store_path(
 
 
 class AgyReviewStore:
-    """JSON review records keyed by run_id. Memory-only when ``path`` is None."""
+    """JSON review records keyed by run_id. Memory-only when ``path`` is None.
+
+    A path-backed write builds the next mapping, writes that mapping, and only
+    then swaps it into ``_mem``. A failed write leaves ``_mem`` unchanged.
+    """
 
     def __init__(self, path: str | os.PathLike | None) -> None:
         self.path: Path | None = Path(path) if path else None
@@ -73,8 +77,10 @@ class AgyReviewStore:
         if stored.get("updated_at") is None:
             stored["updated_at"] = time.time()
         with self._lock:
-            self._mem[str(run_id)] = stored
-            self._write_locked()
+            new_mem = dict(self._mem)
+            new_mem[str(run_id)] = stored
+            self._write_locked(new_mem)
+            self._mem = new_mem
 
     def update(self, run_id: str, **fields: Any) -> dict[str, Any]:
         key = str(run_id)
@@ -82,20 +88,27 @@ class AgyReviewStore:
             current = self._mem.get(key)
             if not isinstance(current, dict):
                 raise KeyError(key)
+            updated = copy.deepcopy(current)
             for name, value in fields.items():
-                current[name] = copy.deepcopy(value)
+                updated[name] = copy.deepcopy(value)
             if "updated_at" not in fields:
-                current["updated_at"] = time.time()
-            self._write_locked()
-            return copy.deepcopy(current)
+                updated["updated_at"] = time.time()
+            new_mem = dict(self._mem)
+            new_mem[key] = updated
+            returned = copy.deepcopy(updated)
+            self._write_locked(new_mem)
+            self._mem = new_mem
+            return returned
 
     def forget(self, run_id: str) -> None:
         key = str(run_id)
         with self._lock:
             if key not in self._mem:
                 return
-            del self._mem[key]
-            self._write_locked()
+            new_mem = dict(self._mem)
+            del new_mem[key]
+            self._write_locked(new_mem)
+            self._mem = new_mem
 
     def prune(self, collected_older_than_sec: float = 7 * 86400, now: float | None = None) -> int:
         """Drop collected records whose timestamp is older than ``now - N``."""
@@ -106,8 +119,9 @@ class AgyReviewStore:
             window = 7 * 86400
         cutoff = moment - window
         with self._lock:
+            new_mem = dict(self._mem)
             dropped = 0
-            for run_id, rec in list(self._mem.items()):
+            for run_id, rec in list(new_mem.items()):
                 if not isinstance(rec, dict) or rec.get("collected") is not True:
                     continue
                 stamp = rec.get("updated_at")
@@ -118,10 +132,11 @@ class AgyReviewStore:
                 except (TypeError, ValueError):
                     when = 0.0
                 if when < cutoff:
-                    del self._mem[run_id]
+                    del new_mem[run_id]
                     dropped += 1
             if dropped:
-                self._write_locked()
+                self._write_locked(new_mem)
+                self._mem = new_mem
             return dropped
 
     def _read_disk(self) -> dict[str, dict[str, Any]]:
@@ -155,12 +170,13 @@ class AgyReviewStore:
             return
         _LOG.warning("agy review store unreadable (%s); renamed aside", why)
 
-    def _write_locked(self) -> None:
+    def _write_locked(self, mem: dict[str, dict[str, Any]] | None = None) -> None:
         path = self.path
         if path is None:
             return
+        runs = self._mem if mem is None else mem
         path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"version": STORE_VERSION, "runs": self._mem}
+        payload = {"version": STORE_VERSION, "runs": runs}
         fd, tmp_name = tempfile.mkstemp(prefix=".agy-reviews-", dir=str(path.parent))
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:

@@ -6,6 +6,7 @@ into the backend only through methods that already exist there.
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import threading
@@ -295,7 +296,13 @@ class AgyReviewController:
         reason: str = "",
         answers: Any = None,
     ) -> dict[str, Any]:
-        """Apply one lead verdict. ValueError leaves the run and the store untouched."""
+        """Apply one lead verdict.
+
+        ValueError leaves the run and the store untouched. The first durable
+        write of the resolution is the commit: if it raises, the shared review
+        dict and the run record are restored and the error propagates. Rework
+        spawn and listeners run only after that write returns.
+        """
         parsed = parse_request_id(request_id if isinstance(request_id, str) else "")
         if parsed is None:
             raise BackendError(
@@ -348,6 +355,13 @@ class AgyReviewController:
                     f"stale review request {request_id}: current round r{current_round}, "
                     f"state {current_state}"
                 )
+            review_snap = copy.deepcopy(review)
+            review_boxes = {
+                key: value
+                for key, value in review.items()
+                if isinstance(value, (dict, list))
+            }
+            rec_snap = {key: rec[key] for key in rec if key != "review"}
             by = self._review_actor(answers)
             reason_text = "" if reason is None else str(reason)
             if len(reason_text) > 2000:
@@ -361,31 +375,43 @@ class AgyReviewController:
                 for item in history
                 if isinstance(item, dict) and item.get("verdict") == "fail"
             ]
-            resolutions[request_id] = {
-                "verdict": normalized,
-                "reason": reason_text,
-                "at": now,
-                "by": by,
-            }
-            history.append({
-                "round": int(req_round),
-                "verdict": normalized,
-                "reason": reason_text,
-                "by": by,
-                "conversation_id": str(rec.get("conversation_id") or ""),
-                "at": now,
-            })
-            review["resolutions"] = resolutions
-            review["history"] = history
-            if normalized == "pass":
-                self._apply_pass_locked(rec, review)
-            elif normalized == "fail":
-                self._apply_fail_locked(rec, review, reason_text, prior_fails, now, req_round)
-            else:
-                review["state"] = "review_unavailable"
-                review["unavailable_reason"] = reason_text
-                review["error_source"] = None
-                self._persist_review(rec)
+            need_spawn = False
+            try:
+                resolutions[request_id] = {
+                    "verdict": normalized,
+                    "reason": reason_text,
+                    "at": now,
+                    "by": by,
+                }
+                history.append({
+                    "round": int(req_round),
+                    "verdict": normalized,
+                    "reason": reason_text,
+                    "by": by,
+                    "conversation_id": str(rec.get("conversation_id") or ""),
+                    "at": now,
+                })
+                review["resolutions"] = resolutions
+                review["history"] = history
+                if normalized == "pass":
+                    self._apply_pass_locked(rec, review)
+                elif normalized == "fail":
+                    need_spawn = self._apply_fail_locked(
+                        rec, review, reason_text, prior_fails, now, req_round
+                    )
+                else:
+                    review["state"] = "review_unavailable"
+                    review["unavailable_reason"] = reason_text
+                    review["error_source"] = None
+                    self._persist_review(rec)
+            except Exception:  # noqa: BLE001 — failed commit restores the shared review and re-raises
+                self._rollback_uncommitted_resolve(
+                    rec, review, review_snap, review_boxes, rec_snap
+                )
+                raise
+            # The first write committed. Spawn must not roll that verdict back.
+            if need_spawn:
+                self._spawn_or_wait(rec, review, reason_text, prior_fails, now=now)
             result = {
                 "ok": True,
                 "request_id": request_id,
@@ -451,7 +477,13 @@ class AgyReviewController:
         prior_fails: list[str],
         now: float,
         req_round: int,
-    ) -> None:
+    ) -> bool:
+        """Persist a fail. True when the caller must spawn the rework.
+
+        The persist is the commit point. Spawning here would start a rework
+        before that write is known to have stuck, and a later spawn error
+        would be able to roll the committed verdict back.
+        """
         redos = int(review.get("redos") or 0)
         max_redos = int(review.get("max_redos") or 0)
         try:
@@ -464,14 +496,49 @@ class AgyReviewController:
             review["state"] = "running"
             review["request_id"] = None
             self._persist_review(rec)
-            self._spawn_or_wait(rec, review, reason_text, prior_fails, now=now)
-            return
+            return True
         if redos >= max_redos:
             review["skip_reason"] = f"rework budget exhausted ({redos}/{max_redos})"
         else:
             review["skip_reason"] = f"rework skipped: {int(left)}s left (<30s)"
         review["state"] = "rejected_final"
         self._persist_review(rec)
+        return False
+
+    def _rollback_uncommitted_resolve(
+        self,
+        rec: dict[str, Any],
+        review: dict[str, Any],
+        review_snap: dict[str, Any],
+        review_boxes: dict[str, Any],
+        rec_snap: dict[str, Any],
+    ) -> None:
+        """Restore a resolve whose first durable write did not commit.
+
+        ``rec["review"]`` keeps its identity. Dicts and lists that were already
+        on that review are cleared and refilled so holders of those containers
+        do not keep the uncommitted verdict.
+        """
+        review.clear()
+        for key, value in review_snap.items():
+            live = review_boxes.get(key)
+            if isinstance(live, dict) and isinstance(value, dict):
+                live.clear()
+                for inner_key, inner_val in value.items():
+                    live[inner_key] = copy.deepcopy(inner_val)
+                review[key] = live
+            elif isinstance(live, list) and isinstance(value, list):
+                live.clear()
+                live.extend(copy.deepcopy(item) for item in value)
+                review[key] = live
+            else:
+                review[key] = copy.deepcopy(value)
+        if rec.get("review") is not review:
+            rec["review"] = review
+        for key in [key for key in rec if key != "review" and key not in rec_snap]:
+            del rec[key]
+        for key, value in rec_snap.items():
+            rec[key] = value
 
     def _spawn_rework(
         self,
