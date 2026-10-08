@@ -1927,6 +1927,9 @@ def summarize_status(payload: dict[str, Any]) -> dict[str, Any]:
     ``usage`` is copied from task results and is never summed.
     A task result ``rework`` dict adds ``used``, ``max``, and the last verdict.
     A task result ``lead_review`` dict adds that outcome brief.
+    Scheduler ``execution_limit`` is the agy execution (account pool) cap.
+    ``active_task_limit`` is the coordinator active-task limit, not worker
+    concurrency. Each is copied only as a non-bool int >= 0.
     """
     cut = _Cut()
     tasks = _task_rows(payload)
@@ -2120,6 +2123,10 @@ def summarize_status(payload: dict[str, Any]) -> dict[str, Any]:
             "capacity": 0 if capacity is None else capacity,
             "waiting_reason": cut.text("" if reason is None else str(reason), _SUMMARY_TEXT_CAP),
         }
+        for key in ("execution_limit", "parked_review_runs", "active_task_limit"):
+            value = scheduler.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                summary["scheduler"][key] = value
     if isinstance(wait, dict):
         summary["wait"] = wait
     return summary
