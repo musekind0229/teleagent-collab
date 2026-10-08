@@ -2478,7 +2478,17 @@ class AppCoordinator:
         conc = raw.get("concurrency")
         if not isinstance(conc, dict):
             return None
-        return as_limit(conc.get("max_runs"))
+        base = as_limit(conc.get("max_runs"))
+        if base is None:
+            return None
+        try:
+            opted_in = getattr(self.backend, "lead_review_mode", None) == "async_v1"
+        except Exception:
+            opted_in = False
+        pending = conc.get("pending_review_runs") if opted_in else 0
+        if isinstance(pending, int) and not isinstance(pending, bool) and pending >= 0:
+            return base + pending
+        return base
 
     def _goal_task_rows(self) -> list[tuple[str, list[dict[str, Any]]]]:
         out: list[tuple[str, list[dict[str, Any]]]] = []

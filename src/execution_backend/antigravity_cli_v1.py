@@ -391,10 +391,8 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             max_tool_calls="unsupported",
             no_progress_sec="enforced",
         )
-        # Awaiting review has no live process: the account lease was released
-        # when the round exited. The coordinator still counts that task as a
-        # running slot, so add those parked runs or one review blocks every
-        # other Goal (loop T7). A still-live proc is not added.
+        # max_runs is the account-pool cap only. Parked awaiting_review runs with
+        # no live proc are pending_review_runs; async_v1 adds that in the coordinator.
         parked_reviews = 0
         seen_runs: set[int] = set()
         try:
@@ -414,9 +412,9 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
                 continue
             parked_reviews += 1
         caps["concurrency"] = {
-            "max_runs": self._account_pool_run_limit() + parked_reviews,
+            "max_runs": self._account_pool_run_limit(),
             "limited_by": ["agy_account_pool"],
-            # Parked reviews only. rework_waiting is not included; max_runs is unchanged.
+            # Parked reviews only (no live proc, no lease); running reworks and rework_waiting are excluded.
             "pending_review_runs": parked_reviews,
         }
         # The prompt-only warning holds with or without skip-permissions; the
