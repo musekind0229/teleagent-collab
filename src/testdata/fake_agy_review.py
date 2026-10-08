@@ -8,13 +8,18 @@ Env:
                    Counter file is ``<script>.n``.
   FAKE_AGY_LOG     jsonl, one object per invocation.
 
-Steps: {"do": "ok"|"exit1"|"sleep"|"hang"|"echo_reason", "write": {rel: text},
-"sec": N, "rel": "x.md", "transcript": "<jsonl path>"|true}. ``echo_reason``
-writes the line after "Reason (verbatim):" into ``rel``. When ``transcript``
-is present, that file (or a one-call default when the value is true) is copied
-to ``$HOME/.gemini/antigravity-cli/brain/<conversation_id>/.system_generated/logs/transcript_full.jsonl``
+Steps: {"do": "ok"|"exit1"|"sleep"|"hang"|"echo_reason"|"block_until",
+"write": {rel: text}, "sec": N, "rel": "x.md", "path": "<gate file>",
+"transcript": "<jsonl path>"|true}. ``echo_reason`` writes the line after
+"Reason (verbatim):" into ``rel``. ``block_until`` waits until ``path`` (or
+``gate``) exists, then exits ok; ``sec`` is the wait limit (default 60). When
+``transcript`` is present, that file (or a one-call default when the value is
+true) is copied to ``$HOME/.gemini/antigravity-cli/brain/<conversation_id>/.system_generated/logs/transcript_full.jsonl``
 before the JSON result is printed, using the same conversation_id. Absent key:
 behaviour unchanged.
+
+``FAKE_AGY_SPAN``, when set, is a jsonl of ``{"event": "start"|"end", "pid", "t"}``.
+Unset: nothing is written there and the invocation log is unchanged.
 """
 from __future__ import annotations
 
@@ -184,6 +189,32 @@ def _log(path: str, row: dict) -> None:
         fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def _span(event: str) -> None:
+    """Optional start/end trace. No-op unless ``FAKE_AGY_SPAN`` is set."""
+    path = os.environ.get("FAKE_AGY_SPAN", "")
+    if not path:
+        return
+    _log(path, {"event": event, "pid": os.getpid(), "t": time.time()})
+
+
+def _wait_gate(step: dict) -> None:
+    """Block until ``path`` or ``gate`` exists. Missing path returns at once."""
+    raw = step.get("path", step.get("gate", ""))
+    text = str(raw or "").strip()
+    if not text:
+        return
+    gate = Path(text)
+    try:
+        limit = float(step.get("sec") or 60)
+    except (TypeError, ValueError):
+        limit = 60.0
+    deadline = time.time() + max(0.0, limit)
+    while not gate.exists():
+        if time.time() >= deadline:
+            return
+        time.sleep(0.05)
+
+
 def main() -> None:
     if not any(arg.startswith("--print=") for arg in sys.argv[1:]):
         sys.stderr.write("fake_agy_review: missing --print=\n")
@@ -207,25 +238,33 @@ def main() -> None:
             "prompt": prompt,
         },
     )
-    conversation_id = f"conv_{n}"
-    if do == "echo_reason":
-        rel = str(step.get("rel") or "reason.txt")
-        _write_map({rel: _verbatim_reason(prompt)})
-    else:
-        _write_map(step.get("write"))
-    # Before any JSON on stdout, including exit1. Hang never prints JSON.
-    _copy_transcript(step, conversation_id)
-    if do == "hang":
-        while True:
-            time.sleep(3600)
-    if do == "sleep":
-        time.sleep(float(step.get("sec") or 0))
+    _span("start")
+    try:
+        conversation_id = f"conv_{n}"
+        if do == "echo_reason":
+            rel = str(step.get("rel") or "reason.txt")
+            _write_map({rel: _verbatim_reason(prompt)})
+        else:
+            _write_map(step.get("write"))
+        # Before any JSON on stdout, including exit1. Hang never prints JSON.
+        _copy_transcript(step, conversation_id)
+        if do == "hang":
+            while True:
+                time.sleep(3600)
+        if do == "block_until":
+            _wait_gate(step)
+            _emit(n, "ok")
+            return
+        if do == "sleep":
+            time.sleep(float(step.get("sec") or 0))
+            _emit(n, "ok")
+            return
+        if do == "exit1":
+            _emit(n, "error", "exit1")
+            raise SystemExit(1)
         _emit(n, "ok")
-        return
-    if do == "exit1":
-        _emit(n, "error", "exit1")
-        raise SystemExit(1)
-    _emit(n, "ok")
+    finally:
+        _span("end")
 
 
 if __name__ == "__main__":

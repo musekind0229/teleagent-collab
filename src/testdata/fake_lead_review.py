@@ -15,7 +15,10 @@ Env:
   FAKE_LEAD_SHAPE   ``codex`` selects the codex argv/stdin/``-o`` convention.
 
 Review steps: ``pass:<reason>``, ``fail:<reason>``, ``invalid_json``,
-``mismatch_id``, ``sleep:<sec>``, ``block_until:<path>``, ``exit1_401``.
+``mismatch_id``, ``sleep:<sec>``, ``block_until:<path>``,
+``block_until:<path>|<sec>``, ``block_until_fail:<path>|<reason>``,
+``exit1_401``. ``block_until`` still waits 30s then passes when no ``|sec``
+is given. ``block_until_fail`` waits up to 120s, then returns fail.
 """
 from __future__ import annotations
 
@@ -186,11 +189,20 @@ def _plan(req: dict) -> str:
 
 
 def _split_step(step: str) -> tuple[str, str]:
-    for name in ("pass", "fail", "sleep", "block_until"):
+    for name in ("block_until_fail", "pass", "fail", "sleep", "block_until"):
         prefix = name + ":"
         if step.startswith(prefix):
             return name, step[len(prefix):]
     return step, ""
+
+
+def _wait_gate(path: str, seconds: float) -> None:
+    gate = Path(path)
+    deadline = time.time() + seconds
+    while not gate.exists():
+        if time.time() >= deadline:
+            return
+        time.sleep(0.05)
 
 
 def _read_prompt(*, codex: bool) -> str:
@@ -236,13 +248,20 @@ def main() -> None:
         time.sleep(float(arg or "0"))
         op, arg = "pass", "slept"
     elif op == "block_until":
-        gate = Path(arg)
-        deadline = time.time() + 30.0
-        while not gate.exists():
-            if time.time() >= deadline:
-                break
-            time.sleep(0.05)
+        # ``path`` alone keeps the historical 30s wait. ``path|sec`` is optional.
+        path_arg, sep, extra = arg.partition("|")
+        wait = 30.0
+        if sep:
+            try:
+                wait = float(extra)
+            except ValueError:
+                wait = 30.0
+        _wait_gate(path_arg, wait)
         op, arg = "pass", "unblocked"
+    elif op == "block_until_fail":
+        path_arg, sep, reason = arg.partition("|")
+        _wait_gate(path_arg, 120.0)
+        op, arg = "fail", (reason if sep else "") or "fail"
     if op == "invalid_json":
         _emit("not json {{{", codex=codex, out_path=out_path)
         return
