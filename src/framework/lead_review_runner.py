@@ -160,6 +160,28 @@ def _bound_event(row: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def _trim_events(events: list[dict[str, Any]], keep: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Trim events list (oldest first, preserving keep) until JSON fits in _EVENTS_MAX_BYTES."""
+    while len(events) > 1:
+        try:
+            encoded = json.dumps(events)
+        except (TypeError, ValueError):
+            break
+        if len(encoded) <= _EVENTS_MAX_BYTES:
+            break
+        target_idx = None
+        for i, ev in enumerate(events):
+            if ev is not keep:
+                target_idx = i
+                break
+        if target_idx is None:
+            break
+        del events[target_idx]
+    if len(events) == 1 and _json_len(events) > _EVENTS_MAX_BYTES:
+        _bound_event(events[-1])
+    return events
+
+
 def _sanitize_process_value(value: Any, depth: int = 0) -> Any:
     """Redact and cap one process value. Small lists and dicts keep their shape."""
     if depth >= 6:
@@ -595,17 +617,7 @@ class LeadReviewRunner:
         events = [dict(item) for item in (lead.get("events") or []) if isinstance(item, Mapping)]
         events.append(row)
         events = events[-_KEEP:]
-        while len(events) > 1:
-            try:
-                encoded = json.dumps(events)
-            except (TypeError, ValueError):
-                break
-            if len(encoded) <= _EVENTS_MAX_BYTES:
-                break
-            del events[0]
-        if len(events) == 1 and _json_len(events) > _EVENTS_MAX_BYTES:
-            _bound_event(events[-1])
-        lead["events"] = events
+        lead["events"] = _trim_events(events, keep=None)
 
     def _lead_state(self, decision: Mapping[str, Any]) -> dict[str, Any]:
         details = decision.get("details") if isinstance(decision.get("details"), Mapping) else {}
@@ -721,10 +733,12 @@ class LeadReviewRunner:
         if pending is None:
             return
         lead = self._lead_state(pending)
-        for item in reversed(lead.get("events") or []):
+        events = lead.get("events") or []
+        for item in reversed(events):
             if isinstance(item, dict) and item.get("event") == _STOPPED and str(item.get("job_id") or "") == job_id:
                 item["lead_processes"] = _sanitize_processes(procs)
                 _bound_event(item)
+                lead["events"] = _trim_events(events, keep=item)
                 self._write(goal_id, decision_id, lead)
                 return
 
