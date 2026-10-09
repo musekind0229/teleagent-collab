@@ -353,6 +353,12 @@ def _cap_arg_value(value: Any, limit: int, depth: int, budget: list[int]) -> Any
     return _clip(_SECRET_RE.sub(_REDACTED, str(value)), limit)
 
 
+def redact_tree(value: Any, limit: int) -> Any:
+    """Redact and bound a data tree. Same redactor used for tool args."""
+    cap = limit if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0 else 0
+    return _cap_arg_value(value, cap, 0, [_ARGS_MAX_NODES])
+
+
 def build_payload(
     rec_review: dict[str, Any],
     snap: dict[str, Any],

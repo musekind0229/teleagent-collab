@@ -19,6 +19,7 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from execution_backend import agy_review
 from lead_adapter.cancel import CancelScope, use_scope as use_lead_scope
 
 _LOG = logging.getLogger("framework.lead_review_runner")
@@ -206,7 +207,10 @@ def _sanitize_process_value(value: Any, depth: int = 0) -> Any:
 
 
 def _sanitize_processes(procs: list[Any]) -> list[Any]:
-    return [_sanitize_process_value(item) for item in list(procs)[:8]]
+    return [
+        _sanitize_process_value(agy_review.redact_tree(item, _EVENT_FIELD_CAP))
+        for item in list(procs)[:8]
+    ]
 
 
 def _round_of(request_id: str) -> int:
