@@ -159,6 +159,16 @@ class TestArgvAndFlags(unittest.TestCase):
 
 
 class TestFactoryAndResolve(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self._pool_patch = patch.dict(os.environ, {}, clear=False)
+        self._pool_patch.start()
+        os.environ.pop("COLLAB_AGY_ACCOUNT_POOL", None)
+
+    def tearDown(self):
+        self._pool_patch.stop()
+        super().tearDown()
+
     def test_factory_aliases(self):
         for name in ("antigravity", "antigravity.cli_v1", "agy", "agy.cli_v1"):
             be = get_execution_backend(name)
@@ -423,6 +433,7 @@ class TestRunJobCli(unittest.TestCase):
         env.pop("COLLAB_EXECUTION_BACKEND", None)
         env.pop("AGY_AUTO_APPROVE", None)
         env.pop("COLLAB_AGY_AUTO_APPROVE", None)
+        env.pop("COLLAB_AGY_ACCOUNT_POOL", None)
         if env_extra:
             env.update(env_extra)
         stdout = io.StringIO()
