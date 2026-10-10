@@ -8,8 +8,10 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -640,6 +642,510 @@ class TestP1PipeAcceptanceTimeout(unittest.TestCase):
                 result = run_antigravity_charter(charter=charter, workdir=root, environ=env)
             self.assertTrue(result.get("ok"), result)
 
+
+class TestStreamDrainShortOutput(unittest.TestCase):
+    def test_short_output_visible_while_child_alive(self):
+        code = (
+            "import sys, time\n"
+            "sys.stdout.write('SHORT_MARKER\\n')\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(1.0)\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-u", "-c", code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        chunks: list[str] = []
+        done = threading.Event()
+        t = threading.Thread(
+            target=AntigravityCliExecutionBackend._drain_stream,
+            args=(proc.stdout, chunks, done),
+        )
+        t.start()
+        try:
+            deadline = time.time() + 0.5
+            while time.time() < deadline:
+                if any("SHORT_MARKER" in c for c in chunks):
+                    break
+                time.sleep(0.02)
+            self.assertTrue(proc.poll() is None, "child exited prematurely")
+            self.assertTrue(
+                any("SHORT_MARKER" in c for c in chunks),
+                f"SHORT_MARKER not drained while child alive: chunks={chunks!r}",
+            )
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+            try:
+                proc.wait(timeout=2.0)
+            except Exception:
+                proc.kill()
+                proc.wait(timeout=2.0)
+            if proc.stdout:
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
+            if proc.stderr:
+                try:
+                    proc.stderr.close()
+                except Exception:
+                    pass
+            t.join(timeout=2.0)
+
+    def test_short_stderr_visible_while_child_alive(self):
+        code = (
+            "import sys, time\n"
+            "sys.stderr.write('SHORT_STDERR_MARKER\\n')\n"
+            "sys.stderr.flush()\n"
+            "time.sleep(1.0)\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-u", "-c", code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        chunks: list[str] = []
+        done = threading.Event()
+        t = threading.Thread(
+            target=AntigravityCliExecutionBackend._drain_stream,
+            args=(proc.stderr, chunks, done),
+        )
+        t.start()
+        try:
+            deadline = time.time() + 0.5
+            while time.time() < deadline:
+                if any("SHORT_STDERR_MARKER" in c for c in chunks):
+                    break
+                time.sleep(0.02)
+            self.assertTrue(proc.poll() is None, "child exited prematurely")
+            self.assertTrue(
+                any("SHORT_STDERR_MARKER" in c for c in chunks),
+                f"SHORT_STDERR_MARKER not drained while child alive: chunks={chunks!r}",
+            )
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+            try:
+                proc.wait(timeout=2.0)
+            except Exception:
+                proc.kill()
+                proc.wait(timeout=2.0)
+            if proc.stdout:
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
+            if proc.stderr:
+                try:
+                    proc.stderr.close()
+                except Exception:
+                    pass
+            t.join(timeout=2.0)
+
+    def test_universal_newlines_crlf_and_cr(self):
+        code = (
+            "import sys\n"
+            "sys.stdout.buffer.write(b'line1\\r\\nline2\\rline3\\n')\n"
+            "sys.stdout.buffer.flush()\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-u", "-c", code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        chunks: list[str] = []
+        done = threading.Event()
+        t = threading.Thread(
+            target=AntigravityCliExecutionBackend._drain_stream,
+            args=(proc.stdout, chunks, done),
+        )
+        t.start()
+        try:
+            done.wait(timeout=3.0)
+            self.assertTrue(done.is_set(), "drainer did not signal natural done/EOF")
+            combined = "".join(chunks)
+            self.assertEqual(combined, "line1\nline2\nline3\n")
+            self.assertNotIn("\r", combined)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            try:
+                proc.wait(timeout=2.0)
+            except Exception:
+                pass
+            if proc.stdout:
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
+            if proc.stderr:
+                try:
+                    proc.stderr.close()
+                except Exception:
+                    pass
+            t.join(timeout=2.0)
+
+    def test_universal_newlines_trailing_cr_at_eof(self):
+        code = (
+            "import sys\n"
+            "sys.stdout.buffer.write(b'trailing_cr\\r')\n"
+            "sys.stdout.buffer.flush()\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-u", "-c", code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        chunks: list[str] = []
+        done = threading.Event()
+        t = threading.Thread(
+            target=AntigravityCliExecutionBackend._drain_stream,
+            args=(proc.stdout, chunks, done),
+        )
+        t.start()
+        try:
+            done.wait(timeout=3.0)
+            self.assertTrue(done.is_set(), "drainer did not signal natural done/EOF")
+            combined = "".join(chunks)
+            self.assertEqual(combined, "trailing_cr\n")
+            self.assertNotIn("\r", combined)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            try:
+                proc.wait(timeout=2.0)
+            except Exception:
+                pass
+            if proc.stdout:
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
+            if proc.stderr:
+                try:
+                    proc.stderr.close()
+                except Exception:
+                    pass
+            t.join(timeout=2.0)
+
+    def test_fake_stream_crlf_split_and_utf8_multibyte_split(self):
+        class ChunkedRaw:
+            def __init__(self, raw_chunks: list[bytes]):
+                self._chunks = list(raw_chunks)
+            def read1(self, n=65536):
+                if not self._chunks:
+                    return b""
+                return self._chunks.pop(0)
+            read = read1
+
+        class FakeStreamWithBuffer:
+            def __init__(self, raw_chunks: list[bytes]):
+                self.buffer = ChunkedRaw(raw_chunks)
+
+        # Split CRLF across chunks: b'part1\r', then b'\npart2'
+        # Split UTF-8 multibyte across chunks: '你好' -> \xe4\xbd\xa0 \xe5\xa5\xbd
+        raw_chunks = [
+            b"part1\r",
+            b"\npart2\r\n\xe4\xbd",
+            b"\xa0\xe5",
+            b"\xa5\xbd\r",
+        ]
+        stream = FakeStreamWithBuffer(raw_chunks)
+        chunks: list[str] = []
+        done = threading.Event()
+        t = threading.Thread(
+            target=AntigravityCliExecutionBackend._drain_stream,
+            args=(stream, chunks, done),
+        )
+        t.start()
+        try:
+            done.wait(timeout=2.0)
+            self.assertTrue(done.is_set(), "drainer did not set done event")
+            combined = "".join(chunks)
+            self.assertEqual(combined, "part1\npart2\n你好\n")
+            self.assertNotIn("\r", combined)
+        finally:
+            t.join(timeout=2.0)
+
+    def test_fake_stream_no_buffer_universal_newlines(self):
+        class FakeStreamTextOnly:
+            def __init__(self, text: str):
+                self._sio = io.StringIO(text)
+            def read(self, n=1):
+                return self._sio.read(n)
+
+        stream = FakeStreamTextOnly("alpha\r\nbeta\rgamma\r")
+        chunks: list[str] = []
+        done = threading.Event()
+        t = threading.Thread(
+            target=AntigravityCliExecutionBackend._drain_stream,
+            args=(stream, chunks, done),
+        )
+        t.start()
+        try:
+            done.wait(timeout=2.0)
+            self.assertTrue(done.is_set(), "drainer did not set done event")
+            combined = "".join(chunks)
+            self.assertEqual(combined, "alpha\nbeta\ngamma\n")
+            self.assertNotIn("\r", combined)
+        finally:
+            t.join(timeout=2.0)
+
+    def test_drain_stream_handles_read_error_and_closed_stream(self):
+        class FailingRaw:
+            def __init__(self):
+                self.calls = 0
+            def read1(self, n=65536):
+                self.calls += 1
+                if self.calls == 1:
+                    return b"first_chunk\n"
+                raise OSError("simulated broken pipe")
+            read = read1
+
+        class FailingStream:
+            def __init__(self):
+                self.buffer = FailingRaw()
+
+        stream = FailingStream()
+        chunks: list[str] = []
+        done = threading.Event()
+        t = threading.Thread(
+            target=AntigravityCliExecutionBackend._drain_stream,
+            args=(stream, chunks, done),
+        )
+        t.start()
+        try:
+            done.wait(timeout=2.0)
+            self.assertTrue(done.is_set(), "done event must be set on exception")
+            self.assertEqual("".join(chunks), "first_chunk\n")
+        finally:
+            t.join(timeout=2.0)
+
+
+class TestStreamLifecycleCoverage(unittest.TestCase):
+    """Deterministic closed-stream and error lifecycle coverage for _drain_stream."""
+
+    def test_genuine_closed_textio_wrapper_raises_value_error(self):
+        """Check (1): Genuine closed TextIOWrapper backed by BytesIO.
+
+        Invoking drainer after close exercises ValueError, asserts done set and thread ended.
+        """
+        bio = io.BytesIO(b"prior_content\n")
+        text_io = io.TextIOWrapper(bio, encoding="utf-8")
+        text_io.close()
+        self.assertTrue(text_io.closed)
+        self.assertTrue(text_io.buffer.closed)
+
+        chunks: list[str] = []
+        done = threading.Event()
+        t = threading.Thread(
+            target=AntigravityCliExecutionBackend._drain_stream,
+            args=(text_io, chunks, done),
+        )
+        t.start()
+        try:
+            done.wait(timeout=2.0)
+            self.assertTrue(done.is_set(), "done event must be set when closed stream raises ValueError")
+            self.assertEqual(chunks, [], "no chunks expected from closed stream")
+        finally:
+            t.join(timeout=2.0)
+        self.assertFalse(t.is_alive(), "drainer thread must not be alive")
+
+    def test_raw_byte_pending_cr_then_oserror_and_valueerror_flushes_lf(self):
+        """Check (2): Raw byte path pending CR then OSError/ValueError flushes LF."""
+        class PendingCRRaw:
+            def __init__(self, err_cls: type[Exception]):
+                self.calls = 0
+                self.err_cls = err_cls
+
+            def read1(self, n=65536):
+                self.calls += 1
+                if self.calls == 1:
+                    return b"first_line\r"
+                raise self.err_cls("simulated read error after CR")
+
+            read = read1
+
+        class StreamWithRaw:
+            def __init__(self, raw):
+                self.buffer = raw
+
+        for err_cls in (OSError, ValueError):
+            with self.subTest(err_cls=err_cls):
+                raw = PendingCRRaw(err_cls)
+                stream = StreamWithRaw(raw)
+                chunks: list[str] = []
+                done = threading.Event()
+                t = threading.Thread(
+                    target=AntigravityCliExecutionBackend._drain_stream,
+                    args=(stream, chunks, done),
+                )
+                t.start()
+                try:
+                    done.wait(timeout=2.0)
+                    self.assertTrue(done.is_set(), f"done event must be set on {err_cls.__name__}")
+                    combined = "".join(chunks)
+                    self.assertEqual(
+                        combined,
+                        "first_line\n",
+                        f"pending CR followed by {err_cls.__name__} must flush LF",
+                    )
+                    self.assertNotIn("\r", combined)
+                finally:
+                    t.join(timeout=2.0)
+                self.assertFalse(t.is_alive(), f"thread must not leak on {err_cls.__name__}")
+
+    def test_incomplete_utf8_then_oserror_and_valueerror_flushes_replacement(self):
+        """Check (3): Incomplete UTF-8 bytes then OSError/ValueError emits replacement char at final flush."""
+        class IncompleteUtf8Raw:
+            def __init__(self, err_cls: type[Exception]):
+                self.calls = 0
+                self.err_cls = err_cls
+
+            def read1(self, n=65536):
+                self.calls += 1
+                if self.calls == 1:
+                    # Incomplete 3-byte UTF-8 sequence prefix for '你' (\xe4\xbd\xa0)
+                    return b"valid_prefix_\xe4\xbd"
+                raise self.err_cls("simulated read error on incomplete utf8 tail")
+
+            read = read1
+
+        class StreamWithRaw:
+            def __init__(self, raw):
+                self.buffer = raw
+
+        for err_cls in (OSError, ValueError):
+            with self.subTest(err_cls=err_cls):
+                raw = IncompleteUtf8Raw(err_cls)
+                stream = StreamWithRaw(raw)
+                chunks: list[str] = []
+                done = threading.Event()
+                t = threading.Thread(
+                    target=AntigravityCliExecutionBackend._drain_stream,
+                    args=(stream, chunks, done),
+                )
+                t.start()
+                try:
+                    done.wait(timeout=2.0)
+                    self.assertTrue(done.is_set(), f"done event must be set on {err_cls.__name__}")
+                    combined = "".join(chunks)
+                    self.assertEqual(
+                        combined,
+                        "valid_prefix_\ufffd",
+                        f"incomplete UTF-8 tail followed by {err_cls.__name__} must emit replacement char",
+                    )
+                finally:
+                    t.join(timeout=2.0)
+                self.assertFalse(t.is_alive(), f"thread must not leak on {err_cls.__name__}")
+
+    def test_text_only_fallback_read_valueerror_with_pending_cr_flushes_lf(self):
+        """Check (4): Text-only fallback read ValueError/OSError with pending CR flushes LF."""
+        class TextOnlyErrorStream:
+            def __init__(self, text: str, err_cls: type[Exception]):
+                self._chars = list(text)
+                self.err_cls = err_cls
+
+            def read(self, n=1):
+                if self._chars:
+                    return self._chars.pop(0)
+                raise self.err_cls("simulated fallback error after CR")
+
+        for err_cls in (ValueError, OSError):
+            with self.subTest(err_cls=err_cls):
+                stream = TextOnlyErrorStream("text_fallback\r", err_cls)
+                chunks: list[str] = []
+                done = threading.Event()
+                t = threading.Thread(
+                    target=AntigravityCliExecutionBackend._drain_stream,
+                    args=(stream, chunks, done),
+                )
+                t.start()
+                try:
+                    done.wait(timeout=2.0)
+                    self.assertTrue(done.is_set(), f"done event must be set on {err_cls.__name__}")
+                    combined = "".join(chunks)
+                    self.assertEqual(
+                        combined,
+                        "text_fallback\n",
+                        f"text fallback pending CR followed by {err_cls.__name__} must flush LF",
+                    )
+                    self.assertNotIn("\r", combined)
+                finally:
+                    t.join(timeout=2.0)
+                self.assertFalse(t.is_alive(), f"thread must not leak on {err_cls.__name__}")
+
+    def test_scripted_deterministic_close_error_during_read_path(self):
+        """Check (5): Scripted deterministic close/error while read path in progress.
+
+        Asserts truthful done and no leaked drainer thread.
+        """
+        class ScriptedBlockingRaw:
+            def __init__(self):
+                self.read_started = threading.Event()
+                self.unblock = threading.Event()
+                self.closed = False
+                self.calls = 0
+
+            def read1(self, n=65536):
+                self.calls += 1
+                if self.calls == 1:
+                    return b"streaming_chunk_1\n"
+                if self.closed:
+                    raise ValueError("I/O operation on closed file.")
+                self.read_started.set()
+                self.unblock.wait(timeout=2.0)
+                if self.closed:
+                    raise ValueError("I/O operation on closed file.")
+                return b""
+
+            read = read1
+
+            def close(self):
+                self.closed = True
+                self.unblock.set()
+
+        class ScriptedStream:
+            def __init__(self, raw):
+                self.buffer = raw
+
+            def close(self):
+                self.buffer.close()
+
+        raw = ScriptedBlockingRaw()
+        stream = ScriptedStream(raw)
+        chunks: list[str] = []
+        done = threading.Event()
+        t = threading.Thread(
+            target=AntigravityCliExecutionBackend._drain_stream,
+            args=(stream, chunks, done),
+        )
+        t.start()
+        try:
+            started = raw.read_started.wait(timeout=2.0)
+            self.assertTrue(started, "drainer must enter read1 in child thread")
+            stream.close()
+            done.wait(timeout=2.0)
+            self.assertTrue(done.is_set(), "done event must be set after close during read")
+            self.assertEqual(chunks, ["streaming_chunk_1\n"])
+        finally:
+            raw.unblock.set()
+            t.join(timeout=2.0)
+        self.assertFalse(t.is_alive(), "drainer thread must have exited cleanly after close")
 
 
 if __name__ == "__main__":

@@ -7,6 +7,8 @@ explicitly sets agy_auto_approve=true.
 """
 from __future__ import annotations
 
+import codecs
+import io
 import json
 import logging
 import os
@@ -914,14 +916,45 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
     def _drain_stream(stream: Any, chunks: list[str], done: threading.Event) -> None:
         """Continuously read one PIPE so the child cannot block on a full buffer."""
         try:
-            while True:
+            raw = getattr(stream, "buffer", None)
+            if raw is not None:
+                utf8_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+                decoder = io.IncrementalNewlineDecoder(utf8_decoder, translate=True)
+                read_raw = getattr(raw, "read1", raw.read)
+                while True:
+                    try:
+                        b = read_raw(65536)
+                    except (ValueError, OSError):
+                        break
+                    if not b:
+                        break
+                    s = decoder.decode(b)
+                    if s:
+                        chunks.append(s)
                 try:
-                    piece = stream.read(65536)
-                except (ValueError, OSError):
-                    break
-                if not piece:
-                    break
-                chunks.append(piece)
+                    tail = decoder.decode(b"", final=True)
+                    if tail:
+                        chunks.append(tail)
+                except Exception:
+                    pass
+            else:
+                decoder = io.IncrementalNewlineDecoder(None, translate=True)
+                while True:
+                    try:
+                        piece = stream.read(1)
+                    except (ValueError, OSError):
+                        break
+                    if not piece:
+                        break
+                    s = decoder.decode(piece)
+                    if s:
+                        chunks.append(s)
+                try:
+                    tail = decoder.decode("", final=True)
+                    if tail:
+                        chunks.append(tail)
+                except Exception:
+                    pass
         finally:
             done.set()
 
