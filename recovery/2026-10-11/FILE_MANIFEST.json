@@ -1,0 +1,66 @@
+{
+  "schema": "checkpoint-file-manifest.v1",
+  "self_excluded": true,
+  "files": [
+    {
+      "path": ".gitattributes",
+      "sha256": "67979a7ce44d06f5781eaf754406987d870fa769ceed7fb63eee4ab7fe8562f6",
+      "bytes": 93
+    },
+    {
+      "path": "README.zh-CN.md",
+      "sha256": "d05d0be7095b1e1d7fd1be5f1f9ef2f179677069bd4ebe980da091ada83cd856",
+      "bytes": 1996
+    },
+    {
+      "path": "RETROSPECTIVE.zh-CN.md",
+      "sha256": "baeb8acc157f8d389f0cc06452c8c0d5e998bad3bec0804b84dc4f203660598d",
+      "bytes": 4821
+    },
+    {
+      "path": "snapshots/lease-witness/lease_witness.py",
+      "sha256": "23631f5528f61a7f30705f191c7548d49d7c7fa1a30fd9d1d297940e0bf2dafe",
+      "bytes": 174
+    },
+    {
+      "path": "snapshots/lease-witness/lease_witness_test.py",
+      "sha256": "7ed357162279f1fde46828b3be5a4d88455e9e5721676f0f0697859a6a340b66",
+      "bytes": 439
+    },
+    {
+      "path": "snapshots/native-entry/native_entry.py",
+      "sha256": "b0fdadbb5effc32afa5ccca6af7d8bf80b0a27eb8c7cc188aa483e713522abeb",
+      "bytes": 12373
+    },
+    {
+      "path": "snapshots/native-entry/test_native_entry.py",
+      "sha256": "bf4a59a9d0e7da1a9e28b52dea2ee5a6938149a73abc2fe19e27dad8ff180a54",
+      "bytes": 8991
+    },
+    {
+      "path": "snapshots/review-policy/src/framework/durable_api.py",
+      "sha256": "c10bfe3e2bddf0de8d59c8782f0e2aee085413ea35f975d6d2b31d15ce8dbfba",
+      "bytes": 132480
+    },
+    {
+      "path": "snapshots/review-policy/tests/test_lead_review_acceptance.py",
+      "sha256": "84ab12c690bee05d5320901a90539a96d88c27f85d47946af51f913a581f8b27",
+      "bytes": 37939
+    },
+    {
+      "path": "SOURCE_MANIFEST.json",
+      "sha256": "29f7281890814cfbe05687fefaf1650506b5796c31bdc1b9e0659bec05819901",
+      "bytes": 3547
+    },
+    {
+      "path": "VERIFICATION.json",
+      "sha256": "9f087993cb5e851af63b51ead41ac0eb11d522cce589697b4d1c0fe489656441",
+      "bytes": 1129
+    },
+    {
+      "path": "verify_checkpoint.py",
+      "sha256": "305e6da171656b415ff7fa6809978223289dda9520bbef52872fe79b05e8f7b9",
+      "bytes": 5892
+    }
+  ]
+}

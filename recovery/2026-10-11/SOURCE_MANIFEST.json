@@ -1,0 +1,64 @@
+{
+  "schema": "recovery-source-manifest.v1",
+  "date": "2026-10-11",
+  "upstream_checkpoint": "49fa3a36e3697e1855c5bc00c14a3df06330f5ec",
+  "historical_candidate_family_baseline": "66e719c149ab7410f1f20d91ec1c82c9bb7d5b28",
+  "integration_status": "NOT_INTEGRATED; snapshots are not replacements for current src/bin",
+  "publication": "original source bytes only; private receipts excluded; provenance summarized rather than raw controller identities",
+  "files": [
+    {
+      "path": "snapshots/review-policy/src/framework/durable_api.py",
+      "original_sha256": "c10bfe3e2bddf0de8d59c8782f0e2aee085413ea35f975d6d2b31d15ce8dbfba",
+      "published_sha256": "c10bfe3e2bddf0de8d59c8782f0e2aee085413ea35f975d6d2b31d15ce8dbfba",
+      "bytes": 132480,
+      "unchanged_bytes": true,
+      "attribution": "AGY implementation; independent AGY limited technical review",
+      "historical_scope": "review_policy persistence only; historical six scoped offline tests"
+    },
+    {
+      "path": "snapshots/review-policy/tests/test_lead_review_acceptance.py",
+      "original_sha256": "84ab12c690bee05d5320901a90539a96d88c27f85d47946af51f913a581f8b27",
+      "published_sha256": "84ab12c690bee05d5320901a90539a96d88c27f85d47946af51f913a581f8b27",
+      "bytes": 37939,
+      "unchanged_bytes": true,
+      "attribution": "AGY regression source; independent Hermes verification",
+      "historical_scope": "historical six scoped public-mapping tests; full file is retained, not fully accepted"
+    },
+    {
+      "path": "snapshots/native-entry/native_entry.py",
+      "original_sha256": "b0fdadbb5effc32afa5ccca6af7d8bf80b0a27eb8c7cc188aa483e713522abeb",
+      "published_sha256": "b0fdadbb5effc32afa5ccca6af7d8bf80b0a27eb8c7cc188aa483e713522abeb",
+      "bytes": 12373,
+      "unchanged_bytes": true,
+      "attribution": "genuine AGY implementation/test; independent genuine AGY common review",
+      "historical_scope": "nine historical fake-runner unit tests; original goal still failed wall budget"
+    },
+    {
+      "path": "snapshots/native-entry/test_native_entry.py",
+      "original_sha256": "bf4a59a9d0e7da1a9e28b52dea2ee5a6938149a73abc2fe19e27dad8ff180a54",
+      "published_sha256": "bf4a59a9d0e7da1a9e28b52dea2ee5a6938149a73abc2fe19e27dad8ff180a54",
+      "bytes": 8991,
+      "unchanged_bytes": true,
+      "attribution": "genuine AGY implementation/test; independent genuine AGY common review",
+      "historical_scope": "nine historical fake-runner unit tests; original goal still failed wall budget"
+    },
+    {
+      "path": "snapshots/lease-witness/lease_witness.py",
+      "original_sha256": "23631f5528f61a7f30705f191c7548d49d7c7fa1a30fd9d1d297940e0bf2dafe",
+      "published_sha256": "23631f5528f61a7f30705f191c7548d49d7c7fa1a30fd9d1d297940e0bf2dafe",
+      "bytes": 174,
+      "unchanged_bytes": true,
+      "attribution": "genuine AGY actual source delivery",
+      "historical_scope": "three historical pure witness tests; not formal service responsibility recovery"
+    },
+    {
+      "path": "snapshots/lease-witness/lease_witness_test.py",
+      "original_sha256": "7ed357162279f1fde46828b3be5a4d88455e9e5721676f0f0697859a6a340b66",
+      "published_sha256": "7ed357162279f1fde46828b3be5a4d88455e9e5721676f0f0697859a6a340b66",
+      "bytes": 439,
+      "unchanged_bytes": true,
+      "attribution": "genuine AGY actual source delivery",
+      "historical_scope": "three historical pure witness tests; not formal service responsibility recovery"
+    }
+  ]
+}

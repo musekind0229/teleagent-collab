@@ -1,0 +1,32 @@
+{
+  "source_hashes_verified": 6,
+  "compiled_source_files": [
+    "snapshots/review-policy/src/framework/durable_api.py",
+    "snapshots/review-policy/tests/test_lead_review_acceptance.py",
+    "snapshots/native-entry/native_entry.py",
+    "snapshots/native-entry/test_native_entry.py",
+    "snapshots/lease-witness/lease_witness.py",
+    "snapshots/lease-witness/lease_witness_test.py"
+  ],
+  "privacy_findings": [],
+  "scope": "checkpoint additions only; manual inspection complements bounded patterns",
+  "offline_tests": {
+    "tests_run": 12,
+    "failures": 0,
+    "errors": 0,
+    "audit_positive_controls": [
+      "subprocess.Popen",
+      "os.system",
+      "socket.connect"
+    ],
+    "unexpected_denied_operations": 0,
+    "scope": "nine fake-runner native-entry + three pure witness tests; no official-service/account operations"
+  },
+  "python_version": "3.12.4",
+  "verification_author": "Hermes checkpoint curation; production source unchanged",
+  "behavior_tests_not_rerun": [
+    "review-policy framework tests",
+    "official service entry",
+    "upstream integration/CI"
+  ]
+}
