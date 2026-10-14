@@ -29,6 +29,7 @@ from execution_backend.agy_account_pool import (
     account_switch_lock,
     clear_windows_antigravity_keyring,
     finish_account_lease,
+    keyring_clear_enabled,
     prepare_antigravity_environ_from_pool,
 )
 from execution_backend.base import (
@@ -722,10 +723,11 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         self._runs[handle] = rec
 
         try:
-            # Machine-wide slot: clear only for a pool-bound spawn, immediately before Popen.
-            # prepare_antigravity_environ_from_pool already cleared; clear again right
-            # before Popen so a concurrent entrance cannot leave a keyring shadow.
-            if str(spawn_env.get(ENV_POOL) or "").strip() or profile:
+            # Machine-wide slot: opt-in only (keyring_clear_enabled), and only for a
+            # pool-bound spawn, immediately before Popen so a concurrent entrance
+            # cannot leave a keyring shadow. Off by default: pool spawns use file
+            # storage and clearing logs out the operator's own agy.
+            if (str(spawn_env.get(ENV_POOL) or "").strip() or profile) and keyring_clear_enabled(spawn_env):
                 clear_windows_antigravity_keyring()
             proc = subprocess.Popen(
                 cmd,

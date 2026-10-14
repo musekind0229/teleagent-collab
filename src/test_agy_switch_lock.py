@@ -69,7 +69,7 @@ _CHILD_PREPARE = textwrap.dedent(
         with open(trace, "a", encoding="utf-8") as fh:
             fh.write(json.dumps({"pid": os.getpid(), "t0": t0, "t1": time.time()}) + "\\n")
     m.clear_windows_antigravity_keyring = fake_clear
-    env = {"PATH": os.environ.get("PATH", ""), "COLLAB_AGY_LOCK_DIR": lock_dir}
+    env = {"PATH": os.environ.get("PATH", ""), "COLLAB_AGY_LOCK_DIR": lock_dir, "COLLAB_AGY_CLEAR_KEYRING": "1"}
     prep = m.prepare_antigravity_environ_from_pool(pool_path, base_environ=env, persist=True)
     print(json.dumps({"profile": prep["agy_profile"], "home": prep["environ"]["HOME"]}), flush=True)
     if mode == "die":
@@ -101,6 +101,7 @@ class TestSwitchLockConcurrency(unittest.TestCase):
     def test_two_threads_prepare_serialized_and_distinct(self):
         with tempfile.TemporaryDirectory() as td:
             pool_path, env = _write_pool(td)
+            env["COLLAB_AGY_CLEAR_KEYRING"] = "1"  # opt-in clear is the serialization probe
             trace: list[dict] = []
             mu = threading.Lock()
 
@@ -295,6 +296,7 @@ class TestStartRunCriticalSection(unittest.TestCase):
     def test_keyring_clear_and_popen_run_inside_switch_lock(self):
         with tempfile.TemporaryDirectory() as td:
             pool_path, env = _write_pool(td, ids=("A",))
+            env["COLLAB_AGY_CLEAR_KEYRING"] = "1"  # opt-in clear must stay inside the lock
             seen: dict = {}
 
             def other_thread_can_lock() -> bool:

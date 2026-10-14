@@ -58,6 +58,12 @@ SSH_CONNECTION_PSEUDO = "203.0.113.1 50000 203.0.113.2 22"
 SSH_CLIENT_PSEUDO = "203.0.113.1 50000 22"
 SSH_TTY_PSEUDO = "windows-agy-pool"  # Windows pool marker; broker uses /dev/pts/0 on Linux
 KEYRING_TARGET = "gemini:antigravity"
+# Opt-in only: deleting the machine-wide slot logs out the operator's own agy /
+# Antigravity desktop. Pool spawns already use file storage (pseudo SSH_*), so
+# agy never reads the slot (log: "Using file-based token storage because SSH
+# session detected"). Enable via env or pool top-level ``clear_system_keyring``.
+ENV_CLEAR_KEYRING = "COLLAB_AGY_CLEAR_KEYRING"
+POOL_CLEAR_KEYRING_KEY = "clear_system_keyring"
 
 ACCOUNT_STATES = frozenset({"available", "busy", "exhausted", "cooldown", "unavailable"})
 DEFAULT_COOLDOWN_SEC = 300.0
@@ -1059,6 +1065,20 @@ def account_environ(
     return env
 
 
+def keyring_clear_enabled(
+    environ: Mapping[str, str] | None = None,
+    pool: AccountPool | None = None,
+) -> bool:
+    """True only when the operator opted in (env or pool top-level flag)."""
+    env = os.environ if environ is None else environ
+    if str(env.get(ENV_CLEAR_KEYRING) or "").strip().lower() in _TRUTHY:
+        return True
+    if pool is not None:
+        raw = pool.extra.get(POOL_CLEAR_KEYRING_KEY)
+        return raw is True or str(raw).strip().lower() in _TRUTHY
+    return False
+
+
 def clear_windows_antigravity_keyring() -> None:
     """Delete cmdkey target ``gemini:antigravity``. Non-Windows returns immediately.
 
@@ -1153,8 +1173,9 @@ def prepare_antigravity_environ_from_pool(
     expire cooldowns / stale busy leases, reclaim leases of dead holders,
     pick an available account whose per-HOME lock is free (a held HOME is
     skipped, not fatal, while another account is available), mark it ``busy``
-    (pid + lease_until + lease_id), persist, clear the machine-wide
-    ``gemini:antigravity`` keyring slot and build the child environ.
+    (pid + lease_until + lease_id), persist and build the child environ.
+    The machine-wide ``gemini:antigravity`` keyring slot is cleared only when
+    ``keyring_clear_enabled`` (opt-in; it logs out the operator's own agy).
 
     ``start_run`` wraps this *and* its Popen in the same lock so nothing can
     clear the keyring between prepare and spawn. Callers release via
@@ -1217,8 +1238,12 @@ def prepare_antigravity_environ_from_pool(
             except Exception:
                 pass
             held_home = None
-        clear_windows_antigravity_keyring()
         env = account_environ(acc, base_environ, pool=pool)
+        if keyring_clear_enabled(base_environ, pool):
+            clear_windows_antigravity_keyring()
+            env[ENV_CLEAR_KEYRING] = "1"  # start_run re-clears right before Popen
+        else:
+            env.pop(ENV_CLEAR_KEYRING, None)
         env[ENV_POOL] = str(Path(pool_path))
         if acc.lease_id:
             env[ENV_LEASE_ID] = acc.lease_id
@@ -1402,6 +1427,9 @@ __all__ = [
     "account_environ",
     "apply_class_to_state",
     "clear_windows_antigravity_keyring",
+    "keyring_clear_enabled",
+    "ENV_CLEAR_KEYRING",
+    "POOL_CLEAR_KEYRING_KEY",
     "apply_job_result_to_pool",
     "cooldown_until_iso",
     "expire_cooldowns",

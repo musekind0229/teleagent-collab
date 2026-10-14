@@ -24,7 +24,7 @@ git pull
 
 换号后库在**本次 spawn 的子进程 environ** 注入伪 `SSH_CONNECTION` / `SSH_CLIENT` / `SSH_TTY`，agy 1.2.11 才走文件 token。`GEMINI_FORCE_FILE_STORAGE=true` 仍会设置，但 **1.2.11 不认**。不要把这些变量写进 PowerShell profile 或机器环境。
 
-串行换号时清机器槽 `gemini:antigravity`（`cmdkey /delete:gemini:antigravity`；槽不存在也继续）。
+默认**不清**机器槽 `gemini:antigravity`：清了会把你自己的 agy / Antigravity 桌面端登出。需要旧行为时设 `COLLAB_AGY_CLEAR_KEYRING=1` 或池 JSON 顶层 `"clear_system_keyring": true`，见 [agy-account-pool.md](agy-account-pool.md)。
 
 ## 5. 串行换号
 
