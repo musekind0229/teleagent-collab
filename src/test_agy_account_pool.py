@@ -29,6 +29,7 @@ from execution_backend import (  # noqa: E402
 )
 from execution_backend.agy_account_pool import (  # noqa: E402
     DEFAULT_TEMP_COOLDOWN_SEC,
+    ENV_CLEAR_KEYRING,
     ENV_COOLDOWN_MODE,
     ENV_COOLDOWN_SEC,
     ENV_HTTP_PROXY,
@@ -36,6 +37,7 @@ from execution_backend.agy_account_pool import (  # noqa: E402
     ENV_POOL,
     ENV_TEMP_COOLDOWN_SEC,
     FORCE_FILE_STORAGE,
+    POOL_CLEAR_KEYRING_KEY,
     SSH_CLIENT_PSEUDO,
     SSH_CONNECTION_PSEUDO,
     SSH_TTY_PSEUDO,
@@ -47,6 +49,7 @@ from execution_backend.agy_account_pool import (  # noqa: E402
     apply_job_result_to_pool,
     clear_windows_antigravity_keyring,
     expire_cooldowns,
+    keyring_clear_enabled,
     load_pool,
     mark_account,
     prepare_antigravity_environ_from_pool,
@@ -1211,18 +1214,60 @@ class TestWindowsAccountSwitch(unittest.TestCase):
         _assert_ssh_pseudos(self, env)
         self.assertNotIn("AGY_AUTO_APPROVE", env)
 
-    def test_prepare_clears_keyring_after_select(self):
+    def test_prepare_does_not_clear_keyring_by_default(self):
+        # Clearing logs out the operator's own agy / Antigravity desktop.
         with tempfile.TemporaryDirectory() as td:
             path = _write_pool_file(td)
             with patch(
                 "execution_backend.agy_account_pool.clear_windows_antigravity_keyring"
             ) as clear:
-                prepare_antigravity_environ_from_pool(
+                prepared = prepare_antigravity_environ_from_pool(
+                    path,
+                    base_environ={"PATH": "x"},
+                    persist=False,
+                )
+        clear.assert_not_called()
+        self.assertNotIn(ENV_CLEAR_KEYRING, prepared["environ"])
+        _assert_ssh_pseudos(self, prepared["environ"])  # file storage still forced
+
+    def test_prepare_clears_keyring_when_env_opts_in(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_pool_file(td)
+            with patch(
+                "execution_backend.agy_account_pool.clear_windows_antigravity_keyring"
+            ) as clear:
+                prepared = prepare_antigravity_environ_from_pool(
+                    path,
+                    base_environ={"PATH": "x", ENV_CLEAR_KEYRING: "1"},
+                    persist=False,
+                )
+        clear.assert_called_once()
+        self.assertEqual(prepared["environ"][ENV_CLEAR_KEYRING], "1")
+
+    def test_prepare_clears_keyring_when_pool_opts_in(self):
+        payload = _pool_dict()
+        payload[POOL_CLEAR_KEYRING_KEY] = True
+        with tempfile.TemporaryDirectory() as td:
+            path = _write_pool_file(td, payload)
+            with patch(
+                "execution_backend.agy_account_pool.clear_windows_antigravity_keyring"
+            ) as clear:
+                prepared = prepare_antigravity_environ_from_pool(
                     path,
                     base_environ={"PATH": "x"},
                     persist=False,
                 )
         clear.assert_called_once()
+        self.assertEqual(prepared["environ"][ENV_CLEAR_KEYRING], "1")
+
+    def test_keyring_clear_enabled_values(self):
+        self.assertFalse(keyring_clear_enabled({}))
+        self.assertFalse(keyring_clear_enabled({ENV_CLEAR_KEYRING: "0"}))
+        self.assertTrue(keyring_clear_enabled({ENV_CLEAR_KEYRING: "true"}))
+        pool = AccountPool(accounts=[], extra={POOL_CLEAR_KEYRING_KEY: False})
+        self.assertFalse(keyring_clear_enabled({}, pool))
+        pool.extra[POOL_CLEAR_KEYRING_KEY] = True
+        self.assertTrue(keyring_clear_enabled({}, pool))
 
     def test_prepare_skips_clear_when_nothing_available(self):
         payload = _pool_dict(a_state="exhausted", b_state="unavailable", c_state="exhausted")
@@ -1287,6 +1332,23 @@ class TestWindowsAccountSwitch(unittest.TestCase):
         ), patch("execution_backend.agy_account_pool.subprocess.run", boom):
             clear_windows_antigravity_keyring()
 
+    def test_start_run_pool_does_not_clear_by_default(self):
+        def fake_popen(*args, **kwargs):
+            raise OSError("stop")
+
+        with tempfile.TemporaryDirectory() as td:
+            be = AntigravityCliExecutionBackend(
+                bin_path="agy",
+                environ={"PATH": "x", "AGY_PROFILE": "A"},
+            )
+            with patch(
+                "execution_backend.antigravity_cli_v1.clear_windows_antigravity_keyring"
+            ) as clear, patch(
+                "execution_backend.antigravity_cli_v1.subprocess.Popen", fake_popen
+            ):
+                be.start_run(title="t", directory=td, instruction="hi")
+        clear.assert_not_called()
+
     def test_start_run_pool_clears_immediately_before_popen(self):
         order: list[str] = []
 
@@ -1300,7 +1362,7 @@ class TestWindowsAccountSwitch(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             be = AntigravityCliExecutionBackend(
                 bin_path="agy",
-                environ={"PATH": "x", "AGY_PROFILE": "A"},
+                environ={"PATH": "x", "AGY_PROFILE": "A", ENV_CLEAR_KEYRING: "1"},
             )
             with patch(
                 "execution_backend.antigravity_cli_v1.clear_windows_antigravity_keyring",

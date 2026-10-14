@@ -49,18 +49,21 @@ try {
 
 Win 上 agy **1.2.11** 走文件凭据的真实触发是子进程里的伪 `SSH_*`（agy 打出 `Using file-based token storage because SSH session detected`）。这是社区「检测 SSH → 文件凭据」做法（oaustegard `agy_auth_broker` / auth-internals、agy-switcher LINUX.md），**不是**官方多账号 API。`SSH_*` **只注入本次 spawn 的子进程 environ**，不写 PowerShell profile、系统环境或 `.bashrc`。
 
-并发 `agy --print` 可能把 `antigravity-oauth-token` 写成尾部多余 `}`（google-antigravity/antigravity-cli#24）。本池换号保持**单次 spawn**，并清 `gemini:antigravity` 槽，避免钥匙串阴影。该 token 与 `.gemini/**` 已 gitignore；日志和异常禁止打印 token 内容。若二进制日后识别 `GEMINI_FORCE_ENCRYPTED_FILE_STORAGE` 可再评估；1.2.11 不依赖。
+并发 `agy --print` 可能把 `antigravity-oauth-token` 写成尾部多余 `}`（google-antigravity/antigravity-cli#24）。本池换号保持**单次 spawn**。该 token 与 `.gemini/**` 已 gitignore；日志和异常禁止打印 token 内容。若二进制日后识别 `GEMINI_FORCE_ENCRYPTED_FILE_STORAGE` 可再评估；1.2.11 不依赖。
 
 保留已有 `AGY_BIN` / `AGY_MODEL` / `AGY_AUTO_APPROVE`。`--dangerously-skip-permissions` **默认仍关闭**。
 
 ## Windows 串行换号
 
-`gemini:antigravity` 钥匙串是机器级单槽。换号顺序：
+换号顺序：
 
-1. `cmdkey /delete:gemini:antigravity`（槽不存在也继续；非 Windows 直接返回）
-2. `HOME` 与 `USERPROFILE` 设为该账号 `home`，并注入上表伪 `SSH_*`（只进子进程）
-3. 配置了代理才注入 `HTTP_PROXY` / `HTTPS_PROXY`
-4. 再 spawn
+1. `HOME` 与 `USERPROFILE` 设为该账号 `home`，并注入上表伪 `SSH_*`（只进子进程）
+2. 配置了代理才注入 `HTTP_PROXY` / `HTTPS_PROXY`
+3. 再 spawn
+
+**默认不碰系统钥匙串**（2026-10-14 起）。`gemini:antigravity` 是机器级单槽，操作者自己的 agy 和 Antigravity 桌面端都用它；以前每次派工都 `cmdkey /delete` 它，结果把操作者登出，`agy --print=/usage` 之类的调用就会反复弹浏览器登录页。池子的子进程有伪 `SSH_*`，agy 选的是文件凭据（日志 `Using file-based token storage because SSH session detected`），不读这个槽，所以不需要清。
+
+确实遇到钥匙串阴影时（池子里的号被系统槽里的号顶替），可以显式打开旧行为：环境变量 `COLLAB_AGY_CLEAR_KEYRING=1`，或池 JSON 顶层 `"clear_system_keyring": true`。打开后在选号后和 Popen 前各清一次，都在切号锁里；槽不存在也继续，非 Windows 直接返回。
 
 代理来源：账号上的 `http_proxy` / `https_proxy`，否则池 JSON 顶层同名字段，否则 `COLLAB_AGY_HTTP_PROXY` / `COLLAB_AGY_HTTPS_PROXY`。只配了 HTTP 时镜像到 `HTTPS_PROXY`。库内不写死代理地址。
 
