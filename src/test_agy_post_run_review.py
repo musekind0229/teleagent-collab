@@ -220,6 +220,27 @@ class PostRunReviewFlowTests(unittest.TestCase):
         self.assertEqual(notes, b"raw notes\n")
         self.assertEqual([r["status"] for r in task["result"]["review_history"]], ["failed", "passed"])
 
+    def test_lead_protocol_slip_is_asked_again(self):
+        class _SlipOnceLead(_ScopeLead):
+            slipped = False
+
+            def decide(self, request, *, schema, cwd, timeout_sec=180):
+                raw, out = super().decide(request, schema=schema, cwd=cwd, timeout_sec=timeout_sec)
+                if request.get("kind") == "review" and not self.slipped:
+                    self.slipped = True
+                    out = {k: v for k, v in out.items() if k != "application_id"}  # live Grok did this
+                    return json.dumps(out), out
+                return raw, out
+
+        lead = _SlipOnceLead()
+        with tempfile.TemporaryDirectory() as td:
+            app = self._app(Path(td), [{"write": {"a.txt": A_BODY}}, {"write": {"b.txt": "beta\n"}}],
+                            LeadAdapterPlanner(lead, cwd=td))
+            status = _drive(app, app.submit(_body(1))["goal_id"])
+        self.assertEqual(status["state"], "completed", status)
+        self.assertTrue(lead.slipped)
+        self.assertEqual(len(lead.reviews), 3)  # A: slip + retry, B: once
+
     def test_without_lead_scope_is_reported_not_judged(self):
         steps = [{"write": {"a.txt": "x\n", "notes.txt": "extra\n"}}]
         with tempfile.TemporaryDirectory() as td:
