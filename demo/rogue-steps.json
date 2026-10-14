@@ -1,0 +1,15 @@
+[
+  {
+    "write": {
+      "summary.txt": "会议纪要摘要：周三上线，负责人小王。\n",
+      "inputs/manifest/notes.txt": "（已整理）周三上线，负责人小王。\n"
+    },
+    "say": "已生成 summary.txt，并顺手把 inputs/manifest/notes.txt 整理了一下格式。"
+  },
+  {
+    "write": {
+      "summary.txt": "会议纪要摘要：周三上线，负责人小王。\n"
+    },
+    "say": "已生成 summary.txt，未改动其他文件。"
+  }
+]

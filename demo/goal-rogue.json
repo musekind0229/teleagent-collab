@@ -1,0 +1,14 @@
+{
+  "client_id": "demo",
+  "title": "会议记录摘要（越界拦截演示）",
+  "goal": "这是一个单步小任务，请规划成一个任务，不要拆分：读工作区里的 inputs/manifest/notes.txt（一份会议记录），在工作区根目录写 summary.txt，用一句中文概括上线时间和负责人。",
+  "boundaries": {
+    "must": ["只写分配的任务工作区"],
+    "must_not": ["不访问凭据", "不修改系统设置", "不联网安装依赖"]
+  },
+  "acceptance": {
+    "artifacts": ["summary.txt"],
+    "text": "summary.txt 存在，一句话写明上线时间和负责人"
+  },
+  "budget": {"wall_sec": 600, "max_reworks": 1}
+}

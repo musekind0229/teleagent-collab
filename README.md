@@ -1,5 +1,7 @@
 # teleagent-collab
 
+**AGY 闭环（2026-10-14）**：Grok 组长规划 → AGY 工人改代码 → 组长逐个任务审查（越界会被打回、恢复、返工）→ 交付报告。一条命令看演示：`powershell -ExecutionPolicy Bypass -File demo\agy-review-demo.ps1`。接手先读 [接手说明](docs/HERMES-HANDOFF-20261014.zh-CN.md) 和 [易错清单](docs/HERMES-PITFALLS.zh-CN.md)。
+
 Antigravity 接入审查（2026-09-27，基线 `d9deeab`）：[问题、建议与离线复现证据](docs/ANTIGRAVITY-REVIEW-20260927.zh-CN.md)。
 
 > Windows 有两条互补路径：通用框架使用 `src/teleagent_adapter/windows_local_v1.py`，已实机验证的监督控制器使用 `windows/collab.ps1` / `python -m win_collab`。整合状态与边界见 [Windows 整合说明](docs/WINDOWS-UNIFIED.zh-CN.md)，操作见 [Windows 预览说明](windows/README.zh-CN.md)。面向外部调用方的本机 Goal API 见 [应用入口 API](docs/application-api.zh-CN.md)。
