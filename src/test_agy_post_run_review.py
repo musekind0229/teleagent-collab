@@ -298,5 +298,29 @@ class ChangeSetTests(unittest.TestCase):
         self.assertEqual(agy_review.instruction_with_feedback("plain", None), "plain")
 
 
+class DeliveryReportTests(unittest.TestCase):
+    def test_report_after_rework_is_in_goal_language(self):
+        lead = _ScopeLead()
+        steps = [
+            {"write": {"a.txt": A_BODY}},
+            {"write": {"b.txt": "beta\n", "a.txt": "rewritten by B\n"}},
+            {"write": {"b.txt": "beta v2\n"}},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            app = PostRunReviewFlowTests._app(self, Path(td), steps, LeadAdapterPlanner(lead, cwd=td))
+            goal_id = app.submit(_body(1))["goal_id"]
+            _drive(app, goal_id)
+            report = app.report(goal_id)
+        md = report["delivery_report_md"]
+        for heading in ("## 目标完成度", "## 是否越界", "## 不确定的地方和剩余风险",
+                        "## 需要上层做的取舍", "## 怎么亲手验证", "## 成本数据", "## 是否建议晋升记忆"):
+            self.assertIn(heading, md)
+        self.assertIn("**已完成**", md)
+        self.assertIn("a.txt (modified)，collab 已恢复原样并让工人返工", md)
+        self.assertIn("返工次数：1", md)
+        self.assertIn("共 3 次工人运行", md)
+        self.assertNotIn("backend runs with skip-permissions", md)
+
+
 if __name__ == "__main__":
     unittest.main()

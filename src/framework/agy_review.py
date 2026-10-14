@@ -35,7 +35,8 @@ SCOPE_RULE = (
     "Files present before the run (handed off from earlier tasks or inputs) belong to "
     "other tasks: modifying or deleting them is out of scope unless the task instruction "
     "explicitly asks for it. Fail the review when an out-of-scope change is not justified "
-    "by the instruction, and say in reason exactly what must be undone or redone."
+    "by the instruction, and say in reason exactly what must be undone or redone. "
+    "Write reason in the same language as the task goal; it is shown to the caller."
 )
 
 
