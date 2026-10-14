@@ -2334,6 +2334,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_rep = sub.add_parser("report", help="GET /v1/requests/{id}/report")
     p_rep.add_argument("request_id", help="request_id / goal_id")
+    p_rep.add_argument(
+        "--md",
+        action="store_true",
+        help="print only the caller-facing delivery report (Markdown, goal language)",
+    )
+    p_rep.add_argument("--out", help="with --md: write the report to this file (UTF-8) instead of stdout")
     _add_full(p_rep)
     p_rep.set_defaults(func=cmd_report)
 
@@ -2416,6 +2422,15 @@ def main(argv: list[str] | None = None) -> int:
             unicode=as_unicode,
         )
         return 130
+    if getattr(args, "md", False) and isinstance(payload, dict) and isinstance(payload.get("delivery_report_md"), str):
+        text = payload["delivery_report_md"]
+        if getattr(args, "out", None):
+            Path(args.out).write_text(text, encoding="utf-8")
+            _emit({"ok": True, "written": str(args.out)}, unicode=as_unicode)
+        else:
+            sys.stdout.buffer.write(text.encode("utf-8"))
+            sys.stdout.flush()
+        return EXIT_OK
     _emit(_present_output(args, payload), unicode=as_unicode)
     if isinstance(payload, dict) and payload.get("ok") is False:
         return EXIT_ERROR

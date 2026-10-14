@@ -319,11 +319,11 @@ Goal 在任何 Task 结果之前就失败（规划失败、预算/协调失败�
 | `execution` | `succeeded` / `failed` / `timeout` / `cancelled` / `in_progress` |
 | `artifacts` | `complete` / `incomplete`（有产出但还缺）/ `candidates_only`（期望文件都在，但所在 Task 失败，未被接受）/ `none`（什么都没产出）/ `not_started`（还没有 Task 就失败，如规划失败）/ `pending`（还在跑）。另给 `delivered_artifacts`（成功 Task 交付的）、`candidate_artifacts`（失败/取消 Task 留下的文件，只 stat）、`missing_artifacts`（含从没跑到的 Task 的期望产物）、`artifacts_by_task` |
 | `independent_checks` | `passed` / `failed` / `not_run`（目前只有 agy「must contain exactly」字面核对算） |
-| `technical_review` | `via_lead_gate`（后端把结果交组长审）/ `not_concluded` / `unsupported`（要了散文验收但没人核）/ `not_available`（后端没有组长审查通道，例如 agy） |
+| `technical_review` | `passed_by_lead` / `failed_by_lead` / `partially_reviewed`（agy 交活后组长真审过，见下文）/ `via_lead_gate`（后端把结果交组长审）/ `not_concluded` / `unsupported`（要了散文验收但没人核）/ `not_available`（没有组长，例如确定性规划器） |
 | `business_acceptance` | 恒为 `not_performed`：服务从不做业务验收 |
 | `deployed` | 恒为 `not_tracked` |
 
-`acceptance` 对象只接受 `artifacts`、`text`、`allow_aigc_marks`；其他键 400，不会在派工前被悄悄丢掉。`required_capabilities` 里的 `lead_review` 需要 planner 能审 **且** 后端把结果交给它（`capabilities.acceptance.lead_review`）；agy 上会 409。
+`acceptance` 对象只接受 `artifacts`、`text`、`allow_aigc_marks`；其他键 400，不会在派工前被悄悄丢掉。`required_capabilities` 里的 `lead_review` 需要 planner 能审 **且** 后端把结果交给它（`capabilities.acceptance.lead_review`）；agy + 组长规划器可以，agy + 确定性规划器 409。
 
 ### 阶段时间线（`phase_timeline`，2026-10-02 起）
 
@@ -380,15 +380,26 @@ agy 后端把每个 worker 的 pid、进程组、启动时间令牌（防 pid �
 3. **dry-run**：再开一单只做演练，不改系统。
 4. **操作者批准**：人看过 dry-run 之后才开安装单。Hermes 不自行批准 decision。
 
-### 组长技术评审与角色边界（#15，2026-10-03 现状）
+### agy 交活后的组长审查与返工（2026-10-14 起）
 
-现状：agy 后端**没有**组长技术评审通道。agy 的 worker 结果不会交给组长审，`acceptance_status.technical_review` 恒为 `not_available`，`--require-capability lead_review` 在 agy 上 409。组长（`--planner lead` / `grok`）在 agy 上只做两件事：出计划，以及裁决后端交上来的 permission / review decision。agy 本身不发 permission 请求（`channels.permission=false`），所以实际只剩出计划。
+agy 不会像 TeleAgent 那样自己发起审查，所以由协调器在交活后替它审：
 
-边界：
+1. **派工前拍快照**：依赖交接和清单拷贝都完成后、启动 agy 之前，记下任务工作区里每个文件的哈希（小的文本文件连内容一起），存在 `<workspaces>/.collab-review/<goal>/<task>.json`，不在工人的工作区里。同一任务返工时沿用第一次的快照，所以每次审查看到的都是累计改动。
+2. **交活后算改动**：agy 正常结束、产物门禁通过后，对比快照算出这次新增 / 修改 / 删除了哪些文件。不属于本任务期望产物的改动记为越界，尤其是前面任务交来的文件和清单输入被改动。`__pycache__`、`.pyc` 之类忽略。结果放在任务结果的 `scope_report`。
+3. **交组长审**：用规划这个 Goal 的同一个组长，`kind=review`，带上改动清单、越界清单、有限长度的 diff 和工人自述，并在审查提示里写明越界规则。组长回答 `pass` / `fail` 和理由，理由要求用目标的语言写。协议性失误（漏 `application_id`、JSON 不合法、超时）再问一次，额度和登录类错误不重试。
+4. **通过**：任务成功，`review.source=lead`，去掉「验收文字没有经过独立核对」这条警告。
+5. **不通过，还有返工额度**（`budget.max_reworks`，默认 1）：把被越界改动的、运行前就存在的文件按快照恢复原样（只能恢复快照里有内容的文本文件，其余在返工意见里点名），任务转 `review → queued`，下一次派工的指令末尾附上组长意见和恢复了哪些文件。工作区里本任务自己的产物保留，工人在原地修。
+6. **不通过且没有额度**，或组长不可用：任务失败，错误里写明组长的理由。
 
-- 服务只做机械验收：产物在不在、agy「must contain exactly」字面核对、AIGC 污染扫描。这些都不是技术评审，也不是业务验收（`business_acceptance` 恒为 `not_performed`）。
-- 技术评审（读代码/产物、跑独立测试、判断是否可合入）由调用方或人做。按「样例 → 实现 + 测试 → dry-run → 操作者批准」分单推进，每一单的结论由人或调用方在下一单里引用。
-- 本轮没有加 agy 上的组长评审开关：#15 最新评论要求先暂停功能扩展、先把最短链路验通，老板也还没拍板。需要时会做成默认关闭的开关。
+`acceptance_status.technical_review` 据此给出 `passed_by_lead` / `failed_by_lead`。每轮审查记在任务的 `review_history`（含每轮的越界清单、恢复了哪些文件、这一轮的用量）。没有组长的进程（确定性规划器）只记 `scope_report` 和一条越界警告，不判。
+
+边界：组长审的是改动和工人自述，不是亲手运行过产物；业务验收仍然是 `not_performed`，由调用方或人做。
+
+### 交付报告（`GET /v1/requests/{id}/report` 的 `delivery_report_md`）
+
+报告接口在原来的持久化报告之外多一个 `delivery_report_md`：给上层直接读的 Markdown，用目标的语言写，按状态现算。章节：目标完成度、改了什么和审查结果、是否越界（含已被打回并恢复的）、不确定的地方和剩余风险、需要上层做的取舍（没有写「无」）、怎么亲手验证（产物绝对路径和复跑目录）、成本数据（工人自报 token、耗时、返工次数、最终是否通过，只记录不分析）、是否建议晋升记忆（恒为建议，collab 内核不写记忆）。
+
+客户端：`python bin/hermes-collab-request.py report <id> --md` 直接打印，`--md --out report.md` 写文件。
 
 ## 查询和控制
 

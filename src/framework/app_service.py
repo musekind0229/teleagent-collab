@@ -4149,6 +4149,11 @@ class CollabApplication:
         out = self.layer.get_report(goal_id)
         if not out.get("ok") and out.get("reason") == "unknown_goal":
             raise AppError(str(out.get("error")), status=404, code="not_found")
+        if out.get("ok"):
+            from framework.delivery_report import render_delivery_report
+
+            # Caller-facing summary in the goal's language, derived from status.
+            out["delivery_report_md"] = render_delivery_report(self.status(goal_id))
         return out
 
     def cancel(self, goal_id: str, reason: str = "") -> dict[str, Any]:
