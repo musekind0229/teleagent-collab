@@ -36,6 +36,7 @@ from framework.input_manifest import (
     make_snapshot_dir,
     project_input_manifest,
     sqlite_snapshot,
+    stage_input_manifest,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -976,3 +977,40 @@ class ProjectHelperTests(unittest.TestCase):
         assert projected is not None
         self.assertEqual(projected["entries"][0]["sha256"], _SHA)
         self.assertEqual(projected["entries"][0]["relative"], "A.TXT")
+
+
+class RestageTests(unittest.TestCase):
+    """A re-dispatch of the same task (rework / continue) finds its first copy."""
+
+    def _manifest(self, root: Path) -> dict:
+        (root / "notes.txt").write_bytes(b"original\n")
+        return {
+            "root": str(root),
+            "entries": [{"relative": "notes.txt", "sha256": hashlib.sha256(b"original\n").hexdigest(), "size": 9}],
+            "max_files": 4,
+            "max_total_bytes": 1024,
+        }
+
+    def test_identical_existing_copy_is_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            src, ws = Path(td) / "src", Path(td) / "ws"
+            src.mkdir()
+            ws.mkdir()
+            manifest = self._manifest(src)
+            first = stage_input_manifest(manifest, ws)
+            again = stage_input_manifest(manifest, ws)
+            self.assertEqual(first, ["inputs/manifest/notes.txt"])
+            self.assertEqual(again, first)
+            self.assertEqual((ws / "inputs" / "manifest" / "notes.txt").read_bytes(), b"original\n")
+
+    def test_tampered_existing_copy_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            src, ws = Path(td) / "src", Path(td) / "ws"
+            src.mkdir()
+            ws.mkdir()
+            manifest = self._manifest(src)
+            stage_input_manifest(manifest, ws)
+            (ws / "inputs" / "manifest" / "notes.txt").write_bytes(b"edited by worker\n")
+            with self.assertRaises(InputManifestError) as cm:
+                stage_input_manifest(manifest, ws)
+            self.assertIn("already exists", str(cm.exception))

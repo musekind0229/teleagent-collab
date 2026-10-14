@@ -177,6 +177,49 @@ class PostRunReviewFlowTests(unittest.TestCase):
         self.assertIn("lead review failed after 0 rework(s)", b["result"]["error"])
         self.assertEqual(status["acceptance_status"]["technical_review"], "failed_by_lead")
 
+    def test_overreach_on_manifest_input_is_restored_and_rework_restages(self):
+        class _OneTaskLead(_ScopeLead):
+            def decide(self, request, *, schema, cwd, timeout_sec=180):
+                if request.get("kind") == "review":
+                    return super().decide(request, schema=schema, cwd=cwd, timeout_sec=timeout_sec)
+                out = {
+                    "application_id": request["application_id"],
+                    "context_summary": request["context_summary"],
+                    "summary": "one task",
+                    "tasks": [{"task_key": "s", "title": "Summarize", "instruction": "write summary.txt",
+                               "depends_on": [], "artifacts": ["summary.txt"]}],
+                }
+                return json.dumps(out), out
+
+        lead = _OneTaskLead()
+        steps = [
+            {"write": {"summary.txt": "sum\n", "inputs/manifest/notes.txt": "tidied\n"}},  # overreach
+            {"write": {"summary.txt": "sum v2\n"}},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            src = root / "src"
+            src.mkdir()
+            (src / "notes.txt").write_bytes(b"raw notes\n")
+            app = self._app(root, steps, LeadAdapterPlanner(lead, cwd=td))
+            body = _body(1)
+            body["acceptance"] = {"artifacts": ["summary.txt"]}
+            body["input_manifest"] = {
+                "root": str(src),
+                "entries": [{"relative": "notes.txt", "sha256": __import__("hashlib").sha256(b"raw notes\n").hexdigest(),
+                             "size": 10}],
+                "max_files": 4,
+                "max_total_bytes": 1024,
+            }
+            status = _drive(app, app.submit(body)["goal_id"])
+            task = status["tasks"][0]
+            notes = (Path(task["workspace"]) / "inputs" / "manifest" / "notes.txt").read_bytes()
+        self.assertEqual(status["state"], "completed", status)
+        self.assertEqual(task["rework_count"], 1)
+        self.assertEqual(task["rework_feedback"][0]["restored"], ["inputs/manifest/notes.txt"])
+        self.assertEqual(notes, b"raw notes\n")
+        self.assertEqual([r["status"] for r in task["result"]["review_history"]], ["failed", "passed"])
+
     def test_without_lead_scope_is_reported_not_judged(self):
         steps = [{"write": {"a.txt": "x\n", "notes.txt": "extra\n"}}]
         with tempfile.TemporaryDirectory() as td:

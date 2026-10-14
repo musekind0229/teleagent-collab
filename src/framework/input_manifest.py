@@ -252,6 +252,24 @@ def project_input_manifest(payload: Mapping[str, Any] | None) -> dict[str, Any] 
     }
 
 
+def _already_staged(final: Path, entries: list[Mapping[str, Any]]) -> bool:
+    """Every entry is present under ``final`` as a regular file with the manifest hash and size."""
+    for entry in entries:
+        dest = final.joinpath(*PurePosixPath(str(entry["relative"])).parts)
+        try:
+            if _is_link(dest) or not dest.is_file() or dest.stat().st_size != int(entry["size"]):
+                return False
+            digest = hashlib.sha256()
+            with dest.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    digest.update(chunk)
+        except OSError:
+            return False
+        if digest.hexdigest() != str(entry["sha256"]):
+            return False
+    return True
+
+
 def stage_input_manifest(manifest: Mapping[str, Any], workspace: Path) -> list[str]:
     """Copy manifest entries into ``workspace/inputs/manifest/<relative>``.
 
@@ -280,6 +298,10 @@ def stage_input_manifest(manifest: Mapping[str, Any], workspace: Path) -> list[s
         raise InputManifestError("manifest_symlink_refused: inputs", code="manifest_symlink_refused")
     inputs.mkdir(parents=True, exist_ok=True)
     final = inputs / "manifest"
+    if not _is_link(final) and final.is_dir() and _already_staged(final, checked["entries"]):
+        # Re-dispatch of the same task (rework, checkpoint continue): the copy
+        # from the first dispatch is still byte-identical to the manifest.
+        return [f"inputs/manifest/{entry['relative']}" for entry in checked["entries"]]
     if _is_link(final) or final.exists():
         raise InputManifestError(
             "manifest destination already exists",
