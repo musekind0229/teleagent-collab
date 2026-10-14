@@ -37,6 +37,7 @@ from framework.app_service import (  # noqa: E402
     AppError,
     CollabApplication,
     CollabHttpServer,
+    DeterministicPlanner,
     compose_capabilities,
 )
 from test_contract_render import _write_fake_agy  # noqa: E402
@@ -210,7 +211,8 @@ class CapabilityDocumentTests(unittest.TestCase):
             self.assertIs(caps["resume"], False)
             self.assertIs(caps["acceptance"]["artifact_presence"], True)
             self.assertIs(caps["acceptance"]["exact_content"], True)
-            self.assertIs(caps["acceptance"]["lead_review"], False)
+            # Post-run review by the coordinator; only effective with a lead planner.
+            self.assertIs(caps["acceptance"]["lead_review"], True)
             self.assertEqual(caps["usage"]["source"], "worker_self_reported")
             self.assertIs(caps["progress"]["available"], True)
             self.assertEqual(caps["progress"]["heartbeat"], "runner_activity")
@@ -605,14 +607,23 @@ class LeadReviewRequirementTests(unittest.TestCase):
         caps["acceptance"]["lead_review"] = True
         self.assertEqual(unmet_capabilities(caps, ["lead_review"]), [])
 
-    def test_open_requiring_lead_review_on_agy_is_409(self) -> None:
+    def test_agy_with_lead_planner_offers_lead_review(self) -> None:
         from framework.app_service import LeadAdapterPlanner
-        from test_app_service import _FakeLead, _request
+        from test_app_service import _FakeLead
 
         with tempfile.TemporaryDirectory() as td:
             backend = AntigravityCliExecutionBackend(bin_path=sys.executable)
             app = CollabApplication(td, planner=LeadAdapterPlanner(_FakeLead(), cwd=td), backend=backend)
             self.assertIs(app.capabilities()["planner"]["lead_review"], True)
+            self.assertIs(app.capabilities()["acceptance"]["lead_review"], True)
+
+    def test_open_requiring_lead_review_on_agy_without_lead_is_409(self) -> None:
+        from test_app_service import _request
+
+        with tempfile.TemporaryDirectory() as td:
+            backend = AntigravityCliExecutionBackend(bin_path=sys.executable)
+            app = CollabApplication(td, planner=DeterministicPlanner(), backend=backend)
+            self.assertIs(app.capabilities()["planner"]["lead_review"], False)
             self.assertIs(app.capabilities()["acceptance"]["lead_review"], False)
             body = _request()
             body["required_capabilities"] = ["lead_review"]

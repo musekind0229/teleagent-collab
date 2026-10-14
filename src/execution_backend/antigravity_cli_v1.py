@@ -357,7 +357,9 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         caps["resume"] = False
         caps["acceptance"]["artifact_presence"] = True
         caps["acceptance"]["exact_content"] = True
-        caps["acceptance"]["lead_review"] = False
+        # agy cannot raise a review itself; the coordinator reviews after the run
+        # (workspace diff + scope check → lead). Effective only with a lead planner.
+        caps["acceptance"]["lead_review"] = True
         caps["acceptance"]["executable_checks"] = False
         caps["usage"]["source"] = "worker_self_reported"
         # One-shot JSON: no percent and no subagent count. The heartbeat is
