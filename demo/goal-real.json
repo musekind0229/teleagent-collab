@@ -1,0 +1,14 @@
+{
+  "client_id": "demo",
+  "title": "slugify 函数与测试（真实演示）",
+  "goal": "在分配的工作区用 Python 标准库实现 slugify.py，提供函数 slugify(text: str) -> str：转小写、去掉首尾空白、把连续的非字母数字字符替换为单个连字符、去掉首尾连字符。写 test_slugify.py（unittest，至少 5 个用例，含空字符串和全符号输入）。最后实际运行 python -m unittest test_slugify，把输出写入 test-output.txt。",
+  "boundaries": {
+    "must": ["只写分配的任务工作区", "只用 Python 标准库"],
+    "must_not": ["不访问凭据", "不修改系统设置", "不联网安装依赖"]
+  },
+  "acceptance": {
+    "artifacts": ["slugify.py", "test_slugify.py", "test-output.txt"],
+    "text": "三个文件存在；test-output.txt 显示 unittest 全部通过（OK）"
+  },
+  "budget": {"wall_sec": 900, "max_reworks": 1}
+}
