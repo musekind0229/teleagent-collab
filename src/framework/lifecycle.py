@@ -107,7 +107,8 @@ _TASK_EDGES = {
     },
     # queued is only for an explicit human "continue" after a checkpoint.
     "awaiting_decision": {"running", "queued", "blocked", "failed", "cancel_requested", "unknown"},
-    "review": {"succeeded", "failed", "running", "awaiting_decision"},
+    # queued: lead review failed and a bounded rework re-dispatches the task.
+    "review": {"succeeded", "failed", "running", "awaiting_decision", "queued"},
     "blocked": {"queued", "running", "cancelled", "failed"},
     "cancel_requested": {"cancelled", "unknown", "failed"},
     "unknown": {"running", "failed", "cancelled", "review"},

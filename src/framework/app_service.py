@@ -34,7 +34,7 @@ from execution_backend.base import (
     unmet_capabilities,
 )
 from execution_backend.inprocess_v1 import InProcessExecutionBackend
-from framework import contract_render
+from framework import agy_review, contract_render
 from framework.artifact_contamination import scan_file, summarize
 from framework.artifact_index import goal_artifact_index
 from framework.artifact_handoff import (
@@ -1392,7 +1392,14 @@ def acceptance_status_view(
         independent = "failed"
     acceptance_caps = caps.get("acceptance") if isinstance(caps.get("acceptance"), Mapping) else {}
     unsupported = any(r.get("status") == "unsupported" for r in reviews)
-    if acceptance_caps.get("lead_review") is not True:
+    by_lead = [r for r in reviews if r.get("source") == "lead"]
+    if by_lead:
+        # Post-run lead review actually ran (agy): report what it concluded.
+        if all(r.get("status") == "passed" for r in by_lead):
+            technical = "passed_by_lead" if len(by_lead) == len(reviews) else "partially_reviewed"
+        else:
+            technical = "failed_by_lead"
+    elif acceptance_caps.get("lead_review") is not True:
         technical = "unsupported" if unsupported else "not_available"
     else:
         technical = "via_lead_gate" if execution == "succeeded" else "not_concluded"
@@ -1510,6 +1517,9 @@ class LeadAdapterPlanner:
         }
         if backend_kind == "review":
             extra["allow_hint"] = TASK_REVIEW_HINT
+            hint = str(action.get("review_hint") or "").strip()
+            if hint:
+                extra["allow_hint"] = f"{TASK_REVIEW_HINT} {hint}"
         request = build_lead_request(
             kind=backend_kind,
             goal=instruction or str(goal.get("desired_outcome") or ""),
@@ -2823,6 +2833,12 @@ class AppCoordinator:
                 merge_manifest_input_files(task, goal_obj, root)
             except InputManifestError as exc:
                 return self._fail_task(goal_id, task_id, {"ok": False, "error": str(exc)})
+            if self._is_agy():
+                # What the workspace held before the worker ran; kept across reworks.
+                try:
+                    agy_review.record_baseline(self.workspaces_root, goal_id, task_id, root)
+                except OSError:
+                    pass
             try:
                 charter = worker_charter_for_task(
                     goal=goal_obj, task=task, siblings=list(snap.get("tasks") or [])
@@ -2844,7 +2860,10 @@ class AppCoordinator:
                     launched = self.backend.start_run(
                         title=str(task.get("title") or task_id),
                         directory=directory,
-                        instruction=str((task.get("inputs") or {}).get("instruction") or ""),
+                        instruction=agy_review.instruction_with_feedback(
+                            str((task.get("inputs") or {}).get("instruction") or ""),
+                            task.get("rework_feedback"),
+                        ),
                         artifacts=[str(x) for x in (task.get("expected_artifacts") or [])],
                         charter=charter,
                     )
@@ -2890,6 +2909,114 @@ class AppCoordinator:
             return self._observe_fresh_run(snap, task)
         finally:
             self._inflight_claims.discard(token)
+
+    def _is_agy(self, result: Any = None) -> bool:
+        backend_id = ""
+        if isinstance(result, Mapping):
+            backend_id = str(result.get("backend") or "")
+        backend_id = backend_id or str(getattr(self.backend, "backend_id", "") or "")
+        return backend_id.startswith("antigravity")
+
+    def _agy_post_run_review(
+        self, snap: Mapping[str, Any], task: Mapping[str, Any], result: Any
+    ) -> tuple[dict[str, Any] | None, Any]:
+        """Scope check + lead review for an agy run that finished cleanly.
+
+        Returns ``(requeued, result)``. ``requeued`` is set when the lead failed
+        the work and a rework was queued; the caller returns it as-is.
+        """
+        if not isinstance(result, Mapping) or not result.get("ok") or not self._is_agy(result):
+            return None, result
+        goal_id = str(snap.get("goal_id") or task.get("goal_id") or "")
+        task_id = str(task.get("task_id") or "")
+        out = dict(result)
+        warnings = [str(w) for w in (out.get("warnings") or []) if isinstance(w, str)]
+        workdir = str(out.get("workspace") or self._trusted_workspace_text(task) or "")
+        baseline = agy_review.load_baseline(self.workspaces_root, goal_id, task_id)
+        if baseline is None or not workdir:
+            warnings.append("no workspace baseline for this run; changes outside the task scope were not checked")
+            out["warnings"] = warnings
+            return None, out
+        changes = agy_review.change_set(
+            baseline,
+            agy_review.scan_workspace(workdir),
+            [str(x) for x in (task.get("expected_artifacts") or [])],
+        )
+        out_of_scope = list(changes["out_of_scope_changes"])
+        out["scope_report"] = {"changed_files": changes["changed_files"], "out_of_scope_changes": out_of_scope}
+        if out_of_scope:
+            listed = ", ".join(f"{r['path']} ({r['status']})" for r in out_of_scope[:8])
+            warnings.append(f"worker changed files outside this task's artifacts: {listed}")
+        out["warnings"] = warnings
+        decider = getattr(self.planner, "decide_action", None)
+        if not callable(decider):
+            return None, out  # no lead in this process: scope is reported, not judged
+        goal = snap.get("goal") if isinstance(snap.get("goal"), Mapping) else {}
+        budget = goal.get("budget") if isinstance(goal.get("budget"), Mapping) else {}
+        try:
+            max_reworks = max(0, int(budget.get("max_reworks", 1)))
+        except (TypeError, ValueError):
+            max_reworks = 1
+        rounds = int(task.get("rework_count") or 0)
+        payload = agy_review.review_payload(
+            changes=changes,
+            worker_response=str(out.get("response") or ""),
+            rework_round=rounds,
+            max_reworks=max_reworks,
+        )
+        self._phase(goal_id, "reviewing", task_id=task_id)
+        try:
+            choice = decider(snap, task, {"kind": "review", "payload": payload, "review_hint": agy_review.SCOPE_RULE})
+        except Exception as exc:
+            rec = _lead_error_record(exc)
+            out["ok"] = False
+            out["error"] = f"lead review unavailable [{rec.get('code')}]: {rec.get('message') or type(exc).__name__}"
+            out["review"] = {"status": "error", "source": "lead", "evidence": out["error"][:240]}
+            return None, out
+        verdict = str(choice.get("verdict") or "")
+        reason = str(choice.get("reason") or "")
+        review = {
+            "status": "passed" if verdict == "pass" else "failed",
+            "source": "lead",
+            "lead": str(getattr(self.planner, "name", "") or "lead"),
+            "evidence": reason[:500],
+            "round": rounds,
+            "out_of_scope": [f"{r['path']} ({r['status']})" for r in out_of_scope][:20],
+        }
+        history = [dict(r) for r in (task.get("review_history") or []) if isinstance(r, Mapping)]
+        if verdict == "pass":
+            from execution_backend.antigravity_cli_v1 import ACCEPTANCE_UNVERIFIED_WARNING
+
+            out["review"] = review
+            out["review_history"] = history + [review]
+            out["warnings"] = [w for w in warnings if w != ACCEPTANCE_UNVERIFIED_WARNING]
+            out["notes"] = [n for n in (out.get("notes") or []) if n != ACCEPTANCE_UNVERIFIED_WARNING]
+            return None, out
+        if rounds < max_reworks:
+            restore = agy_review.restore_preexisting(workdir, baseline, out_of_scope)
+            feedback = agy_review.rework_feedback_entry(
+                round_no=rounds + 1,
+                reason=reason,
+                out_of_scope=out_of_scope,
+                restored=restore["restored"],
+            )
+            review["usage"] = out.get("usage")
+            review["restored"] = restore["restored"]
+            requeued = self.layer.requeue_for_rework(goal_id, task_id, feedback=feedback, review=review)
+            if requeued.get("ok"):
+                return {
+                    "ok": True,
+                    "goal_id": goal_id,
+                    "task_id": task_id,
+                    "state": "running",
+                    "action": "rework_queued",
+                    "rework_count": rounds + 1,
+                }, out
+        out["ok"] = False
+        out["error"] = f"lead review failed after {rounds} rework(s): {reason}"[:600]
+        out["review"] = review
+        out["review_history"] = history + [review]
+        return None, out
 
     def _apply_agy_acceptance(self, snap: Mapping[str, Any], task: Mapping[str, Any], result: Any) -> Any:
         """Shared agy gate. Other backends keep contamination-only gating."""
@@ -2995,6 +3122,9 @@ class AppCoordinator:
         if parked is not None:
             self._phase(goal_id, task_id=task_id, outcome="checkpoint")
             return parked
+        requeued, result = self._agy_post_run_review(snap, task, result)
+        if requeued is not None:
+            return requeued
         ok = bool(isinstance(result, Mapping) and result.get("ok"))
         self._phase(
             goal_id,

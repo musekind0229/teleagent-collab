@@ -1819,6 +1819,67 @@ class DurableLayer:
             self._persist_unlocked()
             return {"ok": True, "reason": REASON_READY, "task_id": tid, "task": found, "state": snap.get("state")}
 
+    def requeue_for_rework(
+        self,
+        goal_id: str,
+        task_id: str,
+        *,
+        feedback: Mapping[str, Any],
+        review: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Lead review failed: running → review → queued, count one rework.
+
+        The caller checks the rework budget. Workspace files stay so the
+        worker fixes them in place; ``rework_feedback`` is appended for the
+        next dispatch's instruction.
+        """
+        gid = _norm_key(goal_id)
+        tid = _norm_key(task_id)
+        with self._rmw():
+            snap = self.goals.get(gid)
+            if snap is None:
+                return {"ok": False, "reason": REASON_UNKNOWN_GOAL, "error": f"unknown goal_id {gid!r}"}
+            tasks = [dict(t) for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
+            found = next((t for t in tasks if t.get("task_id") == tid), None)
+            if found is None:
+                return {"ok": False, "reason": "unknown_task", "error": f"unknown task_id {tid!r}"}
+            src = _norm_key(found.get("status") or "") or "queued"
+            try:
+                if src == "running":
+                    assert_transition("task", "running", "review")
+                    src = "review"
+                assert_transition("task", src, "queued")
+            except LifecycleError as e:
+                return {"ok": False, "reason": REASON_ILLEGAL_STATE, "error": str(e)}
+            prior_run = _norm_key(found.get("run_id") or "")
+            _close_open_phase(found, "rework", detail=str(feedback.get("reason") or "")[:300])
+            found["status"] = "queued"
+            for key in ("run_id", "native_handle", "blocked_on_decision", "progress", "run_started_at", "dispatch_claim"):
+                found.pop(key, None)
+            found["rework_count"] = int(found.get("rework_count") or 0) + 1
+            notes = [f for f in (found.get("rework_feedback") or []) if isinstance(f, Mapping)]
+            notes.append(dict(feedback))
+            found["rework_feedback"] = notes
+            reviews = [r for r in (found.get("review_history") or []) if isinstance(r, Mapping)]
+            if isinstance(review, Mapping):
+                reviews.append({**dict(review), "run_id": prior_run})
+            found["review_history"] = reviews
+            found["result"] = None
+            snap["tasks"] = tasks
+            self._append_history(
+                snap,
+                "rework_task",
+                task_id=tid,
+                mode="redispatch",
+                prior_run_id=prior_run,
+                rework_count=found["rework_count"],
+                event_kind="rework_task",
+                reason="lead_review_failed",
+            )
+            self._touch(snap)
+            self._persist_unlocked()
+            return {"ok": True, "reason": REASON_READY, "task_id": tid, "task": found, "state": snap.get("state")}
+
     def append_goal_warnings(self, goal_id: str, warnings: Sequence[str]) -> dict[str, Any]:
         """Append human-readable warnings onto the persisted Goal body.
 
