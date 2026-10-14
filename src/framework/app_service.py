@@ -2965,14 +2965,25 @@ class AppCoordinator:
             max_reworks=max_reworks,
         )
         self._phase(goal_id, "reviewing", task_id=task_id)
-        try:
-            choice = decider(snap, task, {"kind": "review", "payload": payload, "review_hint": agy_review.SCOPE_RULE})
-        except Exception as exc:
-            rec = _lead_error_record(exc)
-            out["ok"] = False
-            out["error"] = f"lead review unavailable [{rec.get('code')}]: {rec.get('message') or type(exc).__name__}"
-            out["review"] = {"status": "error", "source": "lead", "evidence": out["error"][:240]}
-            return None, out
+        action = {"kind": "review", "payload": payload, "review_hint": agy_review.SCOPE_RULE}
+        choice: Mapping[str, Any] = {}
+        for attempt in range(1, MAX_LEAD_ATTEMPTS_PER_DECISION + 1):
+            try:
+                choice = decider(snap, task, action)
+                break
+            except Exception as exc:
+                # Protocol slips (missing application_id, bad JSON, timeout) get
+                # one more ask, as on the TeleAgent decision path. Quota/auth do not.
+                if lead_error_retryable(exc) and attempt < MAX_LEAD_ATTEMPTS_PER_DECISION:
+                    continue
+                rec = _lead_error_record(exc)
+                out["ok"] = False
+                out["error"] = (
+                    f"lead review unavailable [{rec.get('code')}] after {attempt} attempt(s): "
+                    f"{rec.get('message') or type(exc).__name__}"
+                )
+                out["review"] = {"status": "error", "source": "lead", "evidence": out["error"][:240]}
+                return None, out
         verdict = str(choice.get("verdict") or "")
         reason = str(choice.get("reason") or "")
         review = {
