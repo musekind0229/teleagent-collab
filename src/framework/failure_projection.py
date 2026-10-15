@@ -145,11 +145,28 @@ def _is_cancelled(task: Mapping[str, Any], result: Mapping[str, Any], error_lowe
     return False
 
 
+def caller_command_failure(result: Mapping[str, Any]) -> str | None:
+    """Classify coordinator evidence, never keywords embedded in prose errors."""
+    execution = result.get("acceptance_execution")
+    if not isinstance(execution, Mapping) or execution.get("source") != "caller_contract" or execution.get("ok") is not False:
+        return None
+    if execution.get("timed_out") is True:
+        return "command_timeout"
+    if execution.get("error") or execution.get("capture_complete") is not True:
+        return "command_execution_error"
+    code = execution.get("returncode")
+    if isinstance(code, int) and not isinstance(code, bool) and code != 0:
+        return "command_nonzero"
+    return "command_execution_error"
+
+
 def classify_failure_source(task: Mapping[str, Any], result: Mapping[str, Any], error: str) -> str:
     """Map one failed task onto the public source enum. Default is task_failed."""
     explicit = str(result.get("error_source") or "").strip()
     if explicit in _EXPLICIT_SOURCES:
         return explicit
+    if caller_command_failure(result):
+        return "acceptance"
     lowered = _collapsed(error)
     if lowered.startswith("killed by oom") or "killed by oom (cgroup memory limit)" in lowered:
         return "oom"
@@ -218,7 +235,7 @@ def failure_brief(task: Mapping[str, Any]) -> dict[str, Any]:
     source = classify_failure_source(task, result, error)
     if not error and source == "worker_timeout":
         error = "timeout"
-    return {
+    brief = {
         "task_id": _one_line(task.get("task_id") or ""),
         "run_id": _run_id(task, result),
         "title": sanitize_reason(str(task.get("title") or "")),
@@ -228,6 +245,16 @@ def failure_brief(task: Mapping[str, Any]) -> dict[str, Any]:
         "retryable": False,
         "next_step": _NEXT_STEP[source],
     }
+    kind = caller_command_failure(result) if source == "acceptance" else None
+    if kind:
+        execution = result["acceptance_execution"]
+        brief.update(failure_kind=kind, stage="acceptance", returncode=execution.get("returncode"), timed_out=execution.get("timed_out") is True)
+        brief["next_step"] = {
+            "command_nonzero": "inspect caller acceptance stdout/stderr and fix the artifact or command; open a NEW request citing this request_id",
+            "command_timeout": "inspect the caller command timeout and remaining task budget; fix or split the acceptance check before a NEW request citing this request_id",
+            "command_execution_error": "inspect the caller command launch, cwd, capture and cleanup error; fix the execution environment before a NEW request citing this request_id",
+        }[kind]
+    return brief
 
 
 def goal_level_failure_brief(failure: Any) -> dict[str, Any] | None:

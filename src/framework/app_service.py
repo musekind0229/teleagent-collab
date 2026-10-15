@@ -35,6 +35,7 @@ from execution_backend.base import (
 )
 from execution_backend.inprocess_v1 import InProcessExecutionBackend
 from framework import agy_review, contract_render
+from framework.acceptance_command import validate_command, execute_command
 from framework.artifact_contamination import scan_file, summarize
 from framework.artifact_index import goal_artifact_index
 from framework.artifact_handoff import (
@@ -233,6 +234,8 @@ def compose_capabilities(
     caps["planner"] = planner_doc
     acceptance = caps.get("acceptance") if isinstance(caps.get("acceptance"), dict) else {}
     acceptance["lead_review"] = bool(acceptance.get("lead_review")) and bool(planner_doc["lead_review"])
+    if str(getattr(backend, "backend_id", "") or "").startswith("antigravity"):
+        acceptance["executable_checks"] = True  # coordinator-owned caller command, not worker self-report
     caps["acceptance"] = acceptance
     if not isinstance(caps.get("warnings"), list):
         caps["warnings"] = []
@@ -998,7 +1001,7 @@ def planning_response_schema() -> dict[str, Any]:
 
 _DONE_WHEN_KEYS = frozenset({"artifacts", "text"})
 # Goal-level acceptance keys the service actually reads.
-GOAL_ACCEPTANCE_KEYS = frozenset({"artifacts", "text", "allow_aigc_marks"})
+GOAL_ACCEPTANCE_KEYS = frozenset({"artifacts", "text", "allow_aigc_marks", "command"})
 
 
 def _validate_done_when(row: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -1288,6 +1291,8 @@ def _annotate_task_failure(brief: dict[str, Any], task: Mapping[str, Any] | None
     phase = _failed_phase(task)
     if brief.get("source") in {"worker_timeout"} or "no_progress" in str(brief.get("error") or ""):
         phase = "executing"  # the wall/no-progress clock ran out while it worked
+    if brief.get("stage") == "acceptance" and brief.get("failure_kind"):
+        phase = "testing"
     brief["failed_phase"] = phase or "unknown"
     if present:
         brief["outcome"], what = "candidate_produced", "candidate produced (not accepted)"
@@ -1384,7 +1389,12 @@ def acceptance_status_view(
         if review is not None:
             reviews.append(review)
     exact = [r for r in reviews if r.get("source") == "agy_exact_content"]
-    if not exact:
+    command_checks = [t["result"]["acceptance_execution"] for t in rows
+        if isinstance(t.get("result"), Mapping) and isinstance(t["result"].get("acceptance_execution"), Mapping)
+        and t["result"]["acceptance_execution"].get("source") == "caller_contract"]
+    if command_checks:
+        independent = "passed" if all(e.get("ok") is True for e in command_checks) and all(r.get("status") == "passed" for r in exact) else "failed"
+    elif not exact:
         independent = "not_run"
     elif all(r.get("status") == "passed" for r in exact):
         independent = "passed"
@@ -2964,6 +2974,10 @@ class AppCoordinator:
             rework_round=rounds,
             max_reworks=max_reworks,
         )
+        execution = out.get("acceptance_execution")
+        if isinstance(execution, Mapping):
+            payload["acceptance_execution"] = copy.deepcopy(dict(execution))
+            payload["execution_rule"] = "Coordinator executed the caller contract. Nonzero, timeout, spawn or capture failure cannot pass, even if the worker claims success."
         self._phase(goal_id, "reviewing", task_id=task_id)
         action = {"kind": "review", "payload": payload, "review_hint": agy_review.SCOPE_RULE}
         choice: Mapping[str, Any] = {}
@@ -2986,6 +3000,10 @@ class AppCoordinator:
                 return None, out
         verdict = str(choice.get("verdict") or "")
         reason = str(choice.get("reason") or "")
+        execution_failed = isinstance(execution, Mapping) and not execution.get("ok")
+        if execution_failed:
+            verdict = "fail"
+            reason = "Caller acceptance execution failed (returncode=" + str(execution.get("returncode")) + ", timed_out=" + str(execution.get("timed_out")) + "): " + str(execution.get("error") or "") + "; lead: " + reason
         review = {
             "status": "passed" if verdict == "pass" else "failed",
             "source": "lead",
@@ -2994,6 +3012,9 @@ class AppCoordinator:
             "round": rounds,
             "out_of_scope": [f"{r['path']} ({r['status']})" for r in out_of_scope][:20],
         }
+        if execution_failed:
+            review["source"] = "caller_acceptance_gate"
+            review["lead_verdict"] = str(choice.get("verdict") or "")
         history = [dict(r) for r in (task.get("review_history") or []) if isinstance(r, Mapping)]
         if verdict == "pass":
             from execution_backend.antigravity_cli_v1 import ACCEPTANCE_UNVERIFIED_WARNING
@@ -3113,6 +3134,30 @@ class AppCoordinator:
         out["workspace"] = trusted
         return out
 
+    def _execute_caller_acceptance(self, snap, task, result):
+        if not isinstance(result, Mapping) or not self._is_agy(result):
+            return result
+        out = dict(result)
+        # A worker/backend field with this spelling is not execution evidence.
+        out.pop("acceptance_execution", None)
+        goal = snap.get("goal") if isinstance(snap.get("goal"), Mapping) else {}
+        acceptance = goal.get("acceptance") if isinstance(goal.get("acceptance"), Mapping) else {}
+        if "command" not in acceptance or not out.get("ok"):
+            return out
+        binding = {"goal_id": str(snap.get("goal_id") or ""), "task_id": str(task.get("task_id") or ""), "run_id": str(task.get("run_id") or "")}
+        key = hashlib.sha256(json.dumps(binding, sort_keys=True).encode()).hexdigest()[:24]
+        try:
+            out["acceptance_execution"] = execute_command(
+                acceptance["command"], workspace=self._trusted_workspace_text(task),
+                evidence_root=self.workspaces_root / ".collab-review" / "commands" / key,
+                binding=binding,
+                remaining_wall_sec=(max(0.0, float(budget_of(snap)["wall_sec"]) - (self.now() - float(task["run_started_at"])))
+                    if budget_mode(budget_of(snap)) == "enforce" and budget_of(snap).get("wall_sec") and isinstance(task.get("run_started_at"), (int, float)) else None),
+            )
+        except Exception as exc:
+            out["acceptance_execution"] = {"source": "caller_contract", "binding": binding, "configured": True, "ok": False, "returncode": None, "error": type(exc).__name__ + ": " + str(exc)}
+        return out
+
     def _finish_gated(self, snap: Mapping[str, Any], task: Mapping[str, Any], result: Any) -> dict[str, Any]:
         """Acceptance gate, then contamination scan, then finish_task.
 
@@ -3126,6 +3171,7 @@ class AppCoordinator:
             # Worker finished cleanly: artifact presence, acceptance, contamination.
             self._phase(goal_id, "testing", task_id=task_id)
         result = self._with_trusted_workspace(task, result)
+        result = self._execute_caller_acceptance(snap, task, result)
         result = self._apply_agy_acceptance(snap, task, result)
         result = _gate_backend_result(snap, task, result)
         result = self._attach_usage_report(result)
@@ -3136,6 +3182,10 @@ class AppCoordinator:
         requeued, result = self._agy_post_run_review(snap, task, result)
         if requeued is not None:
             return requeued
+        if isinstance(result, Mapping) and isinstance(result.get("acceptance_execution"), Mapping) and not result["acceptance_execution"].get("ok"):
+            result = dict(result)
+            result["ok"] = False
+            result["error"] = str(result.get("error") or "caller acceptance execution failed")
         ok = bool(isinstance(result, Mapping) and result.get("ok"))
         self._phase(
             goal_id,
@@ -3849,6 +3899,13 @@ class CollabApplication:
             raise AppError("acceptance has unknown keys: " + ", ".join(unknown_acceptance))
         acceptance_obj = dict(acceptance)
         acceptance_obj["artifacts"] = _safe_artifacts(acceptance.get("artifacts"))
+        if "command" in acceptance:
+            if not self.coordinator._is_agy():
+                raise AppError("acceptance.command requires the agy post-run path", status=409, code="capability_unavailable")
+            try:
+                acceptance_obj["command"] = validate_command(acceptance["command"])
+            except ValueError as exc:
+                raise AppError(str(exc)) from exc
         boundaries = payload.get("boundaries") if isinstance(payload.get("boundaries"), Mapping) else {}
         must = _strings(boundaries.get("must") or payload.get("must") or [], field="boundaries.must")
         must_not = _strings(boundaries.get("must_not") or payload.get("must_not") or [], field="boundaries.must_not")
