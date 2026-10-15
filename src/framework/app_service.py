@@ -679,6 +679,12 @@ class LeadAdapterPlanner:
             cwd=self.cwd,
             timeout_sec=self.timeout_sec,
         )
+        if isinstance(parsed, Mapping) and parsed.get("_lead_status") in ("timeout", "call_failed", "error"):
+            raise AppError(
+                f"lead planning failed: {parsed.get('_lead_status')}",
+                status=503,
+                code="lead_unavailable",
+            )
         parsed = unwrap_structured(parsed)
         if isinstance(parsed, Mapping) and parsed.get("_lead_status"):
             raise AppError(
