@@ -141,7 +141,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.agy_bin:
             kw["bin_path"] = args.agy_bin
         if args.model:
-            kw["default_model"] = args.model
+            kw["model"] = args.model
         if args.agy_account_pool:
             kw["account_pool_path"] = args.agy_account_pool
         backend = get_execution_backend("antigravity", **kw)

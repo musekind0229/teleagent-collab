@@ -40,7 +40,13 @@ from execution_backend.inprocess_v1 import InProcessExecutionBackend
 from lead_adapter import get_lead_adapter
 from lead_adapter.base import LeadAdapter
 from lead_adapter.inprocess import InProcessLeadAdapter
-from lead_adapter.schema import build_lead_request, lead_review_response_schema
+from lead_adapter.schema import (
+    LeadDecisionError,
+    build_lead_request,
+    lead_review_response_schema,
+    unwrap_structured,
+    validate_lead_decision,
+)
 
 
 def build_default_goal_request(
@@ -274,6 +280,8 @@ class SimpleCollabRunner:
         verdict = "fail"
         reason = reason_hint or str(worker_result.get("error") or "worker completed with errors")
         next_action = "diagnose"
+        next_action_source = "fallback"
+        lead_status = "ok"
         details: dict[str, Any] = {}
 
         action_payload = {
@@ -314,11 +322,52 @@ class SimpleCollabRunner:
             schema = lead_review_response_schema()
             cwd = str(getattr(self.planner, "cwd", self.persist_root))
             raw, parsed = adapter.decide(lead_req, schema=schema, cwd=cwd)
-            if isinstance(parsed, Mapping):
+
+            # Check safe_failure or adapter error
+            if isinstance(parsed, Mapping) and parsed.get("_lead_status"):
+                status_val = str(parsed.get("_lead_status"))
+                lead_status = status_val
+                verdict = "fail"
+                reason = f"lead adapter status: {status_val}: " + str(parsed.get("error") or "")
                 details = dict(parsed)
-                verdict = str(parsed.get("verdict") or parsed.get("decision") or "fail").lower()
-                reason = str(parsed.get("reason") or reason)
-                next_action = str(parsed.get("next_action") or ("continue" if verdict == "pass" else "diagnose"))
+                next_action = "diagnose"
+                next_action_source = "suggested"
+            else:
+                unwrapped = unwrap_structured(parsed) if isinstance(parsed, Mapping) else None
+                try:
+                    decision = validate_lead_decision(raw, parsed, request=lead_req, kind="review")
+                    details = dict(decision)
+                    lead_status = "ok"
+                    verdict = str(decision.get("verdict") or decision.get("decision") or "fail").lower()
+                    reason = str(decision.get("reason") or reason)
+                    # Check whether lead explicitly returned next_action in the inner unwrapped payload or decision
+                    raw_action = (unwrapped.get("next_action") if isinstance(unwrapped, Mapping) else None) or decision.get("next_action")
+                    if raw_action:
+                        next_action = str(raw_action)
+                        next_action_source = "lead"
+                    else:
+                        next_action = "continue" if verdict == "pass" else "diagnose"
+                        next_action_source = "suggested"
+                except LeadDecisionError as exc:
+                    # Invalid lead reply / wrapper mismatch / missing reason
+                    if isinstance(unwrapped, Mapping) and ("verdict" in unwrapped or "decision" in unwrapped):
+                        details = dict(unwrapped)
+                        lead_status = "unwrapped"
+                        verdict = str(unwrapped.get("verdict") or unwrapped.get("decision") or "fail").lower()
+                        reason = str(unwrapped.get("reason") or reason)
+                        if "next_action" in unwrapped and unwrapped["next_action"]:
+                            next_action = str(unwrapped["next_action"])
+                            next_action_source = "lead"
+                        else:
+                            next_action = "continue" if verdict == "pass" else "diagnose"
+                            next_action_source = "suggested"
+                    else:
+                        details = {"raw": raw, "error": str(exc), "code": exc.code}
+                        lead_status = "error"
+                        verdict = "fail"
+                        reason = f"lead decision validation failed [{exc.code}]: {exc}"
+                        next_action = "diagnose"
+                        next_action_source = "suggested"
         elif callable(decider):
             action = {
                 "kind": "review",
@@ -331,21 +380,30 @@ class SimpleCollabRunner:
                     details = dict(dec)
                     verdict = str(dec.get("verdict") or "fail").lower()
                     reason = str(dec.get("reason") or reason)
-                    next_action = str(dec.get("next_action") or ("continue" if verdict == "pass" else "diagnose"))
+                    if "next_action" in dec and dec["next_action"]:
+                        next_action = str(dec["next_action"])
+                        next_action_source = "lead"
+                    else:
+                        next_action = "continue" if verdict == "pass" else "diagnose"
+                        next_action_source = "suggested"
             except Exception as e:
                 verdict = "fail"
                 reason = f"decider raised {e}"
                 next_action = "diagnose"
+                next_action_source = "fallback"
+                lead_status = "error"
         else:
             # Deterministic / fallback logic
             if worker_result.get("ok"):
                 verdict = "pass"
                 reason = "worker execution completed successfully"
                 next_action = "complete"
+                next_action_source = "fallback"
             else:
                 verdict = "fail"
                 reason = str(worker_result.get("error") or "worker execution failed")
                 next_action = "diagnose"
+                next_action_source = "fallback"
 
         decision_rec = {
             "application_id": app_id,
@@ -357,13 +415,17 @@ class SimpleCollabRunner:
             "verdict": verdict,
             "reason": reason,
             "next_action": next_action,
+            "next_action_source": next_action_source,
+            "lead_status": lead_status,
             "raw_result": dict(worker_result),
             "lead_details": details,
             "consumed_at": time.time(),
         }
 
-        # Persist consumed decision (deduplication & single consumption for this exact phase/signature)
-        self._persist_consumed_decision(app_id, decision_rec)
+        # If lead call experienced an error/call_failed/timeout, we do NOT fake lead consumption success:
+        # We only persist as consumed if lead returned a valid decision (ok or unwrapped)
+        if lead_status in {"ok", "unwrapped"}:
+            self._persist_consumed_decision(app_id, decision_rec)
         return decision_rec
 
     def run_goal(

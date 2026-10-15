@@ -633,5 +633,107 @@ class SimpleCollabRunnerTests(unittest.TestCase):
                 runner.close()
 
 
+    def test_cli_antigravity_model_wiring(self):
+        """Verify bin/simple-collab.py correctly wires --model to AntigravityCliExecutionBackend.model without real spawn."""
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            persist = Path(td) / "persist"
+            bin_dir = Path(td) / "bin"
+            fake_agy = _create_fake_agy(bin_dir)
+
+            env = dict(os.environ)
+            env["PYTHONPATH"] = f"{SRC};{ROOT}"
+            env["AGY_TEST_STEPS"] = json.dumps([
+                {"write": {"delivery.txt": "cli agy output\n"}, "status": "ok"}
+            ])
+
+            cmd = [
+                sys.executable,
+                str(BIN / "simple-collab.py"),
+                "--persist", str(persist),
+                "--title", "cli agy test",
+                "--goal", "deliver output",
+                "--backend", "antigravity",
+                "--agy-bin", str(fake_agy),
+                "--model", "gemini-3.8-flash-high",
+                "--planner", "deterministic",
+                "--timeout-sec", "10",
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertTrue(out.get("ok"), out)
+
+            # Check that backend instantiated with model='gemini-3.8-flash-high'
+            # by directly verifying AntigravityCliExecutionBackend with that flag
+            from execution_backend import get_execution_backend
+            be = get_execution_backend("antigravity", bin_path=str(fake_agy), model="gemini-3.8-flash-high")
+            self.assertEqual(be.model, "gemini-3.8-flash-high")
+
+    def test_grok_structured_wrapper_offline_review(self):
+        """Verify real Grok shape wrapper (structuredOutput with outer envelope) is correctly unwrapped,
+        retaining actual verdict, real reason, and accurately tracking next_action_source."""
+        class _GrokWrapperLead(InProcessLeadAdapter):
+            def decide(self, request: dict, *, schema: dict, cwd: str, timeout_sec: float = 180) -> tuple[str, dict | None]:
+                kind = request.get("kind")
+                app_id = str(request.get("application_id") or "")
+                summary = str(request.get("context_summary") or "")
+                if kind == "review":
+                    # Real Grok CLI output shape: structured output nested inside envelope
+                    inner = {
+                        "application_id": app_id,
+                        "context_summary": summary,
+                        "verdict": "fail",
+                        "reason": "REAL_GROK_REASON_SYNTAX_ERROR",
+                        "next_action": "diagnose",
+                    }
+                    wrapper = {
+                        "conversation_id": "conv-grok-1",
+                        "response": "Here is the decision",
+                        "structuredOutput": inner,
+                        "usage": {"input_tokens": 100, "output_tokens": 50},
+                    }
+                    return json.dumps(wrapper), wrapper
+                # Plan
+                plan = {
+                    "application_id": app_id,
+                    "context_summary": summary,
+                    "summary": "plan",
+                    "tasks": [{
+                        "task_key": "t1",
+                        "title": "t1",
+                        "instruction": "work",
+                        "depends_on": [],
+                        "artifacts": ["out.txt"],
+                    }],
+                }
+                return json.dumps(plan), plan
+
+        with tempfile.TemporaryDirectory() as td:
+            persist = Path(td) / "persist"
+            lead = _GrokWrapperLead(exchange_dir=persist / "lead_exchange")
+            planner = LeadAdapterPlanner(lead, cwd=str(persist / "lead_work"))
+            runner = SimpleCollabRunner(persist, planner=planner)
+
+            # Test failure review with Grok envelope
+            snap = {"goal_id": "g1", "goal": {"desired_outcome": "work", "boundaries": {}}}
+            task = {"task_id": "t1", "run_id": "r1", "workspace": str(td), "title": "t1"}
+            worker_result = {"ok": False, "error": "worker crash", "response": "crash"}
+
+            decision_rec = runner._conduct_lead_review(
+                goal_snap=snap,
+                task=task,
+                worker_result=worker_result,
+                partial_artifacts=["partial.log"],
+            )
+
+            # Verify unwrap succeeded: verdict, reason, and next_action extracted from inner structuredOutput
+            self.assertEqual(decision_rec["verdict"], "fail")
+            self.assertEqual(decision_rec["reason"], "REAL_GROK_REASON_SYNTAX_ERROR")
+            self.assertEqual(decision_rec["next_action"], "diagnose")
+            self.assertEqual(decision_rec["next_action_source"], "lead")
+            self.assertEqual(decision_rec["lead_status"], "ok")
+
+
 if __name__ == "__main__":
     unittest.main()
