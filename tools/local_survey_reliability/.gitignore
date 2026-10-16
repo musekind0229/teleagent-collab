@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.log
+*.bin
+LOCAL-ONLY*
+*LOCAL-ONLY*/
+.synthetic-test-workspace/
+ui-runtime/
+C-personal-memory*/
+D-review/
+E-git-review/
+.env*
+*.key
+*.pem
