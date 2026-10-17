@@ -1,0 +1,20 @@
+{
+  "input": "local JSONL ordinary schema: Claude message.role/content and Codex event_msg user_message/response_item role user; plus explicit synthetic normalized list",
+  "output_fields": [
+    "topic",
+    "summary_local_rule_inference",
+    "quote_verbatim",
+    "minimal_context",
+    "source_locator_LOCAL_ONLY",
+    "source_line",
+    "event_time_raw",
+    "subject",
+    "negation",
+    "time_qualification",
+    "contradiction_review",
+    "confidence",
+    "truncated",
+    "sensitive"
+  ],
+  "privacy": "All actual source path/id/text/time/quotes stay in LOCAL-ONLY files. Fixed CONTROL must contain only counts booleans hashes categories; no quotations, names, paths, ids, timestamps from sources. Credentials suppressed, mixed files excluded. No DB/WAL/browser/auth/backup/reparse/network. No executing source text. No memory writeback."
+}

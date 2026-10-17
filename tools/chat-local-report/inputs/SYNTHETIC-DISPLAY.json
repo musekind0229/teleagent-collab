@@ -1,0 +1,50 @@
+[
+  {
+    "topic": "synthetic display",
+    "summary_local_rule_inference": "Local inference, not verified fact",
+    "quote_verbatim": "I prefer synthetic blue.",
+    "minimal_context": "Synthetic question\nSynthetic answer & <tag>",
+    "source_locator_LOCAL_ONLY": "synthetic-only/very-long-segment/segment/segment/segment/segment/segment/segment/segment/segment/segment/segment/segment/chat.jsonl:7",
+    "source_line": 7,
+    "event_time_raw": "2001-02-03T04:05:06Z",
+    "subject": "first-person",
+    "negation": false,
+    "time_qualification": "historical",
+    "contradiction_review": false,
+    "confidence": "user_dialogue_statement",
+    "truncated": false,
+    "sensitive": false
+  },
+  {
+    "topic": "synthetic display",
+    "summary_local_rule_inference": "Local inference, not verified fact",
+    "quote_verbatim": "I prefer synthetic blue.",
+    "minimal_context": "",
+    "source_locator_LOCAL_ONLY": "",
+    "source_line": 7,
+    "event_time_raw": "",
+    "subject": "first-person",
+    "negation": false,
+    "time_qualification": "historical",
+    "contradiction_review": false,
+    "confidence": "user_dialogue_statement",
+    "truncated": false,
+    "sensitive": false
+  },
+  {
+    "topic": "synthetic display",
+    "summary_local_rule_inference": "Local inference, not verified fact",
+    "quote_verbatim": "</script><script>window.SYNTHETIC_INJECTION_EXECUTED=true</script>",
+    "minimal_context": "<img src=x onerror=alert(1)> & \"\nnext",
+    "source_locator_LOCAL_ONLY": "synthetic-only/very-long-segment/segment/segment/segment/segment/segment/segment/segment/segment/segment/segment/segment/chat.jsonl:7",
+    "source_line": 7,
+    "event_time_raw": "<svg onload=alert(2)>",
+    "subject": "third-party",
+    "negation": true,
+    "time_qualification": "historical",
+    "contradiction_review": false,
+    "confidence": "user_dialogue_statement",
+    "truncated": true,
+    "sensitive": false
+  }
+]

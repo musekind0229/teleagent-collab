@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+test_output*/
+test_display_output/
+reports/
