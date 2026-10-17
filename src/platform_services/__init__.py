@@ -116,6 +116,47 @@ def current_thread_id() -> int:
     return get_platform_services().process.current_thread_id()
 
 
+def get_cmd_wrapper(*, platform: str | None = None):
+    """Windows .cmd/.bat wrapper (owned by windows_cli). None on POSIX.
+
+    Raises PlatformWrapperRequired on Windows when the module is absent;
+    never a silent fallback to shell=True.
+    """
+    from platform_services.cli import PlatformWrapperRequired
+
+    key = _normalize_platform(platform)
+    if not key.startswith("win"):
+        return None
+    try:
+        from platform_services import windows_cli
+    except ImportError as e:
+        raise PlatformWrapperRequired(
+            "platform_services.windows_cli not available on this build"
+        ) from e
+    return windows_cli.CmdWrapper()
+
+
+def capability_report(*, platform: str | None = None) -> dict[str, str]:
+    """What this host provides. Unknown hosts raise via the factory."""
+    key = _normalize_platform(platform)
+    svc = get_platform_services(platform=platform)
+    cmd = "n/a"
+    if key.startswith("win"):
+        try:
+            get_cmd_wrapper(platform=platform)
+            cmd = "available"
+        except NotImplementedError:
+            cmd = "missing"
+    return {
+        "platform": key,
+        "kind": svc.kind,
+        "file_lock": svc.file_lock.name,
+        "process": svc.process.name,
+        "cli_cmd_wrapper": cmd,
+        "path_inspect": "lstat_walk",
+    }
+
+
 def try_acquire_exclusive(path: str, *, blocking: bool = False) -> HeldFileLock:
     return get_file_lock().acquire(path, blocking=blocking)
 
@@ -127,8 +168,10 @@ __all__ = [
     "PlatformServices",
     "ProcessBackend",
     "StdlibProcess",
+    "capability_report",
     "current_pid",
     "current_thread_id",
+    "get_cmd_wrapper",
     "get_file_lock",
     "get_platform_services",
     "reset_platform_services",
