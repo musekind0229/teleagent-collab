@@ -37,7 +37,8 @@ if mode == "structured":
     a = sys.argv[1:]
     used = os.environ.get("FAKE_CLAUDE_USED") or (a[a.index("--model") + 1] if "--model" in a else "default-model")
     out({"type": "result", "subtype": "success", "is_error": False, "result": "done", "structured_output": payload,
-         "total_cost_usd": 0.0012, "num_turns": 1, "modelUsage": {used: {"costUSD": 0.0012}}})
+         "total_cost_usd": 0.0012, "num_turns": 1, "modelUsage": {used: {"costUSD": 0.0012}},
+         "usage": {"output_tokens_details": {"thinking_tokens": 175}}})
 if mode == "result_text":
     out({"type": "result", "subtype": "success", "is_error": False, "result": json.dumps(payload)})
 if mode == "result_prose":
@@ -192,6 +193,8 @@ class ClaudeLeadTests(unittest.TestCase):
         self.assertEqual(lr["models_used"], [DEFAULT_MODEL])
         self.assertFalse(lr["model_mismatch"])
         self.assertAlmostEqual(lr["cost_usd"], 0.0012)
+        self.assertEqual(lr["thinking_tokens"], 175)
+        self.assertIsNone(lr["effort_reported_by_cli"])  # CLI does not echo effort; never invent it
         self.assertEqual(ad.doctor_hint()["last_run"], lr)
 
     def test_model_mismatch_is_flagged_not_hidden(self):

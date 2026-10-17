@@ -159,6 +159,13 @@ def _strict_object(text: str) -> dict | None:
     return obj if isinstance(obj, dict) else None
 
 
+def _thinking_tokens(envelope: Mapping[str, Any]) -> int | None:
+    usage = envelope.get("usage")
+    details = usage.get("output_tokens_details") if isinstance(usage, Mapping) else None
+    value = details.get("thinking_tokens") if isinstance(details, Mapping) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 class ClaudeCodeLeadAdapter(LeadAdapterABC):
     """Spawn ``claude -p`` once, read-only. Failures stay failures."""
 
@@ -236,6 +243,9 @@ class ClaudeCodeLeadAdapter(LeadAdapterABC):
                 "model_mismatch": bool(used_ids) and used_ids != [self.last_run["model_requested"]],
                 "cost_usd": cost if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None,
                 "num_turns": envelope.get("num_turns"),
+                # The CLI JSON never echoes the effort level (2.1.302); thinking tokens are the only signal.
+                "effort_reported_by_cli": None,
+                "thinking_tokens": _thinking_tokens(envelope),
             })
         login_blob = f"{result_text}\n{stderr}" if envelope else f"{out}\n{stderr}"
         # Non-zero is never a decision, even when stdout carries valid JSON.
