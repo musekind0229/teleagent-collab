@@ -24,7 +24,7 @@ Antigravity 接入审查（2026-09-27，基线 `d9deeab`）：[问题、建议�
 - **任务授权（条5）**：`task_kind` 区分文件 vs 系统安装；`install_roots`/`network_allow`/`user_gate_permissions`；见 `docs/task-authorization.md`（机械隔离 ≠ 提示词约束）
 - **Question API（P3）**：`GET /question` + reply/reject + session 绑定；默认 need_human（见 `docs/question-api.md`）
 - **受控安装（P3）**：workdir 内假包 + 授权门控；真装 apt/sudo **blocked**
-- **Grok 真机 lead**：`bin/run-live-grok-lead.py`；Claude/Codex CLI 为 stub 待办；DeepSeek harness 包装接公网 `dsh` headless（无 bin/key 则 fail-closed；live 模型未在本仓默认验收）
+- **Grok 真机 lead**：`bin/run-live-grok-lead.py`；Claude Code lead（`claude_code`，默认 `claude-opus-5-5` + `--effort medium`）与 Codex CLI lead（`codex_cli`，默认 `gpt-6.1-sol` + `model_reasoning_effort=medium`，只读沙箱）已实现，并已在完整应用中真机端到端验收（规划 / 评审通过 / 坏交付被拒）；DeepSeek harness 包装接公网 `dsh` headless（无 bin/key 则 fail-closed；live 模型未在本仓默认验收）
 - **故障恢复（条6）**：`jobs/state` 持久化任务/待决/决定；重启不重派、不重发决定；取消请求 ≠ 执行已停止；见 `docs/fault-recovery.md`
 - **计量**：HTTP 下单需带 `queryID: q_<uuid>`，门户积分按模型档服务端计算（如 **chat-pro**）；缺 `queryID` 时本地有账、门户不计
 
