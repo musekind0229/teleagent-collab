@@ -6,8 +6,8 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
@@ -31,12 +31,12 @@ from lead_adapter import (
     validate_lead_decision,
 )
 from lead_adapter.schema import format_lead_request_prompt
+from platform_services.cli import WRAPPER_INTERPRETER, prepare_cli
 
 SIMULATED = True
 WRAPPER = REPO / "bin" / "run-deepseek-lead.py"
 
-_FAKE_DSH = r'''#!/usr/bin/env python3
-import json
+_FAKE_DSH = r'''import json
 import os
 import sys
 from pathlib import Path
@@ -680,17 +680,32 @@ class TestWrapperDshInvoke(unittest.TestCase):
         self.assertEqual(self.mod.build_dsh_cmd(argv)[-3:], ["--profile", "headless", "-"])
 
     def test_fake_dsh_script_success_and_failure(self):
-        """Real wrapper process against a fake dsh binary (no API)."""
+        """Real wrapper process against a fake dsh program (no API).
+
+        Cross-platform: the fake is a plain .py with no shebang and no exec
+        bit, launched through prepare_cli with an explicit interpreter. The
+        resulting argv reaches the wrapper's own launch chain via
+        COLLAB_DEEPSEEK_HARNESS_BIN (shlex-quoted, so Windows paths survive).
+        """
         req = _req("permission")
         body = _ok_permission(req)
         with tempfile.TemporaryDirectory() as tmp:
-            fake = Path(tmp) / "dsh"
+            fake = Path(tmp) / "fake_dsh.py"
             fake.write_text(_FAKE_DSH, encoding="utf-8")
-            fake.chmod(fake.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            if os.name == "posix":
+                # Prove the fixture does not depend on the exec bit.
+                fake.chmod(0o644)
+                self.assertFalse(os.access(fake, os.X_OK))
+            spec = prepare_cli(str(fake), [], interpreter=sys.executable)
+            self.assertEqual(spec.wrapper_kind, WRAPPER_INTERPRETER)
+            self.assertFalse(spec.shell)
+            self.assertEqual(len(spec.argv), 2)
+            harness_bin = shlex.join(spec.argv)
+            self.assertEqual(shlex.split(harness_bin), list(spec.argv))
             argv_log = Path(tmp) / "argv.json"
             stdin_log = Path(tmp) / "stdin.txt"
             env = os.environ.copy()
-            env["COLLAB_DEEPSEEK_HARNESS_BIN"] = str(fake)
+            env["COLLAB_DEEPSEEK_HARNESS_BIN"] = harness_bin
             env["DEEPSEEK_API_KEY"] = "sk-test-not-real"
             env["COLLAB_FAKE_DSH_STDOUT"] = json.dumps(body)
             env["COLLAB_FAKE_DSH_EXIT"] = "0"
@@ -709,6 +724,8 @@ class TestWrapperDshInvoke(unittest.TestCase):
             self.assertEqual(parsed["decision"], "once")
             self.assertEqual(parsed["application_id"], req["application_id"])
             argv = json.loads(argv_log.read_text(encoding="utf-8"))
+            self.assertEqual(Path(argv[0]).name, "fake_dsh.py")
+            self.assertEqual(argv[1:], ["--profile", "headless", "-"])
             self.assertIn("--profile", argv)
             self.assertIn("headless", argv)
             self.assertNotIn("--json", argv)
