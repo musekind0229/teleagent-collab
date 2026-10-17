@@ -68,8 +68,13 @@ def _resolve(binary: str, env: Mapping[str, str] | None) -> str:
     if os.sep in binary or (os.altsep and os.altsep in binary):
         p = binary
     else:
-        path = (env or {}).get("PATH") if env is not None else None
-        p = shutil.which(binary, path=path) or ""
+        # env given -> only env's PATH is searched (no PATH => not found);
+        # env None -> the parent process PATH.
+        if env is None:
+            p = shutil.which(binary) or ""
+        else:
+            path = env.get("PATH")
+            p = (shutil.which(binary, path=path) or "") if path else ""
     if not p or not Path(p).is_file():
         raise CliLaunchError(f"binary not found: {binary!r}")
     return str(Path(p).absolute())
@@ -85,7 +90,12 @@ def prepare_cli(
     platform: str | None = None,
     cmd_wrapper: CmdWrapper | None = None,
 ) -> LaunchSpec:
-    """Build an argv-only LaunchSpec. Raises; never degrades to a shell."""
+    """Build an argv-only LaunchSpec. Raises; never degrades to a shell.
+
+    Bare names (no path separator) are looked up on ``env["PATH"]`` when
+    ``env`` is given (missing PATH => not found) and on the parent PATH only
+    when ``env`` is None. Paths containing a separator are used as-is.
+    """
     argv_args = _check_args(args)
     key = (platform or sys.platform).lower()
     if interpreter is not None:

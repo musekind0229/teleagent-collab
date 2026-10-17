@@ -60,9 +60,7 @@ def inspect_path(root: str, relative: str, intent: str) -> PathInspection:
         comp = pending.pop(0)
         nxt = os.path.dirname(cur) if comp == ".." else os.path.join(cur, comp)
         if comp == "..":
-            cur = nxt
-            if not _inside(root_n, cur):
-                return out(cur, ESCAPE, "'..' leaves root")
+            cur = nxt  # verdict decided on the final path
             continue
         try:
             st = os.lstat(nxt)
@@ -81,11 +79,11 @@ def inspect_path(root: str, relative: str, intent: str) -> PathInspection:
                 return out(nxt, UNKNOWN, f"readlink failed: {e}")
             chain.append(f"{nxt} -> {target}")
             if os.path.isabs(target) or os.path.splitdrive(target)[0]:
-                tgt = os.path.normcase(os.path.realpath(target))
-                if not _inside(root_n, tgt):
-                    return out(tgt, ESCAPE, "link target outside root")
-                cur = tgt
-                continue
+                # Never realpath: walk the absolute target component by
+                # component so junctions/links inside it are inspected too.
+                drive, rest = os.path.splitdrive(target)
+                cur = os.path.normcase(drive + os.sep) if drive else os.sep
+                target = rest
             tparts = [c for c in target.replace("\\", "/").split("/") if c not in ("", ".")]
             pending = tparts + pending
             continue

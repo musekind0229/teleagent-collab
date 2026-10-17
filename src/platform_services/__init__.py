@@ -8,6 +8,7 @@ claimed/tested host for this knife.
 """
 from __future__ import annotations
 
+import importlib
 import sys
 import threading
 from dataclasses import dataclass
@@ -127,12 +128,13 @@ def get_cmd_wrapper(*, platform: str | None = None):
     key = _normalize_platform(platform)
     if not key.startswith("win"):
         return None
+    mod = "platform_services.windows_cli"
     try:
-        from platform_services import windows_cli
-    except ImportError as e:
-        raise PlatformWrapperRequired(
-            "platform_services.windows_cli not available on this build"
-        ) from e
+        windows_cli = importlib.import_module(mod)
+    except ModuleNotFoundError as e:
+        if e.name != mod:
+            raise  # an internal dependency of windows_cli is missing: real bug
+        raise PlatformWrapperRequired(f"{mod} not available on this build") from e
     return windows_cli.CmdWrapper()
 
 
@@ -140,12 +142,14 @@ def capability_report(*, platform: str | None = None) -> dict[str, str]:
     """What this host provides. Unknown hosts raise via the factory."""
     key = _normalize_platform(platform)
     svc = get_platform_services(platform=platform)
+    from platform_services.cli import PlatformWrapperRequired
+
     cmd = "n/a"
     if key.startswith("win"):
         try:
             get_cmd_wrapper(platform=platform)
             cmd = "available"
-        except NotImplementedError:
+        except PlatformWrapperRequired:
             cmd = "missing"
     return {
         "platform": key,

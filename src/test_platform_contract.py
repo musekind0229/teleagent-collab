@@ -9,7 +9,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import platform_services as ps
@@ -92,6 +94,27 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(spec.wrapper_kind, WRAPPER_WINDOWS_CMD)
         self.assertEqual(spec.argv[-1], "a&b")
 
+    def test_env_path_lookup_semantics(self):
+        if IS_WIN:
+            self.skipTest("POSIX exec-bit lookup")
+        b = self.d / "bin"
+        b.mkdir()
+        t = b / "mytool"
+        t.write_text(f"#!{sys.executable}\n")
+        t.chmod(0o755)
+        name = Path(sys.executable).name
+        # env={} -> no PATH -> bare name not found even though parent PATH has it
+        with self.assertRaises(CliLaunchError):
+            prepare_cli(name, [], env={})
+        with self.assertRaises(CliLaunchError):
+            prepare_cli("mytool", [], env={"HOME": "/x"})
+        spec = prepare_cli("mytool", [], env={"PATH": str(b)})
+        self.assertEqual(spec.argv[0], str(t.absolute()))
+        # absolute path still works with empty env
+        self.assertEqual(prepare_cli(str(t), [], env={}).argv[0], str(t.absolute()))
+        # env=None -> parent PATH
+        prepare_cli(str(self.script), [], interpreter=name)
+
     def test_windows_non_exe_needs_interpreter(self):
         with self.assertRaises(CliLaunchError):
             prepare_cli(str(self.script), [], platform="win32")
@@ -159,6 +182,49 @@ class PathContractTests(unittest.TestCase):
         self.assertEqual(len(r.link_chain), 2)
         self.assertTrue(r.normalized.endswith(os.path.normcase(os.path.join("sub", "f"))))
 
+    def test_simulated_junction_inside_absolute_symlink_target(self):
+        # Simulated seam (no real symlink/junction needed): root/abs is a
+        # symlink to <root>/j/x, and <root>/j is a non-symlink reparse point.
+        root = os.path.normcase(os.path.realpath(str(self.root)))
+        link, junction = os.path.join(root, "abs"), os.path.join(root, "j")
+        (self.root / "j").mkdir()
+        real_lstat = os.lstat
+
+        def fake_lstat(p, *a, **k):
+            p = os.path.normcase(str(p))
+            if p == link:
+                return types.SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_file_attributes=0)
+            if p == junction:
+                return types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_file_attributes=0x400)
+            return real_lstat(p, *a, **k)
+
+        with mock.patch("platform_services.paths.os.lstat", fake_lstat), \
+                mock.patch("platform_services.paths.os.readlink",
+                           lambda p: os.path.join(root, "j", "x")), \
+                mock.patch("platform_services.paths.os.path.realpath",
+                           return_value=root) as rp:
+            # realpath is allowed only for the trusted root, never link targets
+            r = inspect_path(str(self.root), "abs/file.txt", "write")
+            self.assertEqual(rp.call_count, 1)
+        self.assertEqual(r.verdict, UNKNOWN, r)
+        self.assertEqual(len(r.link_chain), 1)
+        for intent in ("write", "delete", "exec"):
+            with self.assertRaises(PathSafetyError):
+                require_safe(PathInspection(r.root, r.normalized, r.link_chain, r.verdict, intent))
+
+    def test_absolute_symlink_target_walked_inside(self):
+        self._symlink(self.root / "absin", str(self.root / "sub"))
+        r = inspect_path(str(self.root), "absin/f", "write")
+        self.assertEqual(r.verdict, INSIDE)
+        self.assertEqual(len(r.link_chain), 1)
+
+    def test_absolute_symlink_target_chain_through_inner_link(self):
+        self._symlink(self.root / "inner", str(self.outside))
+        self._symlink(self.root / "outer", str(self.root / "inner"))
+        r = inspect_path(str(self.root), "outer/f", "write")
+        self.assertEqual(r.verdict, ESCAPE)
+        self.assertEqual(len(r.link_chain), 2)
+
     def test_symlink_loop_unknown(self):
         self._symlink(self.root / "a", "b")
         self._symlink(self.root / "b", "a")
@@ -180,6 +246,25 @@ class CapabilityReportTests(unittest.TestCase):
 
     def test_posix_has_no_cmd_wrapper(self):
         self.assertIsNone(ps.get_cmd_wrapper(platform="linux"))
+
+    def test_windows_cli_module_absent_is_wrapper_required(self):
+        err = ModuleNotFoundError("No module named 'platform_services.windows_cli'",
+                                  name="platform_services.windows_cli")
+        with mock.patch("platform_services.importlib.import_module", side_effect=err):
+            with self.assertRaises(PlatformWrapperRequired):
+                ps.get_cmd_wrapper(platform="win32")
+
+    def test_windows_cli_internal_dep_missing_propagates(self):
+        err = ModuleNotFoundError("No module named 'pywintypes'", name="pywintypes")
+        with mock.patch("platform_services.importlib.import_module", side_effect=err):
+            with self.assertRaises(ModuleNotFoundError) as cm:
+                ps.get_cmd_wrapper(platform="win32")
+        self.assertNotIsInstance(cm.exception, PlatformWrapperRequired)
+        self.assertEqual(cm.exception.name, "pywintypes")
+        other = ImportError("cannot import name 'X'")
+        with mock.patch("platform_services.importlib.import_module", side_effect=other):
+            with self.assertRaises(ImportError):
+                ps.get_cmd_wrapper(platform="win32")
 
 
 if __name__ == "__main__":
