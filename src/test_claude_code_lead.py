@@ -13,7 +13,7 @@ from unittest import mock
 
 from lead_adapter import get_lead_adapter
 from lead_adapter.cancel import CancelScope, use_scope
-from lead_adapter.claude_code import DEFAULT_MODEL, ClaudeBinNotFound, ClaudeCodeLeadAdapter, build_command, resolve_claude_bin
+from lead_adapter.claude_code import DEFAULT_EFFORT, DEFAULT_MODEL, ClaudeBinNotFound, ClaudeCodeLeadAdapter, build_command, resolve_claude_bin
 from lead_adapter.schema import (
     LeadDecisionError,
     build_lead_request,
@@ -96,7 +96,7 @@ class ClaudeLeadTests(unittest.TestCase):
         self.rec = self.dir / "rec.json"
         self.env = mock.patch.dict(os.environ, {"FAKE_CLAUDE_RECORD": str(self.rec)}, clear=False)
         self.env.start()
-        for k in ("COLLAB_CLAUDE_LEAD_BIN", "COLLAB_CLAUDE_LEAD_MODEL", "FAKE_CLAUDE_MODE", "FAKE_CLAUDE_PAYLOAD"):
+        for k in ("COLLAB_CLAUDE_LEAD_BIN", "COLLAB_CLAUDE_LEAD_MODEL", "COLLAB_CLAUDE_LEAD_EFFORT", "FAKE_CLAUDE_MODE", "FAKE_CLAUDE_PAYLOAD"):
             os.environ.pop(k, None)
 
     def tearDown(self):
@@ -155,8 +155,30 @@ class ClaudeLeadTests(unittest.TestCase):
         self.assertEqual(a[a.index("--model") + 1], DEFAULT_MODEL)
 
     def test_default_model_is_pinned_full_id(self):
-        self.assertEqual(DEFAULT_MODEL, "claude-haiku-5-5")
+        self.assertEqual(DEFAULT_MODEL, "claude-opus-5-5")
+        self.assertEqual(DEFAULT_EFFORT, "medium")
         self.assertRegex(DEFAULT_MODEL, r"^claude-[a-z]+-\d")  # full ID, not an alias
+        self.assertNotRegex(DEFAULT_MODEL, "sonnet|haiku")
+
+    def test_effort_default_kwarg_env_and_invalid(self):
+        self._run("structured")
+        a = json.loads(self.rec.read_text())["argv"]
+        self.assertEqual(a[a.index("--effort") + 1], "medium")
+        self._run("structured", effort="high")
+        a = json.loads(self.rec.read_text())["argv"]
+        self.assertEqual(a[a.index("--effort") + 1], "high")
+        os.environ["COLLAB_CLAUDE_LEAD_EFFORT"] = "low"
+        try:
+            self._run("structured")
+            a = json.loads(self.rec.read_text())["argv"]
+            self.assertEqual(a[a.index("--effort") + 1], "low")
+            self.rec.unlink()
+            req, (raw, parsed) = self._run("structured", effort="turbo")
+        finally:
+            os.environ.pop("COLLAB_CLAUDE_LEAD_EFFORT", None)
+        self.assertEqual(parsed.get("_lead_status"), "call_failed")
+        self.assertIn("invalid effort", parsed["error"])
+        self.assertFalse(self.rec.exists())  # nothing spawned
 
     def test_last_run_records_model_used_and_cost(self):
         ad = ClaudeCodeLeadAdapter(bin_path=self.bin)
@@ -166,6 +188,7 @@ class ClaudeLeadTests(unittest.TestCase):
         ad.decide(req, schema=lead_permission_response_schema(), cwd=str(self.dir))
         lr = ad.last_run
         self.assertEqual(lr["model_requested"], DEFAULT_MODEL)
+        self.assertEqual(lr["effort_requested"], DEFAULT_EFFORT)
         self.assertEqual(lr["models_used"], [DEFAULT_MODEL])
         self.assertFalse(lr["model_mismatch"])
         self.assertAlmostEqual(lr["cost_usd"], 0.0012)
@@ -195,7 +218,7 @@ class ClaudeLeadTests(unittest.TestCase):
         self.assertEqual(a[a.index("--model") + 1], "SYNTH-model-b")
 
     def test_build_command_never_has_bypass(self):
-        a = build_command("/x/claude", schema={"type": "object"}, model="claude-haiku-5-5")
+        a = build_command("/x/claude", schema={"type": "object"}, model="claude-opus-5-5", effort="medium")
         self.assertEqual(a[0], "/x/claude")
         self.assertNotIn("--dangerously-skip-permissions", a)
 

@@ -19,7 +19,8 @@ and never logs in. Live login is not verified; "Not logged in" maps to
 Binary: ``COLLAB_CLAUDE_LEAD_BIN`` or PATH ``claude`` (Windows also
 ``claude.cmd``/``claude.exe``). ``COLLAB_LEAD_BIN`` is deliberately ignored so a
 Grok lead path never collides. Model: ``model=`` > ``COLLAB_CLAUDE_LEAD_MODEL`` >
-``DEFAULT_MODEL``, always a full model ID on argv. Aliases such as ``haiku`` were
+``DEFAULT_MODEL``, always a full model ID on argv; effort: ``effort=`` >
+``COLLAB_CLAUDE_LEAD_EFFORT`` > ``DEFAULT_EFFORT`` (``--effort``). Aliases such as ``haiku`` were
 observed to resolve to a different model, so the default is pinned. The model the
 CLI actually used (``modelUsage``) and the cost are kept on ``last_run``.
 """
@@ -45,8 +46,11 @@ from lead_adapter.schema import (
     validate_lead_decision,
 )
 
-# Cheapest full ID that the CLI honoured in a live probe (modelUsage == requested).
-DEFAULT_MODEL = "claude-haiku-5-5"
+# User-chosen lead defaults (full ID, never an alias). Override with model= /
+# COLLAB_CLAUDE_LEAD_MODEL and effort= / COLLAB_CLAUDE_LEAD_EFFORT.
+DEFAULT_MODEL = "claude-opus-5-5"
+DEFAULT_EFFORT = "medium"
+VALID_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 
 # Every tool that could write, execute or reach the network. Belt and braces on
 # top of ``--tools ""``.
@@ -108,7 +112,7 @@ def resolve_claude_bin(
     )
 
 
-def build_command(bin_path: str, *, schema: dict, model: str | None) -> list[str]:
+def build_command(bin_path: str, *, schema: dict, model: str | None, effort: str | None = None) -> list[str]:
     argv = [
         bin_path,
         "-p",
@@ -123,6 +127,8 @@ def build_command(bin_path: str, *, schema: dict, model: str | None) -> list[str
     ]
     if model:
         argv.extend(["--model", model])
+    if effort:
+        argv.extend(["--effort", effort])
     return argv
 
 
@@ -159,9 +165,17 @@ class ClaudeCodeLeadAdapter(LeadAdapterABC):
     name = "claude_code"
     STATUS = "wired_unverified"
 
-    def __init__(self, *, bin_path: str | None = None, model: str | None = None, platform: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        bin_path: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+        platform: str | None = None,
+    ) -> None:
         self._bin_override = (bin_path or "").strip() or None
         self._model = (model or "").strip() or None
+        self._effort = (effort or "").strip().lower() or None
         self._platform = platform
         self.last_run: dict[str, Any] | None = None
 
@@ -175,6 +189,9 @@ class ClaudeCodeLeadAdapter(LeadAdapterABC):
     def _model_name(self) -> str | None:
         return self._model or (os.environ.get("COLLAB_CLAUDE_LEAD_MODEL") or "").strip() or DEFAULT_MODEL
 
+    def _effort_name(self) -> str:
+        return self._effort or (os.environ.get("COLLAB_CLAUDE_LEAD_EFFORT") or "").strip().lower() or DEFAULT_EFFORT
+
     def decide(self, request: dict, *, schema: dict, cwd: str, timeout_sec: float = 180) -> tuple[str, dict | None]:
         req = request if isinstance(request, dict) else {}
         try:
@@ -186,8 +203,12 @@ class ClaudeCodeLeadAdapter(LeadAdapterABC):
         prompt = format_lead_request_prompt(req, allow_hint=hint) + "\n\n" + _JSON_ONLY_LINE
         pinned = pin_lead_response_schema(schema, req)
         model = self._model_name()
-        self.last_run = {"model_requested": model, "models_used": [], "model_mismatch": False, "cost_usd": None}
-        argv = build_command(bin_path, schema=pinned, model=model)
+        effort = self._effort_name()
+        if effort not in VALID_EFFORTS:  # fail closed, never pass an unknown level through
+            return safe_failure("call_failed", f"claude_code invalid effort {effort!r}; valid: {sorted(VALID_EFFORTS)}")
+        self.last_run = {"model_requested": model, "effort_requested": effort, "models_used": [],
+                         "model_mismatch": False, "cost_usd": None}
+        argv = build_command(bin_path, schema=pinned, model=model, effort=effort)
         bad = find_forbidden_flag(argv)
         if bad:  # never rewrite argv and retry
             return safe_failure("call_failed", f"claude_code refused forbidden flag: {bad}")
@@ -262,6 +283,7 @@ class ClaudeCodeLeadAdapter(LeadAdapterABC):
             "bin_path": bin_path,
             "bin_error": bin_error,
             "model": self._model_name(),
+            "effort": self._effort_name(),
             "last_run": self.last_run,
             "tools": "none",
             "permission_mode": "plan",
@@ -270,7 +292,9 @@ class ClaudeCodeLeadAdapter(LeadAdapterABC):
 
 
 __all__ = [
+    "DEFAULT_EFFORT",
     "DEFAULT_MODEL",
+    "VALID_EFFORTS",
     "DISALLOWED_TOOLS",
     "FORBIDDEN_FLAGS",
     "ClaudeBinNotFound",
