@@ -95,7 +95,7 @@ def get_lead_adapter(kind: str | None = None, **kwargs: Any) -> LeadAdapter:
             if k in ("bin_path", "disallowed_tools", "max_turns")
         })
     if name in ("claude", "claude_code", "claude-code"):
-        return ClaudeCodeLeadAdapter()
+        return ClaudeCodeLeadAdapter(**{k: v for k, v in kwargs.items() if k in ("bin_path", "model")})
     if name in ("codex_cli", "codex-cli"):
         return CodexCliLeadAdapter(**{
             k: v for k, v in kwargs.items()
