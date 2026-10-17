@@ -53,6 +53,34 @@ SIMULATED = True
 
 
 class TestLeadStubs(unittest.TestCase):
+    # Never reach a real logged-in claude/codex CLI, even when one is on PATH:
+    # empty PATH, missing explicit bins, and any subprocess spawn fails the test.
+    def setUp(self):
+        empty = tempfile.TemporaryDirectory(prefix="p3-empty-path-")
+        self.addCleanup(empty.cleanup)
+        missing = os.path.join(empty.name, "missing-lead-bin")
+        env = mock.patch.dict(
+            os.environ,
+            {
+                "PATH": empty.name,
+                "COLLAB_CLAUDE_LEAD_BIN": missing,
+                "COLLAB_CODEX_LEAD_BIN": missing,
+                "COLLAB_LEAD_BIN": missing,
+            },
+        )
+        env.start()
+        self.addCleanup(env.stop)
+        self.spawned: list = []
+
+        def _no_spawn(*args, **kwargs):
+            self.spawned.append(args[0] if args else kwargs.get("args"))
+            raise AssertionError(f"P3 lead stub test tried to spawn a CLI: {self.spawned[-1]!r}")
+
+        guard = mock.patch("subprocess.Popen", side_effect=_no_spawn)
+        guard.start()
+        self.addCleanup(guard.stop)
+        self.addCleanup(lambda: self.assertEqual(self.spawned, [], "a lead CLI was spawned"))
+
     def test_claude_stub_no_fake_pass(self):
         ad = get_lead_adapter("claude_code")
         self.assertIsInstance(ad, ClaudeCodeLeadAdapter)
