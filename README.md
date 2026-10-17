@@ -151,6 +151,13 @@ python3 bin/run-job.py jobs/examples/hello.charter.yaml   # 真跑需 :4399 + �
 
 报告落在 `jobs/runs/<name>-<utc>/{status.json,report.json,report.md}`。详见 [`docs/eternal-worker-skeleton.md`](docs/eternal-worker-skeleton.md)。
 
+## 已知限制
+
+- **Claude Code 组长**（`COLLAB_LEAD_ADAPTER=claude_code`，`src/lead_adapter/claude_code.py`）：
+  - 不处理 Windows `.cmd` 启动：没有 codex_cli 那套 `cmd /c` 参数元字符检查。Windows 上请让 `COLLAB_CLAUDE_LEAD_BIN` 指向可直接执行的 `claude.exe`，不要指向 `.cmd` 包装。
+  - 没有 `--max-turns`（Claude Code 2.1.302 无此参数），单次运行只靠超时（`--lead-timeout`，默认 180 秒）兜底；超时会停掉整棵进程树并按 `timeout` 失败，不会当作通过。
+  - 默认 `claude-opus-5-5`、`--effort medium`，可用 `COLLAB_CLAUDE_LEAD_MODEL` / `COLLAB_CLAUDE_LEAD_EFFORT` 覆盖。CLI 的 JSON 输出不回报实际 effort，只能看 `modelUsage` 与 thinking tokens。
+
 ## 一句话
 
 **TeleAgent 出力，可插拔组长把门，脚本把审批和验收跑完——给人只留开题和收件。**
