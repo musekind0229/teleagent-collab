@@ -18,8 +18,10 @@ and never logs in. Live login is not verified; "Not logged in" maps to
 
 Binary: ``COLLAB_CLAUDE_LEAD_BIN`` or PATH ``claude`` (Windows also
 ``claude.cmd``/``claude.exe``). ``COLLAB_LEAD_BIN`` is deliberately ignored so a
-Grok lead path never collides. Model: ``model=`` or ``COLLAB_CLAUDE_LEAD_MODEL``;
-unset means the CLI default.
+Grok lead path never collides. Model: ``model=`` > ``COLLAB_CLAUDE_LEAD_MODEL`` >
+``DEFAULT_MODEL``, always a full model ID on argv. Aliases such as ``haiku`` were
+observed to resolve to a different model, so the default is pinned. The model the
+CLI actually used (``modelUsage``) and the cost are kept on ``last_run``.
 """
 from __future__ import annotations
 
@@ -42,6 +44,9 @@ from lead_adapter.schema import (
     pin_lead_response_schema,
     validate_lead_decision,
 )
+
+# Cheapest full ID that the CLI honoured in a live probe (modelUsage == requested).
+DEFAULT_MODEL = "claude-haiku-5-5"
 
 # Every tool that could write, execute or reach the network. Belt and braces on
 # top of ``--tools ""``.
@@ -158,6 +163,7 @@ class ClaudeCodeLeadAdapter(LeadAdapterABC):
         self._bin_override = (bin_path or "").strip() or None
         self._model = (model or "").strip() or None
         self._platform = platform
+        self.last_run: dict[str, Any] | None = None
 
     def _resolve_bin(self) -> str:
         if self._bin_override:
@@ -167,7 +173,7 @@ class ClaudeCodeLeadAdapter(LeadAdapterABC):
         return resolve_claude_bin(platform=self._platform)
 
     def _model_name(self) -> str | None:
-        return self._model or (os.environ.get("COLLAB_CLAUDE_LEAD_MODEL") or "").strip() or None
+        return self._model or (os.environ.get("COLLAB_CLAUDE_LEAD_MODEL") or "").strip() or DEFAULT_MODEL
 
     def decide(self, request: dict, *, schema: dict, cwd: str, timeout_sec: float = 180) -> tuple[str, dict | None]:
         req = request if isinstance(request, dict) else {}
@@ -179,7 +185,9 @@ class ClaudeCodeLeadAdapter(LeadAdapterABC):
         hint = str(req["extra"].get("allow_hint") or "") if isinstance(req.get("extra"), dict) else ""
         prompt = format_lead_request_prompt(req, allow_hint=hint) + "\n\n" + _JSON_ONLY_LINE
         pinned = pin_lead_response_schema(schema, req)
-        argv = build_command(bin_path, schema=pinned, model=self._model_name())
+        model = self._model_name()
+        self.last_run = {"model_requested": model, "models_used": [], "model_mismatch": False, "cost_usd": None}
+        argv = build_command(bin_path, schema=pinned, model=model)
         bad = find_forbidden_flag(argv)
         if bad:  # never rewrite argv and retry
             return safe_failure("call_failed", f"claude_code refused forbidden flag: {bad}")
@@ -198,6 +206,16 @@ class ClaudeCodeLeadAdapter(LeadAdapterABC):
         out = stdout.strip()
         envelope = _strict_object(out) if out else None
         result_text = str(envelope.get("result") or "") if envelope else ""
+        if envelope is not None and self.last_run is not None:
+            used = envelope.get("modelUsage")
+            used_ids = sorted(used.keys()) if isinstance(used, dict) else []
+            cost = envelope.get("total_cost_usd")
+            self.last_run.update({
+                "models_used": used_ids,
+                "model_mismatch": bool(used_ids) and used_ids != [self.last_run["model_requested"]],
+                "cost_usd": cost if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None,
+                "num_turns": envelope.get("num_turns"),
+            })
         login_blob = f"{result_text}\n{stderr}" if envelope else f"{out}\n{stderr}"
         # Non-zero is never a decision, even when stdout carries valid JSON.
         if code != 0:
@@ -244,6 +262,7 @@ class ClaudeCodeLeadAdapter(LeadAdapterABC):
             "bin_path": bin_path,
             "bin_error": bin_error,
             "model": self._model_name(),
+            "last_run": self.last_run,
             "tools": "none",
             "permission_mode": "plan",
             "live_verified": False,
@@ -251,6 +270,7 @@ class ClaudeCodeLeadAdapter(LeadAdapterABC):
 
 
 __all__ = [
+    "DEFAULT_MODEL",
     "DISALLOWED_TOOLS",
     "FORBIDDEN_FLAGS",
     "ClaudeBinNotFound",

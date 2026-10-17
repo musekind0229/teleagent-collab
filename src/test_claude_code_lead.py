@@ -13,7 +13,7 @@ from unittest import mock
 
 from lead_adapter import get_lead_adapter
 from lead_adapter.cancel import CancelScope, use_scope
-from lead_adapter.claude_code import ClaudeBinNotFound, ClaudeCodeLeadAdapter, build_command, resolve_claude_bin
+from lead_adapter.claude_code import DEFAULT_MODEL, ClaudeBinNotFound, ClaudeCodeLeadAdapter, build_command, resolve_claude_bin
 from lead_adapter.schema import (
     LeadDecisionError,
     build_lead_request,
@@ -34,7 +34,10 @@ payload = json.loads(os.environ.get("FAKE_CLAUDE_PAYLOAD", "{}"))
 def out(obj, rc=0):
     sys.stdout.write(json.dumps(obj)); sys.stdout.flush(); sys.exit(rc)
 if mode == "structured":
-    out({"type": "result", "subtype": "success", "is_error": False, "result": "done", "structured_output": payload})
+    a = sys.argv[1:]
+    used = os.environ.get("FAKE_CLAUDE_USED") or (a[a.index("--model") + 1] if "--model" in a else "default-model")
+    out({"type": "result", "subtype": "success", "is_error": False, "result": "done", "structured_output": payload,
+         "total_cost_usd": 0.0012, "num_turns": 1, "modelUsage": {used: {"costUSD": 0.0012}}})
 if mode == "result_text":
     out({"type": "result", "subtype": "success", "is_error": False, "result": json.dumps(payload)})
 if mode == "result_prose":
@@ -149,7 +152,38 @@ class ClaudeLeadTests(unittest.TestCase):
         self.assertEqual(pinned["properties"]["application_id"]["const"], req["application_id"])
         self.assertIn(req["application_id"], r["stdin"])  # prompt via stdin, not argv
         self.assertEqual(os.path.realpath(r["cwd"]), os.path.realpath(str(self.dir)))
-        self.assertNotIn("--model", a)
+        self.assertEqual(a[a.index("--model") + 1], DEFAULT_MODEL)
+
+    def test_default_model_is_pinned_full_id(self):
+        self.assertEqual(DEFAULT_MODEL, "claude-haiku-5-5")
+        self.assertRegex(DEFAULT_MODEL, r"^claude-[a-z]+-\d")  # full ID, not an alias
+
+    def test_last_run_records_model_used_and_cost(self):
+        ad = ClaudeCodeLeadAdapter(bin_path=self.bin)
+        req = _req()
+        os.environ["FAKE_CLAUDE_MODE"] = "structured"
+        os.environ["FAKE_CLAUDE_PAYLOAD"] = json.dumps(_ok_payload(req))
+        ad.decide(req, schema=lead_permission_response_schema(), cwd=str(self.dir))
+        lr = ad.last_run
+        self.assertEqual(lr["model_requested"], DEFAULT_MODEL)
+        self.assertEqual(lr["models_used"], [DEFAULT_MODEL])
+        self.assertFalse(lr["model_mismatch"])
+        self.assertAlmostEqual(lr["cost_usd"], 0.0012)
+        self.assertEqual(ad.doctor_hint()["last_run"], lr)
+
+    def test_model_mismatch_is_flagged_not_hidden(self):
+        os.environ["FAKE_CLAUDE_USED"] = "claude-sonnet-9-9"
+        try:
+            ad = ClaudeCodeLeadAdapter(bin_path=self.bin)
+            req = _req()
+            os.environ["FAKE_CLAUDE_MODE"] = "structured"
+            os.environ["FAKE_CLAUDE_PAYLOAD"] = json.dumps(_ok_payload(req))
+            raw, parsed = ad.decide(req, schema=lead_permission_response_schema(), cwd=str(self.dir))
+        finally:
+            os.environ.pop("FAKE_CLAUDE_USED", None)
+        self.assertEqual(parsed["decision"], "once")
+        self.assertTrue(ad.last_run["model_mismatch"])
+        self.assertEqual(ad.last_run["models_used"], ["claude-sonnet-9-9"])
 
     def test_model_flag_from_kwarg_and_env(self):
         self._run("structured", model="SYNTH-model-a")
@@ -161,7 +195,7 @@ class ClaudeLeadTests(unittest.TestCase):
         self.assertEqual(a[a.index("--model") + 1], "SYNTH-model-b")
 
     def test_build_command_never_has_bypass(self):
-        a = build_command("/x/claude", schema={"type": "object"}, model=None)
+        a = build_command("/x/claude", schema={"type": "object"}, model="claude-haiku-5-5")
         self.assertEqual(a[0], "/x/claude")
         self.assertNotIn("--dangerously-skip-permissions", a)
 
