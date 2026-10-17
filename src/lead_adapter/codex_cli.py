@@ -44,6 +44,14 @@ EXAMPLE_WINDOWS_CODEX_BIN = (
 
 TEMP_PREFIX = "collab-codex-lead-"
 
+# User-chosen lead defaults. Override with model= / COLLAB_CODEX_LEAD_MODEL and
+# effort= / COLLAB_CODEX_LEAD_EFFORT. Passed as ``-m`` and
+# ``-c model_reasoning_effort=<effort>``.
+DEFAULT_CODEX_MODEL = "gpt-6.1-sol"
+DEFAULT_CODEX_EFFORT = "medium"
+_SAFE_MODEL_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_SAFE_EFFORT_RE = re.compile(r"^[a-z]+$")
+
 # Never place these on the exec argv. Space-separated entries are adjacent tokens
 # (``-s workspace-write``), not a single argv element. Long-form sandbox modes are
 # the same hazard as the short ``-s`` forms.
@@ -240,6 +248,8 @@ def build_command(
     cwd: str,
     schema_path: str,
     last_message_path: str,
+    model: str | None = None,
+    effort: str | None = None,
 ) -> list[str]:
     """Argv for one read-only ``codex exec``. Prompt is stdin (trailing ``-``).
 
@@ -262,6 +272,8 @@ def build_command(
         schema_path,
         "-o",
         last_message_path,
+        *(["-m", model] if model else []),
+        *(["-c", f"model_reasoning_effort={effort}"] if effort else []),
         "-",
     ]
 
@@ -472,11 +484,21 @@ class CodexCliLeadAdapter(LeadAdapterABC):
         *,
         bin_path: str | None = None,
         platform: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
     ) -> None:
+        self._model = (model or "").strip() or None
+        self._effort = (effort or "").strip().lower() or None
         explicit = (bin_path or "").strip()
         # Stored only. Existence is checked in decide / doctor_hint.
         self._bin_override = explicit or None
         self._platform = platform
+
+    def model_name(self) -> str:
+        return self._model or (os.environ.get("COLLAB_CODEX_LEAD_MODEL") or "").strip() or DEFAULT_CODEX_MODEL
+
+    def effort_name(self) -> str:
+        return self._effort or (os.environ.get("COLLAB_CODEX_LEAD_EFFORT") or "").strip().lower() or DEFAULT_CODEX_EFFORT
 
     def _platform_name(self) -> str:
         return self._platform if self._platform is not None else sys.platform
@@ -547,7 +569,16 @@ class CodexCliLeadAdapter(LeadAdapterABC):
             cwd=work,
             schema_path=schema_path,
             last_message_path=last_path,
+            model=self.model_name(),
+            effort=self.effort_name(),
         )
+        if not _SAFE_MODEL_RE.match(self.model_name()) or not _SAFE_EFFORT_RE.match(self.effort_name()):
+            return safe_failure(
+                "call_failed",
+                redact_secrets(
+                    f"codex_cli refused model/effort: {self.model_name()!r} / {self.effort_name()!r}"
+                ),
+            )
         # One shot. A forbidden flag is call_failed — never rewrite argv and retry.
         bad = find_forbidden_flag(argv)
         if bad:
@@ -645,11 +676,15 @@ class CodexCliLeadAdapter(LeadAdapterABC):
             "bin_error": bin_error,
             "sandbox": "read-only",
             "approval_policy": "never",
+            "model": self.model_name(),
+            "reasoning_effort": self.effort_name(),
             "live_verified": False,
         }
 
 
 __all__ = [
+    "DEFAULT_CODEX_EFFORT",
+    "DEFAULT_CODEX_MODEL",
     "EXAMPLE_WINDOWS_CODEX_BIN",
     "FORBIDDEN_FLAGS",
     "TEMP_PREFIX",

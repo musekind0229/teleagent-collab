@@ -1,8 +1,11 @@
 """Pluggable lead adapters (条3).
 
-Grok CLI, Codex CLI (``codex_cli``, read-only sandbox, live login unverified),
-and DeepSeek harness are backends. Claude Code is still a stub. The name
-``codex`` is dialogue-as-lead (inprocess), not the Codex CLI.
+Grok CLI, Claude Code (``claude_code``: one read-only ``claude -p`` call,
+default ``claude-opus-5-5`` / effort ``medium``), Codex CLI (``codex_cli``:
+read-only sandbox, default ``gpt-6.1-sol`` / reasoning effort ``medium``) and
+the DeepSeek harness are backends. The claude_code and codex_cli leads are
+implemented and live-tested end to end (planning, review pass, bad delivery
+rejected). The name ``codex`` is dialogue-as-lead (inprocess), not the Codex CLI.
 """
 from __future__ import annotations
 
@@ -95,7 +98,7 @@ def get_lead_adapter(kind: str | None = None, **kwargs: Any) -> LeadAdapter:
             if k in ("bin_path", "disallowed_tools", "max_turns")
         })
     if name in ("claude", "claude_code", "claude-code"):
-        return ClaudeCodeLeadAdapter()
+        return ClaudeCodeLeadAdapter(**{k: v for k, v in kwargs.items() if k in ("bin_path", "model", "effort")})
     if name in ("codex_cli", "codex-cli"):
         return CodexCliLeadAdapter(**{
             k: v for k, v in kwargs.items()

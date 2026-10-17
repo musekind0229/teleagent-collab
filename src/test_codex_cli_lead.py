@@ -157,7 +157,12 @@ def _assert_clean_argv(test: unittest.TestCase, argv: list[str]) -> None:
     test.assertEqual(argv[14], "-o")
     test.assertTrue(str(argv[15]).endswith("last.json"))
     test.assertEqual(argv[-1], "-")
-    test.assertEqual(len(argv), 17)
+    # 17 base entries, or 21 with the pinned "-m <model> -c model_reasoning_effort=<e>" before "-".
+    test.assertIn(len(argv), (17, 21))
+    if len(argv) == 21:
+        test.assertEqual(argv[16], "-m")
+        test.assertEqual(argv[18], "-c")
+        test.assertTrue(str(argv[19]).startswith("model_reasoning_effort="))
     test.assertIsNone(find_forbidden_flag(argv))
     joined = " ".join(argv)
     for flag in FORBIDDEN_FLAGS:
@@ -594,6 +599,8 @@ class TestCodexCliDecide(unittest.TestCase):
                         cwd=str(self.fake.work),
                         schema_path=argv[13],
                         last_message_path=argv[15],
+                        model="gpt-6.1-sol",
+                        effort="medium",
                     ),
                 )
                 stdin = self.fake.recorded_stdin()
