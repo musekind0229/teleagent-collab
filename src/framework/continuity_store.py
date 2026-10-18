@@ -45,7 +45,11 @@ class ContinuityStore:
     s['pending_decisions']=[x for x in s['pending_decisions']if x['decision_id']!=decision_id];s.setdefault('resolved_decisions',[]).append({**d,'verdict':'continue','grant_id':grant['grant_id']})
     t=next((t for t in s.get('tasks',[])if t['task_id']==d.get('task_id')),None)
     if t and t['status']=='failed':
-     t.setdefault('attempt_history',[]).append(copy.deepcopy({k:v for k,v in t.items()if k!='attempt_history'}));t.setdefault('rework_feedback',[]).append({'reason':d['reason'],'source':'explicit_continuation','prior_result':copy.deepcopy(t.get('result'))});t.update(status='queued',result=None)
+     t.setdefault('attempt_history',[]).append(copy.deepcopy({k:v for k,v in t.items()if k!='attempt_history'}))
+     # Only this exact trusted decision task receives owner input. Existing
+     # instruction_with_feedback renders reason verbatim into the final prompt.
+     t.setdefault('rework_feedback',[]).append({'reason':d['reason']+'\n[owner_feedback]\n'+grant['reason']+'\n[/owner_feedback]','checkpoint_reason':d['reason'],'owner_feedback':grant['reason'],'source':'explicit_continuation','prior_result':copy.deepcopy(t.get('result'))})
+     t.update(status='queued',result=None)
      for k in ('run_id','native_handle','dispatch_claim','progress','run_started_at'):t.pop(k,None)
    elif packages:raise ValueError('increment requires pending owner decision')
    packages[r['package_id']]={'resource':copy.deepcopy(r),'claims':[],'actual_native':0,'actual_lead':0};s['active_resource_package']=r['package_id'];grants.append(copy.deepcopy(grant))

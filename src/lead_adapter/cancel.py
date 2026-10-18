@@ -241,25 +241,39 @@ def communicate(
             send, pending_input = pending_input, None
             out, err = proc.communicate(input=send, timeout=max(0.0, min(_POLL_SEC, remaining)))
             if scope is not None and scope.cancelled:
-                raise LeadCancelled(scope.reason)
+                exc = LeadCancelled(scope.reason)
+                setattr(exc, 'output', out)
+                setattr(exc, 'stderr', err)
+                setattr(exc, 'cleanup', {**stop_process_tree(proc, platform),
+                    'drain_complete': True, 'scope_cancelled': True})
+                raise exc
             return (out if out is not None else (b"" if not proc.text_mode else "")), (err if err is not None else (b"" if not proc.text_mode else ""))
-        except subprocess.TimeoutExpired:
-            pass
-        if scope is not None and scope.cancelled:
-            stop_process_tree(proc, platform)  # normally already done by cancel()
-            _drain(proc)
-            raise LeadCancelled(scope.reason)
-        if time.monotonic() >= deadline:
-            stop_process_tree(proc, platform)
-            _drain(proc)
-            raise subprocess.TimeoutExpired(proc.args, timeout)
+        except subprocess.TimeoutExpired as poll_timeout:
+            # CPython exposes accumulated bytes on TimeoutExpired. Retain them
+            # if post-stop draining cannot finish (e.g. inherited pipe handles).
+            partial_out, partial_err = poll_timeout.output, poll_timeout.stderr
+        if (scope is not None and scope.cancelled) or time.monotonic() >= deadline:
+            cleanup = stop_process_tree(proc, platform)
+            out, err, drained = _drain(proc, partial_out, partial_err)
+            if scope is not None and scope.cancelled:
+                exc = LeadCancelled(scope.reason)
+                setattr(exc, 'output', out)
+                setattr(exc, 'stderr', err)
+            else:
+                exc = subprocess.TimeoutExpired(proc.args, timeout, output=out, stderr=err)
+            setattr(exc, 'cleanup', {**cleanup, 'drain_complete': drained})
+            raise exc
 
 
-def _drain(proc: subprocess.Popen) -> None:
+def _drain(proc: subprocess.Popen, partial_out=None, partial_err=None):
     try:
-        proc.communicate(timeout=5)
+        out, err = proc.communicate(timeout=5)
+        return out, err, True
+    except subprocess.TimeoutExpired as exc:
+        return (exc.output if exc.output is not None else partial_out,
+                exc.stderr if exc.stderr is not None else partial_err, False)
     except Exception:  # noqa: BLE001
-        pass
+        return partial_out, partial_err, False
 
 
 def _run_unaccounted(
@@ -304,9 +318,13 @@ def _run_unaccounted(
         out, err = communicate(proc, timeout=timeout, input_text=input_text.encode("utf-8") if input_text is not None else None, platform=platform, scope=scope)
     except (LeadCancelled, subprocess.TimeoutExpired) as exc:
         try:
-            partial_out, partial_err = proc.communicate(timeout=3)
+            partial_out, partial_err = getattr(exc, 'output', None), getattr(exc, 'stderr', None)
+            if partial_out is None or partial_err is None:
+                partial_out, partial_err = proc.communicate(timeout=3)
             captured = _binary_capture_result(cmd, proc, partial_out, partial_err, complete=False)
-            exc.raw_evidence = captured.raw_evidence
+            evidence = getattr(captured, 'raw_evidence')
+            evidence['cleanup'] = getattr(exc, 'cleanup', {'result': 'not_recorded'})
+            setattr(exc, 'raw_evidence', evidence)
         except Exception:
             exc.raw_evidence = {"capture_status": "not_recorded", "capture_complete": False}
         raise

@@ -653,18 +653,15 @@ def worker_charter_for_task(
     elif isinstance(acceptance_src, str):
         if goal_acceptance_applies(acceptance_src, task, siblings):
             charter["acceptance"] = acceptance_src
-    task_rows=[r for r in (siblings or []) if isinstance(r,Mapping)]
-    own_artifacts=set(str(x) for x in task.get('expected_artifacts',[]))
-    foreign_artifacts={str(a) for r in task_rows if r.get('task_id')!=task.get('task_id') for a in r.get('expected_artifacts',[]) }-own_artifacts
-    if len(task_rows)>1 and any(a in str(acceptance_src) or any(a in m for m in charter['must']) for a in foreign_artifacts):
-        # Preserve goal prose as context, not a contradictory per-task output
-        # obligation. Safety boundaries remain mandatory for every task.
-        charter['must'],deferred=split_task_musts(musts=charter['must'],task=task,siblings=task_rows)
-        deferred.extend(m for m in charter['must'] if any(a in m for a in foreign_artifacts))
-        charter['must']=[m for m in charter['must'] if not any(a in m for a in foreign_artifacts)]
-        charter['must'].insert(0,'Produce only this task expected_artifacts/done_when; goal-level deliverables owned by sibling tasks are context, not permission to add files.')
-        charter['acceptance']=str(done_when.get('text') or 'Deliver this task artifacts; goal-wide final verification belongs to the owning downstream task.') if isinstance(done_when,Mapping) else 'Deliver only this task artifacts.'
-        charter['goal_context']={'acceptance':acceptance_src,'deferred_must':deferred,'artifact_owners':[{'task_id':r.get('task_id'),'artifacts':r.get('expected_artifacts',[])} for r in task_rows]}
+    projection = task_contract_projection(goal=goal_obj, task=task, siblings=siblings)
+    if projection["goal_context"] is not None:
+        charter["acceptance"] = projection["acceptance"]["text"]
+        charter["goal_context"] = projection["goal_context"]
+    # Do not remove a global must merely because it mentions a sibling artifact.
+    # The explicit Task-label scoping used by reviews also applies to workers.
+    charter["must"] = projection["must"]
+    if projection["goal_context"] is not None:
+        charter["must"] = [*charter["must"], "Produce only this task expected_artifacts/done_when; sibling deliverables remain with their declared owners. Global safety and authorization gates remain mandatory."]
     raw_forbidden = goal_obj.get("forbidden_tools")
     if isinstance(raw_forbidden, list):
         forbidden = [str(x).strip() for x in raw_forbidden if str(x).strip()]
@@ -1029,6 +1026,72 @@ def split_task_musts(
         else:
             scoped.append(text)
     return scoped, deferred
+
+
+TASK_SCOPE_POLICY = (
+    "Goal context and sibling artifacts are not current-task deliverables. "
+    "Current acceptance is this task's instruction, expected_artifacts and done_when. "
+    "Goal-wide safety, privacy, no-follow, resource and authorization constraints "
+    "remain mandatory for every task, including constraints stated in goal context. "
+    "Deferral changes delivery ownership only, never permission or safety gates. "
+    "Do not fail a task solely for missing downstream-owned tests/control/docs; "
+    "do fail genuine current-task defects or safety violations. Final goal acceptance remains required."
+)
+
+
+def task_contract_projection(*, goal, task, siblings=None):
+    """Read-only ownership view shared by worker and review request builders.
+
+    No natural-language obligation parser: explicit task artifacts and dependency
+    edges establish owners. Ambiguous/global musts are not deleted by filename.
+    Operational caller checks (command/output protection, material gates) survive.
+    Without a complete multi-task ownership view preserve the legacy contract.
+    """
+    boundaries = goal.get("boundaries") or {}
+    scoped, deferred = split_task_musts(
+        musts=[str(x) for x in boundaries.get("must", [])], task=task, siblings=siblings,
+    )
+    acceptance = effective_caller_acceptance(goal, task)
+    rows = [r for r in (siblings or []) if isinstance(r, Mapping)]
+    me = task.get("task_id")
+    if len(rows) < 2 or not me or not any(r.get("task_id") == me for r in rows) or not all(r.get("expected_artifacts") for r in rows):
+        return {"acceptance": acceptance, "must": scoped, "deferred_must": deferred, "goal_context": None}
+    local = task_acceptance_criteria(task)
+    goal_accept = goal.get("acceptance") or {}
+    goal_text = goal_accept.get("text", "") if isinstance(goal_accept, Mapping) else str(goal_accept)
+    if not isinstance(goal_text, str):
+        raise AppError("acceptance.text must be a string")
+    # Existing exact-file criteria have explicit owners and still gate them.
+    if not local["text"] and _GOAL_EXACT_RE.match(goal_text.strip()) and goal_acceptance_applies(goal_text, task, rows):
+        local["text"] = goal_text
+    if not local["text"]:
+        local["text"] = "Deliver this task's declared artifacts and satisfy its instruction; downstream-owned deliverables are deferred, not waived. All global safety/privacy/authorization constraints still apply."
+    acceptance.update(local)
+    descendants = {me}
+    while True:
+        expanded = descendants | {r.get("task_id") for r in rows if any(d in descendants for d in (r.get("depends_on") or []))}
+        if expanded == descendants:
+            break
+        descendants = expanded
+    own = set(local["artifacts"])
+    owners = [{"task_id": r.get("task_id"), "artifacts": list(r.get("expected_artifacts") or [])} for r in rows]
+    downstream = []
+    for r in rows:
+        if r.get("task_id") != me and r.get("task_id") in descendants:
+            downstream.append({
+                "task_id": r.get("task_id"), "title": r.get("title"),
+                "depends_on": list(r.get("depends_on") or []),
+                "expected_artifacts": list(r.get("expected_artifacts") or []),
+                "deferred_artifacts": [a for a in r.get("expected_artifacts", []) if a not in own],
+                "done_when": r.get("done_when") or {},
+                "instruction": str((r.get("inputs") or {}).get("instruction") or ""),
+            })
+    context = {
+        "policy": TASK_SCOPE_POLICY, "acceptance": goal_accept,
+        "desired_outcome": goal.get("desired_outcome") or "",
+        "deferred_must": deferred, "artifact_owners": owners, "deferred_tasks": downstream,
+    }
+    return {"acceptance": acceptance, "must": scoped, "deferred_must": deferred, "goal_context": context}
 
 
 def lead_error_retryable(exc: BaseException) -> bool:
@@ -1595,9 +1658,11 @@ class LeadAdapterPlanner:
         instruction = str((task.get("inputs") or {}).get("instruction") or task.get("title") or "").strip()
         siblings = [row for row in (goal_snapshot.get("tasks") or []) if isinstance(row, Mapping)]
         goal_must = [str(x) for x in (boundaries.get("must") or [])]
-        scoped_must, deferred_must = split_task_musts(musts=goal_must, task=task, siblings=siblings)
-        task_accept = effective_caller_acceptance(goal, task)
+        projection = task_contract_projection(goal=goal, task=task, siblings=siblings)
+        scoped_must, deferred_must = projection["must"], projection["deferred_must"]
+        task_accept = projection["acceptance"]
         extra = {
+            "goal_context": projection["goal_context"],
             "worker_request": action.get("payload") or {},
             "review_scope": "task",
             "task_acceptance": task_accept,
@@ -1653,6 +1718,19 @@ class LeadAdapterPlanner:
         incomplete = (placeholder or candidate.get("_lead_status") == "review_blocked" or
                       candidate.get("stopReason") == "cancelled" or
                       ("structuredOutput" in candidate and candidate["structuredOutput"] is None))
+        # Only the native post-run gate consumes these exact envelope failures.
+        # Never recover a verdict from stdout when the canonical envelope is empty.
+        no_verdict_code = (
+            "lead_cancelled" if candidate.get("stopReason") == "cancelled" else
+            "lead_structured_missing" if "structuredOutput" in candidate and candidate["structuredOutput"] is None else
+            "lead_incomplete" if candidate.get("_lead_status") == "incomplete" else ""
+        )
+        if (backend_kind == "review" and action.get("native_post_run") is True and no_verdict_code
+                and candidate.get("_lead_status") not in {"error", "call_failed", "timeout"}):
+            from lead_adapter.schema import LeadDecisionError
+            exc = LeadDecisionError(no_verdict_code, str(candidate.get("reason") or candidate.get("structuredOutputError") or no_verdict_code))
+            exc.evidence_payload = copy.deepcopy(dict(candidate))
+            raise exc
         if incomplete:
             return {"verdict": "blocked", "review_status": "review_blocked", "incomplete": True,
                     "reason": "lead response incomplete; not a code verdict",
@@ -2690,6 +2768,20 @@ class AppCoordinator:
             goal_id=goal_id,
         )
 
+    def _review_timeout_outcome(self, goal_id: str, task: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Fence the exact collected run, including archived owner attempts."""
+        live = self.layer.get_goal(goal_id).get("goal") or {}
+        task_id = str(task.get("task_id") or "")
+        current = next((t for t in live.get("tasks", []) if t.get("task_id") == task_id), {})
+        for row in [current, *(current.get("attempt_history") or [])]:
+            prior = row.get("result") or {}
+            if (prior.get("review_timeout") or prior.get("review_no_verdict")) and str(row.get("run_id") or "") == str(task.get("run_id") or ""):
+                return {"ok": True, "goal_id": goal_id, "task_id": task_id,
+                        "state": "awaiting_owner" if row is current else str(live.get("state") or "running"),
+                        "action": "decision_required" if row is current else "stale_terminal_ignored",
+                        "reason": (prior.get("review") or {}).get("code") or "timeout", "idempotent": True}
+        return None
+
     def _after_observe(
         self,
         snap: Mapping[str, Any],
@@ -2702,6 +2794,9 @@ class AppCoordinator:
         goal_id = str(snap.get("goal_id") or task.get("goal_id") or "")
         task_id = str(task.get("task_id") or "")
         run_id = str(task.get("run_id") or "").strip()
+        fenced = self._review_timeout_outcome(goal_id, task)
+        if fenced is not None:
+            return fenced
         self._note_task_progress(
             goal_id,
             task_id,
@@ -3176,15 +3271,45 @@ class AppCoordinator:
             return None, out
 
         self._phase(goal_id, "reviewing", task_id=task_id)
-        action = {"kind": "review", "payload": payload, "review_hint": agy_review.SCOPE_RULE}
+        action = {"kind": "review", "payload": payload, "review_hint": agy_review.SCOPE_RULE, "native_post_run": True}
         choice: Mapping[str, Any] = {}
         for attempt in range(1, MAX_LEAD_ATTEMPTS_PER_DECISION + 1):
             try:
                 choice = decider(snap, task, action)
                 break
             except Exception as exc:
-                # Protocol slips (missing application_id, bad JSON, timeout) get
-                # one more ask, as on the TeleAgent decision path. Quota/auth do not.
+                # Exact no-verdict envelopes share the existing timeout stop-loss.
+                # Neither is a code verdict or permission to buy another review;
+                # retain the collected native result and original lead evidence.
+                code = str(getattr(exc, "code", ""))
+                no_verdict = code in {"lead_incomplete", "lead_cancelled", "lead_structured_missing"}
+                if code == "timeout" or isinstance(exc, TimeoutError) or no_verdict:
+                    code = code if no_verdict else "timeout"
+                    rec = _lead_error_record(exc)
+                    rec["retryable"] = False  # owner grant, never automatic retry
+                    review = {"status": "error", "source": "lead", "code": code,
+                              "evidence": rec["message"], "attempts": attempt}
+                    if no_verdict:
+                        review["evidence_payload"] = copy.deepcopy(getattr(exc, "evidence_payload", {}))
+                    out["native_result"] = copy.deepcopy(dict(result))
+                    out.update(ok=False, review=review,
+                               error="lead review unavailable [" + code + "]: " + rec["message"])
+                    out["review_no_verdict" if no_verdict else "review_timeout"] = True
+                    out["review_history"] = [dict(r) for r in (task.get("review_history") or []) if isinstance(r, Mapping)] + [review]
+                    self._phase(goal_id, task_id=task_id, outcome="checkpoint")
+                    if getattr(self, "continuity_enabled", False):
+                        # Existing trusted continuation preserves this attempt
+                        # and reruns native; it is deliberately not review-only.
+                        self.layer.finish_task(goal_id, task_id, succeeded=False, close_goal=False, result=out)
+                        parked = self.layer.continuity_block(goal_id, task_id=task_id, reason=out["error"])
+                    else:
+                        opened = self.layer.open_checkpoint(goal_id, task_id=task_id,
+                            run_id=str(task.get("run_id") or ""), result=out,
+                            summary=out["error"], reason=out["error"])
+                        parked = {**opened, "goal_id": goal_id, "state": "awaiting_owner", "action": "decision_required"}
+                    return {**parked, "reason": code, "lead_error": rec}, out
+                # Other protocol slips keep the existing retry policy.
+                # Quota/auth remain nonretryable.
                 if lead_error_retryable(exc) and attempt < MAX_LEAD_ATTEMPTS_PER_DECISION:
                     continue
                 rec = _lead_error_record(exc)
@@ -3370,6 +3495,9 @@ class AppCoordinator:
         """
         goal_id = str(snap.get("goal_id") or "")
         task_id = str(task.get("task_id") or "")
+        fenced = self._review_timeout_outcome(goal_id, task)
+        if fenced is not None:
+            return fenced
         if isinstance(result, Mapping) and result.get("ok"):
             # Worker finished cleanly: artifact presence, acceptance, contamination.
             self._phase(goal_id, "testing", task_id=task_id)

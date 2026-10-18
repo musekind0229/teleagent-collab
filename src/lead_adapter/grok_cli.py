@@ -101,6 +101,15 @@ def resolve_lead_bin(
     )
 
 
+def lead_max_turns(value):
+    """Strict API/CLI boundary: only integer 1/2 or their exact CLI strings."""
+    if type(value) is int and value in (1, 2):
+        return value
+    if type(value) is str and value in ('1', '2'):
+        return int(value)
+    raise ValueError('lead max turns must be integer 1 or 2')
+
+
 class GrokCliLeadAdapter(LeadAdapterABC):
     """Spawn Grok/compatible CLI once with disallowed-tools. Failures stay failed."""
 
@@ -118,7 +127,9 @@ class GrokCliLeadAdapter(LeadAdapterABC):
         explicit = (bin_path or "").strip()
         self.bin_path = explicit or resolve_lead_bin()
         self.disallowed_tools = disallowed_tools
-        self.max_turns = max_turns
+        self.max_turns = lead_max_turns(max_turns)
+        if self.max_turns == 2 and not tool_free:
+            raise ValueError('two turns require tool_free=True')
         self.tool_free = tool_free
         self.caller_evidence_root = Path(caller_evidence_root) if caller_evidence_root else None
 
@@ -130,6 +141,9 @@ class GrokCliLeadAdapter(LeadAdapterABC):
         cwd: str,
         timeout_sec: float = 180,
     ) -> tuple[str, dict | None]:
+        # Only tool-free plan/review can use two internal CLI turns. This is
+        # still ONE admitted lead dispatch, not two resource-package claims.
+        max_turns = self.max_turns if self.tool_free and request.get('kind') in ('plan', 'review') else 1
         hint = ""
         if isinstance(request.get("extra"), dict):
             hint = str(request["extra"].get("allow_hint") or "")
@@ -144,7 +158,7 @@ class GrokCliLeadAdapter(LeadAdapterABC):
             "--cwd",
             cwd,
             "--max-turns",
-            str(self.max_turns),
+            str(max_turns),
             "--output-format",
             "json",
             "--json-schema",
@@ -171,14 +185,26 @@ class GrokCliLeadAdapter(LeadAdapterABC):
                 folder = self.caller_evidence_root / ('call-' + uuid.uuid4().hex)
                 folder.mkdir(parents=True)
                 (folder/'PROMPT.txt').write_bytes(prompt.encode('utf-8'))
-                (folder/'CALLER.json').write_text(json.dumps({'argv':cmd, 'os_cwd':os.getcwd(), 'cli_cwd':cwd, 'timeout_sec':float(timeout_sec), 'max_turns':self.max_turns, 'tool_free':self.tool_free, 'prompt_sha256':hashlib.sha256(prompt_path.read_bytes()).hexdigest(), 'schema':pinned_schema, 'prepared_at':time.time(), 'stage':'prepared_before_spawn_not_provider_wire'}, indent=2), encoding='utf-8')
+                (folder/'CALLER.json').write_text(json.dumps({'argv':cmd, 'os_cwd':os.getcwd(), 'cli_cwd':cwd, 'timeout_sec':float(timeout_sec), 'max_turns':max_turns, 'configured_max_turns':self.max_turns, 'tool_free':self.tool_free, 'prompt_sha256':hashlib.sha256(prompt_path.read_bytes()).hexdigest(), 'schema':pinned_schema, 'prepared_at':time.time(), 'stage':'prepared_before_spawn_not_provider_wire'}, indent=2), encoding='utf-8')
             # Own process group (planning and permission/review decisions):
             # timeout or a cancelled Goal stops the whole lead tree.
             proc = run_cancellable(cmd, timeout=float(timeout_sec))
-        except LeadCancelled as exc:
-            return safe_failure("call_failed", f"grok_cli stopped: {exc}")
-        except subprocess.TimeoutExpired:
-            return safe_failure("timeout", "grok_cli timeout")
+        except (LeadCancelled, subprocess.TimeoutExpired) as exc:
+            timed_out = isinstance(exc, subprocess.TimeoutExpired)
+            raw, failed = safe_failure('timeout' if timed_out else 'call_failed',
+                'grok_cli timeout' if timed_out else f'grok_cli stopped: {exc}')
+            # Never promote partial JSON to a decision. Preserve trusted capture
+            # on the failure path just as on normal subprocess completion.
+            failed['raw_evidence'] = copy.deepcopy(getattr(exc, 'raw_evidence', {
+                'capture_status': 'not_recorded', 'capture_complete': False}))
+            failed['raw_evidence']['caller_observation'] = {
+                'outcome': 'timeout' if timed_out else 'cancelled',
+                'failure_stage': 'client_subprocess_deadline' if timed_out else 'client_cancel_scope',
+                'timeout_sec': float(timeout_sec), 'max_turns': max_turns,
+                'tool_free': self.tool_free, 'timeout_exception': timed_out,
+                'cancel_scope_exception': not timed_out,
+                'provider_cause': 'unknown'}
+            return raw, failed
         except OSError as e:
             return safe_failure("call_failed", f"grok_cli spawn failed: {e}")
         finally:
@@ -196,7 +222,7 @@ class GrokCliLeadAdapter(LeadAdapterABC):
             "reason": "only decoded text available; original bytes not recoverable",
         }))
 
-        raw_evidence['caller_observation'] = {'outcome':'process_returned', 'timeout_sec':float(timeout_sec), 'max_turns':self.max_turns, 'tool_free':self.tool_free, 'timeout_exception':False, 'cancel_scope_exception':False}
+        raw_evidence['caller_observation'] = {'outcome':'process_returned', 'timeout_sec':float(timeout_sec), 'max_turns':max_turns, 'tool_free':self.tool_free, 'timeout_exception':False, 'cancel_scope_exception':False}
         raw_evidence['decoded_text'] = {'stdout': proc.stdout or '', 'stderr': proc.stderr or ''}
         # Compatibility decoded views are explicitly NOT original capture bytes.
         raw_evidence.update(stdout=proc.stdout or '', stderr=proc.stderr or '',

@@ -1,9 +1,17 @@
 """Same-store continuity host; recording adapters are TEST injection only."""
-import threading,time,copy
+import threading,time,copy,math
+
+def planning_timeout(value):
+ """Local planning deadline only; never grants resources or releases models."""
+ if isinstance(value,bool):raise ValueError('planning timeout must be finite, > 0 and <= 300 seconds')
+ value=float(value)
+ if not math.isfinite(value) or not 0 < value <= 300:raise ValueError('planning timeout must be finite, > 0 and <= 300 seconds')
+ return value
 from pathlib import Path
 from framework.app_service import CollabApplication,AppCoordinator,CollabHttpServer,_Handler,CoordinatorLoop,LeadAdapterPlanner,budget_block_reason
 from framework.durable_api import DurableLayer
 from lead_adapter.grok_cli import GrokCliLeadAdapter
+from lead_adapter.grok_cli import lead_max_turns as validate_lead_max_turns
 from lead_adapter.cancel import trusted_spawn_admission
 from execution_backend.antigravity_cli_v1 import AntigravityCliExecutionBackend
 
@@ -33,13 +41,18 @@ class ResourceAuthority:
 
 class Lead:
  name='grok_cli'
- def __init__(self,authority,bin_path):
+ def __init__(self,authority,bin_path,*,planning_timeout_sec=180.0,lead_max_turns=1):
   from framework.lead_evidence import EvidenceAdapter
-  self.authority=authority;self.adapter=EvidenceAdapter(GrokCliLeadAdapter(bin_path=bin_path,tool_free=True,caller_evidence_root=Path(authority.layer.persist_root)/'lead-caller-evidence'),Path(authority.layer.persist_root)/'lead-wire-evidence')
+  self.planning_timeout_sec=planning_timeout(planning_timeout_sec)
+  self.authority=authority;self.adapter=EvidenceAdapter(GrokCliLeadAdapter(bin_path=bin_path,tool_free=True,max_turns=lead_max_turns,caller_evidence_root=Path(authority.layer.persist_root)/'lead-caller-evidence'),Path(authority.layer.persist_root)/'lead-wire-evidence')
  def decide(self,request,**kwargs):
   req=copy.deepcopy(request);b={k:req.get(k)for k in ('application_id','context_summary','kind')};b['task_id']=(req.get('extra')or{}).get('current_task',{}).get('task_id');gid=self.authority.resolve(b);s=self.authority.status(gid);p=s['active']
   req.setdefault('extra',{})['resource_package']={'active':p,'prior_packages':[x for x in s['packages'].values()if x is not p],'rule':'choose useful multi-task graph within remaining dispatch/review resources; ordinary rework or owner decision, no automatic goal termination'}
   snapshot=self.authority.layer.get_goal(gid)['goal']
+  if req.get('kind')=='plan':
+   remaining=p['resource']['checkpoint_epoch']-time.time()
+   if remaining<=0:raise ValueError('planning resource checkpoint reached; explicit continuation required')
+   kwargs['timeout_sec']=min(self.planning_timeout_sec,remaining)
   req.setdefault('extra',{})['continuation_context']={'latest_grants':snapshot.get('continuation_grants',[])[-3:],'resolved_decisions':snapshot.get('resolved_decisions',[])[-3:],'rule':'use owner reason/evidence to adjust; ordinary follow-up does not erase prior failure or consume a new planning goal'}
   with trusted_spawn_admission(self.authority,b):return self.adapter.decide(req,**kwargs)
 class Native(AntigravityCliExecutionBackend):
@@ -94,10 +107,12 @@ class Handler(_Handler):
   return super().do_POST()
 
 class GoalService:
- def __init__(self,root,*,lead_bin='grok',native_bin='agy',release=False,task_permissions=False,test_factory=None):
+ def __init__(self,root,*,lead_bin='grok',native_bin='agy',release=False,task_permissions=False,test_factory=None,planning_timeout_sec=180.0,lead_max_turns=1):
+  self.lead_max_turns=validate_lead_max_turns(lead_max_turns)
+  self.planning_timeout_sec=planning_timeout(planning_timeout_sec)
   self.root=Path(root);self.app=CollabApplication(self.root);self.authority=ResourceAuthority(self.app.layer)
   if test_factory is None:
-   lead=Lead(self.authority,lead_bin);backend=Native(self.authority,native_bin,task_permissions=task_permissions)
+   lead=Lead(self.authority,lead_bin,planning_timeout_sec=self.planning_timeout_sec,lead_max_turns=self.lead_max_turns);backend=Native(self.authority,native_bin,task_permissions=task_permissions)
   else:lead,backend=test_factory(self.authority)
   from framework.lead_evidence import EvidenceAdapter
   lead=EvidenceAdapter(lead,self.root/'lead-evidence')

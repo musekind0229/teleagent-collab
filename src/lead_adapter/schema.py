@@ -198,12 +198,18 @@ def format_lead_request_prompt(request: dict, *, allow_hint: str = "") -> str:
             "} "
             f"{echo_rules}"
         )
+    extra = request.get("extra") or {}
+    context = extra.get("goal_context") if isinstance(extra, dict) else None
+    scope_note = ""
+    if kind == "review" and isinstance(extra, dict) and extra.get("review_scope") == "task" and isinstance(context, dict):
+        scope_note = "Acceptance scope (authoritative task/goal separation): " + str(context.get("policy") or "") + "\n"
     body = json.dumps(request, ensure_ascii=False, indent=2, default=str)
     return (
         "You are the team lead for a TeleAgent worker collaboration. "
         "This message is self-contained — do not assume prior conversation memory.\n"
         f"{out_hint}\n"
         f"{allow_hint}\n"
+        f"{scope_note}"
         f"Task goal: {request.get('task_goal')}\n"
         f"Authorized scope: {json.dumps(request.get('authorized_scope'), ensure_ascii=False)}\n"
         f"Prohibitions: {json.dumps(request.get('prohibitions'), ensure_ascii=False)}\n"

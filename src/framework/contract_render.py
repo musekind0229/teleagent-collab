@@ -22,10 +22,11 @@ CONTRACT_FIELDS = (
     "external_inputs",
     "done_when",
     "acceptance",
+    "goal_context",
 )
 _LIST_FIELDS = ("must", "must_not", "forbidden_tools", "input_files")
 _TYPED_FIELDS = frozenset(
-    {"goal", "instruction", "acceptance", "done_when", "external_inputs", *_LIST_FIELDS}
+    {"goal", "instruction", "acceptance", "done_when", "external_inputs", "goal_context", *_LIST_FIELDS}
 )
 # Ignored on an acceptance object. Unknown keys are rejected, not dropped.
 _ACCEPTANCE_SAFE_KEYS = frozenset({"text", "artifacts", "allow_aigc_marks"})
@@ -191,6 +192,11 @@ def normalize_worker_contract(charter: Any) -> dict[str, Any]:
         if key not in _TYPED_FIELDS:
             out[key] = value
             continue
+        if key == "goal_context":
+            if not isinstance(value, Mapping):
+                raise ContractRenderError("goal_context must be an object")
+            out[key] = dict(value)
+            continue
         if key in {"goal", "instruction"}:
             if value is None:
                 continue
@@ -237,6 +243,8 @@ def _reject_corrupt(normalized: Mapping[str, Any]) -> None:
         value = normalized[field]
         if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
             raise ContractRenderError(f"{field} must be a list of strings")
+    if "goal_context" in normalized and not isinstance(normalized.get("goal_context"), Mapping):
+        raise ContractRenderError("goal_context must be an object")
     if "acceptance" in normalized and not isinstance(normalized.get("acceptance"), str):
         raise ContractRenderError("acceptance must be a string after normalize")
     if "done_when" in normalized and not isinstance(normalized.get("done_when"), Mapping):
@@ -272,6 +280,9 @@ def contract_fields_present(normalized: Mapping[str, Any] | None) -> list[str]:
         value = normalized.get(field)
         if field in _LIST_FIELDS or field == "external_inputs":
             if isinstance(value, list) and value:
+                present.append(field)
+        elif field == "goal_context":
+            if isinstance(value, Mapping) and value:
                 present.append(field)
         elif field == "acceptance":
             if isinstance(value, str) and value.strip():
@@ -340,4 +351,6 @@ def render_contract_section(normalized: Mapping[str, Any] | None) -> str:
         blocks.append("\n".join(lines))
     if "acceptance" in fields:
         blocks.append("Acceptance:\n" + str(normalized["acceptance"]).strip())
+    if "goal_context" in fields:
+        blocks.append("Goal context (sibling outputs are not current-task deliverables; global safety remains mandatory):\n" + json.dumps(normalized["goal_context"], ensure_ascii=False, indent=2))
     return "\n\n".join(blocks)
