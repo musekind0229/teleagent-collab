@@ -653,6 +653,18 @@ def worker_charter_for_task(
     elif isinstance(acceptance_src, str):
         if goal_acceptance_applies(acceptance_src, task, siblings):
             charter["acceptance"] = acceptance_src
+    task_rows=[r for r in (siblings or []) if isinstance(r,Mapping)]
+    own_artifacts=set(str(x) for x in task.get('expected_artifacts',[]))
+    foreign_artifacts={str(a) for r in task_rows if r.get('task_id')!=task.get('task_id') for a in r.get('expected_artifacts',[]) }-own_artifacts
+    if len(task_rows)>1 and any(a in str(acceptance_src) or any(a in m for m in charter['must']) for a in foreign_artifacts):
+        # Preserve goal prose as context, not a contradictory per-task output
+        # obligation. Safety boundaries remain mandatory for every task.
+        charter['must'],deferred=split_task_musts(musts=charter['must'],task=task,siblings=task_rows)
+        deferred.extend(m for m in charter['must'] if any(a in m for a in foreign_artifacts))
+        charter['must']=[m for m in charter['must'] if not any(a in m for a in foreign_artifacts)]
+        charter['must'].insert(0,'Produce only this task expected_artifacts/done_when; goal-level deliverables owned by sibling tasks are context, not permission to add files.')
+        charter['acceptance']=str(done_when.get('text') or 'Deliver this task artifacts; goal-wide final verification belongs to the owning downstream task.') if isinstance(done_when,Mapping) else 'Deliver only this task artifacts.'
+        charter['goal_context']={'acceptance':acceptance_src,'deferred_must':deferred,'artifact_owners':[{'task_id':r.get('task_id'),'artifacts':r.get('expected_artifacts',[])} for r in task_rows]}
     raw_forbidden = goal_obj.get("forbidden_tools")
     if isinstance(raw_forbidden, list):
         forbidden = [str(x).strip() for x in raw_forbidden if str(x).strip()]
@@ -853,6 +865,84 @@ def _gate_backend_result(snap: Mapping[str, Any], task: Mapping[str, Any], resul
     return gate_collected_artifacts(result, allow_aigc_marks=allows_aigc_marks(goal, task))
 
 
+def stage_caller_source_archive(goal, task, root):
+    """Explicit trusted caller source contract. Never extract an unpinned zip."""
+    import hashlib, zipfile, os
+    cfg = (goal.get("acceptance") or {}).get("source_archive")
+    if cfg is None:
+        return
+    if not isinstance(cfg, Mapping) or not isinstance(cfg.get("members"), list) or not cfg["members"]:
+        raise ValueError("invalid caller source manifest")
+    archive = Path(cfg["path"])
+    raw = archive.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != cfg.get("sha256"):
+        raise ValueError("source archive hash mismatch")
+    rows = cfg["members"]
+    names = [x["path"] for x in rows]
+    if len(set(names)) != len(names):
+        raise ValueError("duplicate source member")
+    for rel in task.get("expected_artifacts", []):
+        if rel not in names and "src/" + rel in names:
+            raise ValueError("artifact/source path mismatch; use caller canonical src path")
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    receipt_path = root / '.caller-source-stage.json'
+    import json
+    if receipt_path.exists():
+        receipt = json.loads(receipt_path.read_bytes())
+        if receipt.get('archive_sha256') != cfg['sha256'] or receipt.get('members') != rows:
+            raise ValueError('staged source binding changed')
+        return  # Rework preserves post-baseline worker edits.
+    # Validate ALL members before writing ANY; do not repair wrong path spellings.
+    with zipfile.ZipFile(archive) as bundle:
+        if set(bundle.namelist()) != set(names) or len(bundle.namelist()) != len(names):
+            raise ValueError("archive members differ from trusted manifest")
+        values = []
+        for row in rows:
+            rel = row["path"]
+            if not isinstance(rel, str) or Path(rel).is_absolute() or Path(rel).drive or ":" in rel or ".." in Path(rel).parts or "\\" in rel:
+                raise ValueError("unsafe archive member")
+            info = bundle.getinfo(rel)
+            if (info.external_attr >> 16) & 0o170000 == 0o120000:
+                raise ValueError("symlink archive member")
+            data = bundle.read(rel)
+            if len(data) != row["bytes"] or hashlib.sha256(data).hexdigest() != row["sha256"]:
+                raise ValueError("source member hash mismatch")
+            cursor = root
+            for part in Path(rel).parts:
+                cursor = cursor / part
+                if cursor.exists() or cursor.is_symlink():
+                    st = cursor.lstat()
+                    if cursor.is_symlink() or getattr(st, "st_file_attributes", 0) & 0x400:
+                        raise ValueError("reparse staged source")
+            values.append((root / rel, data))
+        for target, data in values:
+            # Rework must never overwrite genuine worker changes with baseline.
+            if target.exists():
+                if target.read_bytes() != data:
+                    raise ValueError('pre-stage source differs from trusted manifest')
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("xb") as stream:
+                stream.write(data)
+        with receipt_path.open('xb') as stream:
+            stream.write(json.dumps({'archive_sha256': cfg['sha256'], 'members': rows}, sort_keys=True).encode())
+
+
+def effective_caller_acceptance(goal, task):
+    """Task extends ordinary fields; explicit goal command/protection wins.
+    Required blocks use explicit task presence (even invalid/empty) else goal.
+    """
+    goal_accept = goal.get("acceptance") if isinstance(goal.get("acceptance"), Mapping) else {}
+    done = task.get("done_when") if isinstance(task.get("done_when"), Mapping) else {}
+    effective = dict(goal_accept)
+    effective.update(done)
+    for key in ("command", "output_protection"):
+        if key in goal_accept:
+            effective[key] = goal_accept[key]
+    return effective
+
+
 def task_acceptance_criteria(task: Mapping[str, Any] | None) -> dict[str, Any]:
     """Acceptance used for a single Task review. Goal remaining work stays on the Goal."""
     row = task if isinstance(task, Mapping) else {}
@@ -1001,7 +1091,7 @@ def planning_response_schema() -> dict[str, Any]:
 
 _DONE_WHEN_KEYS = frozenset({"artifacts", "text"})
 # Goal-level acceptance keys the service actually reads.
-GOAL_ACCEPTANCE_KEYS = frozenset({"artifacts", "text", "allow_aigc_marks", "command"})
+GOAL_ACCEPTANCE_KEYS = frozenset({"artifacts", "text", "allow_aigc_marks", "command", "output_protection", "required_blocks", "review_materials_required", "material_capacity_bytes", "source_archive", "code_scope", "complete_delta_required", "delta_capacity_bytes", "auto_review_materials", "lead_selects_artifacts"})
 
 
 def _validate_done_when(row: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -1059,8 +1149,9 @@ def validate_plan(plan: Any, request: Mapping[str, Any]) -> dict[str, Any]:
     if str(plan.get("context_summary") or "") != str(request.get("context_summary") or ""):
         raise AppError("lead plan context_summary mismatch", code="stale_plan")
     rows = plan.get("tasks")
-    if not isinstance(rows, list) or not 1 <= len(rows) <= MAX_PLAN_TASKS:
-        raise AppError(f"lead plan must contain 1..{MAX_PLAN_TASKS} tasks", code="invalid_plan")
+    task_cap = min(MAX_PLAN_TASKS, int(request.get('max_tasks', MAX_PLAN_TASKS)))
+    if not isinstance(rows, list) or not 1 <= len(rows) <= task_cap:
+        raise AppError(f"lead plan must contain 1..{task_cap} tasks within resource capacity", code="invalid_plan")
     seen: set[str] = set()
     clean: list[dict[str, Any]] = []
     for row in rows:
@@ -1439,7 +1530,7 @@ def _lead_failure_of(parsed: Any) -> tuple[str, str] | None:
 
     status_text = sanitize_reason(str(status), max_len=40) or "error"
     # Adapter errors can carry CLI stderr: redact secret-looking text, one line.
-    message = sanitize_reason(str(parsed.get("error") or status_text), max_len=300)
+    message = sanitize_reason(str(parsed.get("error") or parsed.get('reason') or parsed.get('structuredOutputError') or status_text), max_len=300)
     return status_text, message
 
 
@@ -1455,9 +1546,13 @@ class LeadAdapterPlanner:
 
     def plan(self, goal_snapshot: Mapping[str, Any]) -> dict[str, Any]:
         request = build_planning_request(goal_snapshot)
+        if request['max_tasks'] < 1:
+            raise AppError('resource_plan_infeasible: no native/review capacity after planning', code='resource_plan_infeasible')
+        response_schema = planning_response_schema()
+        response_schema['properties']['tasks']['maxItems'] = request['max_tasks']
         _raw, parsed = self.adapter.decide(
             request,
-            schema=planning_response_schema(),
+            schema=response_schema,
             cwd=self.cwd,
             timeout_sec=self.timeout_sec,
         )
@@ -1501,7 +1596,7 @@ class LeadAdapterPlanner:
         siblings = [row for row in (goal_snapshot.get("tasks") or []) if isinstance(row, Mapping)]
         goal_must = [str(x) for x in (boundaries.get("must") or [])]
         scoped_must, deferred_must = split_task_musts(musts=goal_must, task=task, siblings=siblings)
-        task_accept = task_acceptance_criteria(task)
+        task_accept = effective_caller_acceptance(goal, task)
         extra = {
             "worker_request": action.get("payload") or {},
             "review_scope": "task",
@@ -1551,6 +1646,17 @@ class LeadAdapterPlanner:
             cwd=self.cwd,
             timeout_sec=self.timeout_sec,
         )
+        candidate = parsed if isinstance(parsed, Mapping) else {}
+        from lead_adapter.schema import unwrap_structured
+        inner_candidate = unwrap_structured(dict(candidate)) or {}
+        placeholder = str(inner_candidate.get('reason') or '').strip() in {'占位', 'placeholder', '需要先核对本任务交付物与验收证据后再下结论。'}
+        incomplete = (placeholder or candidate.get("_lead_status") == "review_blocked" or
+                      candidate.get("stopReason") == "cancelled" or
+                      ("structuredOutput" in candidate and candidate["structuredOutput"] is None))
+        if incomplete:
+            return {"verdict": "blocked", "review_status": "review_blocked", "incomplete": True,
+                    "reason": "lead response incomplete; not a code verdict",
+                    "secondary_identity": {"expected": request["application_id"], "observed": candidate.get("application_id"), "original_error": candidate.get("structuredOutputError")}}
         decision = validate_lead_decision(raw, parsed, request=request, kind=backend_kind)
         verdict = str(decision.get("decision") or decision.get("verdict") or "")
         return {"verdict": verdict, "reason": str(decision.get("reason") or "")}
@@ -1572,6 +1678,9 @@ def build_planning_request(goal_snapshot: Mapping[str, Any]) -> dict[str, Any]:
         "current_application": {"goal_id": goal_snapshot.get("goal_id"), "task_count": 0},
         "issued_at": time.time(),
     }
+    if goal_snapshot.get('resource_packages'):
+        from framework.planning_contract import project_plan
+        body = project_plan(body, goal_snapshot)
     body["context_summary"] = context_summary_of(body)
     return body
 
@@ -1779,6 +1888,9 @@ class AppCoordinator:
                     lead_status = e.extra.get("lead_status") if isinstance(e.extra, Mapping) else None
                     if lead_status:
                         failure_extra["lead_status"] = str(lead_status)
+                if getattr(self,'continuity_enabled',False):
+                    self._phase(goal_id,outcome='blocked',detail=detail)
+                    return self.layer.continuity_block(goal_id,reason=detail)
                 self._phase(goal_id, outcome="failed", detail=detail)
                 failed = self.layer.fail_goal(
                     goal_id,
@@ -2841,7 +2953,8 @@ class AppCoordinator:
             goal_obj = snap.get("goal") if isinstance(snap.get("goal"), Mapping) else {}
             try:
                 merge_manifest_input_files(task, goal_obj, root)
-            except InputManifestError as exc:
+                stage_caller_source_archive(goal_obj, task, root)
+            except (InputManifestError, ValueError, OSError) as exc:
                 return self._fail_task(goal_id, task_id, {"ok": False, "error": str(exc)})
             if self._is_agy():
                 # What the workspace held before the worker ran; kept across reworks.
@@ -2867,7 +2980,14 @@ class AppCoordinator:
             self._lock.release()
             try:
                 try:
+                    producer = getattr(self.backend, "authorize_caller_task", None)
+                    if callable(producer) and getattr(self.backend, "_caller_permission_policy", None):
+                        producer(task_id=task_id, title=str(task.get("title") or task_id),
+                                 directory=directory,
+                                 instruction=agy_review.instruction_with_feedback(str((task.get("inputs") or {}).get("instruction") or ""), task.get("rework_feedback")),
+                                 artifacts=[str(x) for x in (task.get("expected_artifacts") or [])])
                     launched = self.backend.start_run(
+                        **({'caller_task_id': task_id} if callable(producer) else {}),
                         title=str(task.get("title") or task_id),
                         directory=directory,
                         instruction=agy_review.instruction_with_feedback(
@@ -2947,11 +3067,18 @@ class AppCoordinator:
             warnings.append("no workspace baseline for this run; changes outside the task scope were not checked")
             out["warnings"] = warnings
             return None, out
+        current_snapshot = agy_review.scan_workspace(workdir)
         changes = agy_review.change_set(
             baseline,
-            agy_review.scan_workspace(workdir),
+            current_snapshot,
             [str(x) for x in (task.get("expected_artifacts") or [])],
         )
+        caller_scope = ((snap.get("goal") or {}).get("acceptance") or {}).get("code_scope", [])
+        if isinstance(caller_scope, list):
+            for row in changes["changed_files"]:
+                if row["path"] in caller_scope:
+                    row["in_scope"] = True
+            changes["out_of_scope_changes"] = [row for row in changes["changed_files"] if not row["in_scope"]]
         out_of_scope = list(changes["out_of_scope_changes"])
         out["scope_report"] = {"changed_files": changes["changed_files"], "out_of_scope_changes": out_of_scope}
         if out_of_scope:
@@ -2968,16 +3095,86 @@ class AppCoordinator:
         except (TypeError, ValueError):
             max_reworks = 1
         rounds = int(task.get("rework_count") or 0)
+        effective_accept = effective_caller_acceptance(goal, task)
+        # Legacy unchanged review calls remain supported. Material-aware new
+        # caller contracts explicitly opt in; missing declaration then blocks.
+        material_mode = (effective_accept.get("review_materials_required") is True or
+                         "required_blocks" in effective_accept or bool(changes.get("diff_truncated")))
+        source_packet = agy_review.build_review_material_packet(
+            workdir=workdir, required_blocks=effective_accept.get("required_blocks"),
+            capacity_limit_bytes=effective_accept.get("material_capacity_bytes", 100_000),
+        ) if material_mode else None
+        if effective_accept.get('auto_review_materials') is True and 'required_blocks' not in effective_accept:
+            # Complete snapshot bytes include whole files and cross-file callers;
+            # this is not an empty function-list waiver. Explicit caller blocks
+            # retain their original strict validation.
+            source_packet = agy_review.build_snapshot_material_packet(
+                current=current_snapshot,
+                capacity_limit_bytes=effective_accept.get('material_capacity_bytes',100_000))
+
         payload = agy_review.review_payload(
             changes=changes,
             worker_response=str(out.get("response") or ""),
             rework_round=rounds,
             max_reworks=max_reworks,
+            source_packet=source_packet,
         )
+        complete_delta = None
+        if effective_accept.get("complete_delta_required"):
+            complete_delta = agy_review.build_complete_delta(
+                baseline=baseline, current=current_snapshot,
+                binding={"goal_id": goal_id, "task_id": task_id, "run_id": str(task.get("run_id") or out.get("run_id") or "")},
+                evidence_root=self.workspaces_root / ".complete-delta" / goal_id / task_id,
+                capacity_bytes=effective_accept.get("delta_capacity_bytes", 100_000))
+            payload["complete_delta"] = complete_delta
+            # Keep original diff_truncated=true. Only exact alternative full
+            # coverage AND required functions remove the material blockage.
+            if complete_delta.get("complete") and source_packet and not source_packet.get("is_blocked"):
+                payload["review_status"] = "complete_alternative_delta"
+                payload["alternative_coverage_verified"] = True
+            else:
+                payload["review_status"] = "review_blocked"
         execution = out.get("acceptance_execution")
         if isinstance(execution, Mapping):
             payload["acceptance_execution"] = copy.deepcopy(dict(execution))
             payload["execution_rule"] = "Coordinator executed the caller contract. Nonzero, timeout, spawn or capture failure cannot pass, even if the worker claims success."
+        # Material blockage / incomplete materials must NOT become code fail or trigger automatic rework:
+        # Persist review_blocked and separate business failure from material blockage.
+        choice = {}
+        material_blocked = False
+        blocked_reason = ""
+        if payload.get("review_status") == "review_blocked":
+            material_blocked = True
+            blocked_reason = "review material blocked: incomplete diff or missing required caller blocks"
+        elif isinstance(source_packet, Mapping) and source_packet.get("is_blocked"):
+            material_blocked = True
+            blocked_reason = "review material blocked: " + str(source_packet.get("blocked_reason") or "missing required source blocks")
+        elif choice.get("review_status") == "review_blocked" or choice.get("_lead_status") == "review_blocked" or choice.get("incomplete"):
+            material_blocked = True
+            blocked_reason = str(choice.get("reason") or "lead review blocked/incomplete")
+
+        if material_blocked:
+            out["ok"] = False
+            out["review_status"] = "review_blocked"
+            out["material_blocked"] = True
+            out["blocked_reason"] = blocked_reason
+            review = {
+                "status": "review_blocked",
+                "source": "material_supply_boundary",
+                "lead": str(getattr(self.planner, "name", "") or "lead"),
+                "evidence": blocked_reason[:500],
+                "round": rounds,
+                "out_of_scope": [f"{r['path']} ({r['status']})" for r in out_of_scope][:20],
+                "unreviewed_dependencies": list((source_packet or {}).get("unreviewed_dependencies") or []),
+                "missing_blocks": list((source_packet or {}).get("missing_blocks") or []),
+                "diff_truncated": bool(payload.get("diff_truncated")),
+            }
+            out["review"] = review
+            history = [dict(r) for r in (task.get("review_history") or []) if isinstance(r, Mapping)]
+            out["review_history"] = history + [review]
+            out["error"] = f"review blocked: {blocked_reason}"
+            return None, out
+
         self._phase(goal_id, "reviewing", task_id=task_id)
         action = {"kind": "review", "payload": payload, "review_hint": agy_review.SCOPE_RULE}
         choice: Mapping[str, Any] = {}
@@ -2998,6 +3195,12 @@ class AppCoordinator:
                 )
                 out["review"] = {"status": "error", "source": "lead", "evidence": out["error"][:240]}
                 return None, out
+
+        if choice.get("incomplete") or choice.get("review_status") == "review_blocked":
+            out.update(ok=False, material_blocked=True, review_status="review_blocked",
+                       error="lead response incomplete; no code verdict",
+                       review={"status": "review_blocked", "source": "lead_incomplete", "evidence": str(choice.get("reason")), "secondary_identity": choice.get("secondary_identity")})
+            return None, out
         verdict = str(choice.get("verdict") or "")
         reason = str(choice.get("reason") or "")
         execution_failed = isinstance(execution, Mapping) and not execution.get("ok")
@@ -3898,7 +4101,7 @@ class CollabApplication:
             # checked; refuse it instead of pretending it is part of the contract.
             raise AppError("acceptance has unknown keys: " + ", ".join(unknown_acceptance))
         acceptance_obj = dict(acceptance)
-        acceptance_obj["artifacts"] = _safe_artifacts(acceptance.get("artifacts"))
+        acceptance_obj["artifacts"] = [] if acceptance.get('lead_selects_artifacts') is True and acceptance.get('artifacts')==[] else _safe_artifacts(acceptance.get("artifacts"))
         if "command" in acceptance:
             if not self.coordinator._is_agy():
                 raise AppError("acceptance.command requires the agy post-run path", status=409, code="capability_unavailable")
@@ -4301,7 +4504,7 @@ class CollabApplication:
         3) Prefer resume/observe when the prior run is still recoverable
         4) Else requeue only the failed Task (keep Goal id / budget / history)
         """
-        del payload  # reserved; body currently unused
+        # The caller may supply explicit binding constraints below.
         current = self.layer.get_goal(goal_id)
         if not current.get("ok"):
             raise AppError(str(current.get("error") or "unknown request"), status=404, code="not_found")
@@ -4354,6 +4557,15 @@ class CollabApplication:
                     target = t
                     break
         prior_run = str((target or {}).get("run_id") or "").strip()
+        if prior_run and isinstance(payload, Mapping):
+            expected_workspace = str((target or {}).get('workspace') or '')
+            requested_workspace = payload.get('workspace') or payload.get('target_directory') or payload.get('directory')
+            wrong_task = payload.get('task_id') is not None and payload['task_id'] != (target or {}).get('task_id')
+            wrong_workspace = requested_workspace is not None and (not expected_workspace or Path(str(requested_workspace)).resolve() != Path(expected_workspace).resolve())
+            known_session = str(((target or {}).get('result') or {}).get('conversation_id') or '')
+            wrong_session = payload.get('conversation_id') is not None and (not known_session or payload['conversation_id'] != known_session)
+            if wrong_task or wrong_workspace or payload.get('cross_workspace_resume') is True or wrong_session:
+                return {'ok': False, 'reason': 'cross_workspace_resume_refused', 'mode': 'refused', 'goal_id': goal_id, 'prior_run_id': prior_run}
 
         resume_mode = False
         if prior_run:

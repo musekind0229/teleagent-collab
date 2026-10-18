@@ -263,7 +263,8 @@ class TestGrokCliAdapterDefaults(unittest.TestCase):
         self.assertIn("timeout", run_kwargs)
         # run_cancellable decodes lead output as utf-8 with replacement.
         cancel_src = (Path(__file__).resolve().parent / "lead_adapter" / "cancel.py").read_text(encoding="utf-8")
-        self.assertIn('encoding="utf-8"', cancel_src)
+        self.assertIn('text=False', cancel_src)
+        self.assertIn('.decode("utf-8", errors="replace")', cancel_src)
         self.assertIn('errors="replace"', cancel_src)
         self.assertEqual((parsed or {}).get("_lead_status"), "call_failed")
         src = Path(__file__).resolve().parent / "lead_adapter" / "grok_cli.py"

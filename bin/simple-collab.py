@@ -30,6 +30,10 @@ from lead_adapter.inprocess import InProcessLeadAdapter
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Simple Collab Runner entry")
+    parser.add_argument('--native-covered-operations', default='', help='Independently verified native tool coverage; never inferred from caller operations')
+    parser.add_argument('--native-executable-sha256', default='', help='Executable hash pin for caller-verified native coverage')
+    parser.add_argument('--caller-operations', default='', help='Trusted local caller configuration: comma-separated read,write,command; no grant from goal text')
+    parser.add_argument('--caller-native-mode', choices=['skip_permissions','strict_headless'], default='strict_headless', help='Expected native mode; does not enable skip or expand native permissions')
     parser.add_argument("--persist", default="./.collab-run-data", help="Persistence directory")
     parser.add_argument("--title", default="", help="Goal title")
     parser.add_argument("--goal", default="", help="Goal desired outcome")
@@ -145,6 +149,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.agy_account_pool:
             kw["account_pool_path"] = args.agy_account_pool
         backend = get_execution_backend("antigravity", **kw)
+        if args.caller_operations:
+            backend.configure_caller_permissions(allowed_operations=args.caller_operations.split(','), native_mode=args.caller_native_mode)
+        if args.native_covered_operations or args.native_executable_sha256:
+            if not (args.native_covered_operations and args.native_executable_sha256):
+                parser.error('native coverage requires both operation facts and executable hash')
+            backend.configure_native_tool_coverage(native_mode=args.caller_native_mode, operations=args.native_covered_operations.split(','), executable_sha256=args.native_executable_sha256)
     else:
         backend = InProcessExecutionBackend()
 

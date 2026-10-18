@@ -865,7 +865,9 @@ def reset_durable_cache() -> None:
         _CACHE.clear()
 
 
-class DurableLayer:
+from framework.continuity_store import ContinuityStore
+
+class DurableLayer(ContinuityStore):
     """File-backed perpetual Goal store. Not a transport."""
 
     def __init__(self, persist_dir_root: str | Path) -> None:

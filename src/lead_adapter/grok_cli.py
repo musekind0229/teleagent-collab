@@ -1,11 +1,13 @@
 """Grok CLI LeadAdapter — one optional backend; no disallowed-tools degradation retry."""
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -110,11 +112,15 @@ class GrokCliLeadAdapter(LeadAdapterABC):
         bin_path: str | None = None,
         disallowed_tools: str = "bash,shell,edit,write,web_search,web_fetch",
         max_turns: int = 1,
+        tool_free: bool = False,
+        caller_evidence_root: str | Path | None = None,
     ) -> None:
         explicit = (bin_path or "").strip()
         self.bin_path = explicit or resolve_lead_bin()
         self.disallowed_tools = disallowed_tools
         self.max_turns = max_turns
+        self.tool_free = tool_free
+        self.caller_evidence_root = Path(caller_evidence_root) if caller_evidence_root else None
 
     def decide(
         self,
@@ -133,8 +139,8 @@ class GrokCliLeadAdapter(LeadAdapterABC):
         pinned_schema = pin_lead_response_schema(schema, request)
         cmd = [
             self.bin_path,
-            "-p",
-            prompt,
+            "--prompt-file",
+            "",  # Unique UTF-8 file assigned inside the protected lifecycle below.
             "--cwd",
             cwd,
             "--max-turns",
@@ -146,8 +152,26 @@ class GrokCliLeadAdapter(LeadAdapterABC):
             "--disallowed-tools",
             self.disallowed_tools,
         ]
-        # Intentionally NO retry that drops --disallowed-tools (条3: delete that degradation).
+        if self.tool_free:
+            cmd += ['--tools', '', '--disable-web-search', '--no-subagents']
+        # Intentionally NO retry that drops --disallowed-tools, widens tools or adds turns.
+        prompt_path = None
         try:
+            # Binary write preserves logical UTF-8 bytes, including LF, without
+            # Windows text translation. Independent calls own independent files.
+            with tempfile.NamedTemporaryFile(
+                mode="wb", prefix="collab-grok-", suffix=".txt",
+                dir=os.environ.get("TMPDIR") or cwd, delete=False,
+            ) as prompt_file:
+                prompt_path = Path(prompt_file.name)
+                prompt_file.write(prompt.encode("utf-8"))
+            cmd[2] = str(prompt_path)
+            if self.caller_evidence_root is not None:
+                import uuid, hashlib, time
+                folder = self.caller_evidence_root / ('call-' + uuid.uuid4().hex)
+                folder.mkdir(parents=True)
+                (folder/'PROMPT.txt').write_bytes(prompt.encode('utf-8'))
+                (folder/'CALLER.json').write_text(json.dumps({'argv':cmd, 'os_cwd':os.getcwd(), 'cli_cwd':cwd, 'timeout_sec':float(timeout_sec), 'max_turns':self.max_turns, 'tool_free':self.tool_free, 'prompt_sha256':hashlib.sha256(prompt_path.read_bytes()).hexdigest(), 'schema':pinned_schema, 'prepared_at':time.time(), 'stage':'prepared_before_spawn_not_provider_wire'}, indent=2), encoding='utf-8')
             # Own process group (planning and permission/review decisions):
             # timeout or a cancelled Goal stops the whole lead tree.
             proc = run_cancellable(cmd, timeout=float(timeout_sec))
@@ -157,20 +181,77 @@ class GrokCliLeadAdapter(LeadAdapterABC):
             return safe_failure("timeout", "grok_cli timeout")
         except OSError as e:
             return safe_failure("call_failed", f"grok_cli spawn failed: {e}")
+        finally:
+            if prompt_path is not None:
+                prompt_path.unlink(missing_ok=True)
 
         out = (proc.stdout or "").strip()
         err = (proc.stderr or "").strip()
         raw = out if out else err
+
+        # Trusted capture provenance is assigned by the binary subprocess layer.
+        # Old decoded/mock returns cannot be reconstructed as original bytes.
+        raw_evidence = copy.deepcopy(getattr(proc, "raw_evidence", {
+            "capture_status": "not_recorded", "capture_complete": False,
+            "reason": "only decoded text available; original bytes not recoverable",
+        }))
+
+        raw_evidence['caller_observation'] = {'outcome':'process_returned', 'timeout_sec':float(timeout_sec), 'max_turns':self.max_turns, 'tool_free':self.tool_free, 'timeout_exception':False, 'cancel_scope_exception':False}
+        raw_evidence['decoded_text'] = {'stdout': proc.stdout or '', 'stderr': proc.stderr or ''}
+        # Compatibility decoded views are explicitly NOT original capture bytes.
+        raw_evidence.update(stdout=proc.stdout or '', stderr=proc.stderr or '',
+                            full_raw=raw, raw_len=len(raw), returncode=proc.returncode,
+                            truncated=len(raw) > 3000, text_fields_are_decoded=True)
+
+        # Summary is separated from raw evidence; raw[:3000] only appears in summary with explicit tag
+        if len(raw) > 3000:
+            summary = f"[TRUNCATED: raw length {len(raw)} exceeds 3000]\n" + raw[:3000]
+        else:
+            summary = raw
+
         if proc.returncode not in (0, None) and not out:
             # Tool-name / CLI errors: keep failed — do NOT strip disallowed-tools and retry.
-            return raw[:3000] or "CALL_FAILED", {
+            err_dict = {
                 "_lead_status": "call_failed",
                 "error": err[:1500] or f"exit={proc.returncode}",
                 "returncode": proc.returncode,
+                "raw_evidence": raw_evidence,
+                "summary": summary or "CALL_FAILED",
             }
+            return summary or "CALL_FAILED", err_dict
 
         parsed = self._parse(out) or self._parse(err)
-        return (raw[:3000] if raw else ""), parsed
+        if parsed is None:
+            parsed = {"raw_text": raw}
+        if isinstance(parsed, dict):
+            # Model response fields must NEVER overwrite coordinator raw evidence.
+            # If the model tried to return a forged "raw_evidence", isolate it and refuse trust.
+            if "raw_evidence" in parsed and parsed["raw_evidence"] != raw_evidence:
+                parsed["untrusted_raw_evidence"] = parsed.pop("raw_evidence")
+            parsed["raw_evidence"] = copy.deepcopy(raw_evidence)
+            parsed["summary"] = summary
+
+            # Classify stopReason cancelled / structuredOutput None / placeholders
+            # as incomplete / review_blocked, so they are not masked as application_id_mismatch
+            # or treated as valid code FAIL.
+            stop_reason = str(parsed.get("stopReason") or "").strip().lower()
+            structured_out = parsed.get("structuredOutput")
+            if stop_reason == "cancelled":
+                parsed["_lead_status"] = "review_blocked"
+                parsed["review_status"] = "review_blocked"
+                parsed["incomplete"] = True
+                parsed["reason"] = parsed.get("reason") or "lead execution cancelled; unreviewed"
+            elif "structuredOutput" in parsed and structured_out is None:
+                parsed["_lead_status"] = "review_blocked"
+                parsed["review_status"] = "review_blocked"
+                parsed["incomplete"] = True
+                parsed["reason"] = parsed.get("reason") or "lead structured output is None; unreviewed"
+
+            if parsed.get('incomplete') and 'max turns reached' in err.lower():
+                parsed['reason'] = 'CLI max turns reached before structured output; incomplete '+str(request.get('kind') or 'lead')+' call, not a business review verdict'
+                parsed['failure_stage'] = 'lead_cli_turn_limit'
+
+        return summary, parsed
 
     @staticmethod
     def _parse(text: str) -> dict | None:

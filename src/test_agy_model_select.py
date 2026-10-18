@@ -9,6 +9,7 @@ RED on 23cc991:
 - ``hermes-collab-request.py open`` had no ``--model``.
 """
 from __future__ import annotations
+from test_synthetic_caller_fixture import fixture_backend, fixture_start
 
 import importlib.util
 import io
@@ -116,11 +117,11 @@ class ModelPrecedenceTests(unittest.TestCase):
             fake = _fake_agy_script(Path(td))
             argv_file = Path(td) / "argv.json"
             env = dict(env, AGY_FAKE_ARGV=str(argv_file), AGY_FAKE_ARTIFACT="delivery.txt")
-            be = AntigravityCliExecutionBackend(bin_path=str(fake), environ=env, timeout_sec=10, poll_sec=0.05)
+            be = fixture_backend(AntigravityCliExecutionBackend(bin_path=str(fake), environ=env, timeout_sec=10, poll_sec=0.05))
             work = Path(td) / "w"
             work.mkdir()
             with _explicit_interpreter_patch(fake):
-                run = be.start_run(title="m", directory=str(work), charter=charter)
+                run = fixture_start(be, title="m", directory=str(work), charter=charter)
                 self.assertTrue(run.get("ok"), run)
                 collected = _wait_done(be, run["run_id"])
             argv = json.loads(argv_file.read_text(encoding="utf-8"))

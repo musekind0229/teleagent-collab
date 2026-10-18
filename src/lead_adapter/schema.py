@@ -181,6 +181,10 @@ def format_lead_request_prompt(request: dict, *, allow_hint: str = "") -> str:
             "provided response schema. Each task needs a stable task_key, title, concrete "
             "worker instruction, dependency keys, and relative artifact paths. "
             f"Copy application_id={app_id_json} and context_summary={summary_json} exactly. "
+            "This call is planning only: no tools, directory scans, implementation, or business verdict. "
+            "The runtime separately reviews every native task after execution; do not create a task merely for lead review. "
+            "When supplied, planning_contract defines dispatch/review units and the feasible task cap. "
+            "A prior incomplete planning call is not a failed business review. Return concise instructions, not source file contents. "
             "Do not execute the work yourself and do not add permissions."
         )
     else:

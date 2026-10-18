@@ -4,6 +4,7 @@ AGY collect_result reports absolute artifact paths and no workspace. The
 regression drives that production shape through AppCoordinator.
 """
 from __future__ import annotations
+from test_synthetic_caller_fixture import fixture_backend, fixture_start
 
 import copy
 import os
@@ -114,12 +115,12 @@ class HandoffWorkspaceTests(unittest.TestCase):
             env["AGY_FAKE_A_BODY"] = A_BODY
             env["AGY_FAKE_B_NAME"] = "b.txt"
             env["AGY_FAKE_B_PREFIX"] = B_PREFIX
-            backend = AntigravityCliExecutionBackend(
+            backend = fixture_backend(AntigravityCliExecutionBackend(
                 bin_path=str(fake),
                 environ=env,
                 timeout_sec=10,
                 poll_sec=0.05,
-            )
+            ))
             app = CollabApplication(root / "app", planner=_AbPlanner(), backend=backend)
             opened = app.submit(_submit_body())
             status = _drive(app, opened["goal_id"])

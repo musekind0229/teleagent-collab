@@ -1,5 +1,6 @@
 """Tests for minimal simple collab runner (bin/simple-collab.py and framework.simple_collab)."""
 from __future__ import annotations
+from test_synthetic_caller_fixture import fixture_backend, fixture_start
 
 import json
 import os
@@ -176,12 +177,12 @@ class SimpleCollabRunnerTests(unittest.TestCase):
                 {"write": {"output1.txt": "hello world\n"}, "status": "ok"}
             ])
 
-            backend = AntigravityCliExecutionBackend(
+            backend = fixture_backend(AntigravityCliExecutionBackend(
                 bin_path=str(fake_agy),
                 environ=env,
                 timeout_sec=15.0,
                 poll_sec=0.05,
-            )
+            ))
 
             lead = _CustomDecisionLead(
                 exchange_dir=persist / "lead_exchange",
@@ -227,12 +228,12 @@ class SimpleCollabRunnerTests(unittest.TestCase):
                 {"write": {"output1.txt": "fixed output\n"}, "status": "ok"},
             ])
 
-            backend = AntigravityCliExecutionBackend(
+            backend = fixture_backend(AntigravityCliExecutionBackend(
                 bin_path=str(fake_agy),
                 environ=env,
                 timeout_sec=15.0,
                 poll_sec=0.05,
-            )
+            ))
 
             lead = _CustomDecisionLead(
                 exchange_dir=persist / "lead_exchange",
@@ -279,12 +280,12 @@ class SimpleCollabRunnerTests(unittest.TestCase):
                 {"write": {"output1.txt": "content\n"}, "status": "ok"}
             ])
 
-            backend = AntigravityCliExecutionBackend(
+            backend = fixture_backend(AntigravityCliExecutionBackend(
                 bin_path=str(fake_agy),
                 environ=env,
                 timeout_sec=15.0,
                 poll_sec=0.05,
-            )
+            ))
             lead = _CustomDecisionLead(
                 exchange_dir=persist / "lead_exchange",
                 plan_tasks=[{
@@ -330,12 +331,12 @@ class SimpleCollabRunnerTests(unittest.TestCase):
                 {"write": {"partial.txt": "failed halfway\n"}, "status": "error", "exit_code": 1, "response": "syntax error"}
             ])
 
-            backend = AntigravityCliExecutionBackend(
+            backend = fixture_backend(AntigravityCliExecutionBackend(
                 bin_path=str(fake_agy),
                 environ=env,
                 timeout_sec=15.0,
                 poll_sec=0.05,
-            )
+            ))
             lead = _CustomDecisionLead(
                 exchange_dir=persist / "lead_exchange",
                 plan_tasks=[{
@@ -414,12 +415,12 @@ class SimpleCollabRunnerTests(unittest.TestCase):
                 {"write": {"in_flight.txt": "still computing\n"}, "sleep": 2.0, "status": "ok"}
             ])
 
-            backend = AntigravityCliExecutionBackend(
+            backend = fixture_backend(AntigravityCliExecutionBackend(
                 bin_path=str(fake_agy),
                 environ=env,
                 timeout_sec=15.0,
                 poll_sec=0.05,
-            )
+            ))
             lead = _CustomDecisionLead(
                 exchange_dir=persist / "lead_exchange",
                 plan_tasks=[{
@@ -497,12 +498,12 @@ class SimpleCollabRunnerTests(unittest.TestCase):
                 {"write": {"initial.txt": "in progress\n"}, "sleep": 0.5, "status": "error", "exit_code": 1, "response": "ACTUAL_FINAL_ERROR"}
             ])
 
-            backend = AntigravityCliExecutionBackend(
+            backend = fixture_backend(AntigravityCliExecutionBackend(
                 bin_path=str(fake_agy),
                 environ=env,
                 timeout_sec=15.0,
                 poll_sec=0.05,
-            )
+            ))
             lead = _CustomDecisionLead(
                 exchange_dir=persist / "lead_exchange",
                 plan_tasks=[{
@@ -593,12 +594,12 @@ class SimpleCollabRunnerTests(unittest.TestCase):
                 {"write": {"fail.txt": "failed\n"}, "status": "error", "exit_code": 1, "response": "syntax error"}
             ])
 
-            backend = AntigravityCliExecutionBackend(
+            backend = fixture_backend(AntigravityCliExecutionBackend(
                 bin_path=str(fake_agy),
                 environ=env,
                 timeout_sec=15.0,
                 poll_sec=0.05,
-            )
+            ))
             lead = _CustomDecisionLead(
                 exchange_dir=persist / "lead_exchange",
                 plan_tasks=[{
@@ -660,9 +661,9 @@ class SimpleCollabRunnerTests(unittest.TestCase):
                 "--timeout-sec", "10",
             ]
             proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
-            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertNotEqual(proc.returncode, 0, proc.stderr) # Default CLI has no trusted caller policy.
             out = json.loads(proc.stdout)
-            self.assertTrue(out.get("ok"), out)
+            self.assertFalse(out.get("ok"), out)
 
             # Check that backend instantiated with model='gemini-3.8-flash-high'
             # by directly verifying AntigravityCliExecutionBackend with that flag

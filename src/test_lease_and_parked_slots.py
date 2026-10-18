@@ -1,6 +1,7 @@
 """#10/#13 box retest: leases released on cancel, dead leases do not block
 startup, parked checkpoints do not hold run slots. Offline fakes only."""
 from __future__ import annotations
+from test_synthetic_caller_fixture import fixture_backend, fixture_start
 
 import json
 import os
@@ -76,7 +77,7 @@ class CancelReleasesLeaseTests(unittest.TestCase):
             )
             ws = Path(td) / "ws"
             ws.mkdir()
-            started = backend.start_run(title="t", directory=str(ws), instruction="x", artifacts=[])
+            started = fixture_start(backend, title="t", directory=str(ws), instruction="x", artifacts=[])
             self.assertTrue(started.get("ok"), started)
             self.assertEqual(load_pool(pool_path).by_id("A").state, "busy")
             code, body = backend.cancel(started["run_id"])
@@ -87,7 +88,7 @@ class CancelReleasesLeaseTests(unittest.TestCase):
             # The only account is reusable right away, not after lease_until.
             ws2 = Path(td) / "ws2"
             ws2.mkdir()
-            again = backend.start_run(title="t2", directory=str(ws2), instruction="x", artifacts=[])
+            again = fixture_start(backend, title="t2", directory=str(ws2), instruction="x", artifacts=[])
             self.assertTrue(again.get("ok"), again)
             backend.cancel(again["run_id"])
             self.assertEqual(load_pool(pool_path).by_id("A").state, "available")

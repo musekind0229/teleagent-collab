@@ -172,7 +172,10 @@ class GoalExactAcceptanceScopeTests(unittest.TestCase):
         goal = {"acceptance": {"artifacts": ["b.txt"], "text": text}}
         a = worker_charter_for_task(goal=goal, task={**rows[0], "inputs": {"instruction": "a"}}, siblings=rows)
         b = worker_charter_for_task(goal=goal, task={**rows[1], "inputs": {"instruction": "b"}}, siblings=rows)
-        self.assertNotIn("acceptance", a)
+        self.assertNotEqual(a.get("acceptance"), text)
+        self.assertNotIn("COLLAB_B_OK", a.get("acceptance", ""))
+        self.assertEqual(a["goal_context"]["acceptance"]["text"], text)
+        self.assertIn("downstream", a["acceptance"])
         self.assertEqual(b["acceptance"], text)
 
     def test_unowned_exact_criterion_goes_to_sinks_not_dropped(self):

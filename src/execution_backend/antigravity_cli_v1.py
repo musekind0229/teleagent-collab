@@ -7,6 +7,7 @@ explicitly sets agy_auto_approve=true.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -142,6 +143,121 @@ def agy_auto_approve_enabled(
         if isinstance(val, str) and val.strip().lower() in _TRUTHY:
             return True
     return False
+
+
+def preflight_headless_permissions(
+    charter: dict | None = None,
+    base_environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Preflight permission verification for headless antigravity CLI worker.
+
+    Classifies headless tool permissions into:
+      1. actual tool mode (mode): e.g. non-interactive print mode with or without skip_permissions
+      2. task-level authorized grant (task_authorized): standard workspace file task permissions
+      3. unknown gate (unknown_gate): undeclared or external sensitive tools / actions
+
+    Inapplicable task permission contracts (e.g. non-file task, sensitive actions,
+    unknown gates) must be blocked BEFORE native worker launch with 0 native runs.
+    """
+    mode = "skip_permissions" if agy_auto_approve_enabled(None, base_environ) else "strict_headless"
+    categories = {"mode": mode, "task_authorized": [], "unknown_gate": []}
+    cfg = charter if isinstance(charter, dict) else {}
+    required, forbidden = cfg.get("required_tools", []), cfg.get("forbidden_tools", [])
+    invalid = not isinstance(required, list) or not isinstance(forbidden, list)
+    conflict = set(str(x).strip().lower() for x in required) & set(str(x).strip().lower() for x in forbidden) if not invalid else set()
+    reason = "explicit trusted caller grant required; charter/env/text cannot grant permission"
+    if conflict:
+        reason = "required_tools and forbidden_tools conflict: " + ",".join(sorted(conflict))
+    elif invalid:
+        reason = "invalid tool requirements"
+    # 1. Check task_kind compatibility
+    task_kind = str(cfg.get("task_kind") or "").strip().lower()
+    if task_kind and task_kind not in ("file_task", "file", "files", "workspace"):
+        reason = f"task_kind '{task_kind}' not applicable for headless CLI worker (only file_task supported)"
+        categories["unknown_gate"].append({"item": f"task_kind:{task_kind}", "reason": reason})
+        return {
+            "blocked": True, "charter_rejected": True,
+            "category": "unknown_gate",
+            "categories": categories,
+            "reason": reason,
+            "mode": mode,
+        }
+
+    # 2. Check forbidden / restricted system actions
+    # Prohibit OS escalation, install roots, raw secrets, external sensitive networks
+    install_roots = cfg.get("install_roots")
+    if install_roots:
+        reason = "system install_roots not permitted on headless worker"
+        categories["unknown_gate"].append({"item": "install_roots", "reason": reason})
+        return {
+            "blocked": True, "charter_rejected": True,
+            "category": "unknown_gate",
+            "categories": categories,
+            "reason": reason,
+            "mode": mode,
+        }
+
+    user_gate = cfg.get("user_gate_permissions")
+    if user_gate:
+        reason = f"user_gate_permissions {user_gate} require interactive confirmation (unknown gate for headless)"
+        categories["unknown_gate"].append({"item": "user_gate_permissions", "reason": reason})
+        return {
+            "blocked": True, "charter_rejected": True,
+            "category": "unknown_gate",
+            "categories": categories,
+            "reason": reason,
+            "mode": mode,
+        }
+
+    forbidden_tools = cfg.get("forbidden_tools") or []
+    if isinstance(forbidden_tools, list):
+        for tool in forbidden_tools:
+            t_str = str(tool).lower()
+            if t_str in ("print", "agy", "headless"):
+                reason = f"required execution tool '{tool}' is forbidden by charter"
+                categories["unknown_gate"].append({"item": f"forbidden:{tool}", "reason": reason})
+                return {
+                    "blocked": True, "charter_rejected": True,
+                    "category": "unknown_gate",
+                    "categories": categories,
+                    "reason": reason,
+                    "mode": mode,
+                }
+
+    # Check intersection of required_tools and forbidden_tools
+    required_tools = cfg.get("required_tools")
+    if isinstance(required_tools, (list, tuple, set)) and isinstance(forbidden_tools, (list, tuple, set)):
+        req_norm = {str(t).strip().lower(): str(t) for t in required_tools if str(t).strip()}
+        forb_norm = {str(t).strip().lower(): str(t) for t in forbidden_tools if str(t).strip()}
+        inter_keys = set(req_norm.keys()) & set(forb_norm.keys())
+        if inter_keys:
+            intersecting = [req_norm[k] for k in inter_keys]
+            reason = f"required_tools and forbidden_tools conflict: non-empty intersection {intersecting}"
+            categories["unknown_gate"].append({"item": "tool_conflict", "reason": reason, "intersection": intersecting})
+            return {
+                "blocked": True, "charter_rejected": True,
+                "category": "unknown_gate",
+                "categories": categories,
+                "reason": reason,
+                "mode": mode,
+            }
+
+    # Check for undeclared sensitive requirements or blocked markers
+    if bool(cfg.get("require_interactive_auth")) or bool(cfg.get("require_sudo")):
+        reason = "interactive authorization or privilege escalation not supported in headless mode"
+        categories["unknown_gate"].append({"item": "elevation", "reason": reason})
+        return {
+            "blocked": True, "charter_rejected": True,
+            "category": "unknown_gate",
+            "categories": categories,
+            "reason": reason,
+            "mode": mode,
+        }
+
+
+    return {"blocked": True, "category": "unknown_gate", "categories": categories,
+            "reason": reason, "mode": mode, "tool_conflict": bool(conflict), "invalid_requirements": invalid}
+
 
 
 def build_agy_argv(
@@ -302,6 +418,8 @@ def _redact_argv(cmd: list[str]) -> list[str]:
 
 
 def _status_ok(status: str | None, returncode: int | None) -> bool:
+    if returncode is not None and type(returncode) is not int:
+        return False
     if returncode not in (0, None):
         return False
     key = str(status or "").strip().lower()
@@ -310,6 +428,7 @@ def _status_ok(status: str | None, returncode: int | None) -> bool:
     if not key:
         return returncode in (0, None)
     return key in _OK_STATUS or key not in _FAIL_STATUS
+
 
 
 
@@ -496,6 +615,9 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         self.timeout_sec = 300.0 if timeout_sec is None else float(timeout_sec)
         self.poll_sec = float(poll_sec)
         self._runs: dict[str, dict[str, Any]] = {}
+        self._caller_permission_policy = None
+        self._verified_native_coverage = None
+        self._caller_grants = {}
         self._session = SessionAttributor()
         # Durable pid record so a restarted service can stop orphaned workers
         # instead of letting them keep writing into task workspaces.
@@ -578,6 +700,41 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         except Exception as exc:  # noqa: BLE001 — spawn-fail path must stay local
             _LOG.warning("agy account lease release after spawn fail (%s)", type(exc).__name__)
 
+    def configure_caller_permissions(self, *, allowed_operations, native_mode):
+        """Trusted application configuration, never a model charter/env field.
+        This is not a security boundary against malicious same-process Python.
+        """
+        if not isinstance(allowed_operations, list) or not allowed_operations or any(x not in {"read", "write", "command"} for x in allowed_operations):
+            raise ValueError("invalid caller operations")
+        if native_mode not in {"skip_permissions", "strict_headless"}:
+            raise ValueError("unknown native coverage")
+        self._caller_permission_policy = {"operations": list(allowed_operations), "native_mode": native_mode}
+
+    def configure_native_tool_coverage(self, *, native_mode, operations, executable_sha256):
+        """Trusted caller's verified coverage facts pinned to this executable.
+        No model charter or environment key is read as evidence here.
+        """
+        path = Path(self.bin_path)
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != executable_sha256:
+            raise ValueError('native coverage executable mismatch')
+        if native_mode not in {'strict_headless', 'skip_permissions'} or any(x not in {'read','write','command'} for x in operations):
+            raise ValueError('invalid native coverage')
+        self._verified_native_coverage = {'mode': native_mode, 'operations': list(operations), 'executable_sha256': executable_sha256}
+
+    def _task_binding(self, *, title, directory, instruction, artifacts, task_id):
+        value = {"task_id": task_id, "title": str(title), "workspace": str(Path(directory).resolve()), "instruction": str(instruction), "artifacts": list(artifacts)}
+        return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+    def authorize_caller_task(self, *, task_id, title, directory, instruction, artifacts):
+        policy = getattr(self, "_caller_permission_policy", None)
+        if not policy or not isinstance(task_id, str) or not task_id:
+            return {"ok": False, "reason": "trusted application permission policy/task id missing"}
+        binding = self._task_binding(title=title, directory=directory, instruction=instruction, artifacts=artifacts, task_id=task_id)
+        if not hasattr(self, "_caller_grants"):
+            self._caller_grants = {}
+        self._caller_grants[binding] = {"task_id": task_id, "binding": binding, "workspace": str(Path(directory).resolve()), "operations": list(policy["operations"]), "native_mode": policy["native_mode"], "source": "trusted_application_configuration"}
+        return {"ok": True, "binding": binding}
+
     def start_run(
         self,
         *,
@@ -586,6 +743,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         instruction: str = "",
         artifacts: list[str] | None = None,
         charter: dict | None = None,
+        caller_task_id: str | None = None,
     ) -> dict[str, Any]:
         root = Path(directory)
         raw_arts = artifacts_from_charter(charter, artifacts)
@@ -623,6 +781,68 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
                 "contract_version": "contract.v0.1-draft",
             }
 
+        # Item 4: Headless permission preflight (prior to dispatch / native worker spawn)
+        # Classify tool permissions into:
+        #   1. actual tool mode (mode)
+        #   2. task authorized grant (task_authorized)
+        #   3. unknown gate (unknown_gate)
+        # Inapplicable permission contract must block BEFORE native worker launch with 0 native runs.
+        task_env = dict(self._base_env())
+        preflight = preflight_headless_permissions(charter, base_environ=task_env)
+        binding = self._task_binding(title=title, directory=root, instruction=instruction, artifacts=arts, task_id=caller_task_id)
+        grant = getattr(self, "_caller_grants", {}).pop(binding, None)
+        actual_native_mode = "skip_permissions" if agy_auto_approve_enabled(charter, task_env) else "strict_headless"
+        # Explicit task grant and native mode/coverage are separate facts.
+        # This adapter has no verified strict-headless tool-rule bridge.
+        coverage = getattr(self, '_verified_native_coverage', None)
+        pinned_coverage = (coverage and coverage['mode'] == actual_native_mode and Path(self.bin_path).is_file()
+                           and hashlib.sha256(Path(self.bin_path).read_bytes()).hexdigest() == coverage['executable_sha256'])
+        native_known = actual_native_mode == 'skip_permissions' or bool(pinned_coverage)
+        required = (charter or {}).get('required_tools', []) if isinstance(charter, dict) else []
+        tool_operations = {'runcommand': 'command', 'readfile': 'read', 'viewfile': 'read', 'writetofile': 'write', 'editfile': 'write'}
+        required_ops = [tool_operations.get(str(name).lower()) for name in required] if isinstance(required, list) else [None]
+        operations_covered = (grant and (actual_native_mode == 'skip_permissions' or (pinned_coverage and set(grant['operations']).issubset(coverage['operations'])))
+                              and all(op is not None and op in grant['operations'] for op in required_ops))
+        preflight.update(binding_verified=bool(grant), native_coverage_known=native_known, actual_native_mode=actual_native_mode)
+        if grant and not preflight.get('charter_rejected') and not preflight.get('tool_conflict') and not preflight.get('invalid_requirements'):
+            if grant['native_mode'] != actual_native_mode:
+                preflight['reason'] = 'native_mode_mismatch'
+            elif not native_known:
+                preflight['reason'] = 'native_coverage_unknown'
+            elif not operations_covered:
+                preflight['reason'] = 'required_operations_not_covered'
+        if (grant and operations_covered and native_known and not preflight.get("tool_conflict") and not preflight.get("invalid_requirements") and not preflight.get("charter_rejected")
+                and grant["native_mode"] == actual_native_mode):
+            preflight.update(blocked=False, category="task_authorized", grant=grant, native_coverage=coverage if pinned_coverage else {'mode': actual_native_mode},
+                             reason="task-bound caller grant; separately verified native mode/coverage")
+        if grant and actual_native_mode == 'strict_headless' and not Path(self.bin_path).exists() and not shutil.which(self.bin_path):
+            run_id = 'agy_unavailable_' + uuid.uuid4().hex[:12]
+            error = 'native executable not found: ' + self.bin_path
+            self._runs[run_id] = {'run_id': run_id, 'native_handle': run_id, 'directory': str(root),
+                'state': 'failed', 'activity': 'idle', 'finish': 'error', 'assistant_error': error,
+                'proc': None, 'harvested': True, 'artifacts': list(artifacts or []), 'returncode': None}
+            return {'ok': False, 'backend': self.backend_id, 'run_id': run_id, 'native_handle': run_id,
+                    'state': 'failed', 'error': error, 'native_started': False,
+                    'permission_preflight': preflight, 'error_source': 'native_capability'}
+        if preflight["blocked"]:
+            reason = preflight.get("reason") or "permission_preflight_blocked"
+            cat = preflight.get("category") or "unknown_gate"
+            state = "not_authorized" if cat == "not_authorized" else "blocked"
+            return {
+                "ok": False,
+                "backend": self.backend_id,
+                "state": state,
+                "error": reason,
+                "errors": [reason],
+                "artifacts_written": [],
+                "skip_permissions": False,
+                "argv_flags": [],
+                "contract_version": "contract.v0.1-draft",
+                "permission_preflight": preflight,
+                "preflight_blocked": True,
+                "native_started": False,
+            }
+
         root.mkdir(parents=True, exist_ok=True)
         # Account switch critical section (pool-global cross-process lock):
         # select+reserve → keyring clear → HOME/USERPROFILE env → Popen.
@@ -639,6 +859,9 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         if failed is not None:
             return failed
         proc = rec["proc"]
+        rec["caller_task_id"] = caller_task_id
+        rec["bound_workspace"] = str(root.resolve())
+        rec["fresh_session"] = not bool(rec.get("conversation_id"))
         rec["pid"] = proc.pid
         if self._registry is not None:
             try:
@@ -648,7 +871,29 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         self._start_pipe_drainers(rec, proc)
         return self._start_payload(rec, ok=True)
 
-    def _start_run_locked(
+    def _start_run_locked(self, **kwargs):
+        """Trusted service-only admission before pool access, under switch lock."""
+        hook = getattr(self, "_trusted_dispatch_hook", None)
+        if hook is None:
+            return self._start_run_unaccounted_locked(**kwargs)
+        binding = {"workspace": str(kwargs["root"]),
+                   "contract_sha256": str(kwargs["contract_meta"].get("contract_sha256") or "")}
+        reservation = hook.reserve("native", binding)
+        self._trusted_dispatch_reservation = reservation
+        self._trusted_dispatch_spawned = False
+        try:
+            result = self._start_run_unaccounted_locked(**kwargs)
+            if not self._trusted_dispatch_spawned:
+                hook.no_spawn(reservation)
+            return result
+        except BaseException:
+            if not self._trusted_dispatch_spawned:
+                hook.no_spawn(reservation)
+            raise
+        finally:
+            self._trusted_dispatch_reservation = None
+
+    def _start_run_unaccounted_locked(
         self,
         *,
         title: str,
@@ -675,6 +920,9 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             prompt=prompt,
             skip_permissions=skip,
         )
+        command_factory = getattr(self, "_trusted_command_factory", None)
+        if command_factory is not None:
+            cmd = command_factory(cmd)
         timeout = self.timeout_sec
         if isinstance(charter, dict) and charter.get("timeout_sec") is not None:
             try:
@@ -752,6 +1000,19 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             rec["harvested"] = True
             rec["path_errors"] = errors + [rec["assistant_error"]]
             return rec, self._start_payload(rec, ok=False)
+        hook = getattr(self, "_trusted_dispatch_hook", None)
+        reservation = getattr(self, "_trusted_dispatch_reservation", None)
+        if hook is not None:
+            # Mark actual before callback; a callback failure must never release
+            # an already-spawned process as a no-spawn reservation.
+            self._trusted_dispatch_spawned = True
+            try:
+                import psutil
+                hook.actual(reservation, pid=proc.pid, birth=psutil.Process(proc.pid).create_time())
+            except BaseException:
+                proc.kill()
+                proc.wait(timeout=5)
+                raise
         # Windows: kill-on-close Job Object (no-op elsewhere; 未在 Win 实测).
         win_job.attach(proc)
         # cgroup v2 oom_kill baseline: a later SIGKILL can then be told apart
@@ -1098,8 +1359,14 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         *,
         dispatch_user_message_id: str | None = None,
         fetch_messages: bool = True,
+        caller_task_id: str | None = None,
+        workspace: str | None = None,
+        conversation_id: str | None = None,
     ) -> dict[str, Any]:
         rec = self._get(run_id)
+        mismatch = (caller_task_id is not None and caller_task_id != rec.get('caller_task_id')) or (workspace is not None and str(Path(workspace).resolve()) != str(Path(rec['directory']).resolve())) or (conversation_id is not None and conversation_id != rec.get('conversation_id'))
+        if mismatch:
+            return {'ok': False, 'busy': False, 'errored': True, 'reason': 'session_workspace_binding_mismatch', 'run_id': run_id, 'native_started': False}
         self._refresh(rec)
         if rec.get("cancelled"):
             activity = "idle"
@@ -1320,11 +1587,132 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
                 present.append(str(path))
             else:
                 missing.append(str(a))
-        ok = bool(obs.get("finish_successful")) and not missing
-        if rec.get("cancelled") or rec.get("timed_out"):
-            ok = False
-        state = "ok" if ok else ("cancelled" if rec.get("cancelled") else "fail")
+        rc = rec.get("returncode")
         parsed = rec.get("agy_json") if isinstance(rec.get("agy_json"), dict) else {}
+        native_status = parsed.get("status")
+
+        # Strict protocol validation for denied_actions
+        raw_denied = parsed.get("denied_actions")
+        denied_shape_invalid = False
+        denied_actions: list[Any] = []
+        if 'denied_actions' in parsed:
+            if isinstance(raw_denied, list):
+                denied_actions = raw_denied
+            else:
+                denied_shape_invalid = True
+                denied_actions = [str(raw_denied)]
+
+        assistant_error = str(rec.get("assistant_error") or parsed.get("error") or "")
+        stderr = str(rec.get("stderr") or "")
+        stdout = str(rec.get("stdout") or "")
+
+        # Detect error patterns sourced from native protocol error or native stderr (do NOT scan business response)
+        has_503 = (
+            "503" in assistant_error
+            or "503" in stderr
+            or (isinstance(parsed.get("error"), str) and "503" in str(parsed.get("error")))
+        )
+        has_conn_closed = (
+            "connection closed" in assistant_error.lower()
+            or "connection reset" in stderr.lower()
+            or "connection closed" in stderr.lower()
+            or (isinstance(parsed.get("error"), str) and "connection" in str(parsed.get("error")).lower())
+        )
+        is_native_error = (
+            str(native_status).upper() in _FAIL_STATUS
+            or bool(assistant_error)
+            or bool(denied_actions)
+            or denied_shape_invalid
+            or has_503
+            or has_conn_closed
+        )
+
+        # Host layer: host returncode must be int (e.g. 0); None, bool, str or missing is NOT ok
+        host_ok = (type(rc) is int and rc == 0) and not rec.get("timed_out") and not rec.get("cancelled")
+        # Native layer: child tool/model execution status
+        native_ok = host_ok and (not is_native_error) and _status_ok(str(native_status) if native_status is not None else None, rc)
+        # Business layer: artifacts present and no denied actions/errors
+        business_ok = native_ok and (not missing) and bool(obs.get("finish_successful"))
+
+        # Explicit ok and state
+        ok = bool(business_ok)
+        if rec.get("cancelled"):
+            state = "cancelled"
+        elif ok:
+            state = "ok"
+        elif rec.get("timed_out"):
+            state = "fail"
+        elif denied_shape_invalid or rc is None:
+            state = "unknown"
+        else:
+            state = "fail"
+
+        # Determine next owner and actionable recovery
+        if ok:
+            next_owner = "caller"
+            recovery_action = "consume_artifacts"
+        elif rec.get("cancelled"):
+            next_owner = "caller"
+            recovery_action = "handle_cancellation_or_abort"
+            _append_result_warning(rec, "task execution was cancelled by caller")
+        elif denied_actions or denied_shape_invalid:
+            next_owner = "project-manager"
+            recovery_action = "review_permission_policy_or_grant_access"
+            _append_result_warning(rec, f"permission denied for actions: {denied_actions}")
+        elif missing:
+            next_owner = "worker"
+            recovery_action = f"re-run task to produce missing artifacts: {missing}"
+            _append_result_warning(rec, f"missing expected artifacts: {missing}")
+        elif has_503:
+            next_owner = "worker"
+            recovery_action = "retry_after_transient_delay"
+            _append_result_warning(rec, "transient 503 capacity error encountered; retry without swapping account")
+        elif has_conn_closed:
+            next_owner = "worker"
+            recovery_action = "retry_connection"
+            _append_result_warning(rec, "upstream connection closed or reset")
+        elif rec.get("timed_out"):
+            next_owner = "worker"
+            recovery_action = "increase_timeout_or_reduce_task_scope"
+            _append_result_warning(rec, "task execution timed out")
+        elif rc is None or type(rc) is not int or rc != 0:
+            next_owner = "worker"
+            recovery_action = "inspect_error_log_and_retry"
+            _append_result_warning(rec, f"host process abnormal returncode: {rc}")
+        else:
+            next_owner = "worker"
+            recovery_action = "inspect_error_log_and_retry"
+
+        layers = {
+            "host": {
+                "returncode": rc,
+                "ok": host_ok,
+                "timed_out": bool(rec.get("timed_out")),
+                "cancelled": bool(rec.get("cancelled")),
+            },
+            "native": {
+                "status": native_status,
+                "ok": native_ok,
+                "denied_actions": denied_actions,
+                "assistant_error": assistant_error,
+                "has_503": has_503,
+                "connection_closed": has_conn_closed,
+            },
+            "business": {
+                "ok": business_ok,
+                "artifacts_present": present,
+                "missing": missing,
+                "next_owner": next_owner,
+                "recovery_action": recovery_action,
+            },
+        }
+
+        err_msg = assistant_error
+        if not err_msg and denied_actions:
+            err_msg = f"permission_denied: {denied_actions}"
+        elif not err_msg and missing:
+            err_msg = f"missing_artifacts: {missing}"
+
         out = {
             "ok": ok,
             "backend": self.backend_id,
@@ -1335,7 +1723,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             "finish": obs.get("finish"),
             "artifacts": present,
             "missing": missing,
-            "error": rec.get("assistant_error") or "",
+            "error": err_msg,
             **({"error_source": rec["error_source"]} if rec.get("error_source") else {}),
             "response": rec.get("response") if rec.get("response") is not None else parsed.get("response"),
             "usage": rec.get("usage") if rec.get("usage") is not None else parsed.get("usage"),
@@ -1344,7 +1732,12 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
                 k: obs.get(k)
                 for k in ("activity", "finish_successful", "cancelled", "errored", "busy")
             },
+            "layers": layers,
+            "next_owner": next_owner,
+            "recovery_action": recovery_action,
         }
+        if rec.get("warnings"):
+            out["warnings"] = list(rec["warnings"])
         if rec.get("model"):
             out["model"] = str(rec["model"])  # the --model= this run was spawned with
         profile = self._agy_profile(rec)
@@ -1352,6 +1745,18 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             out["agy_profile"] = profile
         _apply_contract_meta(out, rec)
         self._attach_spawn_output(out, rec)
+        receipt_files = []
+        for raw in present:
+            path = Path(raw).resolve()
+            try:
+                relative = path.relative_to(root.resolve()).as_posix()
+            except ValueError:
+                continue
+            if path.is_symlink():
+                continue
+            data = path.read_bytes()
+            receipt_files.append({'relative': relative, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+        out['session_receipt'] = {'source': 'backend_observed_process_and_files', 'task_id': rec.get('caller_task_id'), 'run_id': rec['run_id'], 'workspace': str(root.resolve()), 'conversation_id': rec.get('conversation_id') or None, 'fresh_session': rec.get('fresh_session'), 'returncode': rc, 'stdout_sha256': hashlib.sha256(str(out.get('stdout') or '').encode('utf-8')).hexdigest(), 'stderr_sha256': hashlib.sha256(str(out.get('stderr') or '').encode('utf-8')).hexdigest(), 'outputs': receipt_files}
         self._persist_pool_after_collect(out, rec)
         return out
 
@@ -1691,14 +2096,21 @@ def run_antigravity_job_via_public_api(
     wall = timeout_sec
     if wall is None:
         wall = float(charter.get("timeout_sec") or be.timeout_sec)
+    actual_instruction = instruction or str(charter.get('goal') or '')
+    if be._caller_permission_policy:
+        be.authorize_caller_task(task_id=job, title=job, directory=str(root), instruction=actual_instruction, artifacts=arts)
     started = be.start_run(
         title=job,
         directory=str(root),
-        instruction=instruction or str(charter.get("goal") or ""),
+        instruction=actual_instruction,
+        caller_task_id=job,
         artifacts=arts,
         charter=charter,
     )
-    run_id = started["run_id"]
+    if not started.get('run_id') or started.get('state') == 'blocked':
+        return {**started, 'ok': False, 'used_public_api_only': True, 'started': started,
+                'next_owner': 'trusted_application_caller', 'error': started.get('error') or 'explicit caller permission configuration required'}
+    run_id = started['run_id']
     code, pending = be.list_pending_actions(session_id=run_id)
     if code >= 300:
         return {"ok": False, "error": "list_pending failed", "started": started, "backend": be.backend_id}

@@ -47,6 +47,63 @@ from lead_adapter.schema import (
     unwrap_structured,
     validate_lead_decision,
 )
+from framework.acceptance_command import execute_command, validate_command
+
+
+def build_behavior_evidence(
+    *,
+    command: Mapping[str, Any] | None,
+    execution: Mapping[str, Any] | None,
+    input_purpose: str = "",
+    output_protection: Mapping[str, Any] | None = None,
+    expected_assertions: list[str] | None = None,
+    actual_assertions: list[str] | None = None,
+    worker_self_report: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Construct a structured, reproducible behavior evidence record."""
+    cmd_spec = dict(command) if isinstance(command, Mapping) else {}
+    exec_res = dict(execution) if isinstance(execution, Mapping) else {}
+    actual_cmd = exec_res.get("argv") or cmd_spec.get("argv") or []
+    real_rc = exec_res.get("returncode")
+    timed_out = bool(exec_res.get("timed_out"))
+    configured = bool(exec_res.get("configured", bool(cmd_spec)))
+    executed = "returncode" in exec_res and exec_res.get("returncode") is not None
+
+    evidence: dict[str, Any] = {
+        "actual_command": actual_cmd,
+        "argv": actual_cmd,
+        "cwd": str(exec_res.get("cwd") or cmd_spec.get("cwd") or "."),
+        "real_rc": real_rc,
+        "returncode": real_rc,
+        "configured": configured,
+        "executed": executed,
+        "timed_out": timed_out,
+        "input_purpose": str(input_purpose or "acceptance verification"),
+        "output_protection": dict(output_protection or {
+            "preserve_overwritten_by_empty": False,
+            "details": "no preserve violations detected",
+        }),
+        "expected_assertions": list(expected_assertions or []),
+        "actual_assertions": list(actual_assertions or []),
+        "stdout": str(exec_res.get("stdout") or ""),
+        "stderr": str(exec_res.get("stderr") or ""),
+        "stdout_sha256": exec_res.get("stdout_sha256") or hashlib.sha256(str(exec_res.get("stdout") or "").encode("utf-8")).hexdigest(),
+        "stderr_sha256": exec_res.get("stderr_sha256") or hashlib.sha256(str(exec_res.get("stderr") or "").encode("utf-8")).hexdigest(),
+        "stdout_bytes": exec_res.get("stdout_total_bytes", len(str(exec_res.get("stdout") or "").encode("utf-8"))),
+        "stderr_bytes": exec_res.get("stderr_total_bytes", len(str(exec_res.get("stderr") or "").encode("utf-8"))),
+        "self_reported_vs_native": {
+            "worker_self_report": dict(worker_self_report or {}),
+            "native_run": {
+                "argv": actual_cmd,
+                "cwd": str(exec_res.get("cwd") or cmd_spec.get("cwd") or "."),
+                "returncode": real_rc,
+                "ok": exec_res.get("ok"),
+                "timed_out": timed_out,
+                "error": exec_res.get("error"),
+            },
+        },
+    }
+    return evidence
 
 
 def build_default_goal_request(
@@ -295,14 +352,206 @@ class SimpleCollabRunner:
             "status": worker_result.get("status") or task.get("status"),
         }
 
-        if adapter is not None and hasattr(adapter, "decide"):
+        # Extract acceptance command and behavior evidence
+        goal_accept = (goal_snap.get("goal") or {}).get("acceptance") or {}
+        task_accept = task.get("done_when") or {}
+        # One effective caller contract for execution AND the review request.
+        # Task fields extend/override ordinary goal fields. Explicit goal-owned
+        # command/protection fields remain authoritative, including empty values.
+        effective_accept = dict(goal_accept)
+        effective_accept.update(task_accept)
+        for caller_field in ("command", "output_protection"):
+            if caller_field in goal_accept:
+                effective_accept[caller_field] = goal_accept[caller_field]
+        cmd_spec = effective_accept.get("command")
+
+        # Protection semantics come ONLY from the caller contract, never filenames,
+        # worker claims, or PRESERVE keywords. Currently one explicit invariant:
+        # protected existing regular files must remain byte-for-byte unchanged.
+        protection_contract = effective_accept.get("output_protection")
+        protection_rows = []
+        protection_unknown = False
+        protection_active = protection_contract is not None
+        if protection_active:
+            paths = protection_contract.get("unchanged") if isinstance(protection_contract, Mapping) else None
+            if (not isinstance(paths, list) or not paths or
+                    any(not isinstance(x, str) or not x for x in paths) or len(set(paths)) != len(paths)):
+                protection_unknown = True
+                paths = []
+            for rel in paths:
+                row = {"path": rel, "invariant": "unchanged_bytes", "before": None, "after": None}
+                try:
+                    root = Path(workspace).resolve(strict=True)
+                    target = root / rel
+                    if Path(rel).is_absolute() or Path(rel).drive or ":" in rel or ".." in Path(rel).parts:
+                        raise ValueError("invalid protected path")
+                    cursor = root
+                    for part in Path(rel).parts:
+                        cursor = cursor / part
+                        st = cursor.lstat()
+                        if cursor.is_symlink() or getattr(st, "st_file_attributes", 0) & 0x400:
+                            raise ValueError("reparse protected path")
+                    if not target.is_file():
+                        raise ValueError("baseline not regular file")
+                    raw_bytes = target.read_bytes()
+                    row["before"] = {"bytes": len(raw_bytes), "sha256": hashlib.sha256(raw_bytes).hexdigest(), "hex": raw_bytes.hex()}
+                except (OSError, ValueError):
+                    row["error"] = "baseline_unavailable"
+                    protection_unknown = True
+                protection_rows.append(row)
+
+        # Caller-driven acceptance execution:
+        # Never prioritize worker self-supplied acceptance_execution over caller execution.
+        # Worker-supplied execution is recorded only as worker self-report evidence.
+        worker_supplied_exec = worker_result.get("acceptance_execution")
+        exec_res = None
+        if cmd_spec and workspace and Path(workspace).is_dir() and not protection_unknown:
+            evidence_root = self.persist_root / "evidence"
+            binding = {"goal_id": goal_id, "task_id": task_id, "run_id": run_id}
+            try:
+                exec_res = execute_command(
+                    cmd_spec,
+                    workspace=workspace,
+                    evidence_root=evidence_root,
+                    binding=binding,
+                )
+            except Exception as exc:
+                exec_res = {
+                    "source": "caller_contract",
+                    "binding": binding,
+                    "configured": True,
+                    "ok": False,
+                    "returncode": None,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+        elif worker_supplied_exec:
+            # Command was configured or claimed, but caller execution did not run
+            pass
+
+        # Bind retained stream bytes to their own length/hash, not a worker log.
+        if exec_res:
+            for stream_name in ('stdout', 'stderr'):
+                stream_path = exec_res.get(stream_name + '_path')
+                if stream_path:
+                    captured = Path(stream_path).read_bytes()
+                    exec_res[stream_name + '_captured_bytes'] = len(captured)
+                    exec_res[stream_name + '_sha256'] = hashlib.sha256(captured).hexdigest()
+        protection_violated = False
+        for row in protection_rows:
+            if row["before"] is None:
+                continue
+            try:
+                target = Path(workspace) / row["path"]
+                cursor = Path(workspace)
+                for part in Path(row["path"]).parts:
+                    cursor = cursor / part
+                    st = cursor.lstat()
+                    if cursor.is_symlink() or getattr(st, "st_file_attributes", 0) & 0x400:
+                        raise ValueError("reparse after action")
+                raw_bytes = target.read_bytes()
+                row["after"] = {"bytes": len(raw_bytes), "sha256": hashlib.sha256(raw_bytes).hexdigest(), "hex": raw_bytes.hex()}
+                row["satisfied"] = row["before"] == row["after"]
+            except (OSError, ValueError):
+                row["satisfied"] = False
+                row["error"] = "after_unavailable"
+            protection_violated |= not row["satisfied"]
+        output_prot = {
+            "source": "caller_contract",
+            "status": "unknown" if protection_unknown else ("not_configured" if not protection_active else ("failed" if protection_violated else "passed")),
+            "contract": protection_contract,
+            "snapshots": protection_rows,
+            # Compatibility field now derives only from explicit caller invariant.
+            "preserve_overwritten_by_empty": protection_violated,
+            "details": "explicit unchanged-bytes invariant" if protection_active else "no protection invariant configured; protection not verified",
+        }
+
+        worker_self_report = {
+            "status": worker_result.get("status") or task.get("status"),
+            "ok": worker_result.get("ok"),
+            "response": worker_result.get("response") or worker_result.get("output"),
+            "error": worker_result.get("error"),
+            "acceptance_execution": worker_supplied_exec,
+            "behavior_evidence": worker_result.get("behavior_evidence"),
+            "output_protection": worker_result.get("output_protection"),
+        }
+
+        # Build formal behavior evidence structure
+        behavior_ev = build_behavior_evidence(
+            command=cmd_spec,
+            execution=exec_res,
+            input_purpose=str(task.get("title") or goal_snap.get("goal", {}).get("desired_outcome") or "task execution"),
+            output_protection=output_prot,
+            expected_assertions=["returncode == 0", "explicit caller protection invariants satisfied when configured"],
+            actual_assertions=[
+                f"returncode == {exec_res.get('returncode')}" if exec_res else "no command execution",
+                f"preserve_overwritten_by_empty == {output_prot.get('preserve_overwritten_by_empty') if output_prot else False}",
+            ],
+            worker_self_report=worker_self_report,
+        )
+
+
+        # Check command execution and evidence presence
+        command_configured = bool(cmd_spec)
+        command_executed = bool(exec_res and exec_res.get("executed", exec_res.get("returncode") is not None))
+        command_failed = bool(exec_res and not exec_res.get("ok"))
+        missing_materials = bool((command_configured and not command_executed) or protection_unknown or (protection_active and not command_executed))
+
+        review_status = "reviewed"
+        if missing_materials:
+            review_status = "blocked"
+            verdict = "fail"
+            reason = "review_blocked: missing required caller acceptance command execution evidence"
+            next_action = "diagnose"
+            next_action_source = "system_guard"
+        elif command_failed:
+            verdict = "fail"
+            reason = f"acceptance command failed with rc={exec_res.get('returncode')}: {exec_res.get('error') or exec_res.get('stderr')}"
+            next_action = "rework"
+            next_action_source = "behavior_evidence"
+        elif output_prot and output_prot.get("preserve_overwritten_by_empty"):
+            verdict = "fail"
+            reason = f"output protection failure: {output_prot.get('details')}"
+            next_action = "rework"
+            next_action_source = "behavior_evidence"
+
+        artifact_bindings = []
+        for rel in effective_accept.get('artifacts', []):
+            if not isinstance(rel, str) or Path(rel).is_absolute() or Path(rel).drive or ':' in rel or '..' in Path(rel).parts:
+                continue
+            path = Path(workspace) / rel
+            try:
+                cursor = Path(workspace)
+                for part in Path(rel).parts:
+                    cursor = cursor / part
+                    st = cursor.lstat()
+                    if cursor.is_symlink() or getattr(st, 'st_file_attributes', 0) & 0x400:
+                        raise ValueError('reparse artifact')
+                data = path.read_bytes()
+                artifact_bindings.append({'path': rel, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+            except (OSError, ValueError):
+                artifact_bindings.append({'path': rel, 'status': 'unavailable'})
+        behavior_ev['caller_artifacts'] = artifact_bindings
+        evidence_bytes = json.dumps({"binding": {"goal_id": goal_id, "task_id": task_id, "run_id": run_id}, "behavior_evidence": behavior_ev, "acceptance_execution": exec_res}, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        evidence_dir = self.persist_root / "caller-review-snapshots"
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        evidence_sha = hashlib.sha256(evidence_bytes).hexdigest()
+        evidence_path = evidence_dir / (evidence_sha + ".json")
+        try:
+            with evidence_path.open("xb") as stream:
+                stream.write(evidence_bytes)
+        except FileExistsError:
+            if evidence_path.read_bytes() != evidence_bytes:
+                raise ValueError("immutable evidence snapshot mismatch")
+        behavior_ev["immutable_snapshot"] = {"path": str(evidence_path), "sha256": evidence_sha, "bytes": len(evidence_bytes), "encoding": "utf-8"}
+
+        if adapter is not None and hasattr(adapter, "decide") and review_status != "blocked":
             goal_boundaries = (goal_snap.get("goal") or {}).get("boundaries") or {}
             lead_req = build_lead_request(
                 kind="review",
                 goal=str(task.get("title") or (goal_snap.get("goal") or {}).get("desired_outcome") or ""),
                 authorized_scope=list(goal_boundaries.get("must") or ["Stay inside assigned workspace"]),
                 prohibitions=list(goal_boundaries.get("must_not") or []),
-                acceptance_criteria=dict(task.get("done_when") or (goal_snap.get("goal") or {}).get("acceptance") or {}),
+                acceptance_criteria=dict(effective_accept),
                 current_application={
                     "application_id": app_id,
                     "goal_id": goal_id,
@@ -310,6 +559,7 @@ class SimpleCollabRunner:
                     "run_id": run_id,
                     "workspace": workspace,
                     "partial_artifacts": partial_artifacts,
+                    "behavior_evidence": behavior_ev,
                 },
                 application_id=app_id,
                 extra={
@@ -317,10 +567,20 @@ class SimpleCollabRunner:
                     "partial_artifacts": partial_artifacts,
                     "continuation_required": continuation_required,
                     "worker_request": action_payload,
+                    "behavior_evidence": behavior_ev,
+                    "acceptance_execution": exec_res,
                 },
             )
             schema = lead_review_response_schema()
             cwd = str(getattr(self.planner, "cwd", self.persist_root))
+            send_bytes = json.dumps({"request": lead_req, "schema": schema}, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            send_path = evidence_dir / (hashlib.sha256(send_bytes).hexdigest() + ".review.json")
+            try:
+                with send_path.open("xb") as stream:
+                    stream.write(send_bytes)
+            except FileExistsError:
+                if send_path.read_bytes() != send_bytes:
+                    raise ValueError("immutable review request mismatch")
             raw, parsed = adapter.decide(lead_req, schema=schema, cwd=cwd)
 
             # Check safe_failure or adapter error
@@ -332,6 +592,7 @@ class SimpleCollabRunner:
                 details = dict(parsed)
                 next_action = "diagnose"
                 next_action_source = "suggested"
+                review_status = "blocked"
             else:
                 unwrapped = unwrap_structured(parsed) if isinstance(parsed, Mapping) else None
                 try:
@@ -346,8 +607,14 @@ class SimpleCollabRunner:
                         next_action = str(raw_action)
                         next_action_source = "lead"
                     else:
-                        next_action = "continue" if verdict == "pass" else "diagnose"
+                        next_action = "continue" if verdict == "pass" else "rework"
                         next_action_source = "suggested"
+                    # Behavior evidence check: if native execution failed or output protection violated, lead verdict cannot silently pass
+                    if command_failed or (output_prot and output_prot.get("preserve_overwritten_by_empty")):
+                        verdict = "fail"
+                        if "acceptance command failed" not in reason and "output protection" not in reason:
+                            reason = f"acceptance failed (rc={exec_res.get('returncode')}): {reason}"
+                        next_action = "rework"
                 except LeadDecisionError as exc:
                     # Invalid lead reply / wrapper mismatch / missing reason
                     if isinstance(unwrapped, Mapping) and ("verdict" in unwrapped or "decision" in unwrapped):
@@ -368,11 +635,13 @@ class SimpleCollabRunner:
                         reason = f"lead decision validation failed [{exc.code}]: {exc}"
                         next_action = "diagnose"
                         next_action_source = "suggested"
-        elif callable(decider):
+                        review_status = "blocked"
+        elif callable(decider) and review_status != "blocked":
             action = {
                 "kind": "review",
                 "payload": action_payload,
                 "review_hint": reason_hint,
+                "behavior_evidence": behavior_ev,
             }
             try:
                 dec = decider(goal_snap, task, action)
@@ -386,24 +655,46 @@ class SimpleCollabRunner:
                     else:
                         next_action = "continue" if verdict == "pass" else "diagnose"
                         next_action_source = "suggested"
+                    if command_failed or (output_prot and output_prot.get("preserve_overwritten_by_empty")):
+                        verdict = "fail"
+                        next_action = "rework"
             except Exception as e:
                 verdict = "fail"
                 reason = f"decider raised {e}"
                 next_action = "diagnose"
                 next_action_source = "fallback"
                 lead_status = "error"
-        else:
-            # Deterministic / fallback logic
-            if worker_result.get("ok"):
-                verdict = "pass"
-                reason = "worker execution completed successfully"
-                next_action = "complete"
-                next_action_source = "fallback"
+                review_status = "blocked"
+        elif review_status != "blocked":
+            # Deterministic / fallback logic:
+            # Worker self-report ok=True cannot pass alone if acceptance command was configured or unverified.
+            if command_configured:
+                if command_executed and not command_failed and not (output_prot and output_prot.get("preserve_overwritten_by_empty")):
+                    verdict = "pass"
+                    reason = "caller acceptance command passed; protection=" + output_prot["status"]
+                    next_action = "complete"
+                    next_action_source = "fallback"
+                else:
+                    verdict = "fail"
+                    reason = f"acceptance failed (rc={exec_res.get('returncode') if exec_res else 'none'})"
+                    next_action = "rework"
+                    next_action_source = "fallback"
             else:
-                verdict = "fail"
-                reason = str(worker_result.get("error") or "worker execution failed")
-                next_action = "diagnose"
-                next_action_source = "fallback"
+                if worker_result.get("ok") and not (output_prot and output_prot.get("preserve_overwritten_by_empty")):
+                    verdict = "pass"
+                    reason = "worker execution completed successfully"
+                    next_action = "complete"
+                    next_action_source = "fallback"
+                else:
+                    verdict = "fail"
+                    reason = str(worker_result.get("error") or "worker execution failed")
+                    next_action = "diagnose"
+                    next_action_source = "fallback"
+
+        if missing_materials:
+            verdict, review_status, next_action = "fail", "blocked", "diagnose"
+        elif command_failed or protection_violated:
+            verdict, next_action = "fail", "rework"
 
         decision_rec = {
             "application_id": app_id,
@@ -416,15 +707,18 @@ class SimpleCollabRunner:
             "reason": reason,
             "next_action": next_action,
             "next_action_source": next_action_source,
+            "review_status": review_status,
             "lead_status": lead_status,
             "raw_result": dict(worker_result),
+            "behavior_evidence": behavior_ev,
+            "acceptance_execution": exec_res,
             "lead_details": details,
             "consumed_at": time.time(),
         }
 
         # If lead call experienced an error/call_failed/timeout, we do NOT fake lead consumption success:
         # We only persist as consumed if lead returned a valid decision (ok or unwrapped)
-        if lead_status in {"ok", "unwrapped"}:
+        if lead_status in {"ok", "unwrapped"} and review_status != "blocked":
             self._persist_consumed_decision(app_id, decision_rec)
         return decision_rec
 
@@ -500,13 +794,35 @@ class SimpleCollabRunner:
                 lead_reviews.append(review_rec)
             elif existing_review is not None:
                 # Review was already executed by coordinator
+                exec_cmd = task_result.get("acceptance_execution")
+                output_prot = task_result.get("output_protection") or {
+                    "preserve_overwritten_by_empty": False,
+                    "details": "no preserve violations detected",
+                }
+                behavior_ev = task_result.get("behavior_evidence") or build_behavior_evidence(
+                    command=(snap.get("goal") or {}).get("acceptance", {}).get("command"),
+                    execution=exec_cmd,
+                    input_purpose=str(t.get("title") or "task execution"),
+                    output_protection=output_prot,
+                    expected_assertions=["returncode == 0"],
+                    actual_assertions=[f"returncode == {exec_cmd.get('returncode')}" if exec_cmd else "no command execution"],
+                    worker_self_report={
+                        "status": task_status,
+                        "ok": task_result.get("ok"),
+                        "response": task_result.get("response"),
+                    },
+                )
                 lead_reviews.append({
                     "task_id": t.get("task_id"),
                     "verdict": "pass" if existing_review.get("status") == "passed" else "fail",
                     "reason": existing_review.get("evidence") or "",
                     "next_action": "continue" if existing_review.get("status") == "passed" else "rework",
+                    "review_status": "reviewed",
+                    "lead_status": "ok",
                     "partial_artifacts": partial_artifacts,
                     "workspace": ws,
+                    "behavior_evidence": behavior_ev,
+                    "acceptance_execution": exec_cmd,
                 })
 
         final_status = self.app.status(goal_id)

@@ -242,7 +242,7 @@ def communicate(
             out, err = proc.communicate(input=send, timeout=max(0.0, min(_POLL_SEC, remaining)))
             if scope is not None and scope.cancelled:
                 raise LeadCancelled(scope.reason)
-            return out or "", err or ""
+            return (out if out is not None else (b"" if not proc.text_mode else "")), (err if err is not None else (b"" if not proc.text_mode else ""))
         except subprocess.TimeoutExpired:
             pass
         if scope is not None and scope.cancelled:
@@ -262,7 +262,7 @@ def _drain(proc: subprocess.Popen) -> None:
         pass
 
 
-def run_cancellable(
+def _run_unaccounted(
     cmd: Sequence[str],
     *,
     timeout: float,
@@ -280,25 +280,80 @@ def run_cancellable(
         stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+        text=False,
         cwd=cwd,
         **popen_group_kwargs(platform),
     )
+    admission = _SPAWN_ADMISSION.get()
+    if admission is not None:
+        hook, binding, state = admission
+        state["spawned"] = True
+        try:
+            import psutil
+            hook.actual(state["reservation"], pid=proc.pid, birth=psutil.Process(proc.pid).create_time())
+        except BaseException:
+            proc.kill()
+            proc.wait(timeout=5)
+            raise
     # Windows: kill-on-close Job Object, so a dead service takes the tree with it.
     win_job.attach(proc, platform)
     key = register_process(proc)
     if scope is not None:
         scope.attach(proc, platform)
     try:
-        out, err = communicate(proc, timeout=timeout, input_text=input_text, platform=platform, scope=scope)
+        out, err = communicate(proc, timeout=timeout, input_text=input_text.encode("utf-8") if input_text is not None else None, platform=platform, scope=scope)
+    except (LeadCancelled, subprocess.TimeoutExpired) as exc:
+        try:
+            partial_out, partial_err = proc.communicate(timeout=3)
+            captured = _binary_capture_result(cmd, proc, partial_out, partial_err, complete=False)
+            exc.raw_evidence = captured.raw_evidence
+        except Exception:
+            exc.raw_evidence = {"capture_status": "not_recorded", "capture_complete": False}
+        raise
     finally:
         if scope is not None:
             scope.detach(proc)
         unregister_process(key)
         win_job.close(proc)
-    return subprocess.CompletedProcess(list(cmd), proc.returncode, out, err)
+    return _binary_capture_result(cmd, proc, out, err)
+
+
+def _binary_capture_result(cmd, proc, out, err, *, complete=True):
+    # Persist original binary streams BEFORE decoding or parsing model fields.
+    import hashlib, json, os
+    from pathlib import Path
+    captured = isinstance(out, bytes) and isinstance(err, bytes)
+    evidence = {"capture_status": "not_recorded", "capture_complete": False}
+    if captured:
+        root = Path(os.environ.get("TMPDIR") or Path.cwd()) / ".collab-lead-raw"
+        root.mkdir(parents=True, exist_ok=True)
+        streams = {}
+        for name, data in (("stdout", out), ("stderr", err)):
+            digest = hashlib.sha256(data).hexdigest()
+            path = root / (digest + ".bin")
+            try:
+                with path.open("xb") as stream:
+                    stream.write(data)
+            except FileExistsError:
+                if path.read_bytes() != data:
+                    raise ValueError("raw stream digest collision")
+            streams[name] = {"path": str(path), "bytes": len(data), "sha256": digest}
+        evidence = {"capture_status": "original_binary", "capture_complete": complete,
+                    "returncode": proc.returncode, "streams": streams}
+        receipt = json.dumps(evidence, sort_keys=True).encode("utf-8")
+        receipt_path = root / (hashlib.sha256(receipt).hexdigest() + ".json")
+        try:
+            with receipt_path.open("xb") as stream:
+                stream.write(receipt)
+        except FileExistsError:
+            if receipt_path.read_bytes() != receipt:
+                raise ValueError("raw receipt collision")
+        evidence["receipt_path"] = str(receipt_path)
+    result = subprocess.CompletedProcess(list(cmd), proc.returncode,
+                out.decode("utf-8", errors="replace") if isinstance(out, bytes) else out,
+                err.decode("utf-8", errors="replace") if isinstance(err, bytes) else err)
+    result.raw_evidence = evidence
+    return result
 
 
 __all__ = [
@@ -314,3 +369,29 @@ __all__ = [
     "stop_process_tree",
     "use_scope",
 ]
+
+# Internal per-thread/context service boundary. HTTP bodies never create hooks.
+_SPAWN_ADMISSION = contextvars.ContextVar("trusted_lead_spawn_admission", default=None)
+
+@contextlib.contextmanager
+def trusted_spawn_admission(hook, binding):
+    token = _SPAWN_ADMISSION.set((hook, dict(binding), {}))
+    try:
+        yield
+    finally:
+        _SPAWN_ADMISSION.reset(token)
+
+def run_cancellable(cmd, **kwargs):
+    admission = _SPAWN_ADMISSION.get()
+    if admission is None:
+        return _run_unaccounted(cmd, **kwargs)
+    hook, binding, state = admission
+    # Every actual adapter subprocess attempt gets an independent reservation.
+    state.clear()
+    state["reservation"] = hook.reserve("lead", binding)
+    state["spawned"] = False
+    try:
+        return _run_unaccounted(cmd, **kwargs)
+    finally:
+        if not state["spawned"]:
+            hook.no_spawn(state["reservation"])

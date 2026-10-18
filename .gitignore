@@ -54,3 +54,24 @@ windows/local/
 .grok-prompts/
 logs/
 jobs/p2-st-reinstall.charter.yaml
+# Local continuity acceptance states/receipts are not source artifacts.
+tests/continuity-evidence-*/
+tests/continuity-final-*/
+tests/hold-evidence-*/
+docs/MAINTENANCE-STATUS.json
+docs/ACCEPTED-RUNTIME-IMPORT.json
+states/
+tests/restart-evidence-*/
+tests/live-block-revision-v1/
+tests/planning-turn-revision-v1/
+tests/planning-turn-unit.log
+# Local-only maintenance narratives and real-state diagnostic scripts.
+tests/closeout-engineering/
+docs/GOAL-CONTINUITY-DELIVERY.txt
+docs/GOAL-CONTINUITY-SCOPE.md
+docs/LIVE-BLOCK-REVISION-HANDOFF.txt
+docs/PLANNING-TURN-REVISION-HANDOFF.txt
+tests/reconstruct_live_plan_input.py
+tests/verify_live_block_revision.py
+tests/verify_planning_turn_revision.py
+tests/verify_continuity_gate.py

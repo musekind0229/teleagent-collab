@@ -5,6 +5,7 @@ names, escaping links, or silent overwrite.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -303,6 +304,8 @@ def collect_direct_dep_artifacts(
                     "source": source,
                     "from_task": dep_id,
                     "workspace": str(workspace),
+                    "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                    "bytes": source.stat().st_size,
                 }
             )
     if len(items) > MAX_HANDOFF_FILES:
@@ -312,11 +315,57 @@ def collect_direct_dep_artifacts(
 
 def stage_handoff_files(items: Sequence[Mapping[str, Any]], dest_root: Path) -> list[dict[str, Any]]:
     dest_base = Path(dest_root)
+    # All entries are files. A file cannot also be another member's parent.
+    # Resolve ordinary Windows spelling differences before comparing topology;
+    # reject Win32 trailing-dot/space aliases rather than silently renaming them.
+    target_parts = []
+    for item in items:
+        rel = safe_relative_name(item.get("relative"))
+        parts = Path(rel).parts
+        if os.name == 'nt' and any(part != part.rstrip(' .') for part in parts):
+            raise HandoffError(f"ambiguous Windows handoff path: {rel}")
+        key = tuple(os.path.normcase(part) for part in parts)
+        for prior in target_parts:
+            if key[:len(prior)] == prior or prior[:len(key)] == key:
+                raise HandoffError(f"conflicting handoff target topology: {rel}")
+        target_parts.append(key)
+        # An already-existing file in the destination's ancestor chain is also
+        # detectable before copying, including ancestors above a missing root.
+        for parent in (dest_base / rel).parents:
+            if parent.exists() and not parent.is_dir():
+                raise HandoffError(f"handoff target ancestor is not a directory: {rel}")
+            if parent == parent.parent:
+                break
     dest_base.mkdir(parents=True, exist_ok=True)
     if _is_link(dest_base):
         raise HandoffError("links and junctions are not accepted as artifacts")
-    staged: list[dict[str, Any]] = []
+    # Validate every manifest member before copying any member. Bad late entries
+    # must not leave a partially staged input set.
+    import hashlib
+    prepared = []
+    seen = set()
     for item in items:
+        rel = safe_relative_name(item.get("relative"))
+        key = os.path.normcase(rel)
+        if key in seen:
+            raise HandoffError(f"duplicate handoff path {rel}")
+        seen.add(key)
+        workspace = Path(item["workspace"]) if item.get("workspace") else None
+        source = _ordinary_source(Path(item["source"]), workspace)
+        data = source.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        expected = item.get("sha256")
+        if expected is not None and (not isinstance(expected, str) or expected != digest):
+            raise HandoffError(f"handoff source hash mismatch: {rel}")
+        length = item.get("bytes")
+        if length is not None and (type(length) is not int or length != len(data)):
+            raise HandoffError(f"handoff source length mismatch: {rel}")
+        dest = contained_path(dest_base, rel, must_exist=False)
+        if dest.exists() and not _same_file_bytes(source, contained_path(dest_base, rel, must_exist=True)):
+            raise HandoffError(f"refusing to overwrite existing {rel}")
+        prepared.append((item, digest, len(data)))
+    staged: list[dict[str, Any]] = []
+    for item, digest, length in prepared:
         rel = safe_relative_name(item.get("relative"))
         dest = contained_path(dest_base, rel, must_exist=False)
         workspace = Path(item["workspace"]) if item.get("workspace") else None
@@ -363,6 +412,9 @@ def stage_handoff_files(items: Sequence[Mapping[str, Any]], dest_root: Path) -> 
                 "from_task": str(item.get("from_task") or ""),
             }
         )
+    for entry, (_, digest, length) in zip(staged, prepared):
+        entry['sha256'] = digest
+        entry['bytes'] = length
     return staged
 
 
@@ -390,6 +442,11 @@ def copy_staged_inputs(source_root: Path, dest_root: Path, names: Sequence[Any])
         }
         for rel in rels
     ]
+    for item, raw in zip(items, names):
+        if isinstance(raw, Mapping):
+            for field in ['sha256', 'bytes']:
+                if field in raw:
+                    item[field] = raw[field]
     return [row["relative"] for row in stage_handoff_files(items, Path(dest_root))]
 
 

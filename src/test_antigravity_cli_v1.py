@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """antigravity.cli_v1 ExecutionBackend — simulated subprocess; live agy skippable."""
 from __future__ import annotations
+from test_synthetic_caller_fixture import fixture_backend, fixture_start
 
 import importlib.util
 import io
@@ -36,10 +37,26 @@ from execution_backend.antigravity_cli_v1 import (  # noqa: E402
     agy_auto_approve_enabled,
     build_agy_argv,
     parse_agy_json,
+    preflight_headless_permissions,
 )
 from charter import load_charter  # noqa: E402
 
 HELLO = REPO / "jobs/examples/hello.charter.yaml"
+if not HELLO.is_file():
+    HELLO.parent.mkdir(parents=True, exist_ok=True)
+    HELLO.write_text(
+        "name: hello\n"
+        "goal: Write hello-from-worker.txt\n"
+        "must:\n"
+        "  - write hello-from-worker.txt\n"
+        "must_not:\n"
+        "  - delete files\n"
+        "allow_paths: []\n"
+        "done_when:\n"
+        "  artifacts:\n"
+        "    - hello-from-worker.txt\n",
+        encoding="utf-8",
+    )
 
 _FAKE_AGY = r'''#!/usr/bin/env python3
 import json
@@ -90,7 +107,8 @@ def _write_fake_agy(dirpath: str | Path) -> Path:
 
 
 def _hello_charter() -> dict:
-    return load_charter(HELLO)
+    # Explicit synthetic ordinary contract, not the unsafe legacy example's user gates.
+    return {'name':'synthetic-hello','goal':'Write hello-from-worker.txt','done_when':{'artifacts':['hello-from-worker.txt']}}
 
 
 def _agy_live_ready() -> bool:
@@ -196,7 +214,7 @@ class TestSimulatedBackend(unittest.TestCase):
         base.pop("COLLAB_AGY_AUTO_APPROVE", None)
         if env:
             base.update(env)
-        return AntigravityCliExecutionBackend(bin_path=str(fake), environ=base, **kwargs)
+        return fixture_backend(AntigravityCliExecutionBackend(bin_path=str(fake), environ=base, **kwargs))
 
     def test_hello_public_api_no_skip_permissions(self):
         charter = _hello_charter()
@@ -291,7 +309,7 @@ class TestSimulatedBackend(unittest.TestCase):
                     "AGY_FAKE_STATUS": "SUCCESS",
                 },
             )
-            started = be.start_run(
+            started = fixture_start(be,
                 title="t",
                 directory=td,
                 instruction="go",
@@ -315,7 +333,7 @@ class TestSimulatedBackend(unittest.TestCase):
                     "AGY_FAKE_STATUS": "ok",
                 },
             )
-            started = be.start_run(
+            started = fixture_start(be,
                 title="t",
                 directory=td,
                 instruction="go",
@@ -362,7 +380,7 @@ class TestSimulatedBackend(unittest.TestCase):
                     "AGY_AUTO_APPROVE": "true",
                 },
             )
-            started = be.start_run(
+            started = fixture_start(be,
                 title="t",
                 directory=td,
                 instruction="go",
@@ -383,7 +401,7 @@ class TestSimulatedBackend(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             fake = _write_fake_agy(td)
             be = self._backend(fake, {"AGY_FAKE_SLEEP": "30"})
-            started = be.start_run(
+            started = fixture_start(be,
                 title="slow",
                 directory=td,
                 instruction="sleep",
@@ -403,9 +421,9 @@ class TestSimulatedBackend(unittest.TestCase):
             self.assertEqual(collected["state"], "cancelled")
 
     def test_missing_bin_failed_start(self):
-        be = AntigravityCliExecutionBackend(bin_path=str(Path("/no/such/agy-bin-xyz")))
+        be = fixture_backend(AntigravityCliExecutionBackend(bin_path=str(Path("/no/such/agy-bin-xyz"))))
         with tempfile.TemporaryDirectory() as td:
-            started = be.start_run(title="x", directory=td, instruction="hi", artifacts=["a.txt"])
+            started = fixture_start(be,title="x", directory=td, instruction="hi", artifacts=["a.txt"])
             self.assertFalse(started["ok"])
             self.assertEqual(started["state"], "failed")
             obs = be.observe_run(started["run_id"])
@@ -453,15 +471,12 @@ class TestRunJobCli(unittest.TestCase):
                     "AGY_FAKE_CONV": "conv_cli",
                 },
             )
-            self.assertEqual(rc, 0, err + out)
+            # Legacy CLI is not a trusted application caller; flags/env must not grant dispatch.
+            self.assertNotEqual(rc, 0, err + out)
             summary = json.loads(out.strip().splitlines()[-1])
-            self.assertTrue(summary["ok"], summary)
-            self.assertEqual(summary["backend"], "antigravity")
-            self.assertEqual(summary.get("backend_id"), "antigravity.cli_v1")
-            self.assertTrue((Path(ws) / "hello-from-worker.txt").is_file())
-            status = json.loads(Path(summary["status"]).read_text(encoding="utf-8"))
-            self.assertEqual(status.get("backend"), "antigravity.cli_v1")
-            self.assertFalse(status.get("skip_permissions"))
+            self.assertFalse(summary["ok"], summary)
+            self.assertEqual(summary["state"], "blocked")
+            self.assertFalse(summary.get("skip_permissions"))
 
     def test_flag_agy_alias(self):
         with tempfile.TemporaryDirectory() as td:
@@ -475,9 +490,12 @@ class TestRunJobCli(unittest.TestCase):
                     "AGY_FAKE_ARTIFACT": "hello-from-worker.txt",
                 },
             )
-            self.assertEqual(rc, 0, err + out)
+            # Legacy CLI is not a trusted application caller; flags/env must not grant dispatch.
+            self.assertNotEqual(rc, 0, err + out)
             summary = json.loads(out.strip().splitlines()[-1])
-            self.assertEqual(summary["backend"], "antigravity")
+            self.assertFalse(summary["ok"], summary)
+            self.assertEqual(summary["state"], "blocked")
+            self.assertFalse(summary.get("skip_permissions"))
 
 
 @unittest.skipUnless(_agy_live_ready(), "agy not on PATH")
@@ -525,10 +543,10 @@ class TestP1PipeAcceptanceTimeout(unittest.TestCase):
             return spawn
 
         with tempfile.TemporaryDirectory() as td:
-            be = AntigravityCliExecutionBackend(environ=env, timeout_sec=8, poll_sec=0.05)
+            be = fixture_backend(AntigravityCliExecutionBackend(bin_path=sys.executable, environ=env, timeout_sec=8, poll_sec=0.05))
             code = "import json; print(json.dumps({'status':'ok','response':'x'*200000}))"
             with patch("execution_backend.antigravity_cli_v1.subprocess.Popen", factory(code)):
-                run = be.start_run(title="large", directory=td)
+                run = fixture_start(be,title="large", directory=td)
             deadline = time.time() + 5
             obs = be.observe_run(run["run_id"])
             while obs.get("busy") and time.time() < deadline:
@@ -550,12 +568,12 @@ class TestP1PipeAcceptanceTimeout(unittest.TestCase):
             return spawn
 
         with tempfile.TemporaryDirectory() as td:
-            be = AntigravityCliExecutionBackend(environ=env, timeout_sec=0.1, poll_sec=0.05)
+            be = fixture_backend(AntigravityCliExecutionBackend(bin_path=sys.executable, environ=env, timeout_sec=0.1, poll_sec=0.05))
             with patch(
                 "execution_backend.antigravity_cli_v1.subprocess.Popen",
                 factory("import time; time.sleep(30)"),
             ):
-                run = be.start_run(title="deadline", directory=td)
+                run = fixture_start(be,title="deadline", directory=td)
             time.sleep(0.35)
             obs = be.observe_run(run["run_id"])
             self.assertFalse(obs.get("busy"), obs)
@@ -590,7 +608,7 @@ class TestP1PipeAcceptanceTimeout(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             with patch("execution_backend.antigravity_cli_v1.subprocess.Popen", factory(code)):
-                result = run_antigravity_charter(charter=charter, workdir=root, environ=env)
+                result = run_antigravity_charter(charter=charter, workdir=root, environ=env, backend=fixture_backend(AntigravityCliExecutionBackend(bin_path=sys.executable, environ=env)))
             self.assertEqual((root / "answer.txt").read_text(encoding="utf-8"), "WRONG")
             self.assertFalse(result.get("ok"), result)
             self.assertNotEqual(result.get("state"), "ok")
@@ -626,10 +644,320 @@ class TestP1PipeAcceptanceTimeout(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             with patch("execution_backend.antigravity_cli_v1.subprocess.Popen", factory(code)):
-                result = run_antigravity_charter(charter=charter, workdir=root, environ=env)
+                result = run_antigravity_charter(charter=charter, workdir=root, environ=env, backend=fixture_backend(AntigravityCliExecutionBackend(bin_path=sys.executable, environ=env)))
             self.assertTrue(result.get("ok"), result)
 
+
+class TestItem4PermissionPreflight(unittest.TestCase):
+    """Item 4 Headless Permission Preflight Tests (3 categories: mode, task_authorized, unknown_gate)."""
+
+    def test_preflight_blocks_inapplicable_task_kind_with_zero_native_runs(self):
+        """Inapplicable contract (system_install) must block BEFORE worker launch; Popen called 0 times."""
+        charter = {
+            "name": "system-task",
+            "goal": "apt-get install nginx",
+            "task_kind": "system_install",
+            "must": ["install nginx"],
+            "must_not": [],
+            "allow_paths": [],
+            "done_when": {"artifacts": []},
+        }
+        with tempfile.TemporaryDirectory() as td:
+            be = AntigravityCliExecutionBackend(bin_path="agy")
+            with patch("subprocess.Popen") as mock_popen:
+                started = be.start_run(title="sys-install", directory=td, charter=charter)
+                mock_popen.assert_not_called()
+            self.assertFalse(started["ok"])
+            self.assertEqual(started["state"], "blocked")
+            self.assertTrue(started["preflight_blocked"])
+            self.assertFalse(started["native_started"])
+            self.assertIn("permission_preflight", started)
+            self.assertEqual(started["permission_preflight"]["category"], "unknown_gate")
+            self.assertIn("task_kind 'system_install' not applicable", started["error"])
+
+    def test_preflight_blocks_user_gate_permissions(self):
+        """user_gate_permissions are unknown gates for headless and must block before launch."""
+        charter = {
+            "name": "gated-task",
+            "goal": "do something with sudo",
+            "task_kind": "file_task",
+            "user_gate_permissions": ["sudo", "systemd_unit_install"],
+            "must": ["run with sudo"],
+            "must_not": [],
+            "allow_paths": [],
+            "done_when": {"artifacts": []},
+        }
+        with tempfile.TemporaryDirectory() as td:
+            be = AntigravityCliExecutionBackend(bin_path="agy")
+            with patch("subprocess.Popen") as mock_popen:
+                started = be.start_run(title="user-gate", directory=td, charter=charter)
+                mock_popen.assert_not_called()
+            self.assertFalse(started["ok"])
+            self.assertEqual(started["state"], "blocked")
+            self.assertEqual(started["permission_preflight"]["category"], "unknown_gate")
+
+    def test_preflight_blocks_forbidden_execution_tool(self):
+        """Forbidden print/agy tool triggers unknown_gate block."""
+        charter = {
+            "name": "no-print-task",
+            "goal": "no print",
+            "forbidden_tools": ["print"],
+            "must": ["do not print"],
+            "must_not": [],
+            "allow_paths": [],
+            "done_when": {"artifacts": []},
+        }
+        with tempfile.TemporaryDirectory() as td:
+            be = AntigravityCliExecutionBackend(bin_path="agy")
+            with patch("subprocess.Popen") as mock_popen:
+                started = be.start_run(title="no-print", directory=td, charter=charter)
+                mock_popen.assert_not_called()
+            self.assertFalse(started["ok"])
+            self.assertEqual(started["state"], "blocked")
+
+    def test_preflight_allows_authorized_ordinary_task(self):
+        """Ordinary file tasks are task_authorized and pass preflight."""
+        charter = {
+            "name": "file-task",
+            "goal": "Write summary.txt",
+            "task_kind": "file_task",
+            "must": ["Write summary.txt"],
+            "must_not": [],
+            "allow_paths": [],
+            "done_when": {"artifacts": ["summary.txt"]},
+        }
+        # Ordinary charter text alone is not authority; test the untrusted gate explicitly.
+        res = preflight_headless_permissions(charter)
+        self.assertTrue(res["blocked"])
+        self.assertEqual(res["category"], "unknown_gate")
+        self.assertIn("mode", res["categories"])
+        self.assertEqual(res["categories"]["task_authorized"], [])
+        # Positive dispatch is separately covered by PMGrantRecoveryTests with exact trusted task binding.
+
+
+class TestItem4ResultNormalization(unittest.TestCase):
+    """Item 4 Result Normalization Tests (Host/Native/Business layered judgment & recovery)."""
+
+    def _make_backend_with_rec(self, rec: dict) -> AntigravityCliExecutionBackend:
+        be = AntigravityCliExecutionBackend(bin_path="agy")
+        run_id = rec.get("run_id", "run_test_1")
+        rec.setdefault("run_id", run_id)
+        rec.setdefault("native_handle", f"agy:{run_id}")
+        rec.setdefault("directory", tempfile.gettempdir())
+        rec.setdefault("harvested", True)
+        be._runs[run_id] = rec
+        return be
+
+    def test_host0_denied_actions_fails_business_with_pm_owner(self):
+        """Host rc=0 with denied_actions in agy_json must NOT be judged business success; owner=project-manager."""
+        rec = {
+            "run_id": "run_denied",
+            "returncode": 0,
+            "proc": None,
+            "agy_json": {
+                "status": "SUCCESS",
+                "denied_actions": [{"tool": "RunCommand", "reason": "permission denied"}],
+            },
+            "activity": "idle",
+            "finish": "stop",
+            "artifacts": [],
+        }
+        be = self._make_backend_with_rec(rec)
+        collected = be.collect_result("run_denied")
+        self.assertFalse(collected["ok"])
+        self.assertEqual(collected["state"], "fail")
+        self.assertTrue(collected["layers"]["host"]["ok"])
+        self.assertFalse(collected["layers"]["native"]["ok"])
+        self.assertFalse(collected["layers"]["business"]["ok"])
+        self.assertEqual(collected["next_owner"], "project-manager")
+        self.assertEqual(collected["recovery_action"], "review_permission_policy_or_grant_access")
+        self.assertTrue(any("permission denied" in w for w in collected.get("warnings", [])))
+
+    def test_host0_missing_artifacts_fails_business_with_worker_owner(self):
+        """Host rc=0 and native status=SUCCESS but missing required artifacts fails business with owner=worker."""
+        with tempfile.TemporaryDirectory() as td:
+            rec = {
+                "run_id": "run_missing_art",
+                "directory": td,
+                "returncode": 0,
+                "proc": None,
+                "agy_json": {"status": "SUCCESS", "response": "done"},
+                "activity": "idle",
+                "finish": "stop",
+                "artifacts": ["missing_file.txt"],
+            }
+            be = self._make_backend_with_rec(rec)
+            collected = be.collect_result("run_missing_art")
+            self.assertFalse(collected["ok"])
+            self.assertEqual(collected["state"], "fail")
+            self.assertTrue(collected["layers"]["host"]["ok"])
+            self.assertTrue(collected["layers"]["native"]["ok"])
+            self.assertFalse(collected["layers"]["business"]["ok"])
+            self.assertEqual(collected["missing"], ["missing_file.txt"])
+            self.assertEqual(collected["next_owner"], "worker")
+            self.assertIn("re-run task to produce missing artifacts", collected["recovery_action"])
+
+    def test_transient_503_fails_native_without_swapping_account(self):
+        """503 capacity error must stay failed/unknown without marking account permanently bad."""
+        rec = {
+            "run_id": "run_503",
+            "returncode": 0,
+            "proc": None,
+            "agy_json": {
+                "status": "ERROR",
+                "error": "API error: UNAVAILABLE (code 503): No capacity available for model",
+            },
+            "assistant_error": "503: No capacity",
+            "activity": "idle",
+            "finish": "error",
+            "artifacts": [],
+        }
+        be = self._make_backend_with_rec(rec)
+        collected = be.collect_result("run_503")
+        self.assertFalse(collected["ok"])
+        self.assertTrue(collected["layers"]["native"]["has_503"])
+        self.assertEqual(collected["next_owner"], "worker")
+        self.assertEqual(collected["recovery_action"], "retry_after_transient_delay")
+        self.assertTrue(any("503" in w for w in collected.get("warnings", [])))
+
+    def test_connection_closed_fails_with_worker_retry(self):
+        """Connection closed/reset fails native and business layer with owner=worker and retry_connection."""
+        rec = {
+            "run_id": "run_conn",
+            "returncode": 1,
+            "proc": None,
+            "stderr": "connection reset by peer\n",
+            "agy_json": {"status": "ERROR", "error": "connection closed unexpectedly"},
+            "assistant_error": "connection closed unexpectedly",
+            "activity": "idle",
+            "finish": "error",
+            "artifacts": [],
+        }
+        be = self._make_backend_with_rec(rec)
+        collected = be.collect_result("run_conn")
+        self.assertFalse(collected["ok"])
+        self.assertFalse(collected["layers"]["host"]["ok"])
+        self.assertTrue(collected["layers"]["native"]["connection_closed"])
+        self.assertEqual(collected["next_owner"], "worker")
+        self.assertEqual(collected["recovery_action"], "retry_connection")
+
+    def test_positive_control_all_layers_green(self):
+        """Positive control: host 0, native SUCCESS, artifacts present -> business ok=True, next_owner=caller."""
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "delivered.txt"
+            target.write_text("content", encoding="utf-8")
+            rec = {
+                "run_id": "run_positive",
+                "directory": td,
+                "returncode": 0,
+                "proc": None,
+                "agy_json": {"status": "SUCCESS", "response": "completed successfully"},
+                "activity": "idle",
+                "finish": "stop",
+                "artifacts": ["delivered.txt"],
+            }
+            be = self._make_backend_with_rec(rec)
+            collected = be.collect_result("run_positive")
+            self.assertTrue(collected["ok"])
+            self.assertEqual(collected["state"], "ok")
+            self.assertTrue(collected["layers"]["host"]["ok"])
+            self.assertTrue(collected["layers"]["native"]["ok"])
+            self.assertTrue(collected["layers"]["business"]["ok"])
+            self.assertEqual(collected["next_owner"], "caller")
+            self.assertEqual(collected["recovery_action"], "consume_artifacts")
 
 
 if __name__ == "__main__":
     unittest.main()
+
+import hashlib
+
+
+class PMGrantRecoveryTests(unittest.TestCase):
+    def entry(self, charter, *, trusted=False, mismatch=False, strict=False, caller_id='synthetic-current'):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            b=AntigravityCliExecutionBackend(bin_path='offline-no-native',environ={})
+            if trusted:
+                b.configure_caller_permissions(allowed_operations=['read','write','command'],native_mode='strict_headless' if strict else 'skip_permissions')
+                b.authorize_caller_task(task_id='synthetic-current',title='current',directory=td,instruction='payload',artifacts=[])
+            given=dict(charter) if isinstance(charter,dict) else charter
+            if not strict and isinstance(given,dict):given['agy_auto_approve']=True
+            with patch.dict(os.environ,{},clear=True),patch.object(b,'_base_env',return_value={}),patch.object(b,'_start_run_locked',return_value=({}, {'ok':False,'state':'dispatch_spy'})) as dispatch:
+                r=b.start_run(title='other' if mismatch else 'current',directory=td,instruction='payload',artifacts=[],charter=given,caller_task_id=caller_id)
+            return dispatch.call_count,r
+    def test_all_untrusted_entry_forms_block(self):
+        for c in [None,{}, {'task_kind':'file_task'},{'caller_grant':'1'},{'caller_grant':{'task_id':'current','source':'trusted_application_configuration'}},{'task_kind':'file_task','caller_grant':{'task_id':'OTHER','allowed':True}}]:
+            with self.subTest(charter=c):self.assertEqual(self.entry(c)[0],0)
+    def test_trusted_matching_task_can_dispatch(self):self.assertEqual(self.entry({'required_tools':['RunCommand']},trusted=True)[0],1)
+    def test_wrong_payload_binding_blocks(self):self.assertEqual(self.entry({},trusted=True,mismatch=True)[0],0)
+    def test_conflict_always_blocks(self):self.assertEqual(self.entry({'required_tools':['RunCommand'],'forbidden_tools':['RunCommand']},trusted=True)[0],0)
+    def test_unknown_native_coverage_blocks(self):self.assertEqual(self.entry({},trusted=True,strict=True)[0],0)
+    def test_task_id_and_veto_matrix(self):
+        for task in [None,'OTHER']:
+            self.assertEqual(self.entry({},trusted=True,caller_id=task)[0],0)
+        for charter in [{'task_kind':'system_install'},{'install_roots':['C:/Windows']},{'user_gate_permissions':['login']},{'forbidden_tools':['agy']},{'require_sudo':True},{'required_tools':['UnknownTool']}]:
+            self.assertEqual(self.entry(charter,trusted=True)[0],0,charter)
+    def test_exact_rc_and_business_matrix(self):
+        for rc in [False,True,None,'0',0,1]:
+            with tempfile.TemporaryDirectory() as td:
+                b=AntigravityCliExecutionBackend(bin_path='offline');b._runs['r']={'run_id':'r','native_handle':'synthetic:r','directory':td,'returncode':rc,'proc':None,'harvested':True,'agy_json':{'status':'SUCCESS','response':'amount=503 ordinary','denied_actions':[]},'activity':'idle','finish':'stop','artifacts':[],'stdout':'','stderr':''}
+                r=b.collect_result('r');self.assertEqual(r['ok'],type(rc) is int and rc==0)
+
+
+class PMCompleteMaterialRecoveryTests(unittest.TestCase):
+    def test_large_source_full_delta_real_request(self):
+        from framework import agy_review as a
+        from framework.app_service import CollabApplication,LeadAdapterPlanner
+        from types import SimpleNamespace
+        import copy
+        calls=[]
+        class Lead:
+            def decide(self,request,**kwargs):
+                calls.append(copy.deepcopy(request));answer={'application_id':request['application_id'],'context_summary':request['context_summary'],'verdict':'pass','reason':'offline actual request fixture'}
+                return json.dumps(answer),answer
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td);ws=root/'workspace';ws.mkdir()
+            old=b'def target():\n    return 1\n\ndef caller():\n    return target()\n'+b'# baseline padding\n'*5000
+            (ws/'large.py').write_bytes(old)
+            (ws/'tests.py').write_bytes(b'# old line\n'*800)
+            app=CollabApplication(root/'state',planner=LeadAdapterPlanner(Lead(),cwd=ws),backend=SimpleNamespace(backend_id='antigravity.test'))
+            a.record_baseline(app.coordinator.workspaces_root,'g','t',ws)
+            new=old.replace(b'return 1',b'return 2')+b'# changed entire tail\n'*600
+            (ws/'large.py').write_bytes(new); (ws/'tests.py').write_bytes(b'# new changed line\n'*800)
+            task={'task_id':'t','goal_id':'g','run_id':'r','expected_artifacts':['DELIVERY.md'],'done_when':{'artifacts':['DELIVERY.md']}}
+            accept={'review_materials_required':True,'required_blocks':[{'path':'large.py','function':'target','dependency':{'path':'large.py','function':'caller'}}],'complete_delta_required':True,'code_scope':['large.py','tests.py']}
+            q,r=app.coordinator._agy_post_run_review({'goal_id':'g','goal':{'acceptance':accept,'budget':{'max_reworks':0}},'tasks':[task]},task,{'ok':True,'backend':'antigravity.test','workspace':str(ws)})
+            self.assertEqual(len(calls),1);self.assertEqual(r['review']['status'],'passed')
+            payload=calls[0]['extra']['worker_request'];self.assertTrue(payload['complete_delta']['complete'])
+            self.assertTrue(payload['alternative_coverage_verified'])
+            row=payload['complete_delta']['paths'][0]
+            self.assertEqual(Path(row['before']['path']).read_bytes(),old);self.assertEqual(Path(row['after']['path']).read_bytes(),new)
+            self.assertEqual(row['before']['sha256'],hashlib.sha256(old).hexdigest());self.assertEqual(row['after']['sha256'],hashlib.sha256(new).hexdigest())
+            self.assertEqual(payload['out_of_scope_changes'],[])
+            self.assertTrue(payload['diff_truncated'])
+            self.assertIn('tests.py',payload['truncated_files'])
+            self.assertEqual(payload['complete_delta']['binding'],{'goal_id':'g','task_id':'t','run_id':'r'})
+            self.assertIn('def caller()',json.dumps(payload['source_packet']))
+            from unittest.mock import patch
+            baseline=a.load_baseline(app.coordinator.workspaces_root,'g','t')
+            for bad in ['missing_function','no_alternative','capacity','wrong_hash','missing_bytes']:
+                altered=copy.deepcopy(accept);badbase=copy.deepcopy(baseline)
+                if bad=='missing_function':altered['required_blocks'][0]['function']='absent'
+                elif bad=='no_alternative':altered['complete_delta_required']=False
+                elif bad=='capacity':altered['delta_capacity_bytes']=1
+                elif bad=='wrong_hash':badbase['large.py']['sha256']='wrong'
+                elif bad=='missing_bytes':del badbase['large.py']['raw_hex']
+                with patch.object(a,'load_baseline',return_value=badbase):
+                    q,blocked=app.coordinator._agy_post_run_review({'goal_id':'g','goal':{'acceptance':altered,'budget':{'max_reworks':0}},'tasks':[task]},task,{'ok':True,'backend':'antigravity.test','workspace':str(ws)})
+                self.assertEqual(len(calls),1,bad);self.assertEqual(blocked['review']['status'],'review_blocked',bad)
+    def test_missing_endpoint_wrong_hash_capacity_fail_closed(self):
+        from framework import agy_review as a
+        with tempfile.TemporaryDirectory() as td:
+            before={'x.py':{'sha256':'wrong','size':3,'raw_hex':b'abc'.hex()}}
+            after={'x.py':{'sha256':hashlib.sha256(b'def').hexdigest(),'size':3,'raw_hex':b'def'.hex()}}
+            self.assertFalse(a.build_complete_delta(baseline=before,current=after,binding={'task_id':'t'},evidence_root=td)['complete'])
+            before['x.py']['sha256']=hashlib.sha256(b'abc').hexdigest()
+            self.assertFalse(a.build_complete_delta(baseline=before,current=after,binding={'task_id':'t'},evidence_root=td,capacity_bytes=1)['complete'])
+            del before['x.py']['raw_hex']
+            self.assertFalse(a.build_complete_delta(baseline=before,current=after,binding={'task_id':'t'},evidence_root=td)['complete'])

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Post-run lead review on the agy path: scope check, lead verdict, bounded rework."""
 from __future__ import annotations
+from test_synthetic_caller_fixture import fixture_backend, fixture_start
 
 import json
 import os
@@ -124,9 +125,9 @@ class PostRunReviewFlowTests(unittest.TestCase):
             env.pop(key, None)
         env["AGY_FAKE_STATE"] = str(root / "fake-state.txt")
         env["AGY_FAKE_STEPS"] = json.dumps(steps)
-        backend = AntigravityCliExecutionBackend(
+        backend = fixture_backend(AntigravityCliExecutionBackend(
             bin_path=str(_write_fake(bin_dir)), environ=env, timeout_sec=15, poll_sec=0.05
-        )
+        ))
         return CollabApplication(root / "app", planner=planner, backend=backend)
 
     def test_clean_run_passes_lead_review(self):

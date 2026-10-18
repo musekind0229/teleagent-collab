@@ -65,7 +65,8 @@ def _backend(root: Path, **kw):
 
     env = {"PATH": os.environ.get("PATH", ""), "HOME": str(root / "home"), "USERPROFILE": str(root / "home")}
     (root / "home").mkdir(exist_ok=True)
-    return AntigravityCliExecutionBackend(bin_path=_fake_agy(root), environ=env, timeout_sec=60, **kw)
+    from test_synthetic_caller_fixture import fixture_backend
+    return fixture_backend(AntigravityCliExecutionBackend(bin_path=_fake_agy(root), environ=env, timeout_sec=60, **kw))
 
 
 def _alive(pid: int) -> bool:
@@ -306,7 +307,8 @@ class AgyStaleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             be = _backend(root)
-            run = be.start_run(title="t", directory=str(root / "ws"), instruction="SLEEP[4]")
+            from test_synthetic_caller_fixture import fixture_start
+            run = fixture_start(be, title="t", directory=str(root / "ws"), instruction="SLEEP[4]")
             time.sleep(2.0)
             age, prog = self._hb_age(be, run["run_id"])
             self.assertGreater(age, 1.5, f"process-alive poll must not refresh the heartbeat: {prog}")
@@ -316,7 +318,8 @@ class AgyStaleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             be = _backend(root)
-            run = be.start_run(title="t", directory=str(root / "ws"), instruction="SESSION[40,0.25]")
+            from test_synthetic_caller_fixture import fixture_start
+            run = fixture_start(be, title="t", directory=str(root / "ws"), instruction="SESSION[40,0.25]")
             try:
                 # Silent run of the same length ages past 1.5s (test above); a
                 # run touching its agy session files keeps a fresh heartbeat.

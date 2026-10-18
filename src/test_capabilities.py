@@ -481,12 +481,13 @@ class CapabilitySubmitTests(unittest.TestCase):
 class AgyAcceptanceGateApiTests(unittest.TestCase):
     def _backend(self, root: Path, body: str) -> AntigravityCliExecutionBackend:
         fake = _write_fake_agy(root)
-        return AntigravityCliExecutionBackend(
+        from test_synthetic_caller_fixture import fixture_backend
+        return fixture_backend(AntigravityCliExecutionBackend(
             bin_path=str(fake),
             environ=_agy_env(body=body, auto=False),
             timeout_sec=15,
             poll_sec=0.05,
-        )
+        ))
 
     def _drive(self, app: CollabApplication, goal_id: str) -> dict:
         last = None

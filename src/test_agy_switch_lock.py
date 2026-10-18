@@ -5,6 +5,7 @@ Mock keyring / Popen only. Real flock (POSIX) / LockFileEx (Windows) and real
 child processes for death / timeout recovery.
 """
 from __future__ import annotations
+from test_synthetic_caller_fixture import fixture_backend, fixture_start
 
 import json
 import os
@@ -322,13 +323,13 @@ class TestStartRunCriticalSection(unittest.TestCase):
                 seen["home"] = kw["env"]["HOME"]
                 raise OSError("stop")
 
-            be = AntigravityCliExecutionBackend(
-                bin_path="agy", environ=env, account_pool_path=str(pool_path)
-            )
+            be = fixture_backend(AntigravityCliExecutionBackend(
+                bin_path=sys.executable, environ=env, account_pool_path=str(pool_path)
+            ))
             with patch.object(pool_mod, "clear_windows_antigravity_keyring", fake_clear), patch(
                 "execution_backend.antigravity_cli_v1.clear_windows_antigravity_keyring", fake_clear
             ), patch("execution_backend.antigravity_cli_v1.subprocess.Popen", fake_popen):
-                started = be.start_run(title="t", directory=str(Path(td) / "w"), instruction="hi")
+                started = fixture_start(be, title="t", directory=str(Path(td) / "w"), instruction="hi")
             self.assertFalse(started["ok"])
             self.assertEqual(seen["clear_locked"], [True, True])
             self.assertTrue(seen["popen_locked"])

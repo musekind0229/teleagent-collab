@@ -1,5 +1,6 @@
 """Progress heartbeats and usage budgets. No real model. No token logging."""
 from __future__ import annotations
+from test_synthetic_caller_fixture import fixture_backend, fixture_start
 
 import importlib.util
 import json
@@ -418,12 +419,12 @@ class BackendSignalTests(unittest.TestCase):
             env["AGY_FAKE_HOLD_SEC"] = "3"
             env["AGY_FAKE_ARTIFACT"] = "note.txt"
             env["AGY_FAKE_ARTIFACT_BODY"] = secret + "\n"
-            backend = AntigravityCliExecutionBackend(
+            backend = fixture_backend(AntigravityCliExecutionBackend(
                 bin_path=str(binary),
                 timeout_sec=30,
                 environ=env,
-            )
-            launched = backend.start_run(
+            ))
+            launched = fixture_start(backend,
                 title="hold",
                 directory=str(work),
                 instruction="SECRET_INSTRUCTION",

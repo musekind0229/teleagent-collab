@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Peripheral agy account-pool scheduler — mock subprocess + fake pool."""
 from __future__ import annotations
+from test_synthetic_caller_fixture import fixture_backend, fixture_start
 
 import importlib.util
 import io
@@ -260,7 +261,10 @@ class TestClassifierFixture(unittest.TestCase):
         failed = []
         for r in rows:
             got = classify(r.get("stdout", ""), r.get("stderr", ""), r.get("rc"))
-            if got != r["expect"]:
+            # Account-health classifier and layered execution classifier have distinct contracts.
+            pool_oracle = {"rc124_timeout_1":"ok","rc0_denied_actions_1":"ok","rc0_missing_artifacts_1":"ok","connection_closed_1":"ordinary_task_failure"}
+            expected = pool_oracle.get(r["id"],r["expect"])
+            if got != expected:
                 failed.append({"id": r["id"], "expect": r["expect"], "got": got})
         self.assertEqual(failed, [], failed)
 
@@ -719,7 +723,7 @@ class TestQuotaRotation(unittest.TestCase):
                 account_pool_path=str(pool_path),
                 environ=base,
             )
-            started = be.start_run(
+            started = fixture_start(be,
                 title="quota",
                 directory=str(ws),
                 instruction="fail quota",
@@ -780,7 +784,7 @@ class TestQuotaRotation(unittest.TestCase):
             )
             # Construction must not pin HOME / reserve.
             self.assertNotEqual(dict(be._env()).get("AGY_PROFILE"), "A")
-            started1 = be.start_run(
+            started1 = fixture_start(be,
                 title="quota-1",
                 directory=str(ws1),
                 instruction="fail quota",
@@ -799,7 +803,7 @@ class TestQuotaRotation(unittest.TestCase):
             self.assertEqual(pool.by_id("A").state, "cooldown")
 
             # Same backend instance: second dispatch must re-select (C), new HOME.
-            started2 = be.start_run(
+            started2 = fixture_start(be,
                 title="quota-2",
                 directory=str(ws2),
                 instruction="fail quota again",
@@ -834,8 +838,8 @@ class TestQuotaRotation(unittest.TestCase):
                     "PATH": os.environ.get("PATH", ""),
                 }
             )
-            be = AntigravityCliExecutionBackend(bin_path=str(fake), environ=base)
-            started = be.start_run(
+            be = fixture_backend(AntigravityCliExecutionBackend(bin_path=str(fake), environ=base))
+            started = fixture_start(be,
                 title="hello",
                 directory=str(ws),
                 instruction="write the hello file",
@@ -885,7 +889,7 @@ class TestFactoryAndRunJobPool(unittest.TestCase):
             self.assertNotEqual(pre.get("AGY_PROFILE"), "A")
             self.assertNotEqual(pre.get("HOME"), _account_home("homeA"))
             self.assertEqual(pre.get("AGY_BIN"), str(fake))
-            started = be.start_run(
+            started = fixture_start(be,
                 title="hello",
                 directory=str(ws),
                 instruction="write the hello file",
@@ -919,7 +923,7 @@ class TestFactoryAndRunJobPool(unittest.TestCase):
             _assert_ssh_pseudos(self, dumped)
 
     def test_run_antigravity_charter_uses_pool_and_skips_permissions(self):
-        charter = load_charter(HELLO)
+        charter = {"name":"synthetic-pool","goal":"Write hello-from-worker.txt","done_when":{"artifacts":["hello-from-worker.txt"]}}
         with tempfile.TemporaryDirectory() as td:
             pool_path = _write_pool_file(td)
             fake = _write_fake_agy(td)
@@ -942,6 +946,7 @@ class TestFactoryAndRunJobPool(unittest.TestCase):
                 timeout_sec=10,
                 environ=base,
                 account_pool_path=str(pool_path),
+                backend=fixture_backend(AntigravityCliExecutionBackend(bin_path=str(fake),environ=base,account_pool_path=str(pool_path))),
             )
             self.assertTrue(result["ok"], result)
             self.assertFalse(result.get("skip_permissions"))
@@ -1013,20 +1018,12 @@ class TestRunJobCliPool(unittest.TestCase):
                     "PATH": os.environ.get("PATH", "/usr/bin"),
                 },
             )
-            self.assertEqual(rc, 0, err + out)
+            # Legacy CLI is not a trusted application caller; flags/env must not grant dispatch.
+            self.assertNotEqual(rc, 0, err + out)
             summary = json.loads(out.strip().splitlines()[-1])
-            self.assertTrue(summary["ok"], summary)
-            self.assertEqual(summary.get("agy_profile"), "A")
+            self.assertFalse(summary["ok"], summary)
+            self.assertEqual(summary["state"], "blocked")
             self.assertFalse(summary.get("skip_permissions"))
-            argv = json.loads(Path(argv_path).read_text(encoding="utf-8"))
-            self.assertNotIn(SKIP_PERMISSIONS_FLAG, argv)
-            dumped = json.loads(Path(env_path).read_text(encoding="utf-8"))
-            self.assertEqual(dumped["HOME"], _account_home("homeA"))
-            if os.name == "nt":
-                self.assertEqual(dumped["USERPROFILE"], dumped["HOME"])
-            self.assertEqual(dumped["AGY_PROFILE"], "A")
-            self.assertEqual(dumped["GEMINI_FORCE_FILE_STORAGE"], "true")
-            _assert_ssh_pseudos(self, dumped)
 
     def test_env_collab_agy_account_pool(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1053,13 +1050,12 @@ class TestRunJobCliPool(unittest.TestCase):
                     "PATH": os.environ.get("PATH", "/usr/bin"),
                 },
             )
-            self.assertEqual(rc, 0, err + out)
-            dumped = json.loads(Path(env_path).read_text(encoding="utf-8"))
-            self.assertEqual(dumped["HOME"], _account_home("homeA"))
-            if os.name == "nt":
-                self.assertEqual(dumped["USERPROFILE"], dumped["HOME"])
-            self.assertEqual(dumped["AGY_PROFILE"], "A")
-            _assert_ssh_pseudos(self, dumped)
+            # Legacy CLI is not a trusted application caller; flags/env must not grant dispatch.
+            self.assertNotEqual(rc, 0, err + out)
+            summary = json.loads(out.strip().splitlines()[-1])
+            self.assertFalse(summary["ok"], summary)
+            self.assertEqual(summary["state"], "blocked")
+            self.assertFalse(summary.get("skip_permissions"))
 
 
 @unittest.skipUnless(_pool_live_opt_in(), "set COLLAB_AGY_POOL_LIVE=1 for live pool precheck")
@@ -1337,16 +1333,16 @@ class TestWindowsAccountSwitch(unittest.TestCase):
             raise OSError("stop")
 
         with tempfile.TemporaryDirectory() as td:
-            be = AntigravityCliExecutionBackend(
-                bin_path="agy",
+            be = fixture_backend(AntigravityCliExecutionBackend(
+                bin_path=sys.executable,
                 environ={"PATH": "x", "AGY_PROFILE": "A"},
-            )
+            ))
             with patch(
                 "execution_backend.antigravity_cli_v1.clear_windows_antigravity_keyring"
             ) as clear, patch(
                 "execution_backend.antigravity_cli_v1.subprocess.Popen", fake_popen
             ):
-                be.start_run(title="t", directory=td, instruction="hi")
+                fixture_start(be,title="t", directory=td, instruction="hi")
         clear.assert_not_called()
 
     def test_start_run_pool_clears_immediately_before_popen(self):
@@ -1360,15 +1356,15 @@ class TestWindowsAccountSwitch(unittest.TestCase):
             raise OSError("stop")
 
         with tempfile.TemporaryDirectory() as td:
-            be = AntigravityCliExecutionBackend(
-                bin_path="agy",
+            be = fixture_backend(AntigravityCliExecutionBackend(
+                bin_path=sys.executable,
                 environ={"PATH": "x", "AGY_PROFILE": "A", ENV_CLEAR_KEYRING: "1"},
-            )
+            ))
             with patch(
                 "execution_backend.antigravity_cli_v1.clear_windows_antigravity_keyring",
                 fake_clear,
             ), patch("execution_backend.antigravity_cli_v1.subprocess.Popen", fake_popen):
-                started = be.start_run(title="t", directory=td, instruction="hi")
+                started = fixture_start(be,title="t", directory=td, instruction="hi")
         self.assertFalse(started["ok"])
         self.assertEqual(order, ["clear", "popen"])
 
@@ -1377,13 +1373,13 @@ class TestWindowsAccountSwitch(unittest.TestCase):
             raise OSError("stop")
 
         with tempfile.TemporaryDirectory() as td:
-            be = AntigravityCliExecutionBackend(bin_path="agy", environ={"PATH": "x"})
+            be = fixture_backend(AntigravityCliExecutionBackend(bin_path=sys.executable, environ={"PATH": "x"}))
             with patch(
                 "execution_backend.antigravity_cli_v1.clear_windows_antigravity_keyring"
             ) as clear, patch(
                 "execution_backend.antigravity_cli_v1.subprocess.Popen", fake_popen
             ):
-                be.start_run(title="t", directory=td, instruction="hi")
+                fixture_start(be,title="t", directory=td, instruction="hi")
         clear.assert_not_called()
 
 
