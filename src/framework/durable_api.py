@@ -22,6 +22,7 @@ Public kernel path only. No TeleAgent HTTP. No Hermes ledger. No glue rewrite.
 """
 from __future__ import annotations
 
+import copy
 import json
 import threading
 import time
@@ -1478,6 +1479,8 @@ class DurableLayer(ContinuityStore):
                     "error": f"task already bound to run_id {existing!r}",
                 }
             found["run_id"] = rid
+            if found.get("dispatch_block"):
+                found.setdefault("dispatch_history", []).append(found.pop("dispatch_block"))
             handle = _norm_key(native_handle)
             if handle:
                 found["native_handle"] = handle
@@ -1828,6 +1831,7 @@ class DurableLayer(ContinuityStore):
         *,
         feedback: Mapping[str, Any],
         review: Mapping[str, Any] | None = None,
+        prior_result: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Lead review failed: running → review → queued, count one rework.
 
@@ -1854,6 +1858,13 @@ class DurableLayer(ContinuityStore):
             except LifecycleError as e:
                 return {"ok": False, "reason": REASON_ILLEGAL_STATE, "error": str(e)}
             prior_run = _norm_key(found.get("run_id") or "")
+            # Archive collected evidence BEFORE clearing a run for re-dispatch.
+            # The next start_run may refuse; that is not a new business verdict.
+            if isinstance(prior_result, Mapping):
+                found["result"] = copy.deepcopy(dict(prior_result))
+            if isinstance(found.get("result"), Mapping):
+                archived = copy.deepcopy({k: v for k, v in found.items() if k != "attempt_history"})
+                found.setdefault("attempt_history", []).append(archived)
             _close_open_phase(found, "rework", detail=str(feedback.get("reason") or "")[:300])
             found["status"] = "queued"
             for key in ("run_id", "native_handle", "blocked_on_decision", "progress", "run_started_at", "dispatch_claim"):
@@ -1866,7 +1877,8 @@ class DurableLayer(ContinuityStore):
             if isinstance(review, Mapping):
                 reviews.append({**dict(review), "run_id": prior_run})
             found["review_history"] = reviews
-            found["result"] = None
+            # Keep the last collected result visible until a NEW result exists.
+            # dispatch_block, not result, records a refusal to start the next run.
             snap["tasks"] = tasks
             self._append_history(
                 snap,

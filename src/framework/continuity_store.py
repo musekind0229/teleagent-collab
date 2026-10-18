@@ -16,8 +16,8 @@ class ContinuityStore:
    if prior:return {'ok':True,'goal_id':gid,'decision':dict(prior),'duplicate':True}
    category='checkpoint'
    lower=str(reason).lower()
-   if any(word in lower for word in ('resource exhausted','checkpoint reached','time checkpoint','package limit','plan_infeasible')):category='escalate_over_budget'
-   elif any(word in lower for word in ('permission','authorization','not_authorized')):category='escalate_insufficient_auth'
+   if any(word in lower for word in ('resource exhausted','checkpoint reached','time checkpoint','package limit','plan_infeasible','quota','budget exhausted')):category='escalate_over_budget'
+   elif any(word in lower for word in ('permission','authorization','authentication','credential','login','not_authorized')):category='escalate_insufficient_auth'
    d={'decision_id':'continuity_'+uuid.uuid4().hex,'kind':category,'task_id':task_id,'reason':reason,'return_to_upper':True,'continuity':True,'status':'pending'}
    previous_state=s.get('state');s['state']='blocked';s['continuity_state']='awaiting_authorized_owner'
    s.setdefault('pending_decisions',[]).append(d);self._append_history(s,'continuity_block',prior_goal_state=previous_state,**d);self._touch(s);self._persist_unlocked();return {'ok':True,'goal_id':gid,'state':'awaiting_owner','decision':dict(d)}

@@ -3107,7 +3107,7 @@ class AppCoordinator:
                 launched = {"ok": False, "error": "backend dispatch failed: bad result"}
             run_id = str(launched.get("run_id") or launched.get("native_handle") or "")
             if not launched.get("ok") or not run_id:
-                return self._fail_task(goal_id, task_id, dict(launched))
+                return self._fail_task(goal_id, task_id, {**dict(launched), "failure_phase": "dispatch"})
             bound = self.layer.bind_task_run(
                 goal_id,
                 task_id,
@@ -3362,7 +3362,11 @@ class AppCoordinator:
             )
             review["usage"] = out.get("usage")
             review["restored"] = restore["restored"]
-            requeued = self.layer.requeue_for_rework(goal_id, task_id, feedback=feedback, review=review)
+            out["ok"] = False
+            out["native_result"] = copy.deepcopy(dict(result))
+            out["review"] = review
+            out["review_history"] = history + [review]
+            requeued = self.layer.requeue_for_rework(goal_id, task_id, feedback=feedback, review=review, prior_result=out)
             if requeued.get("ok"):
                 return {
                     "ok": True,

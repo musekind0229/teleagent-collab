@@ -74,6 +74,137 @@ class Native(AntigravityCliExecutionBackend):
 
 class ContinuityCoordinator(AppCoordinator):
  continuity_enabled=True
+
+ def _settled_run(self, snap, task):
+  """A collected/archived run is never collected or judged a second time."""
+  gid=snap.get('goal_id');rid=str(task.get('run_id')or'')
+  if not rid:return None
+  live=self.layer.get_goal(gid)['goal'];current=next((t for t in live.get('tasks',[])if t['task_id']==task['task_id']),{})
+  archived=any(str(t.get('run_id')or'')==rid for t in current.get('attempt_history',[]))
+  if archived or str(current.get('run_id')or'')!=rid or current.get('status')not in ('running','review'):
+   return {'ok':True,'goal_id':gid,'task_id':task['task_id'],'state':live['state'],'action':'stale_terminal_ignored','idempotent':True}
+  return None
+
+ def _after_observe(self,snap,task,observation,*,observe_error):
+  settled=self._settled_run(snap,task)
+  if settled is not None:return settled
+  if observation.get('state')=='unknown' or (observation.get('ok')is False and observation.get('busy')is not True):
+   return {'ok':True,'goal_id':snap['goal_id'],'state':'running','action':'observation_unknown','redispatch':False}
+  return super()._after_observe(snap,task,observation,observe_error=observe_error)
+
+ def _finish_gated(self,snap,task,result):
+  settled=self._settled_run(snap,task)
+  if settled is not None:return settled
+  if isinstance(result,dict)and str(result.get('error')or'').startswith(('backend resume failed','backend observe failed','backend observation failed')):
+   # An observation failure is NOT proof that the native process exited.
+   # Keep its running slot/run binding; owner continuation must not respawn it.
+   return self.layer.continuity_block(snap['goal_id'],reason='Unknown native execution; preserve running owner/run and do not redispatch: '+str(result['error']))
+  return super()._finish_gated(snap,task,result)
+
+ def _park_failure(self,snap,task,result,reason):
+  gid=snap['goal_id'];tid=task['task_id']
+  # Dispatch admission is not a replacement for a collected native/lead result.
+  if result.get('failure_phase')=='dispatch':
+   live=self.layer.get_goal(gid)['goal'];current=next(t for t in live['tasks']if t['task_id']==tid)
+   stored=current.get('result')or result
+  else:stored=result
+  self._phase(gid,task_id=tid,outcome='checkpoint',detail=reason)
+  self.layer.finish_task(gid,tid,succeeded=False,close_goal=False,result=stored)
+  return self.layer.continuity_block(gid,task_id=tid,reason=reason)
+
+ def _triage_failure(self,snap,task,result):
+  """Execution diagnosis by the EXISTING lead, never an empty code review.
+
+  review/fail means 'bounded requeue with reason'; pass cannot turn a failed
+  native run into success. Auth/budget/no-verdict/unknown stay owner-owned.
+  """
+  import hashlib,json,re
+  gid=snap['goal_id'];tid=task['task_id'];error=str(result.get('error')or'Worker execution failed')
+  def park(reason):return self._park_failure(snap,task,result,reason)
+  lower=error.lower()
+  review=result.get('review')or{}
+  if (result.get('need_human') or result.get('review_timeout') or result.get('review_no_verdict') or result.get('material_blocked') or review.get('status')not in (None,'not_requested','unsupported','not_available')):
+   return park(error)
+  if any(x in lower for x in ('auth','permission','credential','login','quota','resource exhausted','checkpoint','package limit','not_authorized','denied')):
+   return park(error)
+  if result.get('state')in ('unknown','running','starting') or result.get('busy')is True:
+   return park('Execution state unknown or busy; no redispatch: '+error)
+  status=self.backend._trusted_dispatch_hook.status(gid);package=status['active']
+  if not package:return park('Explicit resource package required')
+  resource=package['resource']
+  if time.time()>=resource['checkpoint_epoch']:return park('Resource time checkpoint reached')
+  for kind in ('native','lead'):
+   used=sum(c['kind']==kind and c['state']!='no_spawn'for c in package['claims'])
+   if used>=resource[kind+'_limit']:return park('resource exhausted: '+kind+'; original failure: '+error)
+  rounds=int(task.get('rework_count')or 0);limit=int(snap['goal'].get('budget',{}).get('max_reworks',1))
+  if rounds>=limit:return park('rework budget exhausted; original failure: '+error)
+  decider=getattr(self.planner,'decide_action',None)
+  if not callable(decider):return park('Current lead cannot diagnose execution failure: '+error)
+  # Stable code + content evidence, not new run ids/mtime or a new lead reason.
+  def stable(v):
+   text=str(v).replace(str(result.get('workspace')or'\x00'),'<workspace>')
+   text=re.sub(r'\b[0-9a-f]{8,}\b','<id>',text,flags=re.I)
+   return re.sub(r'\d+','<n>',text)
+  category=stable(result.get('failure_reason')or result.get('code')or error)
+  evidence={k:stable(result.get(k,''))for k in ('response','stdout','stderr','native_status')}
+  work=Path(self._trusted_workspace_text(task)or self.workspaces_root/gid/tid)
+  files={}
+  for name in task.get('expected_artifacts',[]):
+   p=(work/name).resolve()
+   if p.is_relative_to(work.resolve()):
+    try:
+     if p.is_file():files[name]=hashlib.sha256(p.read_bytes()).hexdigest()if p.stat().st_size<=2_000_000 else 'unknown:artifact_over_evidence_limit'
+    except OSError:files[name]='unknown:artifact_unreadable'
+  evidence['artifact_hashes']=files
+  signature=hashlib.sha256(json.dumps({'category':category,'evidence':evidence},sort_keys=True).encode()).hexdigest()
+  with self.layer._rmw():
+   goal=self.layer.goals[gid];row=next(t for t in goal['tasks']if t['task_id']==tid)
+   history=row.setdefault('execution_failure_history',[])
+   replay=next((h for h in history if h['attempt']==str(task.get('run_id')or task.get('dispatch_claim')or'')and h.get('status')=='deciding'),None)
+   repeated=any(h['signature']==signature for h in history)
+   if not replay and not repeated:
+    history.append({'attempt':str(task.get('run_id')or task.get('dispatch_claim')or''),'signature':signature,'category':category,'status':'deciding','result':copy.deepcopy(result)})
+    self.layer._touch(goal);self.layer._persist_unlocked()
+  if replay:return park('Prior lead diagnosis interrupted/unknown; no equivalent paid retry: '+error)
+  if repeated:return park('Two same failures without new evidence; return to product owner: '+error)
+  action={'kind':'review','payload':{'execution_failure':True,'failure':copy.deepcopy(result),'failure_signature':signature,'resource_package':copy.deepcopy(package)},'review_hint':'Execution diagnosis ONLY, not code acceptance. fail with a concrete adjustment requests bounded native retry; blocked requests owner. pass MUST NOT accept a failed execution. No artifactless acceptance review.'}
+  try:
+   choice=decider(snap,task,action)
+  except Exception as exc:
+   with self.layer._rmw():
+    goal=self.layer.goals[gid];row=next(t for t in goal['tasks']if t['task_id']==tid)
+    row['execution_failure_history'][-1].update(status='unavailable',lead_error={'code':str(getattr(exc,'code',type(exc).__name__)),'message':str(exc)})
+    self.layer._touch(goal);self.layer._persist_unlocked()
+   return park('Lead execution diagnosis unavailable ['+str(getattr(exc,'code',type(exc).__name__))+']: '+str(exc))
+  with self.layer._rmw():
+   goal=self.layer.goals[gid];row=next(t for t in goal['tasks']if t['task_id']==tid)
+   row['execution_failure_history'][-1].update(status='decided',choice=copy.deepcopy(choice));self.layer._touch(goal);self.layer._persist_unlocked()
+  if not isinstance(choice,dict):return park('Lead returned invalid recovery decision; no equivalent retry')
+  reason=str(choice.get('reason')or'').strip()
+  if choice.get('verdict')!='fail' or not reason or choice.get('incomplete') or choice.get('review_status')=='review_blocked':
+   return park('Lead requests owner or returned no valid recovery decision: '+reason+'; '+error)
+  feedback={'reason':reason,'source':'lead_execution_diagnosis','failure_signature':signature,'prior_result':copy.deepcopy(result)}
+  queued=self.layer.requeue_for_rework(gid,tid,feedback=feedback,prior_result=result if result.get('failure_phase')!='dispatch' else task.get('result'))
+  if not queued.get('ok'):return park('Lead recovery could not be queued: '+str(queued))
+  return {'ok':True,'goal_id':gid,'task_id':tid,'state':'running','action':'execution_rework_queued'}
+
+ def _fail_task(self,goal_id,task_id,result):
+  gid,tid=goal_id,task_id
+  snap=self.layer.get_goal(gid)['goal'];task=next(t for t in snap['tasks']if t['task_id']==tid)
+  pre_dispatch=bool(task.get('dispatch_claim'))and not task.get('run_id')
+  if result.get('failure_phase')!='dispatch'and not pre_dispatch:return super()._fail_task(gid,tid,result)
+  result={**result,'failure_phase':'dispatch'}
+  with self.layer._rmw():
+   goal=self.layer.goals[gid];row=next(t for t in goal['tasks']if t['task_id']==tid)
+   row['dispatch_block']=copy.deepcopy(result);self.layer._touch(goal);self.layer._persist_unlocked()
+  snap=self.layer.get_goal(gid)['goal'];task=next(t for t in snap['tasks']if t['task_id']==tid)
+  return self._triage_failure(snap,task,result)
+
+ def _agy_post_run_review(self,snap,task,result):
+  if isinstance(result,dict)and not result.get('ok'):
+   return self._triage_failure(snap,task,result),result
+  return super()._agy_post_run_review(snap,task,result)
+
  def _budget_stop(self,gid):
   s=self.layer.get_goal(gid)['goal'];authority=self.backend._trusted_dispatch_hook;status=authority.status(gid);p=status['active']
   if not p:return self.layer.continuity_block(gid,reason='Explicit resource package required')
