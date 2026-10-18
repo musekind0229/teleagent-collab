@@ -31,7 +31,14 @@ from lead_adapter import (
     validate_lead_decision,
 )
 from lead_adapter.schema import format_lead_request_prompt
-from platform_services.cli import WRAPPER_INTERPRETER, prepare_cli
+from platform_services.cli import (
+    WRAPPER_DIRECT,
+    WRAPPER_INTERPRETER,
+    CliLaunchError,
+    LaunchSpec,
+    PlatformWrapperRequired,
+    prepare_cli,
+)
 
 SIMULATED = True
 WRAPPER = REPO / "bin" / "run-deepseek-lead.py"
@@ -387,6 +394,9 @@ class TestDeepSeekDecideSim(unittest.TestCase):
         self.assertIn("Do not use bash", wrapper)
         self.assertNotIn("api.deepseek.com", wrapper.lower())
         self.assertNotIn("--json", build_dsh_cmd_src(wrapper))
+        self.assertIn("prepare_cli", wrapper)
+        self.assertIn("CliLaunchError", wrapper)
+        self.assertIn("shell=False", wrapper)
 
 
 def build_dsh_cmd_src(wrapper_src: str) -> str:
@@ -514,6 +524,8 @@ class TestWrapperDshInvoke(unittest.TestCase):
             captured["cmd"] = cmd
             captured["input"] = kwargs.get("input")
             captured["cwd"] = kwargs.get("cwd")
+            captured["shell"] = kwargs.get("shell", False)
+            captured["env"] = kwargs.get("env")
             return _Proc(stdout=json.dumps(body), returncode=0)
 
         rc, stdout, stderr = self._run_main(
@@ -533,6 +545,9 @@ class TestWrapperDshInvoke(unittest.TestCase):
         self.assertIn("headless", captured["cmd"])
         self.assertNotIn("--json", captured["cmd"])
         self.assertIn("-", captured["cmd"])
+        self.assertEqual(captured["cmd"][-3:], ["--profile", "headless", "-"])
+        self.assertIs(captured["shell"], False)
+        self.assertIsInstance(captured["env"], dict)
         task = captured["input"] or ""
         self.assertIn("Do not use bash", task)
         self.assertIn(req["application_id"], task)
@@ -683,9 +698,9 @@ class TestWrapperDshInvoke(unittest.TestCase):
         """Real wrapper process against a fake dsh program (no API).
 
         Cross-platform: the fake is a plain .py with no shebang and no exec
-        bit, launched through prepare_cli with an explicit interpreter. The
-        resulting argv reaches the wrapper's own launch chain via
-        COLLAB_DEEPSEEK_HARNESS_BIN (shlex-quoted, so Windows paths survive).
+        bit. The test builds an explicit-interpreter argv via prepare_cli and
+        hands it to COLLAB_DEEPSEEK_HARNESS_BIN; the product wrapper then calls
+        prepare_cli again and spawns via spec.argv/cwd/env with shell=False.
         """
         req = _req("permission")
         body = _ok_permission(req)
@@ -729,6 +744,10 @@ class TestWrapperDshInvoke(unittest.TestCase):
             self.assertIn("--profile", argv)
             self.assertIn("headless", argv)
             self.assertNotIn("--json", argv)
+            # shell=False path: no cmd.exe splice; fake was the real program.
+            joined = " ".join(argv).lower()
+            self.assertNotIn("cmd.exe", joined)
+            self.assertNotIn("/c", argv)
             task = stdin_log.read_text(encoding="utf-8")
             self.assertIn("Do not use bash", task)
 
@@ -745,6 +764,157 @@ class TestWrapperDshInvoke(unittest.TestCase):
             self.assertEqual(proc2.returncode, 2)
             self.assertEqual((proc2.stdout or "").strip(), "")
             self.assertNotIn('"decision": "once"', proc2.stdout)
+
+    def test_invoke_dsh_calls_prepare_cli_and_uses_spec_fields(self):
+        """Unit: wrapper's invoke_dsh must call prepare_cli and spawn from spec."""
+        fake_spec = LaunchSpec(
+            argv=("/usr/bin/true", "--profile", "headless", "-"),
+            cwd="/tmp/collab-dsh-lead-unit",
+            env={"COLLAB_UNIT": "1", "PATH": os.environ.get("PATH", "")},
+            wrapper_kind=WRAPPER_DIRECT,
+        )
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            captured["kwargs"] = dict(kwargs)
+            return _Proc(stdout="{}", returncode=0)
+
+        with mock.patch.object(self.mod, "prepare_cli", return_value=fake_spec) as prep:
+            with mock.patch.object(self.mod.subprocess, "run", fake_run):
+                self.mod.invoke_dsh(
+                    ["/some/dsh", "--extra"],
+                    "task-body",
+                    timeout_sec=5.0,
+                )
+        prep.assert_called_once()
+        binary, args = prep.call_args[0][0], prep.call_args[0][1]
+        self.assertEqual(binary, "/some/dsh")
+        self.assertEqual(list(args), ["--extra", "--profile", "headless", "-"])
+        # Real invoke_dsh passes a TemporaryDirectory as cwd into prepare_cli.
+        called_cwd = prep.call_args.kwargs.get("cwd")
+        if called_cwd is None and len(prep.call_args) > 1:
+            called_cwd = prep.call_args[1].get("cwd")
+        self.assertIsInstance(called_cwd, str)
+        self.assertTrue(called_cwd)
+        # Spawn must use the LaunchSpec fields unchanged (not a different path).
+        self.assertEqual(captured["cmd"], list(fake_spec.argv))
+        self.assertEqual(captured["kwargs"]["cwd"], fake_spec.cwd)
+        self.assertEqual(captured["kwargs"]["env"], dict(fake_spec.env))
+        self.assertIs(captured["kwargs"]["shell"], False)
+        self.assertEqual(captured["kwargs"]["input"], "task-body")
+
+    def test_fake_dsh_path_with_spaces(self):
+        """Paths with spaces still launch via prepare_cli + shell=False."""
+        req = _req("permission")
+        body = _ok_permission(req)
+        with tempfile.TemporaryDirectory() as tmp:
+            spaced_dir = Path(tmp) / "dir with spaces"
+            spaced_dir.mkdir()
+            fake = spaced_dir / "fake dsh.py"
+            fake.write_text(_FAKE_DSH, encoding="utf-8")
+            if os.name == "posix":
+                fake.chmod(0o644)
+                self.assertFalse(os.access(fake, os.X_OK))
+            spec = prepare_cli(str(fake), [], interpreter=sys.executable)
+            self.assertEqual(spec.wrapper_kind, WRAPPER_INTERPRETER)
+            self.assertFalse(spec.shell)
+            harness_bin = shlex.join(spec.argv)
+            self.assertEqual(shlex.split(harness_bin), list(spec.argv))
+            argv_log = Path(tmp) / "argv.json"
+            stdin_log = Path(tmp) / "stdin.txt"
+            env = os.environ.copy()
+            env["COLLAB_DEEPSEEK_HARNESS_BIN"] = harness_bin
+            env["DEEPSEEK_API_KEY"] = "sk-test-not-real"
+            env["COLLAB_FAKE_DSH_STDOUT"] = json.dumps(body)
+            env["COLLAB_FAKE_DSH_EXIT"] = "0"
+            env["COLLAB_FAKE_DSH_ARGV"] = str(argv_log)
+            env["COLLAB_FAKE_DSH_STDIN"] = str(stdin_log)
+            proc = subprocess.run(
+                [sys.executable, str(WRAPPER)],
+                input=json.dumps(_envelope(req, "permission")),
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=env,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            parsed = json.loads(proc.stdout)
+            self.assertEqual(parsed["decision"], "once")
+            argv = json.loads(argv_log.read_text(encoding="utf-8"))
+            self.assertEqual(Path(argv[0]).name, "fake dsh.py")
+            self.assertEqual(argv[1:], ["--profile", "headless", "-"])
+            self.assertNotIn("--json", argv)
+            self.assertNotIn("cmd.exe", " ".join(argv).lower())
+            task = stdin_log.read_text(encoding="utf-8")
+            self.assertIn("Do not use bash", task)
+
+    def test_cli_launch_error_maps_to_fail_closed(self):
+        """CliLaunchError / PlatformWrapperRequired from prepare_cli → rc 2."""
+        req = _req("permission")
+
+        def boom(*_a, **_k):
+            raise PlatformWrapperRequired(
+                "'foo.cmd' is a .cmd/.bat; needs platform_services.windows_cli wrapper"
+            )
+
+        with mock.patch.object(self.mod, "prepare_cli", side_effect=boom):
+            rc, stdout, stderr = self._run_main(
+                _envelope(req, "permission"),
+                lambda *_a, **_k: _Proc(stdout=json.dumps(_ok_permission(req)), returncode=0),
+                {
+                    "COLLAB_DEEPSEEK_HARNESS_BIN": "/usr/bin/true",
+                    "DEEPSEEK_API_KEY": "sk-test-not-real",
+                },
+            )
+        self.assertEqual(rc, 2)
+        self.assertEqual((stdout or "").strip(), "")
+        self.assertNotIn('"decision":"once"', stdout.replace(" ", ""))
+        self.assertNotIn('"decision": "once"', stdout)
+        self.assertIn("launch prepare failed", stderr)
+
+    def test_prepare_cli_win32_cmd_bat_require_wrapper(self):
+        """Without cmd_wrapper, win32 .cmd/.bat raise PlatformWrapperRequired."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("foo.cmd", "bar.bat"):
+                stub = Path(tmp) / name
+                stub.write_text("@echo off\n", encoding="utf-8")
+                with self.assertRaises(PlatformWrapperRequired) as cm:
+                    prepare_cli(str(stub), ["--profile", "headless", "-"], platform="win32")
+                self.assertIsInstance(cm.exception, CliLaunchError)
+                self.assertIn(name.split(".")[-1], str(cm.exception).lower())
+
+    def test_prepare_cli_win32_ps1_rejected_without_interpreter(self):
+        """.ps1 on win32 is rejected (not CmdWrapper scope); no PowerShell support."""
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = Path(tmp) / "foo.ps1"
+            stub.write_text("# noop\n", encoding="utf-8")
+            with self.assertRaises(CliLaunchError) as cm:
+                prepare_cli(str(stub), [], platform="win32")
+            self.assertNotIsInstance(cm.exception, PlatformWrapperRequired)
+            msg = str(cm.exception).lower()
+            self.assertTrue("not .exe" in msg or "interpreter" in msg)
+
+    def test_main_maps_ps1_cli_launch_error_to_fail(self):
+        """main() maps a .ps1-style CliLaunchError to rc 2 / empty stdout."""
+        req = _req("permission")
+
+        def boom(*_a, **_k):
+            raise CliLaunchError("'/tmp/foo.ps1' is not .exe; pass an explicit interpreter")
+
+        with mock.patch.object(self.mod, "prepare_cli", side_effect=boom):
+            rc, stdout, stderr = self._run_main(
+                _envelope(req, "permission"),
+                lambda *_a, **_k: _Proc(returncode=0),
+                {
+                    "COLLAB_DEEPSEEK_HARNESS_BIN": "/usr/bin/true",
+                    "DEEPSEEK_API_KEY": "sk-test-not-real",
+                },
+            )
+        self.assertEqual(rc, 2)
+        self.assertEqual((stdout or "").strip(), "")
+        self.assertNotIn('"decision": "once"', stdout)
+        self.assertIn("launch prepare failed", stderr)
 
 
 @unittest.skipUnless(
