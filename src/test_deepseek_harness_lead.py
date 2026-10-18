@@ -432,7 +432,7 @@ class TestExampleWrapperFailClosed(unittest.TestCase):
     def test_wrapper_missing_key_does_not_invent_once(self):
         req = _req("review")
         env = _fail_closed_env()
-        env["COLLAB_DEEPSEEK_HARNESS_BIN"] = "/usr/bin/true"
+        env["COLLAB_DEEPSEEK_HARNESS_BIN"] = sys.executable
         proc = subprocess.run(
             [sys.executable, str(WRAPPER)],
             input=json.dumps({"request": req}),
@@ -532,7 +532,7 @@ class TestWrapperDshInvoke(unittest.TestCase):
             _envelope(req, "permission"),
             fake_run,
             {
-                "COLLAB_DEEPSEEK_HARNESS_BIN": "/usr/bin/true",
+                "COLLAB_DEEPSEEK_HARNESS_BIN": sys.executable,
                 "DEEPSEEK_API_KEY": "sk-test-not-real",
             },
         )
@@ -566,7 +566,7 @@ class TestWrapperDshInvoke(unittest.TestCase):
             _envelope(req, "review"),
             fake_run,
             {
-                "COLLAB_DEEPSEEK_HARNESS_BIN": "/usr/bin/true",
+                "COLLAB_DEEPSEEK_HARNESS_BIN": sys.executable,
                 "DEEPSEEK_API_KEY": "sk-test-not-real",
             },
         )
@@ -586,7 +586,7 @@ class TestWrapperDshInvoke(unittest.TestCase):
             _envelope(req, "permission"),
             fake_run,
             {
-                "COLLAB_DEEPSEEK_HARNESS_BIN": "/usr/bin/true",
+                "COLLAB_DEEPSEEK_HARNESS_BIN": sys.executable,
                 "DEEPSEEK_API_KEY": "sk-test-not-real",
             },
         )
@@ -605,7 +605,7 @@ class TestWrapperDshInvoke(unittest.TestCase):
             _envelope(req, "permission"),
             fake_run,
             {
-                "COLLAB_DEEPSEEK_HARNESS_BIN": "/usr/bin/true",
+                "COLLAB_DEEPSEEK_HARNESS_BIN": sys.executable,
                 "DEEPSEEK_API_KEY": "sk-test-not-real",
             },
         )
@@ -630,7 +630,7 @@ class TestWrapperDshInvoke(unittest.TestCase):
             _envelope(req, "permission"),
             fake_run,
             {
-                "COLLAB_DEEPSEEK_HARNESS_BIN": "/usr/bin/true",
+                "COLLAB_DEEPSEEK_HARNESS_BIN": sys.executable,
                 "DEEPSEEK_API_KEY": "sk-test-not-real",
             },
         )
@@ -650,7 +650,7 @@ class TestWrapperDshInvoke(unittest.TestCase):
             _envelope(req, "permission"),
             fake_run,
             {
-                "COLLAB_DEEPSEEK_HARNESS_BIN": "/usr/bin/true",
+                "COLLAB_DEEPSEEK_HARNESS_BIN": sys.executable,
                 "DEEPSEEK_API_KEY": "sk-test-not-real",
             },
         )
@@ -768,7 +768,7 @@ class TestWrapperDshInvoke(unittest.TestCase):
     def test_invoke_dsh_calls_prepare_cli_and_uses_spec_fields(self):
         """Unit: wrapper's invoke_dsh must call prepare_cli and spawn from spec."""
         fake_spec = LaunchSpec(
-            argv=("/usr/bin/true", "--profile", "headless", "-"),
+            argv=(sys.executable, "--profile", "headless", "-"),
             cwd="/tmp/collab-dsh-lead-unit",
             env={"COLLAB_UNIT": "1", "PATH": os.environ.get("PATH", "")},
             wrapper_kind=WRAPPER_DIRECT,
@@ -863,7 +863,7 @@ class TestWrapperDshInvoke(unittest.TestCase):
                 _envelope(req, "permission"),
                 lambda *_a, **_k: _Proc(stdout=json.dumps(_ok_permission(req)), returncode=0),
                 {
-                    "COLLAB_DEEPSEEK_HARNESS_BIN": "/usr/bin/true",
+                    "COLLAB_DEEPSEEK_HARNESS_BIN": sys.executable,
                     "DEEPSEEK_API_KEY": "sk-test-not-real",
                 },
             )
@@ -907,7 +907,7 @@ class TestWrapperDshInvoke(unittest.TestCase):
                 _envelope(req, "permission"),
                 lambda *_a, **_k: _Proc(returncode=0),
                 {
-                    "COLLAB_DEEPSEEK_HARNESS_BIN": "/usr/bin/true",
+                    "COLLAB_DEEPSEEK_HARNESS_BIN": sys.executable,
                     "DEEPSEEK_API_KEY": "sk-test-not-real",
                 },
             )

@@ -46,3 +46,10 @@ Explicit Python argv prefix remains a valid path. This slice does **not** claim
 - src discover: 1084 OK (skipped=7).
 - tests discover: 138 OK (skipped=1).
 - Run with `PYTHONPATH=.:src`.
+
+## Follow-up (a19)
+Hermes Windows re-verify of 9cd7f0c found two new module failures caused by
+hard-coded `/usr/bin/true` preflight fixtures (resolve_harness_bin returned
+missing on Windows before CliLaunchError mapping ran). Product probe 3/3
+passed. Fixtures now use `sys.executable` (cross-platform) in
+`src/test_deepseek_harness_lead.py` only; product code unchanged.
