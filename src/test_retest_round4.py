@@ -14,6 +14,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from test_synthetic_caller_fixture import fixture_start
 from framework.app_service import CollabApplication, LeadAdapterPlanner
 from test_app_service import _AsyncBackend, _request
 
@@ -248,7 +249,7 @@ class SessionAttributionTests(unittest.TestCase):
             root = Path(td)
             be, home, patch = _agy_backend(root)
             with patch:
-                run = be.start_run(title="t", directory=str(root / "ws"), instruction="SLEEP[8]")
+                run = fixture_start(be, title="t", directory=str(root / "ws"), instruction="SLEEP[8]")
                 try:
                     time.sleep(0.3)
                     other = _other_writer(root, home, "hold", 4)
@@ -271,8 +272,8 @@ class SessionAttributionTests(unittest.TestCase):
             be, home, patch = _agy_backend(root)
             be._session.fd_scan = False  # Windows / no /proc
             with patch:
-                a = be.start_run(title="a", directory=str(root / "wa"), instruction="SLEEP[8]")
-                b = be.start_run(title="b", directory=str(root / "wb"), instruction="SLEEP[8]")
+                a = fixture_start(be, title="a", directory=str(root / "wa"), instruction="SLEEP[8]")
+                b = fixture_start(be, title="b", directory=str(root / "wb"), instruction="SLEEP[8]")
                 try:
                     time.sleep(0.3)
                     other = _other_writer(root, home, "nohold", 4)
@@ -295,7 +296,7 @@ class SessionAttributionTests(unittest.TestCase):
             root = Path(td)
             be, _home, patch = _agy_backend(root)
             with patch:
-                run = be.start_run(title="t", directory=str(root / "ws"), instruction="HOLD[20]")
+                run = fixture_start(be, title="t", directory=str(root / "ws"), instruction="HOLD[20]")
                 try:
                     time.sleep(2.5)
                     observed_at = time.time()
