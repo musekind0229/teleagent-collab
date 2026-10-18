@@ -25,7 +25,13 @@ class Tests(unittest.TestCase):
   self.assertEqual(backend.timeout_sec,300)
   with patch.object(AntigravityCliExecutionBackend,'start_run',return_value={})as start:
    backend.start_run(title='synthetic',directory=str(ROOT),charter={'timeout_sec':5400})
-  self.assertEqual(start.call_args.kwargs['charter']['timeout_sec'],300)
+  self.assertEqual(start.call_args.kwargs['charter']['timeout_sec'],5400)
+ def test_explicit_cap_never_extends_shorter_caller_deadline(self):
+  backend=Native(object(),'never-execute',native_timeout_sec=900)
+  for prior,expected in ((30,30),(.25,.25),(5400,900),(None,900)):
+   with self.subTest(prior=prior),patch.object(AntigravityCliExecutionBackend,'start_run',return_value={})as start:
+    backend.start_run(title='synthetic',directory=str(ROOT),charter={'timeout_sec':prior})
+    self.assertEqual(start.call_args.kwargs['charter']['timeout_sec'],expected)
  def test_cli_accepts_finite_fractional_and_rejects_invalid(self):
   spec=importlib.util.spec_from_file_location('goal_entry_deadline',ROOT/'bin/goal-entry.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
   # argparse must validate before service construction or state writes.
@@ -59,10 +65,20 @@ class Tests(unittest.TestCase):
   with tempfile.TemporaryDirectory(dir=ROOT)as td,patch('subprocess.Popen',side_effect=AssertionError('NO SPAWN')):
    service=goal_service.GoalService(Path(td),lead_bin='never-execute',native_bin=sys.executable,native_timeout_sec=900)
    try:
+    import time
+    app=service.app
+    with patch('framework.app_service.read_git_head',return_value='synthetic'),patch('framework.app_service.process_start_tip',return_value='synthetic'):
+     gid=app.submit({'idempotency_key':'deadline','title':'Synthetic','goal':'synthetic only','acceptance':{'artifacts':['RESULT.md']}})['goal_id']
+    now=time.time()
+    def grant(key,window):return {'goal_id':gid,'grant_id':key,'reason':'synthetic explicit','resource':{'package_id':key,'native_limit':1,'lead_limit':1,'original_epoch':now,'checkpoint_epoch':now+window}}
+    app.layer.continuity_authorize(gid,decision_id='',grant=grant('first',5400),trusted=True)
+    blocked=app.layer.continuity_block(gid,reason='synthetic owner checkpoint')
+    app.layer.continuity_authorize(gid,decision_id=blocked['decision']['decision_id'],grant=grant('second',6000),trusted=True)
     self.assertEqual(service.native_timeout_sec,900)
     self.assertEqual(service.app.coordinator.backend.native_timeout_sec,900)
     self.assertFalse(service.server.released)
-    self.assertEqual(service.app.layer.list_goals()['goals'],[])
+    self.assertEqual(app.layer.get_goal(gid)['goal']['resource_packages']['first']['resource']['checkpoint_epoch'],now+5400)
+    self.assertEqual(app.layer.get_goal(gid)['goal']['resource_packages']['second']['resource']['checkpoint_epoch'],now+6000)
    finally:service.server.server_close()
 
 if __name__=='__main__':unittest.main(verbosity=2)

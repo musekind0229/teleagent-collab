@@ -63,16 +63,19 @@ class Lead:
   req.setdefault('extra',{})['continuation_context']={'latest_grants':snapshot.get('continuation_grants',[])[-3:],'resolved_decisions':snapshot.get('resolved_decisions',[])[-3:],'rule':'use owner reason/evidence to adjust; ordinary follow-up does not erase prior failure or consume a new planning goal'}
   with trusted_spawn_admission(self.authority,b):return self.adapter.decide(req,**kwargs)
 class Native(AntigravityCliExecutionBackend):
- def __init__(self,authority,bin_path,*,task_permissions=False,native_timeout_sec=300.0):
-  self.native_timeout_sec=native_timeout(native_timeout_sec)
+ def __init__(self,authority,bin_path,*,task_permissions=False,native_timeout_sec=None):
+  self.native_timeout_sec=None if native_timeout_sec is None else native_timeout(native_timeout_sec)
   super().__init__(bin_path=bin_path,timeout_sec=self.native_timeout_sec);self._trusted_dispatch_hook=authority
   if task_permissions:
    self.configure_caller_permissions(allowed_operations=['read','write','command'],native_mode='skip_permissions');env=dict(self._base_env());env['AGY_AUTO_APPROVE']='1';self._base_environ=env;self._environ=dict(env)
  def start_run(self,*,title,directory,instruction='',artifacts=None,charter=None,caller_task_id=None):
   # Render, contract hash and the backend deadline must all see the SAME
   # per-run value, never the whole-goal wall/checkpoint allowance.
+  if self.native_timeout_sec is None:
+   return super().start_run(title=title,directory=directory,instruction=instruction,artifacts=artifacts,charter=charter,caller_task_id=caller_task_id)
   bounded=copy.deepcopy(charter)if isinstance(charter,dict)else{}
-  bounded['timeout_sec']=self.native_timeout_sec
+  prior=bounded.get('timeout_sec')
+  bounded['timeout_sec']=self.native_timeout_sec if prior is None else min(native_timeout(prior),self.native_timeout_sec)
   return super().start_run(title=title,directory=directory,instruction=instruction,artifacts=artifacts,charter=bounded,caller_task_id=caller_task_id)
  def authorize_caller_task(self,**kwargs):
   root=Path(kwargs['directory'])
@@ -252,8 +255,8 @@ class Handler(_Handler):
   return super().do_POST()
 
 class GoalService:
- def __init__(self,root,*,lead_bin='grok',native_bin='agy',release=False,task_permissions=False,test_factory=None,planning_timeout_sec=180.0,lead_max_turns=1,native_timeout_sec=300.0):
-  self.native_timeout_sec=native_timeout(native_timeout_sec)
+ def __init__(self,root,*,lead_bin='grok',native_bin='agy',release=False,task_permissions=False,test_factory=None,planning_timeout_sec=180.0,lead_max_turns=1,native_timeout_sec=None):
+  self.native_timeout_sec=None if native_timeout_sec is None else native_timeout(native_timeout_sec)
   self.lead_max_turns=validate_lead_max_turns(lead_max_turns)
   self.planning_timeout_sec=planning_timeout(planning_timeout_sec)
   self.root=Path(root);self.app=CollabApplication(self.root);self.authority=ResourceAuthority(self.app.layer)
