@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import stat
 import subprocess
@@ -209,10 +210,14 @@ def _other_writer(root: Path, home: Path, mode: str, secs: float) -> subprocess.
     return subprocess.Popen([sys.executable, str(script), str(home), mode, str(secs)])
 
 
-def _age(prog) -> float:
+def _hb_epoch(prog) -> float:
     from framework.progress_budget import parse_iso
 
-    return time.time() - parse_iso(prog["last_heartbeat_at"])
+    return parse_iso(prog["last_heartbeat_at"])
+
+
+def _age(prog) -> float:
+    return time.time() - _hb_epoch(prog)
 
 
 def _fd_scan() -> bool:
@@ -280,11 +285,18 @@ class SessionAttributionTests(unittest.TestCase):
                 run = be.start_run(title="t", directory=str(root / "ws"), instruction="HOLD[20]")
                 try:
                     time.sleep(2.5)
+                    observed_at = time.time()
                     prog = be.observe_run(run["run_id"])["progress"]
+                    # Checked before cleanup so cancel/wait time is not counted.
+                    # last_heartbeat_at is truncated to whole seconds, so the true
+                    # heartbeat lies in [hb, hb + 1). "Younger than 1 s at observe"
+                    # therefore means hb >= floor(observed_at - 1). A stale
+                    # heartbeat (start time, ~2.5 s old) still fails this.
+                    hb = _hb_epoch(prog)
+                    self.assertGreaterEqual(hb, math.floor(observed_at - 1.0), prog)
+                    self.assertEqual(prog["heartbeat_signals"]["session"], {"used": True, "attribution": "open_handle"})
                 finally:
                     _reap(be, run["run_id"])
-            self.assertLess(_age(prog), 1.0, prog)
-            self.assertEqual(prog["heartbeat_signals"]["session"], {"used": True, "attribution": "open_handle"})
 
     def test_fake_agy_launch_is_explicit_interpreter(self):
         """The fixture never relies on a shebang, exec bit or /bin/sh."""
