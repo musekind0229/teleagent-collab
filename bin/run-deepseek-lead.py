@@ -51,6 +51,8 @@ _SRC = _REPO / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+from platform_services.cli import CliLaunchError, prepare_cli
+
 PERMISSION_DECISIONS = frozenset({"once", "reject", "deny_job", "demand_safe_path"})
 REVIEW_VERDICTS = frozenset({"pass", "fail"})
 
@@ -268,18 +270,25 @@ def _timeout_sec(envelope: dict) -> float:
 
 
 def invoke_dsh(harness_argv: list[str], task: str, *, timeout_sec: float) -> subprocess.CompletedProcess:
-    cmd = build_dsh_cmd(harness_argv)
     # Throwaway cwd: even if the model ignores the no-tools rule, do not write
     # the collab repo or the job workspace. Do not pass --json.
+    # Launch via prepare_cli → LaunchSpec (argv/cwd/env, shell always False).
     with tempfile.TemporaryDirectory(prefix="collab-dsh-lead-") as tmp:
+        spec = prepare_cli(
+            harness_argv[0],
+            list(harness_argv[1:]) + ["--profile", "headless", "-"],
+            cwd=tmp,
+            env=os.environ.copy(),
+        )
         return subprocess.run(
-            cmd,
+            list(spec.argv),
             input=task,
             capture_output=True,
             text=True,
             timeout=float(timeout_sec),
-            cwd=tmp,
-            env=os.environ.copy(),
+            cwd=spec.cwd,
+            env=dict(spec.env) if spec.env is not None else None,
+            shell=False,  # contract: never True; LaunchSpec.shell is always False
         )
 
 
@@ -310,6 +319,8 @@ def main(argv: list[str] | None = None) -> int:
         proc = invoke_dsh(harness_argv, task, timeout_sec=_timeout_sec(envelope))
     except subprocess.TimeoutExpired:
         return _fail("dsh --profile headless timed out", app_id=app_id)
+    except CliLaunchError as e:
+        return _fail(f"dsh launch prepare failed: {e}", app_id=app_id)
     except OSError as e:
         return _fail(f"dsh spawn failed: {e}", app_id=app_id)
 
