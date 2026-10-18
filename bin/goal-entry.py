@@ -3,7 +3,7 @@ from pathlib import Path
 import sys,argparse,json,time,os,urllib.request,urllib.error,hashlib
 ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT/'src'))
 from framework.durable_api import DurableLayer
-from framework.goal_service import GoalService,planning_timeout
+from framework.goal_service import GoalService,planning_timeout,native_timeout
 from lead_adapter.grok_cli import lead_max_turns
 
 def save(p,x):
@@ -85,6 +85,7 @@ def consume_owner_packet(state,goal_id,*,event_id,packet_sha256,receipt_id):
 def main():
  p=argparse.ArgumentParser(description=__doc__);p.add_argument('--state',required=True);sub=p.add_subparsers(dest='cmd',required=True)
  serve=sub.add_parser('serve');serve.add_argument('--restart-settled',type=float);serve.add_argument('--model-release',action='store_true');serve.add_argument('--task-workspace-permissions',action='store_true');serve.add_argument('--lead-bin',default='grok');serve.add_argument('--native-bin',default='agy');serve.add_argument('--planning-timeout-sec',type=planning_timeout,default=180,help='planning only: finite seconds > 0 and <= 300 (default: 180); capped by active resource checkpoint, does not release models')
+ serve.add_argument('--native-timeout-sec',type=native_timeout,default=300.0,help='per-native-run finite positive deadline; independent of resource checkpoint (default backend-compatible 300); not model release')
  serve.add_argument('--lead-max-turns',type=lead_max_turns,default=1,help='tool-free plan/review internal CLI turns: 1 or 2 (default: 1); permission stays 1; not a resource grant')
  op=sub.add_parser('open');op.add_argument('--goal',required=True);op.add_argument('--must',action='append',default=[]);op.add_argument('--must-not',action='append',default=[]);op.add_argument('--key',required=True);op.add_argument('--native-limit',type=int,default=0);op.add_argument('--lead-limit',type=int,default=0);op.add_argument('--window-sec',type=int,default=1800)
  for name in ('status','report','consume','wait'):
@@ -111,7 +112,7 @@ def main():
    from framework.host_restart import archive_settled_host
    archive_settled_host(state,expected_epoch=a.restart_settled,write_json=save)
   import psutil
-  service=GoalService(state,lead_bin=a.lead_bin,native_bin=a.native_bin,release=a.model_release,task_permissions=a.task_workspace_permissions,planning_timeout_sec=a.planning_timeout_sec,lead_max_turns=a.lead_max_turns);endpoint=service.start();save(state/'host.json',{'endpoint':endpoint,'pid':os.getpid(),'birth':psutil.Process().create_time(),'model_release':a.model_release,'synthetic':False,'planning_timeout_sec':a.planning_timeout_sec,'lead_max_turns':a.lead_max_turns});print(json.dumps({'state':'serving'if a.model_release else'HOLD','endpoint':endpoint}),flush=True)
+  service=GoalService(state,lead_bin=a.lead_bin,native_bin=a.native_bin,release=a.model_release,task_permissions=a.task_workspace_permissions,planning_timeout_sec=a.planning_timeout_sec,lead_max_turns=a.lead_max_turns,native_timeout_sec=a.native_timeout_sec);endpoint=service.start();save(state/'host.json',{'endpoint':endpoint,'pid':os.getpid(),'birth':psutil.Process().create_time(),'model_release':a.model_release,'synthetic':False,'planning_timeout_sec':a.planning_timeout_sec,'native_timeout_sec':a.native_timeout_sec,'lead_max_turns':a.lead_max_turns});print(json.dumps({'state':'serving'if a.model_release else'HOLD','endpoint':endpoint}),flush=True)
   try:
    while not(state/'stop.json').exists():
     if not service.server.released and(state/'host-release.json').exists():

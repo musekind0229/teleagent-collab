@@ -1,6 +1,13 @@
 """Same-store continuity host; recording adapters are TEST injection only."""
 import threading,time,copy,math
 
+def native_timeout(value):
+ """Finite positive per-native-run deadline, not a package checkpoint."""
+ if isinstance(value,bool):raise ValueError('native timeout must be finite and > 0 seconds')
+ value=float(value)
+ if not math.isfinite(value)or value<=0:raise ValueError('native timeout must be finite and > 0 seconds')
+ return value
+
 def planning_timeout(value):
  """Local planning deadline only; never grants resources or releases models."""
  if isinstance(value,bool):raise ValueError('planning timeout must be finite, > 0 and <= 300 seconds')
@@ -56,10 +63,17 @@ class Lead:
   req.setdefault('extra',{})['continuation_context']={'latest_grants':snapshot.get('continuation_grants',[])[-3:],'resolved_decisions':snapshot.get('resolved_decisions',[])[-3:],'rule':'use owner reason/evidence to adjust; ordinary follow-up does not erase prior failure or consume a new planning goal'}
   with trusted_spawn_admission(self.authority,b):return self.adapter.decide(req,**kwargs)
 class Native(AntigravityCliExecutionBackend):
- def __init__(self,authority,bin_path,*,task_permissions=False):
-  super().__init__(bin_path=bin_path);self._trusted_dispatch_hook=authority
+ def __init__(self,authority,bin_path,*,task_permissions=False,native_timeout_sec=300.0):
+  self.native_timeout_sec=native_timeout(native_timeout_sec)
+  super().__init__(bin_path=bin_path,timeout_sec=self.native_timeout_sec);self._trusted_dispatch_hook=authority
   if task_permissions:
    self.configure_caller_permissions(allowed_operations=['read','write','command'],native_mode='skip_permissions');env=dict(self._base_env());env['AGY_AUTO_APPROVE']='1';self._base_environ=env;self._environ=dict(env)
+ def start_run(self,*,title,directory,instruction='',artifacts=None,charter=None,caller_task_id=None):
+  # Render, contract hash and the backend deadline must all see the SAME
+  # per-run value, never the whole-goal wall/checkpoint allowance.
+  bounded=copy.deepcopy(charter)if isinstance(charter,dict)else{}
+  bounded['timeout_sec']=self.native_timeout_sec
+  return super().start_run(title=title,directory=directory,instruction=instruction,artifacts=artifacts,charter=bounded,caller_task_id=caller_task_id)
  def authorize_caller_task(self,**kwargs):
   root=Path(kwargs['directory'])
   if not root.is_absolute():return {'ok':False,'reason':'absolute assigned task workspace required'}
@@ -238,12 +252,13 @@ class Handler(_Handler):
   return super().do_POST()
 
 class GoalService:
- def __init__(self,root,*,lead_bin='grok',native_bin='agy',release=False,task_permissions=False,test_factory=None,planning_timeout_sec=180.0,lead_max_turns=1):
+ def __init__(self,root,*,lead_bin='grok',native_bin='agy',release=False,task_permissions=False,test_factory=None,planning_timeout_sec=180.0,lead_max_turns=1,native_timeout_sec=300.0):
+  self.native_timeout_sec=native_timeout(native_timeout_sec)
   self.lead_max_turns=validate_lead_max_turns(lead_max_turns)
   self.planning_timeout_sec=planning_timeout(planning_timeout_sec)
   self.root=Path(root);self.app=CollabApplication(self.root);self.authority=ResourceAuthority(self.app.layer)
   if test_factory is None:
-   lead=Lead(self.authority,lead_bin,planning_timeout_sec=self.planning_timeout_sec,lead_max_turns=self.lead_max_turns);backend=Native(self.authority,native_bin,task_permissions=task_permissions)
+   lead=Lead(self.authority,lead_bin,planning_timeout_sec=self.planning_timeout_sec,lead_max_turns=self.lead_max_turns);backend=Native(self.authority,native_bin,task_permissions=task_permissions,native_timeout_sec=self.native_timeout_sec)
   else:lead,backend=test_factory(self.authority)
   from framework.lead_evidence import EvidenceAdapter
   lead=EvidenceAdapter(lead,self.root/'lead-evidence')
