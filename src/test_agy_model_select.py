@@ -32,7 +32,7 @@ from execution_backend.antigravity_cli_v1 import (  # noqa: E402
 )
 from execution_backend.inprocess_v1 import InProcessExecutionBackend  # noqa: E402
 from framework.app_service import AppError, CollabApplication, worker_charter_for_task  # noqa: E402
-from test_contract_render import _write_fake_agy  # noqa: E402
+from test_contract_render import _FAKE_AGY  # noqa: E402
 
 REPO = SRC.parent
 AGY_MODELS_SAMPLE = (
@@ -57,6 +57,34 @@ def _wait_done(be: AntigravityCliExecutionBackend, run_id: str, sec: float = 10.
         time.sleep(0.05)
         obs = be.observe_run(run_id)
     return be.collect_result(run_id)
+
+
+def _fake_agy_script(root: Path) -> Path:
+    """Plain ``fake_agy.py``: no shebang, no exec bit, no ``.cmd``/``/bin/sh`` shim."""
+    body = _FAKE_AGY.split("\n", 1)[1] if _FAKE_AGY.startswith("#!") else _FAKE_AGY
+    script = root / "fake_agy.py"
+    script.write_text(body, encoding="utf-8")
+    return script
+
+
+def _explicit_interpreter_patch(script: Path):
+    """Wrap ``build_agy_argv`` so ``bin_path`` becomes ``prepare_cli`` 's prefix.
+
+    The prefix is ``[sys.executable, fake_agy.py]`` on every platform. All other
+    argv (including ``--model=``) is the product's own; test-only.
+    """
+    from execution_backend import antigravity_cli_v1 as agy_mod
+    from platform_services.cli import prepare_cli
+
+    prefix = list(prepare_cli(str(script), [], interpreter=sys.executable).argv)
+    real_build = agy_mod.build_agy_argv
+
+    def build(**kw):
+        cmd = real_build(**kw)
+        assert cmd[0] == str(script), cmd
+        return prefix + list(cmd[1:])
+
+    return mock.patch.object(agy_mod, "build_agy_argv", side_effect=build)
 
 
 def _goal(**overrides) -> dict:
@@ -85,16 +113,19 @@ class ModelPrecedenceTests(unittest.TestCase):
 
     def _spawned_model(self, env: dict[str, str], charter: dict | None) -> tuple[str, dict]:
         with tempfile.TemporaryDirectory() as td:
-            fake = _write_fake_agy(td)
+            fake = _fake_agy_script(Path(td))
             argv_file = Path(td) / "argv.json"
             env = dict(env, AGY_FAKE_ARGV=str(argv_file), AGY_FAKE_ARTIFACT="delivery.txt")
             be = AntigravityCliExecutionBackend(bin_path=str(fake), environ=env, timeout_sec=10, poll_sec=0.05)
             work = Path(td) / "w"
             work.mkdir()
-            run = be.start_run(title="m", directory=str(work), charter=charter)
-            self.assertTrue(run.get("ok"), run)
-            collected = _wait_done(be, run["run_id"])
+            with _explicit_interpreter_patch(fake):
+                run = be.start_run(title="m", directory=str(work), charter=charter)
+                self.assertTrue(run.get("ok"), run)
+                collected = _wait_done(be, run["run_id"])
             argv = json.loads(argv_file.read_text(encoding="utf-8"))
+            # The child really ran: argv[0] is the script (sys.argv), not a shim.
+            self.assertEqual(Path(argv[0]).name, "fake_agy.py", argv)
             models = [a.split("=", 1)[1] for a in argv if a.startswith("--model=")]
             self.assertEqual(len(models), 1, argv)
             return models[0], collected
@@ -117,6 +148,20 @@ class ModelPrecedenceTests(unittest.TestCase):
     def test_builtin_default_without_env_or_charter(self) -> None:
         model, _ = self._spawned_model(_clean_env(), None)
         self.assertEqual(model, DEFAULT_AGY_MODEL)
+
+    def test_fake_agy_launch_is_explicit_interpreter(self) -> None:
+        from execution_backend import antigravity_cli_v1 as agy_mod
+
+        with tempfile.TemporaryDirectory() as td:
+            script = _fake_agy_script(Path(td))
+            self.assertFalse(script.read_text(encoding="utf-8").startswith("#!"))
+            self.assertFalse((Path(td) / "fake-agy.cmd").exists())
+            with _explicit_interpreter_patch(script):
+                argv = agy_mod.build_agy_argv(
+                    bin_path=str(script), model="m-x", prompt="p", skip_permissions=False
+                )
+            self.assertEqual(argv[:2], [sys.executable, str(script)])
+            self.assertIn("--model=m-x", argv)
 
     def test_worker_charter_carries_goal_model(self) -> None:
         charter = worker_charter_for_task(
