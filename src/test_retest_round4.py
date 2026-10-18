@@ -320,7 +320,8 @@ class SessionAttributionTests(unittest.TestCase):
             self.assertFalse(script.read_text(encoding="utf-8").startswith("#!"))
             self.assertFalse((root / "fake_agy").exists())
             with patch, mock.patch("subprocess.Popen", side_effect=OSError("probe")) as popen:
-                be.start_run(title="t", directory=str(root / "ws"), instruction="SLEEP[0]")
+                from test_synthetic_caller_fixture import fixture_start
+                fixture_start(be, title="t", directory=str(root / "ws"), instruction="SLEEP[0]")
             argv = popen.call_args[0][0]
             self.assertEqual(argv[:2], [sys.executable, str(script)])
             self.assertTrue(any(a.startswith("--print=") for a in argv), argv)
