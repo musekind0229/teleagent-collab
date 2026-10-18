@@ -13,7 +13,11 @@ def validate_settled(state):
   except psutil.NoSuchProcess:pass
  gone(host.get('pid'),host.get('birth'));store=state/'.collab-durable/store.json';raw=store.read_bytes();data=json.loads(raw)
  for snapshot in data.get('goals',{}).values():
-  if any(t.get('status')in ('running','awaiting_decision','review','cancel_requested')for t in snapshot.get('tasks',[])):raise ValueError('active or ambiguous task prevents host restart')
+  active=[t for t in snapshot.get('tasks',[])if t.get('status')in ('running','awaiting_decision','review','cancel_requested')]
+  # A persisted review-only intent owns no new native run. Only once ALL
+  # recorded processes below are proven gone may a new HOLD host load it;
+  # the coordinator will park unknown intent, never repeat its paid review.
+  if any(not(t.get('status')=='review'and(t.get('review_recovery')or{}).get('status')=='inflight')for t in active):raise ValueError('active or ambiguous task prevents host restart')
   for package in snapshot.get('resource_packages',{}).values():
    for c in package['claims']:
     if c['state']=='reserved':raise ValueError('unsettled reservation requires owner investigation')

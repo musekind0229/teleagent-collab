@@ -38,13 +38,21 @@ class ContinuityStore:
     return {'ok':True,'goal_id':gid,'duplicate':True}
    packages=s.setdefault('resource_packages',{})
    if r['package_id']in packages:raise ValueError('package identity reused')
+   review_binding=None
+   if 'review_only'in grant:
+    from framework.review_recovery import validate_review_grant
+    review_binding=validate_review_grant(self,gid,decision_id,grant)
    if decision_id:
     d=next((d for d in s.get('pending_decisions',[])if d['decision_id']==decision_id and d.get('continuity')),None)
     if not d:raise ValueError('no pending owner decision')
     if any(t['status']=='running'for t in s.get('tasks',[])):raise ValueError('active worker cannot change package')
     s['pending_decisions']=[x for x in s['pending_decisions']if x['decision_id']!=decision_id];s.setdefault('resolved_decisions',[]).append({**d,'verdict':'continue','grant_id':grant['grant_id']})
     t=next((t for t in s.get('tasks',[])if t['task_id']==d.get('task_id')),None)
-    if t and t['status']=='failed':
+    if t and review_binding:
+     if t.get('review_recovery'):t.setdefault('review_recovery_history',[]).append(copy.deepcopy(t['review_recovery']))
+     t['review_recovery']={'grant_id':grant['grant_id'],'binding':copy.deepcopy(review_binding),'status':'authorized'}
+    elif t and t['status']=='failed':
+     if t.get('review_recovery')and t['review_recovery'].get('status')in('authorized','inflight'):t['review_recovery']['status']='superseded_by_native_continuation'
      t.setdefault('attempt_history',[]).append(copy.deepcopy({k:v for k,v in t.items()if k!='attempt_history'}))
      # Only this exact trusted decision task receives owner input. Existing
      # instruction_with_feedback renders reason verbatim into the final prompt.

@@ -83,10 +83,15 @@ def consume_owner_packet(state,goal_id,*,event_id,packet_sha256,receipt_id):
  return record
 
 def main():
- p=argparse.ArgumentParser(description=__doc__);p.add_argument('--state',required=True);sub=p.add_subparsers(dest='cmd',required=True)
+ p=argparse.ArgumentParser(description=__doc__);p.add_argument('--state',required=True);p.add_argument('--existing-state',action='store_true',help='explicit opt-in to an existing external same-store; serve additionally requires settled binding, store digest and new backup');sub=p.add_subparsers(dest='cmd',required=True)
  serve=sub.add_parser('serve');serve.add_argument('--restart-settled',type=float);serve.add_argument('--model-release',action='store_true');serve.add_argument('--task-workspace-permissions',action='store_true');serve.add_argument('--lead-bin',default='grok');serve.add_argument('--native-bin',default='agy');serve.add_argument('--planning-timeout-sec',type=planning_timeout,default=180,help='planning only: finite seconds > 0 and <= 300 (default: 180); capped by active resource checkpoint, does not release models')
  serve.add_argument('--native-timeout-sec',type=native_timeout,default=None,help='optional per-native-run finite positive cap; never extends a shorter caller deadline; omitted preserves legacy behavior; not model release')
  serve.add_argument('--lead-max-turns',type=lead_max_turns,default=1,help='tool-free plan/review internal CLI turns: 1 or 2 (default: 1); permission stays 1; not a resource grant')
+ serve.add_argument('--expected-store-sha256');serve.add_argument('--state-backup')
+ for name in ('review-prepare','review-authorize'):
+  q=sub.add_parser(name);q.add_argument('--goal-id',required=True)
+  if name=='review-prepare':q.add_argument('--task-id',required=True);q.add_argument('--decision-id',required=True)
+  else:q.add_argument('--grant-file',required=True)
  op=sub.add_parser('open');op.add_argument('--goal',required=True);op.add_argument('--must',action='append',default=[]);op.add_argument('--must-not',action='append',default=[]);op.add_argument('--key',required=True);op.add_argument('--native-limit',type=int,default=0);op.add_argument('--lead-limit',type=int,default=0);op.add_argument('--window-sec',type=int,default=1800)
  for name in ('status','report','consume','wait'):
   q=sub.add_parser(name);q.add_argument('--goal-id',required=True)
@@ -97,7 +102,8 @@ def main():
  end=sub.add_parser('end');end.add_argument('--goal-id',required=True);end.add_argument('--decision-id',required=True);end.add_argument('--reason',required=True);end.add_argument('--alternative',required=True)
  release=sub.add_parser('release-models');release.add_argument('--reason',required=True)
  sub.add_parser('stop');a=p.parse_args();state=Path(os.path.abspath(a.state))
- if not state.is_relative_to(ROOT):raise ValueError('state must be a new directory within this isolated checkout')
+ if not state.is_relative_to(ROOT)and not a.existing_state:raise ValueError('external state requires explicit --existing-state')
+ if a.existing_state and (not(state/'.collab-durable/store.json').is_file()or not(state/'host.json').is_file()):raise ValueError('existing same-store/host required; never initialize external state')
  for ancestor in [*reversed(state.parents),state]:
   if ancestor.exists()and(ancestor.is_symlink()or getattr(ancestor.lstat(),'st_file_attributes',0)&0x400):raise ValueError('state reparse refused')
  if a.cmd=='serve':
@@ -110,9 +116,15 @@ def main():
    if a.restart_settled is None:raise ValueError('host already configured; explicit --restart-settled OLD_BIRTH required')
    if a.model_release:raise ValueError('settled restart must begin HOLD; later release-models and explicit continuation required')
    from framework.host_restart import archive_settled_host
-   archive_settled_host(state,expected_epoch=a.restart_settled,write_json=save)
+   if a.existing_state:
+    from framework.review_recovery import backup_existing_state
+    from framework.persist_lock import persist_lock
+    with persist_lock(state):
+     backup_existing_state(state,expected_store_sha256=a.expected_store_sha256,backup=a.state_backup,expected_birth=a.restart_settled)
+     archive_settled_host(state,expected_epoch=a.restart_settled,write_json=save)
+   else:archive_settled_host(state,expected_epoch=a.restart_settled,write_json=save)
   import psutil
-  service=GoalService(state,lead_bin=a.lead_bin,native_bin=a.native_bin,release=a.model_release,task_permissions=a.task_workspace_permissions,planning_timeout_sec=a.planning_timeout_sec,lead_max_turns=a.lead_max_turns,native_timeout_sec=a.native_timeout_sec);endpoint=service.start();save(state/'host.json',{'endpoint':endpoint,'pid':os.getpid(),'birth':psutil.Process().create_time(),'model_release':a.model_release,'synthetic':False,'planning_timeout_sec':a.planning_timeout_sec,'native_timeout_sec':a.native_timeout_sec,'lead_max_turns':a.lead_max_turns});print(json.dumps({'state':'serving'if a.model_release else'HOLD','endpoint':endpoint}),flush=True)
+  service=GoalService(state,lead_bin=a.lead_bin,native_bin=a.native_bin,release=a.model_release,task_permissions=a.task_workspace_permissions,planning_timeout_sec=a.planning_timeout_sec,lead_max_turns=a.lead_max_turns,native_timeout_sec=a.native_timeout_sec);endpoint=service.start();save(state/'host.json',{'endpoint':endpoint,'pid':os.getpid(),'birth':psutil.Process().create_time(),'model_release':a.model_release,'synthetic':False,'runtime_root':str(ROOT),'same_store':str(state/'.collab-durable/store.json'),'planning_timeout_sec':a.planning_timeout_sec,'native_timeout_sec':a.native_timeout_sec,'lead_max_turns':a.lead_max_turns});print(json.dumps({'state':'serving'if a.model_release else'HOLD','endpoint':endpoint}),flush=True)
   try:
    while not(state/'stop.json').exists():
     if not service.server.released and(state/'host-release.json').exists():
@@ -130,6 +142,14 @@ def main():
    if not host.get('model_release')and not host.get('synthetic'):result.update(state='HOLD',reason='host model release absent; goal retained, no models called')
    else:
     d=next((d for d in snap.get('pending_decisions',[])if d.get('continuity')),None);now=time.time();grant={'goal_id':gid,'grant_id':'initial_'+hashlib.sha256(a.key.encode()).hexdigest(),'reason':'product owner initial bounded package','resource':{'package_id':'initial_'+gid,'original_epoch':now,'checkpoint_epoch':now+a.window_sec,'native_limit':a.native_limit,'lead_limit':a.lead_limit}};result['authorization']=layer.continuity_authorize(gid,decision_id=d['decision_id']if d else'',grant=grant,trusted=True)
+ elif a.cmd=='review-prepare':
+  from framework.review_recovery import review_binding
+  result={'goal_id':a.goal_id,'review_only':review_binding(layer,a.goal_id,a.task_id,a.decision_id),'authorization':False,'models_called':False}
+ elif a.cmd=='review-authorize':
+  if not host.get('model_release')and not host.get('synthetic'):raise ValueError('HOLD: explicit host release absent')
+  grant=json.loads(Path(a.grant_file).read_bytes())
+  if not isinstance(grant,dict)or not isinstance(grant.get('review_only'),dict):raise ValueError('exact owner review grant required')
+  result=layer.continuity_authorize(a.goal_id,decision_id=grant['review_only']['decision_id'],grant=grant,trusted=True)
  elif a.cmd=='end':result=layer.continuity_end(a.goal_id,decision_id=a.decision_id,reason=a.reason,alternative=a.alternative,trusted=True)
  elif a.cmd=='release-models':
   import psutil

@@ -1661,9 +1661,13 @@ class LeadAdapterPlanner:
         projection = task_contract_projection(goal=goal, task=task, siblings=siblings)
         scoped_must, deferred_must = projection["must"], projection["deferred_must"]
         task_accept = projection["acceptance"]
+        worker_request = action.get("payload") or {}
+        if (task.get('review_recovery')or{}).get('status')=='inflight' and action.get('native_post_run')is True:
+            from framework.review_material_codec import pack_material
+            worker_request=pack_material(worker_request)
         extra = {
             "goal_context": projection["goal_context"],
-            "worker_request": action.get("payload") or {},
+            "worker_request": worker_request,
             "review_scope": "task",
             "task_acceptance": task_accept,
             "goal_acceptance": dict(goal.get("acceptance") or {}),
@@ -3236,6 +3240,10 @@ class AppCoordinator:
         # Material blockage / incomplete materials must NOT become code fail or trigger automatic rework:
         # Persist review_blocked and separate business failure from material blockage.
         choice = {}
+        recovery=task.get('review_recovery')or{}
+        if recovery.get('status')=='inflight':
+            previous=task.get('result')or{}
+            payload['owner_review_recovery']={'grant_id':recovery['grant_id'],'binding':recovery['binding'],'original_review':{k:(previous.get('review')or{}).get(k)for k in ('status','source','code','attempts','evidence')},'original_failure':str(previous.get('error')or'')[:1000],'rule':'Same native run, explicit owner-authorized new review. Prior no-verdict is retained, not a code FAIL or PASS. Judge the complete current pinned materials.'}
         material_blocked = False
         blocked_reason = ""
         if payload.get("review_status") == "review_blocked":

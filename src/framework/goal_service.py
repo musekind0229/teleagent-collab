@@ -233,6 +233,10 @@ class ContinuityCoordinator(AppCoordinator):
   if s.get('owner_termination'):return {'ok':True,'goal_id':gid,'state':'failed','owner_termination':s['owner_termination']}
   pending=next((d for d in s.get('pending_decisions',[])if d.get('continuity')),None)
   if pending:return {'ok':True,'goal_id':gid,'state':'awaiting_owner','decision':pending}
+  recovery=next((t for t in s.get('tasks',[])if (t.get('review_recovery')or{}).get('status')in ('authorized','inflight')),None)
+  if recovery:
+   from framework.review_recovery import process_review
+   return process_review(self,gid,recovery)
   if not s.get('resource_packages'):return self.layer.continuity_block(gid,reason='Explicit initial package required')
   outcome=super()._process_goal(gid);s=self.layer.get_goal(gid)['goal'];tasks=s.get('tasks',[])
   failed=[t for t in tasks if t['status']=='failed'];busy=any(t['status']in ('running','awaiting_decision')for t in tasks);status={t['task_id']:t['status']for t in tasks}
