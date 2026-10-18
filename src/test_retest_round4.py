@@ -220,6 +220,19 @@ def _age(prog) -> float:
     return time.time() - _hb_epoch(prog)
 
 
+def _hb_within_whole_second_tolerance(hb: float, observed_at: float) -> bool:
+    """Whole-second tolerance contract for the serialized heartbeat.
+
+    ``last_heartbeat_at`` is written by ``utc_iso`` at seconds resolution, so the
+    fraction is lost and a strict "true age < 1 s" cannot be recovered from it.
+    The check is only: the serialized heartbeat is not earlier than
+    ``floor(observed_at - 1)``, with ``observed_at`` sampled before observe.
+    This tolerates up to just under 2 s of true age (quantization), and still
+    rejects a start-time heartbeat about 2.5 s old.
+    """
+    return hb >= math.floor(observed_at - 1.0)
+
+
 def _fd_scan() -> bool:
     from execution_backend.agy_session_attribution import fd_scan_available
 
@@ -288,12 +301,12 @@ class SessionAttributionTests(unittest.TestCase):
                     observed_at = time.time()
                     prog = be.observe_run(run["run_id"])["progress"]
                     # Checked before cleanup so cancel/wait time is not counted.
-                    # last_heartbeat_at is truncated to whole seconds, so the true
-                    # heartbeat lies in [hb, hb + 1). "Younger than 1 s at observe"
-                    # therefore means hb >= floor(observed_at - 1). A stale
-                    # heartbeat (start time, ~2.5 s old) still fails this.
+                    # Whole-second tolerance (see _hb_within_whole_second_tolerance):
+                    # serialized heartbeat not earlier than floor(observed_at - 1),
+                    # observed_at sampled before observe. This does not claim the
+                    # true age is strictly under 1 s.
                     hb = _hb_epoch(prog)
-                    self.assertGreaterEqual(hb, math.floor(observed_at - 1.0), prog)
+                    self.assertTrue(_hb_within_whole_second_tolerance(hb, observed_at), (hb, observed_at, prog))
                     self.assertEqual(prog["heartbeat_signals"]["session"], {"used": True, "attribution": "open_handle"})
                 finally:
                     _reap(be, run["run_id"])
@@ -312,6 +325,27 @@ class SessionAttributionTests(unittest.TestCase):
             self.assertEqual(argv[:2], [sys.executable, str(script)])
             self.assertTrue(any(a.startswith("--print=") for a in argv), argv)
             self.assertNotIn("/bin/sh", argv)
+
+    def test_heartbeat_whole_second_tolerance_boundary(self):
+        """Deterministic record of the quantization tolerance (all platforms)."""
+        from framework.progress_budget import parse_iso, utc_iso
+
+        def serialized(epoch: float) -> float:
+            return parse_iso(utc_iso(epoch))
+
+        observed_at = 1760000000.999
+        # Documented tolerance: a heartbeat ~1.999 s old still passes, because
+        # utc_iso drops the fraction. This is not a strict "< 1 s" check.
+        hb = serialized(1759999999.0)
+        self.assertAlmostEqual(observed_at - hb, 1.999, places=3)
+        self.assertTrue(_hb_within_whole_second_tolerance(hb, observed_at))
+        # A fresh heartbeat passes.
+        self.assertTrue(_hb_within_whole_second_tolerance(serialized(observed_at - 0.2), observed_at))
+        # A start-time heartbeat about 2.5 s old is rejected, wherever the
+        # fractional part falls.
+        for frac in (0.0, 0.25, 0.5, 0.75, 0.999):
+            obs = 1760000000.0 + frac
+            self.assertFalse(_hb_within_whole_second_tolerance(serialized(obs - 2.5), obs), frac)
 
     def test_unused_reason_reaches_goal_progress(self):
         from framework.progress_budget import bound_task_progress

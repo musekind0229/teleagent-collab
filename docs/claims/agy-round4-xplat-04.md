@@ -34,12 +34,19 @@ account_pool, platform_services/*, antigravity_cli_v1 / agy_session_attribution)
     `skipUnless(fd_scan_available())` — they assert `/proc` fd attribution
     (`held open by another process`, `open_handle`), which Windows does not have.
 - Heartbeat freshness (`..._holding_its_own_session_file_keeps_heartbeat`,
-  after Hermes a21): asserted before `_reap`, so cancel/wait time is not
-  counted. `last_heartbeat_at` is whole-second, so the check is
-  `hb >= floor(observed_at - 1)` (true age under 1 s at observe); a stale
-  start-time heartbeat (~2.5 s) still fails. Root cause of the earlier Linux
-  flake: traceback showed `1.0096 not less than 1.0` with an integer-second
-  stamp, i.e. truncation, not a slow heartbeat.
+  after Hermes a21/a22): asserted before `_reap`, so cancel/wait time is not
+  counted. Test contract is whole-second tolerance: with `observed_at`
+  sampled before observe, the serialized `last_heartbeat_at` must not be
+  earlier than `floor(observed_at - 1)`. `utc_iso` writes seconds resolution,
+  so this does NOT prove the true age is strictly under 1 s; it tolerates up
+  to just under 2 s of true age (e.g. observed_at ...000.999 with heartbeat
+  ...999.0, about 1.999 s, passes). A start-time heartbeat about 2.5 s old is
+  still rejected. Recorded by the deterministic, all-platform
+  `test_heartbeat_whole_second_tolerance_boundary`. A strict < 1 s check
+  would need an untruncated signal or a controlled clock; out of scope.
+- The earlier Linux flake (`1.0096 not less than 1.0`, integer-second stamp)
+  is consistent with truncation error; the failing values alone do not rule
+  out a real delay.
 - Timing: SLEEP[5] -> SLEEP[8] in the two silent-run cases so a slow child
   start cannot end the run before the 2.8 s observation. Thresholds unchanged.
 
@@ -52,6 +59,8 @@ account_pool, platform_services/*, antigravity_cli_v1 / agy_session_attribution)
 - 0cfda46: round4 failed 1 of 6 and 2 of 10 runs, always
   `test_run_holding_its_own_session_file_keeps_heartbeat` (`1.0096 not less
   than 1.0`, `1.0 not less than 1.0`); src 1085 OK on 3 of 4 runs.
-- This revision: src/test_retest_round4.py 14 OK on 20 of 20 runs;
-  src discover 1085 OK (skipped=7) on 2 of 2 runs; tests discover 138 OK
-  (skipped=1). Logs kept on the Linux side.
+- ad970d7: src/test_retest_round4.py 14 OK on 20 of 20 runs; src discover
+  1085 OK (skipped=7) on 2 of 2 runs; tests discover 138 OK (skipped=1).
+- This revision (wording + boundary test): src/test_retest_round4.py 15 OK on
+  10 of 10 runs; src discover 1086 OK (skipped=7) on 2 of 2 runs; tests
+  discover 138 OK (skipped=1).
