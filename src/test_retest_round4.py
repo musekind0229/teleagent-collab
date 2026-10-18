@@ -152,18 +152,55 @@ for _ in range(int(float(sys.argv[3]) / 0.2)):
 """
 
 
+# Keys a Windows Python child needs to start (e.g. SYSTEMROOT for hash seeding).
+_WIN_ENV_KEYS = ("SYSTEMROOT", "SystemRoot", "WINDIR", "TEMP", "TMP", "PATHEXT", "COMSPEC")
+
+
 def _agy_backend(root: Path):
+    """Fake agy backend that launches on POSIX and Windows alike.
+
+    The fake is a plain ``fake_agy.py`` (no shebang, no exec bit, no /bin/sh
+    wrapper). Its launch prefix comes from ``prepare_cli(..., interpreter=
+    sys.executable)``; while the returned context is active, the backend's argv
+    builder swaps ``bin_path`` for that prefix. Product code is untouched.
+    """
+    from execution_backend import antigravity_cli_v1 as agy_mod
     from execution_backend.antigravity_cli_v1 import AntigravityCliExecutionBackend
+    from platform_services.cli import prepare_cli
 
     home = root / "home"
     home.mkdir(exist_ok=True)
     script = root / "fake_agy.py"
     script.write_text(_FAKE_AGY, encoding="utf-8")
-    wrapper = root / "fake_agy"
-    wrapper.write_text(f"#!/bin/sh\nexec {sys.executable} {script} \"$@\"\n", encoding="utf-8")
-    wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC)
+    prefix = list(prepare_cli(str(script), [], interpreter=sys.executable).argv)
     env = {"PATH": os.environ.get("PATH", ""), "HOME": str(home), "USERPROFILE": str(home)}
-    return AntigravityCliExecutionBackend(bin_path=str(wrapper), environ=env, timeout_sec=60), home
+    for key in _WIN_ENV_KEYS:
+        if os.name == "nt" and os.environ.get(key):
+            env[key] = os.environ[key]
+    real_build = agy_mod.build_agy_argv
+
+    def build(**kw):
+        cmd = real_build(**kw)
+        assert cmd[0] == str(script), cmd
+        return prefix + cmd[1:]
+
+    patch = mock.patch.object(agy_mod, "build_agy_argv", side_effect=build)
+    be = AntigravityCliExecutionBackend(bin_path=str(script), environ=env, timeout_sec=60)
+    return be, home, patch
+
+
+def _reap(be, *run_ids: str) -> None:
+    """Cancel and wait, so Windows can delete the temp dir afterwards."""
+    for rid in run_ids:
+        be.cancel(rid)
+    for rid in run_ids:
+        proc = (be._runs.get(rid) or {}).get("proc")
+        if proc is not None:
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=10)
 
 
 def _other_writer(root: Path, home: Path, mode: str, secs: float) -> subprocess.Popen:
@@ -178,59 +215,91 @@ def _age(prog) -> float:
     return time.time() - parse_iso(prog["last_heartbeat_at"])
 
 
-@unittest.skipUnless(_POSIX, "fake agy wrapper is a POSIX shell script")
+def _fd_scan() -> bool:
+    from execution_backend.agy_session_attribution import fd_scan_available
+
+    return fd_scan_available()
+
+
 class SessionAttributionTests(unittest.TestCase):
+    """Fake agy runs on every platform; fd-scan cases need /proc (Linux)."""
+
+    @unittest.skipUnless(_fd_scan(), "needs process fd scan (/proc)")
     def test_other_process_session_file_does_not_refresh_silent_run(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            be, home = _agy_backend(root)
-            run = be.start_run(title="t", directory=str(root / "ws"), instruction="SLEEP[5]")
-            time.sleep(0.3)
-            other = _other_writer(root, home, "hold", 4)
-            try:
-                time.sleep(2.5)
-                prog = be.observe_run(run["run_id"])["progress"]
-            finally:
-                other.kill()
-                other.wait()
+            be, home, patch = _agy_backend(root)
+            with patch:
+                run = be.start_run(title="t", directory=str(root / "ws"), instruction="SLEEP[8]")
+                try:
+                    time.sleep(0.3)
+                    other = _other_writer(root, home, "hold", 4)
+                    try:
+                        time.sleep(2.5)
+                        prog = be.observe_run(run["run_id"])["progress"]
+                    finally:
+                        other.kill()
+                        other.wait()
+                finally:
+                    _reap(be, run["run_id"])
             self.assertGreater(_age(prog), 1.5, f"foreign session file refreshed the heartbeat: {prog}")
             note = prog["heartbeat_signals"]["session"]
             self.assertFalse(note["used"])
             self.assertIn("held open by another process", note["reason"])
-            be.cancel(run["run_id"])
 
     def test_without_fd_scan_two_runs_sharing_home_are_ambiguous(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            be, home = _agy_backend(root)
+            be, home, patch = _agy_backend(root)
             be._session.fd_scan = False  # Windows / no /proc
-            a = be.start_run(title="a", directory=str(root / "wa"), instruction="SLEEP[5]")
-            b = be.start_run(title="b", directory=str(root / "wb"), instruction="SLEEP[5]")
-            time.sleep(0.3)
-            other = _other_writer(root, home, "nohold", 4)
-            try:
-                time.sleep(2.5)
-                prog = be.observe_run(a["run_id"])["progress"]
-            finally:
-                other.kill()
-                other.wait()
+            with patch:
+                a = be.start_run(title="a", directory=str(root / "wa"), instruction="SLEEP[8]")
+                b = be.start_run(title="b", directory=str(root / "wb"), instruction="SLEEP[8]")
+                try:
+                    time.sleep(0.3)
+                    other = _other_writer(root, home, "nohold", 4)
+                    try:
+                        time.sleep(2.5)
+                        prog = be.observe_run(a["run_id"])["progress"]
+                    finally:
+                        other.kill()
+                        other.wait()
+                finally:
+                    _reap(be, a["run_id"], b["run_id"])
             self.assertGreater(_age(prog), 1.5, prog)
             note = prog["heartbeat_signals"]["session"]
             self.assertFalse(note["used"])
             self.assertIn("ambiguous: 2 runs", note["reason"])
-            be.cancel(a["run_id"])
-            be.cancel(b["run_id"])
 
+    @unittest.skipUnless(_fd_scan(), "needs process fd scan (/proc)")
     def test_run_holding_its_own_session_file_keeps_heartbeat(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            be, _home = _agy_backend(root)
-            run = be.start_run(title="t", directory=str(root / "ws"), instruction="HOLD[20]")
-            time.sleep(2.5)
-            prog = be.observe_run(run["run_id"])["progress"]
+            be, _home, patch = _agy_backend(root)
+            with patch:
+                run = be.start_run(title="t", directory=str(root / "ws"), instruction="HOLD[20]")
+                try:
+                    time.sleep(2.5)
+                    prog = be.observe_run(run["run_id"])["progress"]
+                finally:
+                    _reap(be, run["run_id"])
             self.assertLess(_age(prog), 1.0, prog)
             self.assertEqual(prog["heartbeat_signals"]["session"], {"used": True, "attribution": "open_handle"})
-            be.cancel(run["run_id"])
+
+    def test_fake_agy_launch_is_explicit_interpreter(self):
+        """The fixture never relies on a shebang, exec bit or /bin/sh."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            be, _home, patch = _agy_backend(root)
+            script = root / "fake_agy.py"
+            self.assertFalse(script.read_text(encoding="utf-8").startswith("#!"))
+            self.assertFalse((root / "fake_agy").exists())
+            with patch, mock.patch("subprocess.Popen", side_effect=OSError("probe")) as popen:
+                be.start_run(title="t", directory=str(root / "ws"), instruction="SLEEP[0]")
+            argv = popen.call_args[0][0]
+            self.assertEqual(argv[:2], [sys.executable, str(script)])
+            self.assertTrue(any(a.startswith("--print=") for a in argv), argv)
+            self.assertNotIn("/bin/sh", argv)
 
     def test_unused_reason_reaches_goal_progress(self):
         from framework.progress_budget import bound_task_progress
