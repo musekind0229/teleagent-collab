@@ -101,11 +101,25 @@ def main():
  cont=sub.add_parser('continue');cont.add_argument('--goal-id',required=True);cont.add_argument('--decision-id',required=True);cont.add_argument('--grant-id',required=True);cont.add_argument('--reason',required=True);cont.add_argument('--native-limit',type=int,required=True);cont.add_argument('--lead-limit',type=int,required=True);cont.add_argument('--window-sec',type=int,required=True)
  end=sub.add_parser('end');end.add_argument('--goal-id',required=True);end.add_argument('--decision-id',required=True);end.add_argument('--reason',required=True);end.add_argument('--alternative',required=True)
  release=sub.add_parser('release-models');release.add_argument('--reason',required=True)
- sub.add_parser('stop');a=p.parse_args();state=Path(os.path.abspath(a.state))
+ sub.add_parser('stop')
+ events=sub.add_parser('lifecycle');events.add_argument('operation',choices=['status','consume','report','resume','drain']);events.add_argument('--event-id',required=True);events.add_argument('--consumer',choices=['qq','pm','owner']);events.add_argument('--sha256');events.add_argument('--receipt-id');events.add_argument('--report-file');events.add_argument('--evidence')
+ a=p.parse_args();state=Path(os.path.abspath(a.state))
  if not state.is_relative_to(ROOT)and not a.existing_state:raise ValueError('external state requires explicit --existing-state')
  if a.existing_state and (not(state/'.collab-durable/store.json').is_file()or not(state/'host.json').is_file()):raise ValueError('existing same-store/host required; never initialize external state')
  for ancestor in [*reversed(state.parents),state]:
   if ancestor.exists()and(ancestor.is_symlink()or getattr(ancestor.lstat(),'st_file_attributes',0)&0x400):raise ValueError('state reparse refused')
+ if a.cmd=='lifecycle':
+  from framework.lifecycle_events import LifecycleOutbox
+  box=LifecycleOutbox(state)
+  if a.operation=='consume':box.consume(a.event_id,a.consumer,packet_sha256=a.sha256,receipt_id=a.receipt_id)
+  elif a.operation=='report':box.report(a.event_id,packet_sha256=a.sha256,report=json.loads(Path(a.report_file).read_bytes()),receipt_id=a.receipt_id)
+  elif a.operation=='resume':box.resume(a.event_id,a.consumer,evidence=a.evidence)
+  elif a.operation=='drain':
+   from framework.runtime_guard import verify_runtime,registration_path
+   verify_runtime(ROOT)
+   from framework.lifecycle_transport import HermesLifecycleSender
+   box.deliver(a.event_id,HermesLifecycleSender(registration_path().parent/'lifecycle-routes.json'))
+  print(json.dumps(box.status(a.event_id),ensure_ascii=False));return
  if a.cmd=='serve':
   from framework.runtime_guard import verify_runtime
   runtime_verification=verify_runtime(ROOT)

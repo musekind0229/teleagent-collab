@@ -268,6 +268,17 @@ class GoalService:
   self.lead_max_turns=validate_lead_max_turns(lead_max_turns)
   self.planning_timeout_sec=planning_timeout(planning_timeout_sec)
   self.root=Path(root);self.app=CollabApplication(self.root);self.authority=ResourceAuthority(self.app.layer)
+  from framework.lifecycle_events import LifecycleOutbox
+  self.lifecycle=LifecycleOutbox(self.root,runtime=self.runtime_verification or {'runtime_root':'synthetic'})
+  self.lifecycle.recover_interrupted()
+  self.app.layer._lifecycle_publisher=self.lifecycle
+  for snapshot in self.app.layer.goals.values():self.lifecycle.publish(snapshot)
+  self.delivery_stop=threading.Event()
+  if test_factory is None:
+   from framework.lifecycle_transport import HermesLifecycleSender
+   from framework.runtime_guard import registration_path
+   self.lifecycle_sender=HermesLifecycleSender(registration_path().parent/'lifecycle-routes.json')
+  else:self.lifecycle_sender=None
   if test_factory is None:
    lead=Lead(self.authority,lead_bin,planning_timeout_sec=self.planning_timeout_sec,lead_max_turns=self.lead_max_turns);backend=Native(self.authority,native_bin,task_permissions=task_permissions,native_timeout_sec=self.native_timeout_sec)
   else:lead,backend=test_factory(self.authority)
@@ -277,8 +288,21 @@ class GoalService:
   self.app.coordinator=ContinuityCoordinator(self.app.layer,planner=planner,backend=backend,workspaces_root=self.root/'workspaces')
   backend._trusted_dispatch_hook=self.authority;backend._continuity_workspace_root=(self.root/'workspaces').resolve()
   self.server=CollabHttpServer(('127.0.0.1',0),self.app);self.server.RequestHandlerClass=Handler;self.server.authority=self.authority;self.server.released=release or test_factory is not None;self.server.synthetic=test_factory is not None;self.loop=CoordinatorLoop(self.app,interval=.05)
+ def _deliver_lifecycle(self,channel):
+  from framework.persist_lock import atomic_write_json
+  while not self.delivery_stop.wait(2):
+   if not self.server.released or self.lifecycle_sender is None:continue
+   for path in self.lifecycle.root.glob('*.json'):
+    if self.delivery_stop.is_set():break
+    try:self.lifecycle.deliver(path.stem,self.lifecycle_sender,channels=(channel,))
+    except Exception as exc:atomic_write_json(self.root/'lifecycle-health.json',{'state':'delivery_blocked','responsible':'product_owner','reason':'delivery worker: '+type(exc).__name__,'business_acceptance':False})
  def start(self):
   self.thread=threading.Thread(target=self.server.serve_forever,daemon=True);self.thread.start()
+  self.delivery_threads=[threading.Thread(target=self._deliver_lifecycle,args=(c,),name='collab-lifecycle-'+c,daemon=True)for c in ('qq','pm','owner')]
+  for thread in self.delivery_threads:thread.start()
   if self.server.released:self.loop.start()
   return 'http://127.0.0.1:'+str(self.server.server_port)
- def close(self):self.loop.stop();self.server.shutdown();self.server.server_close();self.thread.join(timeout=3)
+ def close(self):
+  self.delivery_stop.set();self.loop.stop()
+  for thread in getattr(self,'delivery_threads',[]):thread.join(timeout=65)
+  self.server.shutdown();self.server.server_close();self.thread.join(timeout=3)

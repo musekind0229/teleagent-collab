@@ -937,6 +937,14 @@ class DurableLayer(ContinuityStore):
         for gid, snap in self.goals.items():
             slug = "".join(c if c.isalnum() or c in "-_." else "_" for c in gid)[:80] or "goal"
             _atomic_write(goals_dir / f"{slug}.json", snap)
+            publisher = getattr(self, '_lifecycle_publisher', None)
+            if publisher is not None:
+                try:
+                    publisher.publish(snap)
+                except Exception as exc:
+                    # A notification fault cannot rewrite or reject business
+                    # persistence. Durable store remains the reconciliation source.
+                    _atomic_write(Path(self.persist_root) / 'lifecycle-health.json', {'state': 'delivery_blocked', 'responsible': 'product_owner', 'reason': 'event persistence failed: ' + type(exc).__name__, 'business_acceptance': False})
 
     def persist(self) -> Path:
         with self._rmw():
