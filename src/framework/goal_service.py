@@ -270,9 +270,8 @@ class GoalService:
   self.root=Path(root);self.app=CollabApplication(self.root);self.authority=ResourceAuthority(self.app.layer)
   from framework.lifecycle_events import LifecycleOutbox
   self.lifecycle=LifecycleOutbox(self.root,runtime=self.runtime_verification or {'runtime_root':'synthetic'})
-  self.lifecycle.recover_interrupted()
+  self.lifecycle.reconcile(self.app.layer.goals.values())
   self.app.layer._lifecycle_publisher=self.lifecycle
-  for snapshot in self.app.layer.goals.values():self.lifecycle.publish(snapshot)
   self.delivery_stop=threading.Event()
   if test_factory is None:
    from framework.lifecycle_transport import HermesLifecycleSender

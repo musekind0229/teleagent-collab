@@ -1,14 +1,45 @@
 """Durable same-goal lifecycle facts with independent delivery/consumption.
 No model, route discovery, raw evidence traversal or maintenance execution here.
 """
-from pathlib import Path
-import copy,hashlib,json,re,time
+from pathlib import Path,PurePosixPath
+import copy,hashlib,json,re,time,math
 from framework.persist_lock import persist_lock,atomic_write_json
 
 def digest(value):return hashlib.sha256(json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest()
 def line(value):
  text=' '.join(str(value).split())[:160]
  return re.sub(r'(?i)MEDIA\s*:', 'MEDIA：',text).replace('[[','［［').replace(']]','］］')
+def task_evidence(task):
+ """Only producer-backed structured fields; never open a product artifact."""
+ result=task.get('result')if isinstance(task.get('result'),dict)else{}
+ native=result.get('native_result')if isinstance(result.get('native_result'),dict)else{}
+ receipt=result.get('session_receipt',native.get('session_receipt'))
+ tid,rid=task.get('task_id'),task.get('run_id')
+ review=result.get('review')if isinstance(result.get('review'),dict)else{}
+ usage=result.get('usage')if isinstance(result.get('usage'),dict)else native.get('usage')
+ numbers={k:v for k,v in (usage.items()if isinstance(usage,dict)else[])if k in('input_tokens','output_tokens','total_tokens')and type(v)in(int,float)and math.isfinite(v)and v>=0}
+ out={'task_id':tid,'run_id':rid,'status':task.get('status'),'backend':result.get('backend',native.get('backend')),'review':{k:review[k]for k in('status','source','code','attempts')if k in review},'usage':numbers,'usage_available':bool(numbers),'manifest':[],'manifest_available':False,'execution_receipt_status':'unknown_missing','observed_run_count':None,'result_class':{k:result[k]for k in('ok','review_no_verdict','review_timeout','material_blocked')if type(result.get(k))is bool}}
+ if not isinstance(receipt,dict):return out
+ if receipt.get('source')!='backend_observed_process_and_files' or not tid or not rid or receipt.get('task_id')!=tid or receipt.get('run_id')!=rid:
+  out['execution_receipt_status']='rejected_identity_or_source';return out
+ if type(receipt.get('returncode'))is not int or type(receipt.get('fresh_session'))is not bool:
+  out['execution_receipt_status']='rejected_execution_fields';return out
+ outputs=receipt.get('outputs')
+ if not isinstance(outputs,list)or len(outputs)>1000:
+  out['execution_receipt_status']='rejected_manifest_shape_or_bound';return out
+ manifest=[];seen=set()
+ for row in outputs:
+  if not isinstance(row,dict):out['execution_receipt_status']='rejected_manifest_row';return out
+  path=row.get('relative');sha=row.get('sha256');size=row.get('bytes')
+  if not isinstance(path,str)or not path or len(path)>2048 or '\\' in path or ':'in path or PurePosixPath(path).is_absolute()or '..'in PurePosixPath(path).parts or path in seen or not isinstance(sha,str)or not re.fullmatch('[0-9a-f]{64}',sha)or type(size)is not int or size<0:
+   out['execution_receipt_status']='rejected_manifest_identity';return out
+  seen.add(path);manifest.append({'path':path,'bytes':size,'sha256':sha})
+ selected={k:receipt[k]for k in('source','task_id','run_id')}
+ if type(receipt.get('fresh_session'))is bool:selected['fresh_session']=receipt['fresh_session']
+ if type(receipt.get('returncode'))is int:selected['returncode']=receipt['returncode']
+ out.update(session_receipt=selected,execution_receipt_status='backend_observed_bound',manifest=manifest,manifest_available=True,observed_run_count=1)
+ return out
+
 class LifecycleOutbox:
  def __init__(self,state,*,runtime=None):
   self.state=Path(state);self.root=self.state/'lifecycle-events';self.receipts=self.state/'lifecycle-delivery';self.runtime=runtime or {};self.window=86400
@@ -33,8 +64,13 @@ class LifecycleOutbox:
     return obj
    tasks=[]
    for t in snapshot.get('tasks',[]):
-    result=t.get('result')or{};review=result.get('review')or{};usage=result.get('usage')or{}
-    tasks.append({'task_id':t.get('task_id'),'run_id':t.get('run_id'),'status':t.get('status'),'backend':result.get('backend'),'attempt_count':len(t.get('attempt_history',[]))+1,'rework_count':t.get('rework_count',0),'review':{k:review[k]for k in('status','source','code','attempts')if k in review},'usage':{k:v for k,v in usage.items()if k in('input_tokens','output_tokens','total_tokens')and type(v)in(int,float)},'usage_available':bool(usage),'manifest':[{k:a[k]for k in('path','sha256','bytes')if k in a}for a in t.get('artifact_manifest',[])if isinstance(a,dict)]})
+    selected=task_evidence(t)
+    history=t.get('attempt_history')if isinstance(t.get('attempt_history'),list)else[]
+    selected['prior_attempts']=[task_evidence(a)for a in history[-100:]if isinstance(a,dict)]
+    selected['history_truncated']=len(history)>100
+    selected['retained_attempt_records']=len(history)
+    selected['rework_count']=t.get('rework_count',0)
+    tasks.append(selected)
    packages=[]
    for p in snapshot.get('resource_packages',{}).values():
     summary={k:p[k]for k in('package_id','actual_native','actual_lead')if k in p}
@@ -112,10 +148,25 @@ class LifecycleOutbox:
     return
    atomic_write_json(self.receipts/(event_id+'.report.json'),body);s.update(report_sha256=sha,maintenance_authorized=False);s['owner'].update(state='pending');self._save(event_id,s)
  def recover_interrupted(self):
-  # Never turn an interrupted send into pending: its external effect is unknown.
+  # Validate immutable fact first, repair ONLY absent metadata, then classify
+  # prior inflight effects. Corrupt facts/rows remain untouched for the owner.
   for path in self.root.glob('*.json'):
-   with persist_lock(self.receipts):
-    s=self.status(path.stem)
-    for c in('qq','pm','owner'):
-     if s[c]['state']=='inflight':s[c].update(state='delivery_blocked',reason='interrupted send effect unknown',responsible='product_owner',recovery='reconcile external delivery before explicit resume')
-    self._save(path.stem,s)
+   try:
+    event=self._event(path.stem)
+    self._prepare_delivery(event)
+    with persist_lock(self.receipts):
+     s=self.status(path.stem)
+     for c in('qq','pm','owner'):
+      if s[c]['state']=='inflight':s[c].update(state='delivery_blocked',reason='interrupted send effect unknown',responsible='product_owner',recovery='reconcile external delivery before explicit resume')
+     self._save(path.stem,s)
+   except (OSError,ValueError,KeyError,TypeError)as exc:
+    self.health(path.stem,'recovery: '+type(exc).__name__)
+ def health(self,event_id,reason):
+  root=self.state/'lifecycle-recovery-blocked'
+  safe=event_id if re.fullmatch('[0-9a-f]{64}',event_id or '')else'unknown'
+  atomic_write_json(root/(safe+'.json'),{'event_id':event_id,'state':'delivery_blocked','responsible':'product_owner','reason':reason,'recovery':'inspect corrupt/missing side evidence without overwriting or resending','business_acceptance':False})
+ def reconcile(self,snapshots):
+  self.recover_interrupted()
+  for snapshot in snapshots:
+   try:self.publish(snapshot)
+   except(OSError,ValueError,KeyError,TypeError)as exc:self.health('unknown','reconcile: '+type(exc).__name__)
