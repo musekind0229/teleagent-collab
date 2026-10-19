@@ -85,4 +85,37 @@ class Tests(unittest.TestCase):
   with patch.object(Path,'is_symlink',return_value=True):self.assertEqual(observe_rules(t,{})['rows'][0]['state'],'blocked')
   self.assertEqual(p.read_bytes(),b'synthetic')
   p.write_bytes(b'x'*2000001);self.assertEqual(observe_rules(t,{})['rows'][0]['state'],'blocked')
+ def test_historical_alias_budget_survives_checkpoint_restart(self):
+  import copy,json
+  from framework.governance_daily import audit_ledger
+  old={'issues':[{'issue_id':'original','owner':'pm','aliases':['known-same-problem'],'rounds':[{'number':n,'result':'failed','evidence':'synthetic'}for n in(1,2)]}]}
+  cp=self.root/'alias-checkpoint.json';self.assertEqual(audit_ledger(old,cp),[]);before=cp.read_bytes()
+  for transfer in(False,True):
+   new=copy.deepcopy(old);new['issues'][0]['aliases']=[]
+   if transfer:new['issues'].append({'issue_id':'new-narrow-name','owner':'worker','aliases':['known-same-problem'],'rounds':[{'number':1,'result':'in_progress','evidence':'synthetic'}]})
+   self.assertTrue(audit_ledger(new,cp));self.assertEqual(cp.read_bytes(),before)
+  good=copy.deepcopy(old);good['issues'][0]['aliases'].append('new-evidenced-alias');self.assertEqual(audit_ledger(good,cp),[])
+  reloaded=json.loads(cp.read_bytes());self.assertEqual(len(reloaded['issues'][0]['rounds']),2)
+  reloaded['issues'][0]['aliases'].remove('known-same-problem');self.assertTrue(audit_ledger(reloaded,cp))
+ def test_rule_line_exposes_blocked_and_missing_baseline_not_other_lines(self):
+  import hashlib,copy
+  from framework.governance_daily import collect,rule_targets
+  targets=rule_targets(self.root)
+  for t in targets:
+   p=Path(t['path']);p.parent.mkdir(parents=True,exist_ok=True);p.write_text('synthetic-'+(t['profile']if t['kind']=='SOUL'else t['kind']))
+  baseline={'approved':True,'user_approval_reference':'synthetic','hashes':{t['path']:hashlib.sha256(Path(t['path']).read_bytes()).hexdigest()for t in targets}}
+  denied=Path(next(t['path']for t in targets if t['profile']=='watchdog'and t['kind']=='SOUL'))
+  def line(result):return next(s for s in result['preview'].splitlines()if s.startswith('规则：'))
+  normal=collect(self.root,{'issues':[]},{},baseline=baseline);self.assertIn('check=complete',line(normal));self.assertIn('blocked=0',line(normal));self.assertTrue(normal['rule_observation']['all_approved_match'])
+  original=Path.read_bytes
+  def reader(p):
+   if p==denied:raise PermissionError('synthetic-private-exception-value')
+   return original(p)
+  with patch.object(Path,'read_bytes',reader):blocked=collect(self.root,{'issues':[]},{},baseline=baseline)
+  s=line(blocked);self.assertIn('check=blocked',s);self.assertIn('blocked=1',s);self.assertIn('owner=watchdog',s);self.assertIn('io_unavailable',s);self.assertNotIn('synthetic-private-exception-value',blocked['preview']);self.assertFalse(blocked['rule_observation']['all_approved_match']);self.assertEqual(len(blocked['preview'].splitlines()),10)
+  for invalid in(None,'not-a-hash'):
+   partial=copy.deepcopy(baseline)
+   if invalid is None:del partial['hashes'][str(denied)]
+   else:partial['hashes'][str(denied)]=invalid
+   r=collect(self.root,{'issues':[]},{},baseline=partial);self.assertIn('check=unknown',line(r));self.assertIn('uncovered=1',line(r));self.assertFalse(r['rule_observation']['all_approved_match'])
 if __name__=='__main__':unittest.main(verbosity=2)

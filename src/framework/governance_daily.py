@@ -28,17 +28,21 @@ def rule_targets(home):
 def observe_rules(targets,baseline):
  approved=isinstance(baseline,dict)and bool(baseline.get('user_approval_reference'))and baseline.get('approved')is True
  hashes=baseline.get('hashes',{})if approved else{};rows=[]
+ if not isinstance(hashes,dict):hashes={}
  for t in targets:
-  p=Path(t['path']);row={**t,'sha256':None,'state':'missing'}
+  p=Path(t['path']);expected=hashes.get(str(p));covered=approved and isinstance(expected,str)and re.fullmatch('[0-9a-f]{64}',expected)is not None
+  row={**t,'sha256':None,'state':'missing','baseline_covered':bool(covered)}
   try:
    if any(x.is_symlink()or getattr(x.lstat(),'st_file_attributes',0)&0x400 for x in[p,*p.parents]if x.exists()):raise ValueError('reparse refused')
    if p.is_file():
     if p.stat().st_size>2000000:raise ValueError('rule file over bound')
-    sha=hashlib.sha256(p.read_bytes()).hexdigest();expected=hashes.get(str(p));row.update(sha256=sha,state='unapproved'if not approved or not expected else'match'if sha==expected else'drift')
-  except(OSError,ValueError)as exc:row.update(state='blocked',reason=type(exc).__name__)
+    sha=hashlib.sha256(p.read_bytes()).hexdigest();row.update(sha256=sha,state='unapproved'if not covered else'match'if sha==expected else'drift')
+  except(OSError,ValueError)as exc:row.update(state='blocked',reason='invalid_path_or_size'if isinstance(exc,ValueError)else'io_unavailable')
   rows.append(row)
  shared={name:len({r['sha256']for r in rows if r['kind']==name and r['sha256']})==1 and sum(r['kind']==name and r['sha256']is not None for r in rows)==len(PROFILES)for name in SKILLS}
- return {'approved_baseline_status':'approved'if approved else'unapproved','rows':rows,'missing':sum(r['state']=='missing'for r in rows),'drift':sum(r['state']=='drift'for r in rows),'all_approved_match':approved and bool(rows)and all(r['state']=='match'for r in rows),'shared_skill_equal':shared,'SOUL_policy':'role-specific individual approved baselines, not forced equal hashes'}
+ blocked=sum(r['state']=='blocked'for r in rows);missing=sum(r['state']=='missing'for r in rows);uncovered=sum(not r['baseline_covered']for r in rows)
+ reasons=sorted({r['reason']for r in rows if r.get('reason')})
+ return {'approved_baseline_status':'approved'if approved else'unapproved','rows':rows,'missing':missing,'blocked':blocked,'uncovered':uncovered,'verification_status':'blocked'if blocked else'unknown'if not approved or missing or uncovered else'complete','safe_reasons':reasons,'verification_owner':'watchdog','drift':sum(r['state']=='drift'for r in rows),'all_approved_match':approved and bool(rows)and all(r['state']=='match'for r in rows),'shared_skill_equal':shared,'SOUL_policy':'role-specific individual approved baselines, not forced equal hashes'}
 
 def validate_ledger(ledger,previous=None):
  issues=ledger.get('issues',[]);errors=[];ids=set();names=set()
@@ -62,6 +66,8 @@ def validate_ledger(ledger,previous=None):
   for old in previous.get('issues',[]):
    now=current.get(old['issue_id'])
    if now is None:errors.append('historical issue removed/renamed: '+old['issue_id']);continue
+   for alias in old.get('aliases',[]):
+    if alias not in now.get('aliases',[]):errors.append('historical alias removed or transferred: '+old['issue_id'])
    for idx,r in enumerate(old.get('rounds',[])):
     if idx>=len(now.get('rounds',[])):errors.append('round history shortened: '+old['issue_id']);break
     new=now['rounds'][idx]
@@ -98,10 +104,10 @@ def render_daily(p):
   '昨天：'+text(p.get('yesterday','unknown（无获准工程摘要）')),
   '当前/负责人：'+text(p.get('current','unknown（需责任人更新）')),
   '需决定：'+text(p.get('decisions','unknown（未提供经核决定项）')),
-  'API调用：'+calls+'；口径='+('完整聚合'if measured else'unknown：未获安全完整API聚合，非session数'),
+  'API调用：'+calls+'；口径='+('完整聚合'if measured else'unknown：缺可核昨日完整API聚合，非session数'),
   '仓库：'+repository_summary(repos),
   '真实goal完成/失败：'+goal_counts+'（昨日UTC+08；仅经核完整聚合）',
-  '规则：'+text('baseline='+str(rules.get('approved_baseline_status','unknown'))+' missing='+str(rules.get('missing','unknown'))+' drift='+str(rules.get('drift','unknown'))+' shared-diff='+str(sum(v is False for v in rules.get('shared_skill_equal',{}).values()))+'；SOUL按角色'),
+  '规则：'+text('check='+str(rules.get('verification_status','unknown'))+' blocked='+str(rules.get('blocked','unknown'))+' uncovered='+str(rules.get('uncovered','unknown'))+' baseline='+str(rules.get('approved_baseline_status','unknown'))+' missing='+str(rules.get('missing','unknown'))+' checked-drift='+str(rules.get('drift','unknown'))+' shared-diff='+str(sum(v is False for v in rules.get('shared_skill_equal',{}).values()))+' owner='+str(rules.get('verification_owner','watchdog'))+' reasons='+','.join(rules.get('safe_reasons',[]))+'；SOUL按角色',400),
   '轮数/阻塞owner：'+text(p.get('rounds','unknown'),4000),
   '证据/时效：'+text(p.get('evidence','unknown'))])
 
@@ -132,7 +138,7 @@ def collect(home,ledger,inputs,*,baseline=None):
  for key in('yesterday','current','decisions'):
   packet[key]=inputs.get(key,'unknown（PM未提供安全摘要）')if fresh else'unknown（摘要缺失或过期；project-manager更新）'
  packet['evidence']=str(packet.get('evidence','no safe summary'))+'; source_date='+str(source_day or'unknown')+'; freshness='+('current-day'if fresh else'stale-or-unknown')
- packet.update(date=day,timezone='UTC+08:00',rules={k:rules[k]for k in('approved_baseline_status','missing','drift','shared_skill_equal')},rounds=rounds)
+ packet.update(date=day,timezone='UTC+08:00',rules={k:rules[k]for k in('approved_baseline_status','missing','drift','shared_skill_equal','blocked','uncovered','verification_status','verification_owner','safe_reasons')},rounds=rounds)
  return {'packet':packet,'preview':render_daily(packet),'rule_observation':rules,'ledger_errors':errors,'collected_at':now.isoformat(),'window':'previous local calendar day for completion summaries; calls require explicit safe aggregate window_date/coverage, not inferred from sessions'}
 def audit_ledger(ledger,path):
  path=Path(path)

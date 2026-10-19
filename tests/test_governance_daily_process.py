@@ -62,4 +62,11 @@ class Physical(unittest.TestCase):
    r=subprocess.run([sys.executable,'-B','-c',CHILD,str(ROOT),'scheduled-spy',str(bp)],capture_output=True,text=True,env={**os.environ,'PYTHONIOENCODING':'utf-8','SPY_LOG':str(self.p/'spy.log'),'SPY_GUARD':str(self.p/'guard.log')},timeout=30)
    self.assertEqual(r.returncode,0,r.stderr)
   self.assertEqual((self.p/'spy.log').read_text().splitlines(),['spy-only'])
+ def test_alias_transfer_after_separate_cli_process_keeps_original_budget(self):
+  import copy
+  old={'issues':[{'issue_id':'synthetic','owner':'pm','aliases':['same-known-problem'],'rounds':[{'number':n,'result':'failed','evidence':'synthetic'}for n in(1,2)]}]}
+  self.ledger.write_text(json.dumps(old));r=self.runcli();self.assertEqual(r.returncode,0,r.stderr)
+  good=copy.deepcopy(old);good['issues'][0]['aliases'].append('new-evidenced-alias');self.ledger.write_text(json.dumps(good));r=self.runcli();self.assertEqual(r.returncode,0,r.stderr)
+  checkpoint=(self.p/'checkpoint.json').read_bytes();bad=copy.deepcopy(good);bad['issues'][0]['aliases'].remove('same-known-problem');bad['issues'].append({'issue_id':'narrow','owner':'worker','aliases':['same-known-problem'],'rounds':[]})
+  self.ledger.write_text(json.dumps(bad));r=self.runcli();self.assertEqual(r.returncode,2,r.stderr);self.assertEqual((self.p/'checkpoint.json').read_bytes(),checkpoint);self.assertIn('BLOCKED',json.loads(self.output.read_bytes())['packet']['rounds'])
 if __name__=='__main__':unittest.main(verbosity=2)

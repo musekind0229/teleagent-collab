@@ -14,7 +14,12 @@ package outside Git. This repository contains only code and synthetic tests.
 All rule installation, including normalization, requires the user's approval.
 A missing skill is missing, not implicitly approved. Candidate/preflight hashes
 are observations, never approval. Role SOUL hashes need not equal one another;
-shared skills compare the same mother, each SOUL its individual approved hash.
+Shared skills compare the same mother, each SOUL its individual approved hash.
+Approval and successful verification are separate: rule line explicitly reports
+check=blocked/unknown/complete, blocked and uncovered counts, watchdog owner and
+bounded safe reason codes. A rejected SOUL read is never hidden behind zero
+observed drift. Missing/malformed approved hashes are uncovered/unknown; sources
+are not followed through reparse or read around denial to improve the summary.
 
 ## Data contract / counting
 
@@ -70,7 +75,14 @@ Only an in_progress round may finalize its result. Changing implementation
 branch/worktree is not new identity. Existing archive/ACL failures and original
 lifecycle third-round exception must remain in the private seed. This is a daily
 accounting check, NOT automatic repair, resource release or permission to resume
-paused material review. Missing upper approval produces a local blocked report
+paused material review. Historical aliases are append-only ownership evidence:
+removing an old alias is blocked even before another issue attempts to claim it.
+Existing aliases cannot migrate to a new issue/id or a fresh round budget. New
+aliases may be added to their existing issue without changing rounds. Necessary
+historical corrections must retain the old aliases/evidence and add an explicit
+upper disposition note, not silently transfer/delete identities. This does not
+claim perfect semantic detection of previously unknown alternative names.
+Missing upper approval produces a local blocked report
 and nonzero status owned by PM; it never starts another business resource.
 
 ## One daily identity and delivery
