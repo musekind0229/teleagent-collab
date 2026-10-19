@@ -28,6 +28,8 @@ def _print(label: str, payload: dict) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from framework.runtime_guard import verify_runtime
+    verify_runtime()
     parser = argparse.ArgumentParser(description="v0.2 P1 durable delegation demo (file-backed).")
     parser.add_argument("--persist", default=".", help="persist dir for .collab-durable/")
     parser.add_argument("--submit-key", default="p1-demo-key")

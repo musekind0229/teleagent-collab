@@ -293,6 +293,8 @@ def invoke_dsh(harness_argv: list[str], task: str, *, timeout_sec: float) -> sub
 
 
 def main(argv: list[str] | None = None) -> int:
+    from framework.runtime_guard import verify_runtime
+    verify_runtime()
     argv = list(sys.argv[1:] if argv is None else argv)
     envelope = _load_envelope(argv)
     if envelope is None:

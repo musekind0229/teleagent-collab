@@ -66,5 +66,5 @@ class Tests(unittest.TestCase):
       self.assertFalse((state/'owner-consumption'/(raised['event_id']+'.json')).exists())
     finally:
      service.close()
-     (ROOT.parent/'evidence/WORKER-PHYSICAL-COMMANDS.json').write_text(json.dumps(commands,indent=2))
+     (Path(os.environ.get('COLLAB_TEST_EVIDENCE_DIR',str(base)))/'WORKER-PHYSICAL-COMMANDS.json').write_text(json.dumps(commands,indent=2))
 if __name__=='__main__':unittest.main(verbosity=2)

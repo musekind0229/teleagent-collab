@@ -107,6 +107,8 @@ def main():
  for ancestor in [*reversed(state.parents),state]:
   if ancestor.exists()and(ancestor.is_symlink()or getattr(ancestor.lstat(),'st_file_attributes',0)&0x400):raise ValueError('state reparse refused')
  if a.cmd=='serve':
+  from framework.runtime_guard import verify_runtime
+  runtime_verification=verify_runtime(ROOT)
   state.mkdir(parents=True,exist_ok=True)
   import msvcrt
   lease=(state/'host-owner.lock').open('a+b');lease.seek(0);lease.write(b'0');lease.flush();lease.seek(0)
@@ -124,12 +126,13 @@ def main():
      archive_settled_host(state,expected_epoch=a.restart_settled,write_json=save)
    else:archive_settled_host(state,expected_epoch=a.restart_settled,write_json=save)
   import psutil
-  service=GoalService(state,lead_bin=a.lead_bin,native_bin=a.native_bin,release=a.model_release,task_permissions=a.task_workspace_permissions,planning_timeout_sec=a.planning_timeout_sec,lead_max_turns=a.lead_max_turns,native_timeout_sec=a.native_timeout_sec);endpoint=service.start();save(state/'host.json',{'endpoint':endpoint,'pid':os.getpid(),'birth':psutil.Process().create_time(),'model_release':a.model_release,'synthetic':False,'runtime_root':str(ROOT),'same_store':str(state/'.collab-durable/store.json'),'planning_timeout_sec':a.planning_timeout_sec,'native_timeout_sec':a.native_timeout_sec,'lead_max_turns':a.lead_max_turns});print(json.dumps({'state':'serving'if a.model_release else'HOLD','endpoint':endpoint}),flush=True)
+  service=GoalService(state,lead_bin=a.lead_bin,native_bin=a.native_bin,release=a.model_release,task_permissions=a.task_workspace_permissions,planning_timeout_sec=a.planning_timeout_sec,lead_max_turns=a.lead_max_turns,native_timeout_sec=a.native_timeout_sec);endpoint=service.start();save(state/'host.json',{'endpoint':endpoint,'pid':os.getpid(),'birth':psutil.Process().create_time(),'model_release':a.model_release,'synthetic':False,'runtime_root':str(ROOT),'runtime_verification':runtime_verification,'same_store':str(state/'.collab-durable/store.json'),'planning_timeout_sec':a.planning_timeout_sec,'native_timeout_sec':a.native_timeout_sec,'lead_max_turns':a.lead_max_turns});print(json.dumps({'state':'serving'if a.model_release else'HOLD','endpoint':endpoint}),flush=True)
   try:
    while not(state/'stop.json').exists():
     if not service.server.released and(state/'host-release.json').exists():
      release=json.loads((state/'host-release.json').read_bytes());identity=json.loads((state/'host.json').read_bytes())
      if release.get('pid')==os.getpid()and release.get('birth')==identity['birth']:
+      identity['runtime_verification']=verify_runtime(ROOT)
       service.server.released=True;identity['model_release']=True;save(state/'host.json',identity);service.loop.start()
     time.sleep(.2)
   finally:service.close();save(state/'settled.json',{'thread_alive':service.thread.is_alive(),'state':'settled'})

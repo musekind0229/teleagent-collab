@@ -7,6 +7,9 @@ import test_goal_loop_maintenance as fixture
 from framework.review_recovery import backup_existing_state
 from framework.durable_api import DurableLayer
 from test_goal_entry_handoff import GUARD
+# Explicit child-only synthetic seam. No production CLI/environment bypass;
+# child audit still forbids any model subprocess and remote access.
+RUNTIME_TEST_SEAM='\nimport sys\nsys.path.insert(0,'+repr(str(ROOT/'src'))+')\nimport framework.runtime_guard as rg\nrg.verify_runtime=lambda *a,**k:{"synthetic_test_only":True}\n'
 
 class Tests(unittest.TestCase):
  def test_cli_exact_review_grant_is_idempotent_without_native_replay(self):
@@ -57,7 +60,7 @@ class Tests(unittest.TestCase):
    raw=(state/'.collab-durable/store.json').read_bytes();sha=hashlib.sha256(raw).hexdigest()
    (state/'host.json').write_text(json.dumps({'pid':1000000000,'birth':1.0}))
    (state/'settled.json').write_text(json.dumps({'thread_alive':False}))
-   guard=base/'guard';guard.mkdir();(guard/'sitecustomize.py').write_text(GUARD.replace('__PORT__','1'))
+   guard=base/'guard';guard.mkdir();(guard/'sitecustomize.py').write_text(GUARD.replace('__PORT__','1')+RUNTIME_TEST_SEAM)
    env={k:os.environ[k]for k in ('SYSTEMROOT','WINDIR')if k in os.environ};env.update(PYTHONPATH=str(guard),PYTHONIOENCODING='utf-8')
    argv=[sys.executable,'-B',str(ROOT/'bin/goal-entry.py'),'--state',str(state),'--existing-state','serve','--restart-settled','1.0','--expected-store-sha256',sha,'--state-backup',str(base/'new-backup'),'--native-timeout-sec','900']
    proc=subprocess.Popen(argv,env=env,cwd=ROOT,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)

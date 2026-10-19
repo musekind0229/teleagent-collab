@@ -41,6 +41,8 @@ from scheduler import (  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
+    from framework.runtime_guard import verify_runtime
+    verify_runtime()
     ap = argparse.ArgumentParser(description="Parallel TeleAgent job scheduler")
     ap.add_argument(
         "charters",

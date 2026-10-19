@@ -2404,6 +2404,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from framework.runtime_guard import verify_runtime
+    verify_runtime()
     # Do not change encoding here. backslashreplace only stops
     # UnicodeEncodeError when the console code page cannot hold a character.
     _reconfigure(sys.stdout, errors="backslashreplace")

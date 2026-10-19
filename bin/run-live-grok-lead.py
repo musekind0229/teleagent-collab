@@ -46,6 +46,8 @@ def _fail(report: dict, reason: str, **extra) -> int:
 
 
 def main() -> int:
+    from framework.runtime_guard import verify_runtime
+    verify_runtime()
     ap = argparse.ArgumentParser(
         description="Live Grok lead loop against TeleAgent worker HTTP (:4397 Windows / :4399 posix)"
     )

@@ -43,6 +43,8 @@ def _json_flag(raw: str):
 
 
 def main(argv: list[str] | None = None) -> int:
+    from framework.runtime_guard import verify_runtime
+    verify_runtime()
     parser = argparse.ArgumentParser(
         description="Durable Goal layer (file-backed). Does not bind a transport.",
     )

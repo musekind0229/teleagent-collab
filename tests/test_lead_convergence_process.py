@@ -48,10 +48,11 @@ class Tests(unittest.TestCase):
    self.assertEqual(parsed['raw_evidence']['caller_observation']['effective_internal_turn_limit'],8)
    self.assertEqual(validate_lead_decision(raw,parsed,request=req)['verdict'],'pass')
    observed=json.loads((root/'SYNTHETIC-OBSERVED.json').read_bytes());self.assertEqual(observed['argv'],seen[0][1:])
-   E=ROOT.parent/'lead-convergence-evidence';(E/'PHYSICAL-ARGV-PROMPT-SCHEMA.json').write_text(json.dumps({'synthetic_only':True,'argv':seen[0],'observed':observed,'actual_lead_dispatches':1,'reported_internal_turns':3,'internal_turn_limit':8},indent=2))
+   E=Path(os.environ.get('COLLAB_TEST_EVIDENCE_DIR',str(root)));(E/'PHYSICAL-ARGV-PROMPT-SCHEMA.json').write_text(json.dumps({'synthetic_only':True,'argv':seen[0],'observed':observed,'actual_lead_dispatches':1,'reported_internal_turns':3,'internal_turn_limit':8},indent=2))
  def test_goal_entry_cli_eight_loads_hold_and_preserves_default_one(self):
   with tempfile.TemporaryDirectory(dir=ROOT,prefix='synthetic-convergence-')as td:
-   root=Path(td);guard=root/'guard';guard.mkdir();(guard/'sitecustomize.py').write_text(GUARD)
+   from test_review_recovery_cli import RUNTIME_TEST_SEAM
+   root=Path(td);guard=root/'guard';guard.mkdir();(guard/'sitecustomize.py').write_text(GUARD+RUNTIME_TEST_SEAM)
    env={k:os.environ[k]for k in ('SYSTEMROOT','WINDIR')if k in os.environ};env.update(PYTHONPATH=str(guard),PYTHONIOENCODING='utf-8')
    for turns in (None,8):
     state=root/('state-'+str(turns));argv=[sys.executable,'-B',str(ROOT/'bin/goal-entry.py'),'--state',str(state),'serve','--native-bin',sys.executable,'--lead-bin','NEVER_EXECUTE']

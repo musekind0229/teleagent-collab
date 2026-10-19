@@ -63,7 +63,7 @@ class Tests(unittest.TestCase):
   for f in Path(self.tmp.name).glob('*.bin'):f.unlink()
   def fake(cmd,**kw):
    prompt=Path(cmd[2]).read_bytes();observed.update(prompt_bytes=len(prompt),argv=cmd,schema=json.loads(cmd[cmd.index('--json-schema')+1]))
-   evidence=ROOT.parent/'material-visibility-evidence'
+   evidence=Path(os.environ.get('COLLAB_TEST_EVIDENCE_DIR',self.tmp.name))
    (evidence/'SYNTHETIC-FINAL-PROMPT.txt').write_bytes(prompt)
    (evidence/'SYNTHETIC-ARGV-SCHEMA.json').write_text(json.dumps({'argv':cmd,'pinned_schema':observed['schema'],'prompt_sha256':hashlib.sha256(prompt).hexdigest(),'synthetic_only':True},indent=2))
    self.assertIn(self.new,prompt);self.assertIn(b'Summary diff is truncated',prompt)
@@ -74,7 +74,7 @@ class Tests(unittest.TestCase):
   with patch('lead_adapter.grok_cli.run_cancellable',side_effect=fake)as run:
    GrokCliLeadAdapter(bin_path='NEVER',tool_free=True,max_turns=8).decide(req,schema=lead_review_response_schema(),cwd=self.tmp.name)
   self.assertEqual(run.call_count,1);self.assertEqual(observed['argv'][observed['argv'].index('--max-turns')+1],'8')
-  (ROOT.parent/'material-visibility-evidence/FINAL-PROMPT-METRICS.json').write_text(json.dumps({'synthetic_only':True,'prompt_bytes':observed['prompt_bytes'],'source_bytes':len(self.new),'summary_truncated':True,'direct_body_visible':True,'schema_pinned':True,'dispatch_calls':1},indent=2))
+  (Path(os.environ.get('COLLAB_TEST_EVIDENCE_DIR',self.tmp.name))/'FINAL-PROMPT-METRICS.json').write_text(json.dumps({'synthetic_only':True,'prompt_bytes':observed['prompt_bytes'],'source_bytes':len(self.new),'summary_truncated':True,'direct_body_visible':True,'schema_pinned':True,'dispatch_calls':1},indent=2))
  def test_multiple_edits_reconstruct_before_exactly_without_files(self):
   from framework.review_material_codec import readable_material
   for old,new in [(b'a\nb\nc\nd\ne\n',b'FIRST\na\nc\nD\ne\nLAST'),(b'a\r\nb\r\nc',b'a\r\nB\r\nc'),(b'old',b'new'),(b'',b''),(b'\n\n',b'\n')]:

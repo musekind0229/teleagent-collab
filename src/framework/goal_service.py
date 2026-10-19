@@ -260,6 +260,10 @@ class Handler(_Handler):
 
 class GoalService:
  def __init__(self,root,*,lead_bin='grok',native_bin='agy',release=False,task_permissions=False,test_factory=None,planning_timeout_sec=180.0,lead_max_turns=1,native_timeout_sec=None):
+  self.runtime_verification=None
+  if test_factory is None:
+   from framework.runtime_guard import verify_runtime
+   self.runtime_verification=verify_runtime()
   self.native_timeout_sec=None if native_timeout_sec is None else native_timeout(native_timeout_sec)
   self.lead_max_turns=validate_lead_max_turns(lead_max_turns)
   self.planning_timeout_sec=planning_timeout(planning_timeout_sec)

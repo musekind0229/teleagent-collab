@@ -14,6 +14,8 @@ from execution_backend import run_file_job_via_public_api  # noqa: E402
 
 
 def main(argv: list[str]) -> int:
+    from framework.runtime_guard import verify_runtime
+    verify_runtime()
     if len(argv) < 2:
         print("usage: run-inprocess-job.py <charter.yaml> [workdir]", file=sys.stderr)
         return 2

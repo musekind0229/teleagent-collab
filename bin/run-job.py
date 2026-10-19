@@ -235,6 +235,8 @@ def dry_run_result(charter: dict, instruction: str, arts: list[str]) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from framework.runtime_guard import verify_runtime
+    verify_runtime()
     ap = argparse.ArgumentParser(description="Run a TeleAgent job from a charter file")
     ap.add_argument("charter", help="Path to .charter.yaml / .yaml / .json")
     ap.add_argument(
