@@ -48,3 +48,18 @@ cancel, schema, agy_account_pool). AGY / Grok / Codex callers are not wired.
 ## After this slice
 Knife 9 (test/agy-round3-fixture-xplat-09) stays queued per Hermes a31. This
 slice is limited wiring verification, not a real dsh / account / deploy gate.
+
+## Fixture fix after Hermes a32 (9728781 not approved)
+
+Hermes found the product path green on Windows but 5 new-class tests erroring
+from two test-only fixture bugs. Fixed in the test only (no product or
+CmdWrapper change):
+
+- `_FAKE_CMD` is now built per test from the temp dir, so it is a host-valid
+  absolute path (drive-absolute on Windows); it is never created or spawned.
+- Script-path rejection now uses only chars legal in Windows file names
+  (`&`, `%`, `^`); `|` (with the others) is covered through argv rejection,
+  so no illegal file name is created.
+
+Linux after fix: new class OK x3 (skipped=2), module OK (skipped=3),
+src discover Ran 1113 OK (skipped=12), tests Ran 138 OK, platform contract OK.

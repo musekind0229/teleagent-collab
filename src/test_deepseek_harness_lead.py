@@ -947,12 +947,13 @@ class TestDeepSeekCmdWrapperWire(unittest.TestCase):
     only on Windows. prepare_cli's own contract (no wrapper => reject) stays.
     """
 
-    _FAKE_CMD = "/fake/Windows/System32/cmd.exe"
-
     def setUp(self):
         self.mod = _load_wrapper()
         self._tmp = tempfile.TemporaryDirectory()
         self.d = Path(self._tmp.name)
+        # Host-valid absolute path (drive-absolute on Windows); never created
+        # or spawned. CmdWrapper rejects a non-absolute injected cmd_exe.
+        self._FAKE_CMD = str(self.d / "fake-sys" / "System32" / "cmd.exe")
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -1059,8 +1060,11 @@ class TestDeepSeekCmdWrapperWire(unittest.TestCase):
         self.assertNotIsInstance(cm.exception, PlatformWrapperRequired)
 
     def test_dangerous_chars_rejected_once_no_retry_no_shell(self):
-        for ch in ("&", "%", "^", "|"):
-            with self.subTest(ch=ch):
+        # Script path: only chars that are legal in Windows file names, so the
+        # stub can be created on every host. "|" (and the rest) are covered
+        # through argv rejection below without touching the file system.
+        for ch in ("&", "%", "^"):
+            with self.subTest(path_ch=ch):
                 stub = self._stub(f"bad{ch}dsh.cmd")
                 ran = []
                 with mock.patch.object(self.mod, "get_cmd_wrapper",
@@ -1073,15 +1077,18 @@ class TestDeepSeekCmdWrapperWire(unittest.TestCase):
                 gw.assert_called_once()
                 self.assertEqual(ran, [])
         stub = self._stub("dsh.cmd")
-        ran = []
-        with mock.patch.object(self.mod, "get_cmd_wrapper",
-                               return_value=self._test_wrapper()):
-            with mock.patch.object(self.mod.subprocess, "run",
-                                   lambda *a, **k: ran.append(k)):
-                with self.assertRaises(CliLaunchError):
-                    self.mod.invoke_dsh([str(stub), "a&b"], "t", timeout_sec=5.0,
-                                        platform="win32")
-        self.assertEqual(ran, [])
+        for ch in ("&", "%", "^", "|"):
+            with self.subTest(arg_ch=ch):
+                ran = []
+                with mock.patch.object(self.mod, "get_cmd_wrapper",
+                                       return_value=self._test_wrapper()) as gw:
+                    with mock.patch.object(self.mod.subprocess, "run",
+                                           lambda *a, **k: ran.append(k)):
+                        with self.assertRaises(CliLaunchError):
+                            self.mod.invoke_dsh([str(stub), f"a{ch}b"], "t",
+                                                timeout_sec=5.0, platform="win32")
+                gw.assert_called_once()
+                self.assertEqual(ran, [])
 
     def test_missing_windows_cli_fails_closed(self):
         stub = self._stub("dsh.cmd")
