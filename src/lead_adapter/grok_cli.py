@@ -101,13 +101,26 @@ def resolve_lead_bin(
     )
 
 
+MAX_TOOL_FREE_LEAD_TURNS = 32
+
+
 def lead_max_turns(value):
-    """Strict API/CLI boundary: only integer 1/2 or their exact CLI strings."""
-    if type(value) is int and value in (1, 2):
-        return value
-    if type(value) is str and value in ('1', '2'):
-        return int(value)
-    raise ValueError('lead max turns must be integer 1 or 2')
+    """Explicit bounded agentic-turn budget, not tokens or paid dispatch count.
+
+    Keep defaults/legacy 1 and 2 unchanged. Larger values require the existing
+    tool-free plan/review mode; permission dispatch remains one turn.
+    """
+    if type(value) is int:
+        turns = value
+    elif type(value) is str and re.fullmatch(r'[1-9][0-9]*', value):
+        if len(value) > len(str(MAX_TOOL_FREE_LEAD_TURNS)):
+            raise ValueError('lead max turns exceeds bounded maximum')
+        turns = int(value)
+    else:
+        raise ValueError('lead max turns must be an exact positive integer')
+    if not 1 <= turns <= MAX_TOOL_FREE_LEAD_TURNS:
+        raise ValueError(f'lead max turns must be 1..{MAX_TOOL_FREE_LEAD_TURNS}')
+    return turns
 
 
 class GrokCliLeadAdapter(LeadAdapterABC):
@@ -124,12 +137,12 @@ class GrokCliLeadAdapter(LeadAdapterABC):
         tool_free: bool = False,
         caller_evidence_root: str | Path | None = None,
     ) -> None:
+        self.max_turns = lead_max_turns(max_turns)
+        if self.max_turns > 1 and not tool_free:
+            raise ValueError('multiple turns require tool_free=True')
         explicit = (bin_path or "").strip()
         self.bin_path = explicit or resolve_lead_bin()
         self.disallowed_tools = disallowed_tools
-        self.max_turns = lead_max_turns(max_turns)
-        if self.max_turns == 2 and not tool_free:
-            raise ValueError('two turns require tool_free=True')
         self.tool_free = tool_free
         self.caller_evidence_root = Path(caller_evidence_root) if caller_evidence_root else None
 
@@ -141,13 +154,13 @@ class GrokCliLeadAdapter(LeadAdapterABC):
         cwd: str,
         timeout_sec: float = 180,
     ) -> tuple[str, dict | None]:
-        # Only tool-free plan/review can use two internal CLI turns. This is
-        # still ONE admitted lead dispatch, not two resource-package claims.
+        # Only tool-free plan/review can use configured internal CLI turns.
+        # This is ONE admitted lead dispatch, not max_turns package claims.
         max_turns = self.max_turns if self.tool_free and request.get('kind') in ('plan', 'review') else 1
         hint = ""
         if isinstance(request.get("extra"), dict):
             hint = str(request["extra"].get("allow_hint") or "")
-        prompt = format_lead_request_prompt(request, allow_hint=hint)
+        prompt = format_lead_request_prompt(request, allow_hint=hint, tool_free=self.tool_free)
         if isinstance(request.get("extra"), dict) and request["extra"].get("legacy_prompt"):
             prompt = str(request["extra"]["legacy_prompt"]) + "\n\n" + prompt
         pinned_schema = pin_lead_response_schema(schema, request)
@@ -254,6 +267,15 @@ class GrokCliLeadAdapter(LeadAdapterABC):
             # If the model tried to return a forged "raw_evidence", isolate it and refuse trust.
             if "raw_evidence" in parsed and parsed["raw_evidence"] != raw_evidence:
                 parsed["untrusted_raw_evidence"] = parsed.pop("raw_evidence")
+            observed_turns = parsed.get('num_turns')
+            if type(observed_turns) is not int or observed_turns < 0 or not any(k in parsed for k in ('stopReason', 'structuredOutput')):
+                observed_turns = None
+            raw_evidence['caller_observation'].update(
+                configured_internal_turn_limit=self.max_turns,
+                effective_internal_turn_limit=max_turns,
+                reported_internal_turns=observed_turns,
+                reported_internal_turns_source='CLI envelope report, not billing' if observed_turns is not None else 'unknown',
+                resource_accounting='one admitted CLI dispatch; internal turns never create extra package claims')
             parsed["raw_evidence"] = copy.deepcopy(raw_evidence)
             parsed["summary"] = summary
 

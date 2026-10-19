@@ -86,7 +86,7 @@ def main():
  p=argparse.ArgumentParser(description=__doc__);p.add_argument('--state',required=True);p.add_argument('--existing-state',action='store_true',help='explicit opt-in to an existing external same-store; serve additionally requires settled binding, store digest and new backup');sub=p.add_subparsers(dest='cmd',required=True)
  serve=sub.add_parser('serve');serve.add_argument('--restart-settled',type=float);serve.add_argument('--model-release',action='store_true');serve.add_argument('--task-workspace-permissions',action='store_true');serve.add_argument('--lead-bin',default='grok');serve.add_argument('--native-bin',default='agy');serve.add_argument('--planning-timeout-sec',type=planning_timeout,default=180,help='planning only: finite seconds > 0 and <= 300 (default: 180); capped by active resource checkpoint, does not release models')
  serve.add_argument('--native-timeout-sec',type=native_timeout,default=None,help='optional per-native-run finite positive cap; never extends a shorter caller deadline; omitted preserves legacy behavior; not model release')
- serve.add_argument('--lead-max-turns',type=lead_max_turns,default=1,help='tool-free plan/review internal CLI turns: 1 or 2 (default: 1); permission stays 1; not a resource grant')
+ serve.add_argument('--lead-max-turns',type=lead_max_turns,default=1,help='tool-free plan/review internal CLI turns: exact integer 1..32 (default 1, recommend explicit 4 for new goals); permission stays 1; one dispatch, not a resource grant')
  serve.add_argument('--expected-store-sha256');serve.add_argument('--state-backup')
  for name in ('review-prepare','review-authorize'):
   q=sub.add_parser(name);q.add_argument('--goal-id',required=True)

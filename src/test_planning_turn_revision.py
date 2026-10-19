@@ -34,7 +34,7 @@ class Tests(unittest.TestCase):
    adapter=GrokCliLeadAdapter(bin_path='NOT_EXECUTED',tool_free=True,caller_evidence_root=d)
    def fake(cmd,**kw):
     self.assertEqual(cmd[cmd.index('--tools')+1],'');self.assertIn('--no-subagents',cmd);self.assertIn('--disable-web-search',cmd);self.assertEqual(cmd[cmd.index('--max-turns')+1],'1');self.assertEqual(kw['timeout'],180)
-    self.assertEqual(Path(cmd[2]).read_text(encoding='utf-8'),format_lead_request_prompt(req));return subprocess.CompletedProcess(cmd,1,text['stdout'],text['stderr'])
+    self.assertEqual(Path(cmd[2]).read_text(encoding='utf-8'),format_lead_request_prompt(req,tool_free=True));return subprocess.CompletedProcess(cmd,1,text['stdout'],text['stderr'])
    with patch('lead_adapter.grok_cli.run_cancellable',side_effect=fake)as runner:raw,p=adapter.decide(req,schema=planning_response_schema(),cwd=str(W),timeout_sec=180)
    self.assertEqual(runner.call_count,1);assert isinstance(p,dict);self.assertTrue(p['incomplete']);self.assertEqual(p['failure_stage'],'lead_cli_turn_limit');self.assertIn('not a business review verdict',p['reason']);self.assertFalse(p['raw_evidence']['caller_observation']['timeout_exception']);self.assertEqual(p['raw_evidence']['capture_status'],'not_recorded');self.assertTrue(list(Path(d).glob('call-*/CALLER.json')))
  def test_schema_cap_sent(self):

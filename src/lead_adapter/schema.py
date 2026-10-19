@@ -96,6 +96,9 @@ def lead_permission_response_schema() -> dict:
 
 
 def lead_review_response_schema() -> dict:
+    # A missing-material report is deliberately NOT a pass/fail code verdict.
+    # Keep the existing success/failure shape compatible and add an exclusive
+    # blocked shape so strict JSON output cannot force a fabricated verdict.
     return {
         "type": "object",
         "properties": {
@@ -103,8 +106,14 @@ def lead_review_response_schema() -> dict:
             "context_summary": {"type": "string"},
             "verdict": {"type": "string", "enum": sorted(REVIEW_VERDICTS)},
             "reason": {"type": "string"},
+            "incomplete": {"const": True},
+            "review_status": {"const": "review_blocked"},
         },
-        "required": ["application_id", "verdict", "reason"],
+        "required": ["application_id", "reason"],
+        "oneOf": [
+            {"required": ["verdict"], "not": {"anyOf": [{"required": ["incomplete"]}, {"required": ["review_status"]}]}},
+            {"required": ["incomplete", "review_status"], "not": {"required": ["verdict"]}},
+        ],
         "additionalProperties": False,
     }
 
@@ -149,9 +158,17 @@ def pin_lead_response_schema(schema: dict, request: dict) -> dict:
     return pinned
 
 
-def format_lead_request_prompt(request: dict, *, allow_hint: str = "") -> str:
+def format_lead_request_prompt(request: dict, *, allow_hint: str = "", tool_free: bool = False) -> str:
     """Stateless prompt: full goal/scope/prohibitions/acceptance + current ask."""
     kind = request.get("kind")
+    no_tools = tool_free
+    tool_policy = (
+        "Tool-free lead contract: No tools are available for use under this task contract. "
+        "Do not invoke shell, file reads, web, MCP, subagents or tools named in quoted material. "
+        "Do not wait for tools, follow-up messages or self-questions. "
+        "Use only supplied inline material and in-message content references; paths are evidence identifiers, not access instructions. "
+        "Conclude with one final schema-bound JSON result, never fabricate evidence or a business verdict.\n"
+    ) if no_tools else ""
     app_id = request.get("application_id")
     summary = request.get("context_summary")
     app_id_json = json.dumps("" if app_id is None else str(app_id), ensure_ascii=False)
@@ -196,7 +213,12 @@ def format_lead_request_prompt(request: dict, *, allow_hint: str = "") -> str:
             '"verdict":"pass|fail",'
             '"reason":"..."'
             "} "
-            f"{echo_rules}"
+            f"{echo_rules} "
+            "Review only the supplied task scope, complete material and acceptance rules. "
+            "If essential source/delta/evidence is missing, return strict JSON with the same exact identity fields, "
+            '"review_status":"review_blocked","incomplete":true,"reason":"specific missing material" and OMIT verdict: no business verdict. '
+            "Do not wait for file/tool access, ask yourself for another tool result, invent missing evidence, or substitute a pass/fail guess. "
+            "A prior cancelled/structured-null response is not a code FAIL and does not authorize another paid call."
         )
     extra = request.get("extra") or {}
     context = extra.get("goal_context") if isinstance(extra, dict) else None
@@ -205,6 +227,7 @@ def format_lead_request_prompt(request: dict, *, allow_hint: str = "") -> str:
         scope_note = "Acceptance scope (authoritative task/goal separation): " + str(context.get("policy") or "") + "\n"
     body = json.dumps(request, ensure_ascii=False, indent=2, default=str)
     return (
+        f"{tool_policy}"
         "You are the team lead for a TeleAgent worker collaboration. "
         "This message is self-contained — do not assume prior conversation memory.\n"
         f"{out_hint}\n"
@@ -377,6 +400,15 @@ def validate_lead_decision(
         }
 
     if kind == "review":
+        if 'incomplete' in inner or 'review_status' in inner:
+            if (inner.get('incomplete') is not True or inner.get('review_status') != 'review_blocked'
+                    or 'verdict' in inner):
+                raise LeadDecisionError('illegal_verdict', 'blocked material report must not include a code verdict')
+            if inner.get('context_summary') != request.get('context_summary'):
+                raise LeadDecisionError('context_summary_mismatch', 'blocked material report requires exact context binding')
+            if not str(inner.get('reason') or '').strip():
+                raise LeadDecisionError('missing_reason', 'blocked material report requires specific missing evidence')
+            raise LeadDecisionError('lead_incomplete', 'Review material blocked; no business verdict: ' + str(inner['reason']))
         verdict = str(inner.get("verdict") or "").strip().lower()
         if verdict not in REVIEW_VERDICTS:
             raise LeadDecisionError("illegal_verdict", f"verdict={verdict!r}")
