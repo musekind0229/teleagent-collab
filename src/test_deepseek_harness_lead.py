@@ -174,7 +174,9 @@ class TestFactory(unittest.TestCase):
             os.environ.pop("COLLAB_LEAD_BIN", None)
             os.environ.pop("COLLAB_DEEPSEEK_LEAD_BIN", None)
             ad3 = DeepSeekHarnessLeadAdapter()
-            self.assertTrue(ad3.bin_path.endswith("bin/run-deepseek-lead.py"))
+            self.assertEqual(
+                Path(ad3.bin_path), REPO / "bin" / "run-deepseek-lead.py"
+            )
 
 
 class TestDeepSeekDecideSim(unittest.TestCase):
