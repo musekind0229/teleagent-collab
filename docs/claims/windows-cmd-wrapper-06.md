@@ -86,3 +86,9 @@ Do not assert a single unique `/c` string spelling; assert structure, safety, an
 - Auto-wiring product callers to `get_cmd_wrapper()`.
 - Expanding the rejected-character set or adding PowerShell/CALL.
 - Knife 7 (`test/deepseek-default-path-xplat-07`).
+
+## Status (Hermes a27)
+- `windows_cli.py` applied verbatim from Hermes patch (baseline `aa8af01`, patch sha256
+  `cb43dc93…656e`, source sha256 `ac4ee995…eb49`).
+- Windows roundtrip cwd assertion now normcases both sides (Windows preserves directory
+  case; path semantics equal). No product cwd change.

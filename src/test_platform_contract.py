@@ -475,7 +475,7 @@ class WindowsCmdWrapperLiveTests(unittest.TestCase):
             self.assertEqual(r.returncode, 0, msg=(r.stdout, r.stderr, args))
             data = json.loads(self.out.read_text(encoding="utf-8"))
             self.assertEqual(data["marker"], "ran")
-            self.assertEqual(data["cwd"], os.path.normcase(cwd))
+            self.assertEqual(os.path.normcase(data["cwd"]), os.path.normcase(cwd))
 
     def test_explicit_env_passed(self):
         import json
