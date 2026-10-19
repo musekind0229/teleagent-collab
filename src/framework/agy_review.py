@@ -547,7 +547,7 @@ def build_complete_delta(*, baseline, current, binding, evidence_root, capacity_
             raise ValueError("delta does not reconstruct candidate")
         rows.append({"path": rel, "before": refs["before"], "after": refs["after"],
                      "before_exists": before is not None, "after_exists": after is not None, "edits": ops})
-    packet = {"complete": True, "binding": binding, "paths": rows,
+    packet = {"complete": True, "binding": binding, "paths": rows, "capacity_bytes": capacity_bytes,
               "coverage": "all changed paths; every changed byte reconstructs endpoint"}
     raw = json.dumps(packet, ensure_ascii=False, sort_keys=True).encode("utf-8")
     if len(raw) > capacity_bytes:

@@ -225,6 +225,10 @@ def format_lead_request_prompt(request: dict, *, allow_hint: str = "", tool_free
     scope_note = ""
     if kind == "review" and isinstance(extra, dict) and extra.get("review_scope") == "task" and isinstance(context, dict):
         scope_note = "Acceptance scope (authoritative task/goal separation): " + str(context.get("policy") or "") + "\n"
+    readable = ""
+    if kind == 'review' and isinstance(extra, dict) and isinstance(extra.get('worker_request'), dict):
+        from framework.review_material_codec import readable_material
+        readable = readable_material(extra['worker_request'], expected_artifacts=(extra.get('current_task') or {}).get('expected_artifacts') or [])
     body = json.dumps(request, ensure_ascii=False, indent=2, default=str)
     return (
         f"{tool_policy}"
@@ -239,6 +243,7 @@ def format_lead_request_prompt(request: dict, *, allow_hint: str = "", tool_free
         f"Acceptance criteria: {json.dumps(request.get('acceptance_criteria'), ensure_ascii=False)}\n"
         f"application_id: {request.get('application_id')}\n"
         f"context_summary: {request.get('context_summary')}\n"
+        f"{readable}"
         f"Full request JSON:\n{body}\n"
     )
 

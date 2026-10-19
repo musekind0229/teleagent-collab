@@ -111,7 +111,7 @@ class Tests(unittest.TestCase):
   self.assertIn('owner_review_recovery',expanded)
   metrics={'synthetic_only':True,'before_bytes':len(json.dumps(expanded,ensure_ascii=False).encode()),'after_bytes':len(json.dumps(packed,ensure_ascii=False).encode()),'lossless_roundtrip':True,'no_actual_portal_wire_read':True}
   self.assertLess(metrics['after_bytes'],metrics['before_bytes'])
-  (ROOT.parent/'review-recovery-evidence/MATERIAL-METRICS.json').write_text(json.dumps(metrics,indent=2))
+  (self.root/'MATERIAL-METRICS.json').write_text(json.dumps(metrics,indent=2))
 
  def test_recovery_material_gate_refuses_without_lead_even_after_grant(self):
   app,a,l,b,gid=self.make(answers=('partial',))

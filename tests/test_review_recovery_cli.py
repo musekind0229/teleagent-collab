@@ -34,7 +34,7 @@ class Tests(unittest.TestCase):
    grantfile=f.root/'synthetic-review-grant.json';grantfile.write_text(json.dumps(grant))
    cli('review-authorize','--goal-id',gid,'--grant-file',str(grantfile));self.assertTrue(cli('review-authorize','--goal-id',gid,'--grant-file',str(grantfile))['duplicate'])
    l.answers=['pass'];f.drive(app,gid);self.assertEqual(b.starts,1);self.assertEqual(b.collections,1);self.assertEqual(app.layer.get_goal(gid)['goal']['state'],'completed')
-   (ROOT.parent/'review-recovery-evidence/CLI-COMMANDS.json').write_text(json.dumps(commands,indent=2))
+   (f.root/'CLI-COMMANDS.json').write_text(json.dumps(commands,indent=2))
   finally:f.doCleanups()
  def test_external_settled_backup_and_wrong_hash_live_owner_refused(self):
   with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR',ROOT))as td:

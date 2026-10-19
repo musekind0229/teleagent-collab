@@ -3256,6 +3256,14 @@ class AppCoordinator:
             material_blocked = True
             blocked_reason = str(choice.get("reason") or "lead review blocked/incomplete")
 
+        if not material_blocked:
+            from framework.review_material_codec import readable_material
+            try:
+                readable_material(payload, expected_artifacts=task.get('expected_artifacts') or [])
+            except (ValueError, KeyError, TypeError, UnicodeError) as exc:
+                material_blocked = True
+                blocked_reason = 'review material not directly readable: ' + str(exc)
+
         if material_blocked:
             out["ok"] = False
             out["review_status"] = "review_blocked"
