@@ -269,7 +269,7 @@ class GoalService:
   self.planning_timeout_sec=planning_timeout(planning_timeout_sec)
   self.root=Path(root);self.app=CollabApplication(self.root);self.authority=ResourceAuthority(self.app.layer)
   from framework.lifecycle_events import LifecycleOutbox
-  self.lifecycle=LifecycleOutbox(self.root,runtime=self.runtime_verification or {'runtime_root':'synthetic'})
+  self.lifecycle=LifecycleOutbox(self.root,runtime={**(self.runtime_verification or {'runtime_root':'synthetic'}),'execution_class':'synthetic'if test_factory is not None else'real'})
   self.lifecycle.reconcile(self.app.layer.goals.values())
   self.app.layer._lifecycle_publisher=self.lifecycle
   self.delivery_stop=threading.Event()

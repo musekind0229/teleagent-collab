@@ -11,7 +11,9 @@ sys.addaudithook(audit)
 CHILD='''import sys,json
 from pathlib import Path
 sys.path.insert(0,sys.argv[1]);from framework.lifecycle_events import LifecycleOutbox
-root=Path(sys.argv[2]);box=LifecycleOutbox(root,runtime={'head':'a'*40,'runtime_root':'synthetic'})
+root=Path(sys.argv[2]);box=LifecycleOutbox(root,runtime={'head':'a'*40,'runtime_root':'synthetic','execution_class':'real'})
+# Test-only real-origin branch injection, not production synthetic qualification.
+if not(root/'lifecycle-activation.json').exists():box.arm([{'goal_id':'synthetic_goal','state':'running','pending_decisions':[]}],authorized_goal_id='synthetic_goal',approval_reference='synthetic-only',source_sha256='a'*64,now=10)
 s={'goal_id':'synthetic_goal','state':'completed','goal':{'title':'synthetic'},'tasks':[],'pending_decisions':[]}
 e=box.publish(s)
 if sys.argv[3]=='prepare':

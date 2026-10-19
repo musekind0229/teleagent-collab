@@ -14,7 +14,8 @@ class HermesLifecycleSender:
   route=rule.get(channel)or{}
   if channel=='qq':
    target=route.get('target');profile=route.get('profile')
-   if not isinstance(target,str)or not target.startswith('qq:')or not profile:return {'status':'route_unbound'}
+   if profile!='default':return {'status':'route_profile_not_approved'}
+   if not isinstance(target,str)or not target.startswith('qqbot:')or target=='qqbot:':return {'status':'route_unbound'}
    argv=[str(binary),'-p',profile,'send','--to',target,'--json','--file','-'];text=payload
   else:
    profile=route.get('profile')

@@ -48,6 +48,41 @@ class LifecycleOutbox:
   obj=json.loads((self.root/(event_id+'.json')).read_bytes());body={k:v for k,v in obj.items()if k!='packet_sha256'}
   if obj['event_id']!=event_id or digest(body)!=obj['packet_sha256']:raise ValueError('lifecycle packet hash mismatch')
   return obj
+ def arm(self,snapshots,*,authorized_goal_id,approval_reference,source_sha256,now=None):
+  """Trusted local operator only; production caller holds store persist lock.
+  Capture durable source identities, not event-file timestamps. Never auto-rearm.
+  """
+  if not isinstance(approval_reference,str)or not approval_reference.strip()or not re.fullmatch('[0-9a-f]{64}',source_sha256 or ''):raise ValueError('exact source digest and owner approval required')
+  snapshots=list(snapshots)
+  if not any(s.get('goal_id')==authorized_goal_id for s in snapshots):raise ValueError('authorized goal absent from source')
+  baseline=[]
+  for s in snapshots:
+   gid=s['goal_id']
+   if s.get('state')in('completed','failed','cancelled'):baseline.append([gid,s['state']])
+   for field in('pending_decisions','resolved_decisions'):
+    for d in s.get(field,[]):
+     if isinstance(d,dict)and d.get('decision_id'):baseline.append([gid,d['decision_id']])
+  path=self.state/'lifecycle-activation.json'
+  with persist_lock(self.root):
+   if path.exists():raise ValueError('activation already exists; no implicit baseline reset')
+   data={'schema':'collab-lifecycle-activation-v1','store_root':str(self.state.resolve()),'armed':True,'authorized_goal_id':authorized_goal_id,'approval_reference':approval_reference,'activation_epoch':time.time()if now is None else now,'source_sha256':source_sha256,'excluded_source_identities':baseline,'excluded_event_ids':[p.stem for p in self.root.glob('*.json')]}
+   data['activation_id']=digest(data);atomic_write_json(path,data)
+  return data
+ def _activation(self):
+  path=self.state/'lifecycle-activation.json'
+  if not path.exists():return None
+  value=json.loads(path.read_bytes())
+  if not isinstance(value,dict):raise ValueError('activation record must be object')
+  body={k:v for k,v in value.items()if k!='activation_id'}
+  if digest(body)!=value.get('activation_id')or value.get('armed')is not True or value.get('store_root')!=str(self.state.resolve()):raise ValueError('invalid activation record')
+  return value
+ def _qualification(self,gid,identity,event_id):
+  a=self._activation()
+  if not a:return {'eligible':False,'reason':'not_armed'}
+  if self.runtime.get('execution_class')!='real':return {'eligible':False,'reason':'synthetic_or_unknown_runtime'}
+  if gid!=a['authorized_goal_id']:return {'eligible':False,'reason':'goal_not_authorized'}
+  if [gid,identity]in a['excluded_source_identities']or event_id in a['excluded_event_ids']:return {'eligible':False,'reason':'preactivation_source_or_backlog'}
+  return {'eligible':True,'activation_id':a['activation_id'],'execution_class':'real','source_identity':[gid,identity]}
  def publish(self,snapshot,*,host_exited=False):
   gid=snapshot['goal_id'];pending=[d for d in snapshot.get('pending_decisions',[])if d.get('continuity')]
   status='awaiting_owner'if pending else snapshot.get('state')
@@ -76,7 +111,8 @@ class LifecycleOutbox:
     summary={k:p[k]for k in('package_id','actual_native','actual_lead')if k in p}
     summary['claims']=[{k:c[k]for k in('claim_id','kind','state','pid','birth')if k in c}for c in p.get('claims',[])if isinstance(c,dict)]
     packages.append(summary)
-   obj={'schema':'collab-lifecycle-v1','goal_id':gid,'event':identity,'event_id':event_id,'state':status,'title':line((snapshot.get('goal')or{}).get('title')or gid),'decision_id':identity if pending else None,'runtime':{k:self.runtime[k]for k in('head','runtime_root','branch')if k in self.runtime},'tasks':tasks,'packages':packages,'business_acceptance':False,'owner':'product_owner','maintenance_owner':'project-manager','maintenance_authorized':False}
+   obj={'schema':'collab-lifecycle-v1','goal_id':gid,'event':identity,'event_id':event_id,'state':status,'title':line((snapshot.get('goal')or{}).get('title')or gid),'decision_id':identity if pending else None,'runtime':{k:self.runtime[k]for k in('head','runtime_root','branch','execution_class')if k in self.runtime},'tasks':tasks,'packages':packages,'business_acceptance':False,'owner':'product_owner','maintenance_owner':'project-manager','maintenance_authorized':False}
+   obj['qualification']=self._qualification(gid,identity,event_id)
    obj['packet_sha256']=digest(obj);atomic_write_json(path,obj)
   self._prepare_delivery(obj)
   return obj
@@ -92,6 +128,11 @@ class LifecycleOutbox:
  def _save(self,event_id,row):atomic_write_json(self.receipts/(event_id+'.json'),row)
  def deliver(self,event_id,sender,*,now=None,channels=('qq','pm','owner')):
   now=time.time()if now is None else now;e=self._event(event_id)
+  a=self._activation();q=e.get('qualification')or{}
+  if not a or q.get('eligible')is not True or q.get('activation_id')!=a['activation_id']or e['goal_id']!=a['authorized_goal_id']:
+   with persist_lock(self.receipts):
+    s=self.status(event_id);s['qualification_blocked']={'reason':q.get('reason','missing_or_changed_activation'),'responsible':'product_owner','recovery':'do not authorize historical/synthetic packet by replay or route edits'};self._save(event_id,s)
+   return
   # Independent bounded mechanical delivery. Sender is injected by the existing
   # host or approved operator drain, never a model-generated command.
   for channel in channels:

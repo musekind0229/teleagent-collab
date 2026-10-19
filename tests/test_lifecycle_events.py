@@ -12,7 +12,11 @@ class Tests(unittest.TestCase):
   return {'goal_id':'synthetic_goal','state':status,'goal':{'title':'Synthetic\nuser text','private':'DO NOT EXPORT'},'pending_decisions':[],'tasks':[{'task_id':'synthetic_task','run_id':'synthetic_run','status':'succeeded','result':{'backend':'synthetic','response':'PRIVATE RAW THOUGHT','usage':{'input_tokens':3},'review':{'status':'passed'},'artifacts':['PRIVATE LIST']}}],'resource_packages':{}}
  def outbox(self):
   from framework.lifecycle_events import LifecycleOutbox
-  return LifecycleOutbox(self.root,runtime={'head':'a'*40,'runtime_root':'synthetic runtime'})
+  # Explicit synthetic test seam exercises an eligible real-origin branch;
+  # the production service marks test_factory packets synthetic and ineligible.
+  box=LifecycleOutbox(self.root,runtime={'head':'a'*40,'runtime_root':'synthetic runtime','execution_class':'real'})
+  if not(self.root/'lifecycle-activation.json').exists():box.arm([self.snapshot('running')],authorized_goal_id='synthetic_goal',approval_reference='synthetic test only',source_sha256='a'*64,now=10)
+  return box
  def test_auto_event_stable_restart_and_whitelist_no_task_or_ack_event(self):
   b=self.outbox();self.assertIsNone(b.publish(self.snapshot('running')))
   event=b.publish(self.snapshot());self.assertEqual(event['event_id'],self.outbox().publish(self.snapshot())['event_id'])
@@ -74,7 +78,7 @@ class Tests(unittest.TestCase):
   import subprocess
   route=self.root/'route.json';sender=HermesLifecycleSender(route)
   self.assertEqual(sender('qq','one\ntwo\nthree')['status'],'route_unbound')
-  route.write_text(json.dumps({'approved':True,'hermes_executable':sys.executable,'qq':{'profile':'synthetic','target':'qq:SYNTHETIC'},'pm':{'profile':'project-manager'}}))
+  route.write_text(json.dumps({'approved':True,'hermes_executable':sys.executable,'qq':{'profile':'default','target':'qqbot:SYNTHETIC'},'pm':{'profile':'project-manager'}}))
   with patch('subprocess.run',return_value=subprocess.CompletedProcess([],0,json.dumps({'success':True,'message_id':'spy-id'}),''))as run:
    self.assertEqual(sender('qq','one\ntwo\nthree')['status'],'sent');argv=run.call_args.args[0];self.assertIn('--json',argv);self.assertEqual(run.call_args.kwargs['input'],'one\ntwo\nthree');self.assertNotIn('shell',run.call_args.kwargs)
   with patch('subprocess.run',return_value=subprocess.CompletedProcess([],1,'target_busy','')):
