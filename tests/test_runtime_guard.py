@@ -62,7 +62,9 @@ class Tests(unittest.TestCase):
     for m in MARKERS:(p/m).parent.mkdir(parents=True,exist_ok=True);(p/m).write_text('synthetic')
   bare=Path(self.tmp.name)/'bare';bare.mkdir();(bare/'HEAD').write_text('not-read');(bare/'objects').mkdir();(bare/'refs').mkdir()
   protected=Path(self.tmp.name)/'states/fixture/.git';protected.mkdir(parents=True)
-  r=inventory(Path(self.tmp.name));self.assertEqual(r['counts']['complete_collab_copy'],1);self.assertEqual(r['counts']['worktree_git_file'],1);self.assertEqual(r['counts']['other_git_directory'],1);self.assertEqual(r['counts']['bare_objects_archive'],1);self.assertTrue(r['scan_complete_within_scope'])
+  with patch('framework.repository_inventory.source_tree',side_effect=lambda p:p.name=='full'):
+   r=inventory(Path(self.tmp.name))
+  self.assertEqual(r['counts']['complete_collab_copy'],1);self.assertEqual(r['counts']['worktree_git_file'],1);self.assertEqual(r['counts']['other_git_directory'],1);self.assertEqual(r['counts']['bare_objects_archive'],1);self.assertTrue(r['scan_complete_within_scope'])
  def test_all_existing_cli_mains_have_gate_and_goal_serve_checks_before_mkdir(self):
   import ast
   for path in (ROOT/'bin').glob('*.py'):
@@ -83,5 +85,15 @@ class Tests(unittest.TestCase):
   for status in (301,404,403,429,500):
    response.status=status
    with self.subTest(status=status),patch('http.client.HTTPSConnection',return_value=conn),self.assertRaises(RuntimeRejected):self.real_github_head()
+
+ def test_old_layout_counts_but_overlay_markers_without_head_do_not(self):
+  from framework.repository_inventory import inventory,MARKERS
+  a=Path(self.tmp.name)/'old-layout';a.mkdir();(a/'.git').mkdir();(a/'src/framework').mkdir(parents=True)
+  b=Path(self.tmp.name)/'overlay';b.mkdir();(b/'.git').mkdir()
+  for marker in MARKERS:(b/marker).parent.mkdir(parents=True,exist_ok=True);(b/marker).write_text('synthetic')
+  with patch('framework.repository_inventory.source_tree',side_effect=lambda p:p.name=='old-layout',create=True):
+   r=inventory(Path(self.tmp.name))
+  self.assertEqual(next(x['kind']for x in r['repositories']if Path(x['path']).name=='overlay'),'other_git_directory')
+  self.assertEqual(r['counts']['complete_collab_copy'],1);self.assertEqual(r['counts']['current_layout_marker_matches'],1)
 
 if __name__=='__main__':unittest.main(verbosity=2)
