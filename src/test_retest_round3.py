@@ -68,6 +68,75 @@ def _backend(root: Path, **kw):
     return AntigravityCliExecutionBackend(bin_path=_fake_agy(root), environ=env, timeout_sec=60, **kw)
 
 
+# Keys a Windows Python child needs to start (same list as test_retest_round4).
+_WIN_ENV_KEYS = ("SYSTEMROOT", "SystemRoot", "WINDIR", "TEMP", "TMP", "PATHEXT", "COMSPEC")
+
+
+def _xplat_backend(case: unittest.TestCase, root: Path, **kw):
+    """Fake agy backend that launches on POSIX and Windows alike (knife 9, Hermes a34).
+
+    The fake is a plain ``fake_agy.py`` (no shebang, no exec bit, no ``.cmd`` or
+    /bin/sh shim). Its launch prefix comes from ``prepare_cli(..., interpreter=
+    sys.executable)``; for the rest of the test, ``build_agy_argv`` is wrapped so
+    only ``bin_path`` is swapped for that prefix. Every other argv element,
+    including the multi-line ``--print=`` prompt, is the product's own and reaches
+    the real child process unchanged. (A ``.cmd`` shim forwarding ``%*`` keeps only
+    the first line of a multi-line argument, so SLEEP/SESSION/WRITE were lost on
+    Windows.) Product code is untouched; callers reap runs with ``_reap_runs``.
+    """
+    from unittest import mock
+
+    from execution_backend import antigravity_cli_v1 as agy_mod
+    from execution_backend.antigravity_cli_v1 import AntigravityCliExecutionBackend
+    from platform_services.cli import prepare_cli
+
+    home = root / "home"
+    home.mkdir(exist_ok=True)
+    script = root / "fake_agy.py"
+    script.write_text(_FAKE, encoding="utf-8")
+    prefix = list(prepare_cli(str(script), [], interpreter=sys.executable).argv)
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": str(home), "USERPROFILE": str(home)}
+    for key in _WIN_ENV_KEYS:
+        if os.name == "nt" and os.environ.get(key):
+            env[key] = os.environ[key]
+    real_build = agy_mod.build_agy_argv
+
+    def build(**bkw):
+        cmd = real_build(**bkw)
+        assert cmd[0] == str(script), cmd
+        return prefix + list(cmd[1:])
+
+    patch = mock.patch.object(agy_mod, "build_agy_argv", side_effect=build)
+    patch.start()
+    case.addCleanup(patch.stop)
+    return AntigravityCliExecutionBackend(bin_path=str(script), environ=env, timeout_sec=60, **kw)
+
+
+def _run_proc(be, run_id: str):
+    return (be._runs.get(run_id) or {}).get("proc")
+
+
+def _reap_runs(be) -> None:
+    """Cancel, wait and join readers for every run, so Windows can delete the temp dir."""
+    for rid, rec in list(be._runs.items()):
+        proc = rec.get("proc")
+        if proc is not None and proc.poll() is None:
+            try:
+                be.cancel(rid)
+            except Exception:  # noqa: BLE001  cleanup only
+                pass
+    for rec in list(be._runs.values()):
+        proc = rec.get("proc")
+        if proc is not None:
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=10)
+        for t in rec.get("drain_threads") or []:
+            t.join(timeout=5)
+
+
 def _alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -305,19 +374,34 @@ class AgyStaleTests(unittest.TestCase):
     def test_live_but_silent_agy_heartbeat_ages(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            be = _backend(root)
-            run = be.start_run(title="t", directory=str(root / "ws"), instruction="SLEEP[4]")
-            time.sleep(2.0)
-            age, prog = self._hb_age(be, run["run_id"])
-            self.assertGreater(age, 1.5, f"process-alive poll must not refresh the heartbeat: {prog}")
-            be.cancel(run["run_id"])
+            be = _xplat_backend(self, root)
+            try:
+                run = be.start_run(title="t", directory=str(root / "ws"), instruction="SLEEP[4]")
+                time.sleep(2.0)
+                age, prog = self._hb_age(be, run["run_id"])
+                # Fixture precondition: the fake worker really is alive but silent.
+                self.assertIsNone(_run_proc(be, run["run_id"]).poll(), f"fixture: fake agy exited early: {prog}")
+                self.assertGreater(age, 1.5, f"process-alive poll must not refresh the heartbeat: {prog}")
+            finally:
+                _reap_runs(be)
 
     def test_session_activity_keeps_heartbeat_fresh(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            be = _backend(root)
-            run = be.start_run(title="t", directory=str(root / "ws"), instruction="SESSION[40,0.25]")
+            be = _xplat_backend(self, root)
+            session = root / "home" / ".gemini" / "antigravity-cli" / "conversations" / "c.db"
             try:
+                run = be.start_run(title="t", directory=str(root / "ws"), instruction="SESSION[40,0.25]")
+                # Fixture precondition: the session file is really created and growing.
+                deadline = time.time() + 5
+                while not session.exists():
+                    self.assertLess(time.time(), deadline, "fixture: fake agy never wrote its session file")
+                    time.sleep(0.05)
+                size = session.stat().st_size
+                deadline = time.time() + 5
+                while session.stat().st_size <= size:
+                    self.assertLess(time.time(), deadline, "fixture: session file is not growing")
+                    time.sleep(0.05)
                 # Silent run of the same length ages past 1.5s (test above); a
                 # run touching its agy session files keeps a fresh heartbeat.
                 time.sleep(2.0)
@@ -329,20 +413,49 @@ class AgyStaleTests(unittest.TestCase):
                     self.assertLess(time.time(), deadline, prog)
                     time.sleep(0.2)
             finally:
-                be.cancel(run["run_id"])
+                _reap_runs(be)
 
     def test_goal_progress_goes_stale(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            app = CollabApplication(root / "app", backend=_backend(root), stale_after_sec=1.0)
-            req = dict(_request(), goal="SLEEP[5]")
-            gid = app.submit(req)["goal_id"]
-            app.coordinator.process_goal(gid)
-            time.sleep(2.0)
-            app.coordinator.process_goal(gid)
-            self.assertEqual(app.status(gid)["progress"]["state"], "stale")
-            app.cancel(gid)
-            app.coordinator.process_goal(gid)
+            be = _xplat_backend(self, root)
+            app = CollabApplication(root / "app", backend=be, stale_after_sec=1.0)
+            try:
+                req = dict(_request(), goal="SLEEP[5]")
+                gid = app.submit(req)["goal_id"]
+                app.coordinator.process_goal(gid)
+                time.sleep(2.0)
+                app.coordinator.process_goal(gid)
+                # Fixture precondition: the fake worker is still running (not "done").
+                procs = [r.get("proc") for r in be._runs.values() if r.get("proc") is not None]
+                self.assertTrue(procs, "fixture: no fake agy was started")
+                self.assertTrue(all(pr.poll() is None for pr in procs), f"fixture: fake agy exited early: {procs}")
+                self.assertEqual(app.status(gid)["progress"]["state"], "stale")
+                app.cancel(gid)
+                app.coordinator.process_goal(gid)
+            finally:
+                _reap_runs(be)
+
+    def test_fake_agy_launch_keeps_multiline_prompt(self):
+        """The fixture launches via an explicit interpreter and keeps the product's
+        multi-line ``--print=`` argument intact (no shebang, exec bit, .cmd or /bin/sh)."""
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            be = _xplat_backend(self, root)
+            script = root / "fake_agy.py"
+            self.assertFalse(script.read_text(encoding="utf-8").startswith("#!"))
+            self.assertFalse((root / "fake_agy").exists())
+            self.assertFalse((root / "fake_agy.cmd").exists())
+            with mock.patch("subprocess.Popen", side_effect=OSError("probe")) as popen:
+                be.start_run(title="t", directory=str(root / "ws"), instruction="SLEEP[4]")
+            argv = popen.call_args[0][0]
+            self.assertEqual(argv[:2], [sys.executable, str(script)])
+            prompt = next(a for a in argv if a.startswith("--print="))
+            self.assertIn("\n", prompt, "product prompt is multi-line; fixture must not flatten it")
+            self.assertIn("SLEEP[4]", prompt)
+            self.assertNotIn("/bin/sh", argv)
 
     def test_capability_names_activity_heartbeat(self):
         with tempfile.TemporaryDirectory() as td:
@@ -494,17 +607,21 @@ class PhaseVisibilityTests(unittest.TestCase):
     def test_acceptance_failure_is_testing_phase(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            app = CollabApplication(root / "app", backend=_backend(root))
-            req = dict(_request(), goal="WRITE[delivery.txt]",
-                       acceptance={"artifacts": ["delivery.txt"], "text": "delivery.txt must contain exactly NOPE"})
-            gid = app.submit(req)["goal_id"]
-            for _ in range(30):
-                app.coordinator.process_goal(gid)
-                if app.status(gid)["state"] in {"failed", "completed"}:
-                    break
-                time.sleep(0.1)
-            p = app.status(gid)["primary_failure"]
-            self.assertEqual((p["failed_phase"], p["outcome"]), ("testing", "candidate_produced"))
+            be = _xplat_backend(self, root)
+            app = CollabApplication(root / "app", backend=be)
+            try:
+                req = dict(_request(), goal="WRITE[delivery.txt]",
+                           acceptance={"artifacts": ["delivery.txt"], "text": "delivery.txt must contain exactly NOPE"})
+                gid = app.submit(req)["goal_id"]
+                for _ in range(30):
+                    app.coordinator.process_goal(gid)
+                    if app.status(gid)["state"] in {"failed", "completed"}:
+                        break
+                    time.sleep(0.1)
+                p = app.status(gid)["primary_failure"]
+                self.assertEqual((p["failed_phase"], p["outcome"]), ("testing", "candidate_produced"))
+            finally:
+                _reap_runs(be)
 
     def test_progress_shows_coordinator_phase(self):
         with tempfile.TemporaryDirectory() as td:
