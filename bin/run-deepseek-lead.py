@@ -51,7 +51,10 @@ _SRC = _REPO / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+from platform_services import get_cmd_wrapper
 from platform_services.cli import CliLaunchError, prepare_cli
+
+_WIN_CMD_SUFFIXES = (".cmd", ".bat")
 
 PERMISSION_DECISIONS = frozenset({"once", "reject", "deny_job", "demand_safe_path"})
 REVIEW_VERDICTS = frozenset({"pass", "fail"})
@@ -269,16 +272,50 @@ def _timeout_sec(envelope: dict) -> float:
     return val if val > 0 else 180.0
 
 
-def invoke_dsh(harness_argv: list[str], task: str, *, timeout_sec: float) -> subprocess.CompletedProcess:
+def _cmd_wrapper_for(binary: str, env: dict | None, *, platform: str | None = None):
+    """CmdWrapper only for a Windows .cmd/.bat target; None otherwise.
+
+    The wrapper is passed to prepare_cli explicitly; prepare_cli itself never
+    auto-wires one. POSIX, .exe and explicit-interpreter prefixes (the head is
+    then the interpreter) get None and keep their launch path unchanged. A
+    missing windows_cli raises PlatformWrapperRequired (no shell fallback).
+    """
+    key = (platform or sys.platform).lower()
+    if not key.startswith("win") or not binary:
+        return None
+    if os.sep in binary or (os.altsep and os.altsep in binary):
+        target = binary
+    elif env is None:
+        target = shutil.which(binary) or ""
+    else:
+        path = env.get("PATH")
+        target = (shutil.which(binary, path=path) or "") if path else ""
+    if not target.lower().endswith(_WIN_CMD_SUFFIXES):
+        return None
+    return get_cmd_wrapper(platform=key)
+
+
+def invoke_dsh(
+    harness_argv: list[str],
+    task: str,
+    *,
+    timeout_sec: float,
+    platform: str | None = None,
+) -> subprocess.CompletedProcess:
     # Throwaway cwd: even if the model ignores the no-tools rule, do not write
     # the collab repo or the job workspace. Do not pass --json.
     # Launch via prepare_cli → LaunchSpec (argv/cwd/env, shell always False).
+    # Windows .cmd/.bat: explicit CmdWrapper (system cmd, no shell=True).
+    env = os.environ.copy()
+    wrapper = _cmd_wrapper_for(harness_argv[0], env, platform=platform)
     with tempfile.TemporaryDirectory(prefix="collab-dsh-lead-") as tmp:
         spec = prepare_cli(
             harness_argv[0],
             list(harness_argv[1:]) + ["--profile", "headless", "-"],
             cwd=tmp,
-            env=os.environ.copy(),
+            env=env,
+            platform=platform,
+            cmd_wrapper=wrapper,
         )
         return subprocess.run(
             list(spec.argv),

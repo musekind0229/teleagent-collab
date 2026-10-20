@@ -34,6 +34,7 @@ from lead_adapter.schema import format_lead_request_prompt
 from platform_services.cli import (
     WRAPPER_DIRECT,
     WRAPPER_INTERPRETER,
+    WRAPPER_WINDOWS_CMD,
     CliLaunchError,
     LaunchSpec,
     PlatformWrapperRequired,
@@ -917,6 +918,240 @@ class TestWrapperDshInvoke(unittest.TestCase):
         self.assertEqual((stdout or "").strip(), "")
         self.assertNotIn('"decision": "once"', stdout)
         self.assertIn("launch prepare failed", stderr)
+
+
+_FAKE_DSH_WIRE = r"""import json
+import os
+import sys
+from pathlib import Path
+
+log = os.environ.get("COLLAB_FAKE_DSH_LOG", "")
+task = sys.stdin.read()
+if log:
+    Path(log).write_text(json.dumps({
+        "argv": sys.argv,
+        "cwd": os.getcwd(),
+        "marker": os.environ.get("COLLAB_FAKE_DSH_MARKER", ""),
+        "stdin": task,
+    }), encoding="utf-8")
+sys.stdout.write(os.environ.get("COLLAB_FAKE_DSH_STDOUT", ""))
+raise SystemExit(int(os.environ.get("COLLAB_FAKE_DSH_EXIT", "0")))
+"""
+
+
+class TestDeepSeekCmdWrapperWire(unittest.TestCase):
+    """Knife 8: product invoke_dsh passes CmdWrapper explicitly for win .cmd/.bat.
+
+    Unit cases run everywhere with platform="win32" and an injected test
+    cmd.exe path (nothing is spawned). The real cmd/bat end-to-end cases run
+    only on Windows. prepare_cli's own contract (no wrapper => reject) stays.
+    """
+
+    def setUp(self):
+        self.mod = _load_wrapper()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self._tmp.name)
+        # Host-valid absolute path (drive-absolute on Windows); never created
+        # or spawned. CmdWrapper rejects a non-absolute injected cmd_exe.
+        self._FAKE_CMD = str(self.d / "fake-sys" / "System32" / "cmd.exe")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _stub(self, name: str) -> Path:
+        p = self.d / name
+        p.write_text("@echo off\r\n", encoding="utf-8")
+        return p
+
+    def _test_wrapper(self):
+        from platform_services.windows_cli import CmdWrapper
+
+        return CmdWrapper(cmd_exe=self._FAKE_CMD)
+
+    def _invoke(self, harness_argv, *, platform="win32"):
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            captured["kwargs"] = dict(kwargs)
+            return _Proc(stdout="{}", returncode=0)
+
+        with mock.patch.object(self.mod, "get_cmd_wrapper",
+                               return_value=self._test_wrapper()) as gw:
+            with mock.patch.object(self.mod.subprocess, "run", fake_run):
+                self.mod.invoke_dsh(harness_argv, "task-body", timeout_sec=5.0,
+                                    platform=platform)
+        return gw, captured
+
+    def test_win_cmd_and_bat_go_through_explicit_cmd_wrapper(self):
+        for name in ("dsh.cmd", "dsh.BAT"):
+            with self.subTest(name=name):
+                stub = self._stub(name)
+                gw, cap = self._invoke([str(stub), "--extra"])
+                gw.assert_called_once()
+                self.assertEqual(cap["cmd"][:6],
+                                 [self._FAKE_CMD, "/d", "/v:off", "/s", "/c", "@"])
+                self.assertEqual(Path(cap["cmd"][6]).name, name)
+                self.assertEqual(cap["cmd"][7:], ["--extra", "--profile", "headless", "-"])
+                self.assertIs(cap["kwargs"]["shell"], False)
+                self.assertEqual(cap["kwargs"]["input"], "task-body")
+                self.assertTrue(cap["kwargs"]["cwd"])
+                self.assertIsNotNone(cap["kwargs"]["env"])
+
+    def test_wrapper_kind_is_windows_cmd(self):
+        stub = self._stub("dsh.cmd")
+        with mock.patch.object(self.mod, "get_cmd_wrapper",
+                               return_value=self._test_wrapper()):
+            w = self.mod._cmd_wrapper_for(str(stub), {"PATH": ""}, platform="win32")
+        spec = prepare_cli(str(stub), ["-"], platform="win32", cmd_wrapper=w)
+        self.assertEqual(spec.wrapper_kind, WRAPPER_WINDOWS_CMD)
+        self.assertFalse(spec.shell)
+
+    def test_bare_name_resolves_on_env_path(self):
+        self._stub("dsh.cmd")
+        with mock.patch.object(self.mod, "get_cmd_wrapper",
+                               return_value=self._test_wrapper()) as gw:
+            with mock.patch.object(self.mod.shutil, "which",
+                                   return_value=str(self.d / "dsh.cmd")) as wh:
+                w = self.mod._cmd_wrapper_for("dsh", {"PATH": str(self.d)},
+                                              platform="win32")
+        self.assertIsNotNone(w)
+        gw.assert_called_once()
+        self.assertEqual(wh.call_args.kwargs.get("path"), str(self.d))
+
+    def test_non_cmd_targets_get_no_wrapper(self):
+        exe = self._stub("dsh.exe")
+        py = self._stub("fake.py")
+        ps1 = self._stub("dsh.ps1")
+        cmd = self._stub("dsh.cmd")
+        cases = [
+            (str(exe), "win32"),          # plain .exe: direct
+            (sys.executable, "win32"),    # explicit interpreter prefix head
+            (str(py), "win32"),
+            (str(ps1), "win32"),          # .ps1 stays unsupported
+            (str(cmd), "linux"),          # POSIX unchanged
+            (str(cmd), "darwin"),
+        ]
+        for binary, plat in cases:
+            with self.subTest(binary=binary, platform=plat):
+                with mock.patch.object(self.mod, "get_cmd_wrapper") as gw:
+                    w = self.mod._cmd_wrapper_for(binary, {"PATH": ""}, platform=plat)
+                self.assertIsNone(w)
+                gw.assert_not_called()
+
+    def test_win_exe_launch_unchanged(self):
+        exe = self._stub("dsh.exe")
+        gw, cap = self._invoke([str(exe)])
+        gw.assert_not_called()
+        self.assertEqual(cap["cmd"], [str(exe.absolute()), "--profile", "headless", "-"])
+        self.assertIs(cap["kwargs"]["shell"], False)
+
+    def test_win_ps1_still_rejected_without_spawn(self):
+        ps1 = self._stub("dsh.ps1")
+        ran = []
+        with mock.patch.object(self.mod, "get_cmd_wrapper") as gw:
+            with mock.patch.object(self.mod.subprocess, "run",
+                                   lambda *a, **k: ran.append(a)):
+                with self.assertRaises(CliLaunchError) as cm:
+                    self.mod.invoke_dsh([str(ps1)], "t", timeout_sec=5.0,
+                                        platform="win32")
+        gw.assert_not_called()
+        self.assertEqual(ran, [])
+        self.assertNotIsInstance(cm.exception, PlatformWrapperRequired)
+
+    def test_dangerous_chars_rejected_once_no_retry_no_shell(self):
+        # Script path: only chars that are legal in Windows file names, so the
+        # stub can be created on every host. "|" (and the rest) are covered
+        # through argv rejection below without touching the file system.
+        for ch in ("&", "%", "^"):
+            with self.subTest(path_ch=ch):
+                stub = self._stub(f"bad{ch}dsh.cmd")
+                ran = []
+                with mock.patch.object(self.mod, "get_cmd_wrapper",
+                                       return_value=self._test_wrapper()) as gw:
+                    with mock.patch.object(self.mod.subprocess, "run",
+                                           lambda *a, **k: ran.append(k)):
+                        with self.assertRaises(CliLaunchError):
+                            self.mod.invoke_dsh([str(stub)], "t", timeout_sec=5.0,
+                                                platform="win32")
+                gw.assert_called_once()
+                self.assertEqual(ran, [])
+        stub = self._stub("dsh.cmd")
+        for ch in ("&", "%", "^", "|"):
+            with self.subTest(arg_ch=ch):
+                ran = []
+                with mock.patch.object(self.mod, "get_cmd_wrapper",
+                                       return_value=self._test_wrapper()) as gw:
+                    with mock.patch.object(self.mod.subprocess, "run",
+                                           lambda *a, **k: ran.append(k)):
+                        with self.assertRaises(CliLaunchError):
+                            self.mod.invoke_dsh([str(stub), f"a{ch}b"], "t",
+                                                timeout_sec=5.0, platform="win32")
+                gw.assert_called_once()
+                self.assertEqual(ran, [])
+
+    def test_missing_windows_cli_fails_closed(self):
+        stub = self._stub("dsh.cmd")
+
+        def missing(**_k):
+            raise PlatformWrapperRequired("platform_services.windows_cli not available")
+
+        with mock.patch.object(self.mod, "get_cmd_wrapper", side_effect=missing):
+            with mock.patch.object(self.mod.subprocess, "run") as run:
+                with self.assertRaises(PlatformWrapperRequired):
+                    self.mod.invoke_dsh([str(stub)], "t", timeout_sec=5.0,
+                                        platform="win32")
+        run.assert_not_called()
+
+    def test_prepare_cli_contract_still_rejects_without_injected_wrapper(self):
+        stub = self._stub("dsh.cmd")
+        with self.assertRaises(PlatformWrapperRequired):
+            prepare_cli(str(stub), ["-"], platform="win32")
+
+    def _real_cmd_roundtrip(self, suffix: str, exit_code: int):
+        req = _req("permission")
+        body = _ok_permission(req)
+        fake = self.d / "fake_dsh.py"
+        fake.write_text(_FAKE_DSH_WIRE, encoding="utf-8")
+        script = self.d / f"fake dsh{suffix}"
+        script.write_text(f'@"{sys.executable}" "{fake}" %*\r\n', encoding="utf-8")
+        log = self.d / "log.json"
+        env = os.environ.copy()
+        env["COLLAB_DEEPSEEK_HARNESS_BIN"] = str(script)
+        env["DEEPSEEK_API_KEY"] = "sk-test-not-real"
+        env["COLLAB_FAKE_DSH_STDOUT"] = json.dumps(body)
+        env["COLLAB_FAKE_DSH_EXIT"] = str(exit_code)
+        env["COLLAB_FAKE_DSH_LOG"] = str(log)
+        env["COLLAB_FAKE_DSH_MARKER"] = "knife-08"
+        proc = subprocess.run(
+            [sys.executable, str(WRAPPER)],
+            input=json.dumps(_envelope(req, "permission")),
+            capture_output=True, text=True, timeout=30, env=env,
+        )
+        return req, proc, log
+
+    @unittest.skipUnless(os.name == "nt", "real cmd/bat round trip: Windows only")
+    def test_real_cmd_bat_product_entry_roundtrip(self):
+        for suffix in (".cmd", ".bat"):
+            with self.subTest(suffix=suffix):
+                req, proc, log = self._real_cmd_roundtrip(suffix, 0)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                parsed = json.loads(proc.stdout)
+                self.assertEqual(parsed["decision"], "once")
+                self.assertEqual(parsed["application_id"], req["application_id"])
+                rec = json.loads(log.read_text(encoding="utf-8"))
+                self.assertEqual(Path(rec["argv"][0]).name, "fake_dsh.py")
+                self.assertEqual(rec["argv"][1:], ["--profile", "headless", "-"])
+                self.assertEqual(rec["marker"], "knife-08")
+                self.assertIn("collab-dsh-lead-", Path(rec["cwd"]).name)
+                self.assertIn("Do not use bash", rec["stdin"])
+                log.unlink()
+
+    @unittest.skipUnless(os.name == "nt", "real cmd/bat round trip: Windows only")
+    def test_real_cmd_nonzero_exit_fails_closed(self):
+        _req_, proc, _log = self._real_cmd_roundtrip(".cmd", 1)
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual((proc.stdout or "").strip(), "")
 
 
 @unittest.skipUnless(
