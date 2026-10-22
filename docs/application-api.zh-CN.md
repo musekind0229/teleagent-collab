@@ -319,11 +319,11 @@ Goal 在任何 Task 结果之前就失败（规划失败、预算/协调失败�
 | `execution` | `succeeded` / `failed` / `timeout` / `cancelled` / `in_progress` |
 | `artifacts` | `complete` / `incomplete`（有产出但还缺）/ `candidates_only`（期望文件都在，但所在 Task 失败，未被接受）/ `none`（什么都没产出）/ `not_started`（还没有 Task 就失败，如规划失败）/ `pending`（还在跑）。另给 `delivered_artifacts`（成功 Task 交付的）、`candidate_artifacts`（失败/取消 Task 留下的文件，只 stat）、`missing_artifacts`（含从没跑到的 Task 的期望产物）、`artifacts_by_task` |
 | `independent_checks` | `passed` / `failed` / `not_run`（目前只有 agy「must contain exactly」字面核对算） |
-| `technical_review` | `via_lead_gate`（后端把结果交组长审）/ `not_concluded` / `unsupported`（要了散文验收但没人核）/ `not_available`（后端没有组长审查通道，例如 agy） |
+| `technical_review` | `via_lead_gate`（后端把结果交组长审）/ `not_concluded` / `unsupported`（要了散文验收但没人核）/ `not_available`（后端没有组长审查通道，例如 `--planner deterministic` 下的 agy） |
 | `business_acceptance` | 恒为 `not_performed`：服务从不做业务验收 |
 | `deployed` | 恒为 `not_tracked` |
 
-`acceptance` 对象只接受 `artifacts`、`text`、`allow_aigc_marks`；其他键 400，不会在派工前被悄悄丢掉。`required_capabilities` 里的 `lead_review` 需要 planner 能审 **且** 后端把结果交给它（`capabilities.acceptance.lead_review`）；agy 上会 409。
+`acceptance` 对象只接受 `artifacts`、`text`、`allow_aigc_marks`；其他键 400，不会在派工前被悄悄丢掉。`required_capabilities` 里的 `lead_review` 需要 planner 能审 **且** 后端把结果交给它（`capabilities.acceptance.lead_review`）。agy 只在 `--planner lead` / `grok` 时打开该能力；`--planner deterministic` 下仍 409。
 
 ### 阶段时间线（`phase_timeline`，2026-10-02 起）
 
@@ -382,13 +382,22 @@ agy 后端把每个 worker 的 pid、进程组、启动时间令牌（防 pid �
 
 ### 组长技术评审与角色边界（#15，2026-10-03 现状）
 
-现状：agy 后端**没有**组长技术评审通道。agy 的 worker 结果不会交给组长审，`acceptance_status.technical_review` 恒为 `not_available`，`--require-capability lead_review` 在 agy 上 409。组长（`--planner lead` / `grok`）在 agy 上只做两件事：出计划，以及裁决后端交上来的 permission / review decision。agy 本身不发 permission 请求（`channels.permission=false`），所以实际只剩出计划。
+**更新（分支 `feat/agy-lead-review`，未合入、未部署）**：agy 后端新增组长技术评审回路，只在 `--planner lead` / `grok` 时打开（`capabilities.channels.review=true`、`capabilities.acceptance.lead_review=true`）；`--planner deterministic` 行为不变（仍是下面「原先」一段）。
+
+- worker 成功且声明的产物都在时，后端不直接收尾，而是挂一个 `kind=review` 的 decision（`request_id = agyrev:<run_id>:r<轮次>`），组长在后台线程里异步审，协调拍子不被阻塞。产物缺失的照原失败路径走，不送审。
+- 组长 `pass`：任务成功（审后产物被改动则按 `lead_review_unavailable: artifacts_changed_after_review` 失败）。`fail`：按章程 `max_redos`（默认 1，上限 3）在同一工作区返工；返工次数落盘，重启不清零。用完仍 fail：`acceptance_failed: lead_review_rejected; rework budget exhausted (r/N); last reason: …`。
+- 组长不可用（超时、非法输出等）：最多 2 次尝试后失败，`lead_review_unavailable: <code> after <n> attempt(s); next step: …`，结果里 `lead_review.human_action_required=true`。401 等不可重试错误不重试。
+- 重启丢了正在跑的返工进程：`lead_review_interrupted: round R worker lost in service restart; used reworks r/N are kept`，不自动重派。等审中的轮次重启后用同一 `request_id` 恢复。
+- 人工裁决优先：人先 resolve 时后台组长调用被取消；旧轮次或冲突的组长结果只丢弃（事件 `lead_review_stale_result` / `lead_review_late_result` / `lead_review_superseded` / `lead_review_stopped` 记在 decision 的 `details.lead_review.events`，不改当前轮次和已终态）。
+- 客户端 `summarize_status` 显示 `lead_review`（状态、轮次、尝试次数、错误码）与任务的 `rework`（used/max/最后裁决）。
+
+原先：agy 后端**没有**组长技术评审通道。agy 的 worker 结果不会交给组长审，`acceptance_status.technical_review` 恒为 `not_available`，`--require-capability lead_review` 在 agy 上 409。组长（`--planner lead` / `grok`）在 agy 上只做两件事：出计划，以及裁决后端交上来的 permission / review decision。agy 本身不发 permission 请求（`channels.permission=false`），所以实际只剩出计划。
 
 边界：
 
 - 服务只做机械验收：产物在不在、agy「must contain exactly」字面核对、AIGC 污染扫描。这些都不是技术评审，也不是业务验收（`business_acceptance` 恒为 `not_performed`）。
 - 技术评审（读代码/产物、跑独立测试、判断是否可合入）由调用方或人做。按「样例 → 实现 + 测试 → dry-run → 操作者批准」分单推进，每一单的结论由人或调用方在下一单里引用。
-- 本轮没有加 agy 上的组长评审开关：#15 最新评论要求先暂停功能扩展、先把最短链路验通，老板也还没拍板。需要时会做成默认关闭的开关。
+- agy 上的组长评审跟随 `--planner`：只有组长规划器时打开，确定性规划器下保持关闭。组长评审是技术评审，不是业务验收。
 
 ## 查询和控制
 

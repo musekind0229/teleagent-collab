@@ -2,6 +2,8 @@
 """Simulated tests for Grok lead-bin resolution (Windows / posix). No live CLI."""
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -11,6 +13,8 @@ from unittest import mock
 _SRC = Path(__file__).resolve().parent
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
+
+from lead_adapter.cancel import LeadCancelled
 
 from lead_adapter.grok_cli import (
     LEGACY_LINUX_LEAD_BIN,
@@ -271,6 +275,287 @@ class TestGrokCliAdapterDefaults(unittest.TestCase):
         self.assertIn("NO retry that drops --disallowed-tools", text)
         self.assertNotIn("retry without disallowed-tools", text)
 
+
+class TestGrokCliBoundedInlineReviewProfile(unittest.TestCase):
+    def _make_req(self, kind: str = "review") -> dict:
+        return {
+            "application_id": "rev_test123",
+            "context_summary": "sum_test123:review goal",
+            "kind": kind,
+            "task_goal": "review goal",
+            "authorized_scope": ["scope"],
+            "prohibitions": ["no tools"],
+            "acceptance_criteria": {"verdict": "strict"},
+            "current_application": {"target": "something"},
+        }
+
+    def test_review_opted_in_passes_bounded_flags_and_system_prompt(self):
+        req = self._make_req("review")
+        calls: list[list[str]] = []
+        captured_kwargs: list[dict] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            captured_kwargs.append(dict(kwargs))
+
+            class P:
+                returncode = 0
+                stdout = json.dumps({
+                    "application_id": "rev_test123",
+                    "context_summary": "sum_test123:review goal",
+                    "verdict": "pass",
+                    "reason": "clean",
+                })
+                stderr = ""
+
+            return P()
+
+        ad = GrokCliLeadAdapter(
+            bin_path="/bin/fake-grok",
+            bounded_inline_review_profile=True,
+        )
+        with mock.patch("lead_adapter.grok_cli.run_cancellable", fake_run):
+            raw, parsed = ad.decide(req, schema={"type": "object"}, cwd="/tmp", timeout_sec=42)
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("timeout", captured_kwargs[0])
+        self.assertEqual(captured_kwargs[0]["timeout"], 42.0)
+        cmd = calls[0]
+        # Bounded flags
+        self.assertIn("--tools", cmd)
+        tools_idx = cmd.index("--tools")
+        self.assertEqual(cmd[tools_idx + 1], "")
+
+        self.assertIn("--no-subagents", cmd)
+        self.assertIn("--disable-web-search", cmd)
+
+        self.assertIn("--reasoning-effort", cmd)
+        effort_idx = cmd.index("--reasoning-effort")
+        self.assertEqual(cmd[effort_idx + 1], "low")
+
+        self.assertIn("--system-prompt-override", cmd)
+        sp_idx = cmd.index("--system-prompt-override")
+        self.assertTrue(len(cmd[sp_idx + 1]) > 0)
+
+        # Preserve --disallowed-tools, schema, cwd, timeout bound, and one-call behavior
+        self.assertIn("--disallowed-tools", cmd)
+        self.assertIn("--json-schema", cmd)
+        schema_idx = cmd.index("--json-schema")
+        pinned = json.loads(cmd[schema_idx + 1])
+        self.assertEqual(pinned.get("properties", {}).get("application_id", {}).get("const"), "rev_test123")
+        self.assertEqual(pinned.get("properties", {}).get("context_summary", {}).get("const"), "sum_test123:review goal")
+
+        self.assertEqual(parsed.get("verdict"), "pass")
+
+    def test_review_opted_out_unchanged_behavior(self):
+        req = self._make_req("review")
+        calls: list[list[str]] = []
+        captured_kwargs: list[dict] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            captured_kwargs.append(dict(kwargs))
+
+            class P:
+                returncode = 0
+                stdout = json.dumps({
+                    "application_id": "rev_test123",
+                    "context_summary": "sum_test123:review goal",
+                    "verdict": "pass",
+                    "reason": "clean",
+                })
+                stderr = ""
+
+            return P()
+
+        # Default is False (opted out)
+        ad = GrokCliLeadAdapter(bin_path="/bin/fake-grok")
+        with mock.patch("lead_adapter.grok_cli.run_cancellable", fake_run):
+            ad.decide(req, schema={"type": "object"}, cwd="/tmp")
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("timeout", captured_kwargs[0])
+        cmd = calls[0]
+        self.assertNotIn("--tools", cmd)
+        self.assertNotIn("--no-subagents", cmd)
+        self.assertNotIn("--disable-web-search", cmd)
+        self.assertNotIn("--reasoning-effort", cmd)
+        self.assertNotIn("--system-prompt-override", cmd)
+        self.assertIn("--disallowed-tools", cmd)
+
+    def test_plan_and_permission_unchanged_when_opted_in(self):
+        for kind in ("plan", "permission"):
+            with self.subTest(kind=kind):
+                req = self._make_req(kind)
+                calls: list[list[str]] = []
+                captured_kwargs: list[dict] = []
+
+                def fake_run(cmd, **kwargs):
+                    calls.append(list(cmd))
+                    captured_kwargs.append(dict(kwargs))
+
+                    class P:
+                        returncode = 0
+                        stdout = json.dumps({
+                            "application_id": "rev_test123",
+                            "context_summary": "sum_test123:review goal",
+                            "decision": "once",
+                            "reason": "approved",
+                        })
+                        stderr = ""
+
+                    return P()
+
+                ad = GrokCliLeadAdapter(
+                    bin_path="/bin/fake-grok",
+                    bounded_inline_review_profile=True,
+                )
+                with mock.patch("lead_adapter.grok_cli.run_cancellable", fake_run):
+                    ad.decide(req, schema={"type": "object"}, cwd="/tmp")
+
+                self.assertEqual(len(calls), 1)
+                self.assertIn("timeout", captured_kwargs[0])
+                cmd = calls[0]
+                self.assertNotIn("--tools", cmd)
+                self.assertNotIn("--no-subagents", cmd)
+                self.assertNotIn("--disable-web-search", cmd)
+                self.assertNotIn("--reasoning-effort", cmd)
+                self.assertNotIn("--system-prompt-override", cmd)
+                self.assertIn("--disallowed-tools", cmd)
+
+    def test_opted_in_review_timeout_fails_with_no_retry(self):
+        req = self._make_req("review")
+        calls: list[list[str]] = []
+        captured_kwargs: list[dict] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            captured_kwargs.append(dict(kwargs))
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=30.0)
+
+        ad = GrokCliLeadAdapter(
+            bin_path="/bin/fake-grok",
+            bounded_inline_review_profile=True,
+        )
+        with mock.patch("lead_adapter.grok_cli.run_cancellable", fake_run):
+            raw, parsed = ad.decide(req, schema={"type": "object"}, cwd="/tmp", timeout_sec=30.0)
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("timeout", captured_kwargs[0])
+        self.assertEqual(raw, "TIMEOUT")
+        self.assertEqual(parsed, {"_lead_status": "timeout", "error": "grok_cli timeout"})
+
+    def test_opted_in_review_spawn_failure_fails_with_no_retry(self):
+        req = self._make_req("review")
+        calls: list[list[str]] = []
+        captured_kwargs: list[dict] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            captured_kwargs.append(dict(kwargs))
+            raise OSError("permission denied")
+
+        ad = GrokCliLeadAdapter(
+            bin_path="/bin/fake-grok",
+            bounded_inline_review_profile=True,
+        )
+        with mock.patch("lead_adapter.grok_cli.run_cancellable", fake_run):
+            raw, parsed = ad.decide(req, schema={"type": "object"}, cwd="/tmp")
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("timeout", captured_kwargs[0])
+        self.assertEqual(raw, "CALL_FAILED")
+        self.assertEqual(parsed.get("_lead_status"), "call_failed")
+        self.assertIn("grok_cli spawn failed", parsed.get("error", ""))
+
+    def test_opted_in_review_nonzero_exit_fails_with_no_retry(self):
+        req = self._make_req("review")
+        calls: list[list[str]] = []
+        captured_kwargs: list[dict] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            captured_kwargs.append(dict(kwargs))
+
+            class P:
+                returncode = 1
+                stdout = ""
+                stderr = "flag error or model crash"
+
+            return P()
+
+        ad = GrokCliLeadAdapter(
+            bin_path="/bin/fake-grok",
+            bounded_inline_review_profile=True,
+        )
+        with mock.patch("lead_adapter.grok_cli.run_cancellable", fake_run):
+            raw, parsed = ad.decide(req, schema={"type": "object"}, cwd="/tmp")
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("timeout", captured_kwargs[0])
+        self.assertEqual(parsed.get("_lead_status"), "call_failed")
+        self.assertEqual(parsed.get("returncode"), 1)
+        self.assertIn("flag error or model crash", parsed.get("error", ""))
+
+    def test_opted_in_review_cancelled_returns_call_failed(self):
+        req = self._make_req("review")
+        calls: list[list[str]] = []
+        captured_kwargs: list[dict] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            captured_kwargs.append(dict(kwargs))
+            raise LeadCancelled("goal stopped")
+
+        ad = GrokCliLeadAdapter(
+            bin_path="/bin/fake-grok",
+            bounded_inline_review_profile=True,
+        )
+        with mock.patch("lead_adapter.grok_cli.run_cancellable", fake_run):
+            raw, parsed = ad.decide(req, schema={"type": "object"}, cwd="/tmp")
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("timeout", captured_kwargs[0])
+        self.assertEqual(raw, "CALL_FAILED")
+        self.assertEqual(parsed.get("_lead_status"), "call_failed")
+        self.assertIn("grok_cli stopped", parsed.get("error", ""))
+
+    def test_grok_cli_source_uses_run_cancellable_not_subprocess_run(self):
+        src = (Path(__file__).resolve().parent / "lead_adapter" / "grok_cli.py").read_text(encoding="utf-8")
+        self.assertIn("run_cancellable(cmd", src)
+        self.assertNotIn("subprocess.run(", src)
+
+
+
+@unittest.skipIf(sys.platform == "win32", "posix shebang fake binary")
+class TestGrokCliBoundedProfileRealCancelChain(unittest.TestCase):
+    """No mocks: the opted-in review argv goes through the real run_cancellable."""
+
+    def test_bounded_review_argv_through_real_run_cancellable(self):
+        import os
+        import stat
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "fake-grok"
+            fake.write_text(
+                "#!" + sys.executable + "\n"
+                "import json, sys\n"
+                "print(json.dumps({'application_id': 'rev_real', 'context_summary': 's',"
+                " 'verdict': 'pass', 'reason': 'ok', 'argv': sys.argv[1:]}))\n",
+                encoding="utf-8",
+            )
+            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+            req = {"application_id": "rev_real", "context_summary": "s", "kind": "review"}
+            ad = GrokCliLeadAdapter(bin_path=str(fake), bounded_inline_review_profile=True)
+            with mock.patch("subprocess.run", side_effect=AssertionError("subprocess.run must not be used")):
+                raw, parsed = ad.decide(req, schema={"type": "object"}, cwd=tmp, timeout_sec=30)
+            argv = (parsed or {}).get("argv") or []
+            self.assertIn("--tools", argv, raw)
+            self.assertEqual(argv[argv.index("--tools") + 1], "")
+            for flag in ("--no-subagents", "--disable-web-search", "--disallowed-tools"):
+                self.assertIn(flag, argv)
+            self.assertEqual(argv[argv.index("--reasoning-effort") + 1], "low")
+            self.assertEqual(parsed.get("verdict"), "pass")
 
 if __name__ == "__main__":
     unittest.main()

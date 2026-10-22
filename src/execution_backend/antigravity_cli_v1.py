@@ -7,6 +7,8 @@ explicitly sets agy_auto_approve=true.
 """
 from __future__ import annotations
 
+import codecs
+import io
 import json
 import logging
 import os
@@ -50,6 +52,8 @@ from execution_backend.agy_run_registry import (
     kill_process_tree,
     process_start_token,
 )
+from execution_backend.agy_review_controller import AgyReviewController
+from execution_backend.agy_review_store import AgyReviewStore, resolve_review_store_path
 from framework.progress_budget import (
     artifact_checkpoint,
     budget_enforcement_capability,
@@ -336,9 +340,11 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
     backend_id = BACKEND_ID
 
     def capabilities(self) -> dict[str, Any]:
-        """One-shot ``agy --print``. No permission/question/review channel.
+        """One-shot ``agy --print``. No permission or question channel.
 
-        ``list_pending_actions`` is always empty and ``reply_permission`` is 501.
+        The review channel is on only after ``enable_lead_review``
+        (``lead_review_mode`` ``async_v1``). Otherwise ``list_pending_actions``
+        is empty. ``reply_permission`` is 501.
         External pins are prompt text only. ``skip_permissions`` mirrors
         ``agy_auto_approve_enabled(charter=None)`` on this backend's env.
         Run records are in-process; restart does not resume them.
@@ -387,13 +393,38 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             max_tool_calls="unsupported",
             no_progress_sec="enforced",
         )
+        # max_runs is the account-pool cap only. Parked awaiting_review runs with
+        # no live proc are pending_review_runs; async_v1 adds that in the coordinator.
+        parked_reviews = 0
+        seen_runs: set[int] = set()
+        try:
+            run_records = list(self._runs.values())
+        except RuntimeError:
+            run_records = []
+        for rec in run_records:
+            if not isinstance(rec, dict) or id(rec) in seen_runs:
+                continue
+            seen_runs.add(id(rec))
+            review = rec.get("review")
+            if not isinstance(review, dict) or review.get("state") != "awaiting_review":
+                continue
+            proc = rec.get("proc")
+            poll = getattr(proc, "poll", None)
+            if callable(poll) and poll() is None:
+                continue
+            parked_reviews += 1
         caps["concurrency"] = {
             "max_runs": self._account_pool_run_limit(),
             "limited_by": ["agy_account_pool"],
+            # Parked reviews only (no live proc, no lease); running reworks and rework_waiting are excluded.
+            "pending_review_runs": parked_reviews,
         }
         # The prompt-only warning holds with or without skip-permissions; the
         # status view shows it only on Goals that actually pin inputs.
         caps["warnings"] = [PROMPT_ONLY_INPUTS_WARNING] + ([SKIP_PERMISSIONS_WARNING] if skip else [])
+        if self._lead_review:
+            caps["channels"]["review"] = True
+            caps["acceptance"]["lead_review"] = True
         known, source = self._model_catalog.known()
         caps["models"] = {
             "selectable": True,
@@ -408,6 +439,18 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
     def enable_model_probe(self) -> None:
         """Service start: refresh the known-model list from ``agy models`` in the background."""
         self._model_catalog.enable_auto_refresh()
+
+    def enable_lead_review(self) -> None:
+        """Turn on async lead review for later runs and for rows restored at startup."""
+        self._review.enable()
+
+    @property
+    def lead_review_mode(self) -> str:
+        return self._review.mode
+
+    def add_review_listener(self, cb) -> None:
+        """``cb(request_id, verdict, state)`` after each non-idempotent resolve."""
+        self._review.add_listener(cb)
 
     def _probe_models(self) -> list[str] | None:
         """``agy models`` under a pool account HOME (else the base env). None on failure."""
@@ -473,6 +516,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         persist_pool: bool = True,
         precheck: Any | None = None,
         run_registry_path: str | None = None,
+        review_store_path: str | None = None,
     ) -> None:
         # Base environ (no account pin). Per-dispatch HOME lives on each run rec.
         # Only an explicit account_pool_path (from inject / factory) enables
@@ -517,6 +561,10 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         self.reclaimed_leases_at_start: list[dict[str, Any]] = []
         if self._account_pool_path:
             self.reclaimed_leases_at_start = self._reclaim_pool_leases_at_start()
+        self._lead_review = False
+        review_path = resolve_review_store_path(explicit=review_store_path, environ=self._base_env(), run_registry_path=reg_path or None)
+        self._review = AgyReviewController(self, store=AgyReviewStore(review_path))
+        self._review.restore()
 
     def _base_env(self) -> Mapping[str, str]:
         return self._base_environ if self._base_environ is not None else os.environ
@@ -643,6 +691,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             except Exception as exc:  # noqa: BLE001
                 _LOG.warning("agy run registry record failed (%s)", type(exc).__name__)
         self._start_pipe_drainers(rec, proc)
+        self._review.arm(rec, charter, prompt)
         return self._start_payload(rec, ok=True)
 
     def _start_run_locked(
@@ -721,41 +770,9 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         self._runs[run_id] = rec
         self._runs[handle] = rec
 
-        try:
-            # Machine-wide slot: clear only for a pool-bound spawn, immediately before Popen.
-            # prepare_antigravity_environ_from_pool already cleared; clear again right
-            # before Popen so a concurrent entrance cannot leave a keyring shadow.
-            if str(spawn_env.get(ENV_POOL) or "").strip() or profile:
-                clear_windows_antigravity_keyring()
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(root),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                stdin=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                start_new_session=True,
-                env=dict(spawn_env),
-            )
-        except OSError as e:
-            self._release_pool_after_failed_spawn(spawn_env)
-            rec["state"] = "failed"
-            rec["activity"] = "idle"
-            rec["finish"] = "error"
-            rec["assistant_error"] = f"agy spawn failed: {e}"
-            rec["harvested"] = True
-            rec["path_errors"] = errors + [rec["assistant_error"]]
-            return rec, self._start_payload(rec, ok=False)
-        # Windows: kill-on-close Job Object (no-op elsewhere; 未在 Win 实测).
-        win_job.attach(proc)
-        # cgroup v2 oom_kill baseline: a later SIGKILL can then be told apart
-        # from an OOM kill by the service's memory limit (Linux only).
-        oom_dir = cgroup_oom.cgroup_dir(proc.pid) or cgroup_oom.cgroup_dir()
-        rec["_oom_cgroup"] = str(oom_dir) if oom_dir else ""
-        rec["_oom_kill_before"] = cgroup_oom.oom_kill_count(oom_dir)
-        rec["proc"] = proc
+        failed = self._spawn_locked(rec, cmd, spawn_env, errors)
+        if failed is not None:
+            return rec, failed
         return rec, None
 
     def _start_payload(self, rec: dict[str, Any], *, ok: bool) -> dict[str, Any]:
@@ -899,14 +916,45 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
     def _drain_stream(stream: Any, chunks: list[str], done: threading.Event) -> None:
         """Continuously read one PIPE so the child cannot block on a full buffer."""
         try:
-            while True:
+            raw = getattr(stream, "buffer", None)
+            if raw is not None:
+                utf8_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+                decoder = io.IncrementalNewlineDecoder(utf8_decoder, translate=True)
+                read_raw = getattr(raw, "read1", raw.read)
+                while True:
+                    try:
+                        b = read_raw(65536)
+                    except (ValueError, OSError):
+                        break
+                    if not b:
+                        break
+                    s = decoder.decode(b)
+                    if s:
+                        chunks.append(s)
                 try:
-                    piece = stream.read(65536)
-                except (ValueError, OSError):
-                    break
-                if not piece:
-                    break
-                chunks.append(piece)
+                    tail = decoder.decode(b"", final=True)
+                    if tail:
+                        chunks.append(tail)
+                except Exception:
+                    pass
+            else:
+                decoder = io.IncrementalNewlineDecoder(None, translate=True)
+                while True:
+                    try:
+                        piece = stream.read(1)
+                    except (ValueError, OSError):
+                        break
+                    if not piece:
+                        break
+                    s = decoder.decode(piece)
+                    if s:
+                        chunks.append(s)
+                try:
+                    tail = decoder.decode("", final=True)
+                    if tail:
+                        chunks.append(tail)
+                except Exception:
+                    pass
         finally:
             done.set()
 
@@ -1097,6 +1145,8 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
     ) -> dict[str, Any]:
         rec = self._get(run_id)
         self._refresh(rec)
+        self._review.on_exit(rec)
+        self._review.retry_waiting(rec)
         if rec.get("cancelled"):
             activity = "idle"
             fin = "cancelled"
@@ -1142,6 +1192,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         if profile:
             out["agy_profile"] = profile
         out["progress"] = self._runner_progress(rec)
+        self._review.override_awaiting(out, rec)
         return _apply_contract_meta(out, rec)
 
     def _runs_sharing_home(self, rec: Mapping[str, Any]) -> int:
@@ -1348,7 +1399,10 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
             out["agy_profile"] = profile
         _apply_contract_meta(out, rec)
         self._attach_spawn_output(out, rec)
-        self._persist_pool_after_collect(out, rec)
+        with self._review.hold():
+            if self._review.pool_pending(rec):
+                self._persist_pool_after_collect(out, rec)
+            self._review.project(out, rec)
         return out
 
     def _attach_spawn_output(self, out: dict[str, Any], rec: dict[str, Any]) -> None:
@@ -1396,7 +1450,11 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
 
     def list_pending_actions(self, *, session_id: str | None = None) -> tuple[int, list]:
         # agy print is one-shot. No permission channel — same as inprocess.
-        return 200, []
+        if not self._lead_review and not self._review._has_review_rec():
+            return 200, []
+        for rec in self._review.iter_records(session_id):
+            self._review.retry_waiting(rec)
+        return self._review.pending_actions(session_id)
 
     def reply_permission(self, request_id: str, reply: str) -> tuple[int, Any]:
         # Fail-closed. skip-permissions is NOT an approval through this contract.
@@ -1406,11 +1464,77 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         )
         return 501, body
 
+    def resolve_decision(
+        self,
+        request_id: str,
+        *,
+        verdict: str,
+        reason: str = "",
+        answers: Any = None,
+    ) -> dict[str, Any]:
+        """Apply one lead verdict. ValueError leaves the run and the store untouched."""
+        return self._review.resolve_decision(request_id, verdict=verdict, reason=reason, answers=answers)
+
+    def review_outcome(self, request_id: str) -> dict[str, Any] | None:
+        """Recorded verdict for an agy review id, or None. Never raises."""
+        return self._review.review_outcome(request_id)
+
+    def _spawn_locked(
+        self,
+        rec: dict[str, Any],
+        cmd: list[str],
+        spawn_env: Mapping[str, str],
+        errors: list[str],
+    ) -> dict[str, Any] | None:
+        """Popen into ``rec``. Returns a failure payload, or None when the child started."""
+        profile = str(spawn_env.get(ENV_PROFILE) or "").strip()
+        root = Path(str(rec.get("directory") or ""))
+        try:
+            # Machine-wide slot: clear only for a pool-bound spawn, immediately before Popen.
+            # prepare_antigravity_environ_from_pool already cleared; clear again right
+            # before Popen so a concurrent entrance cannot leave a keyring shadow.
+            if str(spawn_env.get(ENV_POOL) or "").strip() or profile:
+                clear_windows_antigravity_keyring()
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(root),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                start_new_session=True,
+                env=dict(spawn_env),
+            )
+        except OSError as e:
+            self._release_pool_after_failed_spawn(spawn_env)
+            rec["state"] = "failed"
+            rec["activity"] = "idle"
+            rec["finish"] = "error"
+            rec["assistant_error"] = f"agy spawn failed: {e}"
+            rec["harvested"] = True
+            rec["path_errors"] = errors + [rec["assistant_error"]]
+            return self._start_payload(rec, ok=False)
+        # Windows: kill-on-close Job Object (no-op elsewhere; 未在 Win 实测).
+        win_job.attach(proc)
+        # cgroup v2 oom_kill baseline: a later SIGKILL can then be told apart
+        # from an OOM kill by the service's memory limit (Linux only).
+        oom_dir = cgroup_oom.cgroup_dir(proc.pid) or cgroup_oom.cgroup_dir()
+        rec["_oom_cgroup"] = str(oom_dir) if oom_dir else ""
+        rec["_oom_kill_before"] = cgroup_oom.oom_kill_count(oom_dir)
+        rec["proc"] = proc
+        return None
+
     def cancel(self, run_id: str) -> tuple[int, Any]:
         try:
             rec = self._get(run_id)
         except BackendError as e:
             return 404, {"ok": False, "error": str(e)}
+        # Review decision, kill, wait, and lease release run under the controller lock.
+        reviewed = self._review.cancel_run(rec)
+        if reviewed is not None:
+            return reviewed
         proc: subprocess.Popen | None = rec.get("proc")
         if proc is None or proc.poll() is not None:
             self._harvest(rec)
@@ -1431,6 +1555,7 @@ class AntigravityCliExecutionBackend(ExecutionBackendABC):
         rec["state"] = "cancelled"
         self._harvest(rec)
         self._release_pool_lease_after_cancel(rec)
+        self._review.cancel_live(rec)
         return 200, {"ok": True, "run_id": rec["run_id"], "state": "cancelled"}
 
     def _release_pool_lease_after_cancel(self, rec: dict[str, Any]) -> None:
@@ -1578,6 +1703,8 @@ def apply_agy_acceptance_gate(
         return result
     acceptance = charter.get("acceptance")
     result["force_lead_review"] = bool(charter.get("force_lead_review"))
+    if isinstance(result.get("review"), dict) and result["review"].get("source") == "lead_review":
+        return result
     notes = _ensure_notes(result)
     exact_text = acceptance.strip() if isinstance(acceptance, str) else ""
     exact = bool(exact_text and _EXACT_CONTENT_RE.match(exact_text))

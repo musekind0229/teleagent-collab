@@ -21,6 +21,12 @@ Classes (first match wins):
 
 eligibility_blocked is not auth_invalid and not quota_exhausted: oauth may
 already be on disk; the account is simply not eligible in this location.
+Explicit genuine location/product eligibility blocks win first (even if mixed
+with 503 or auth/quota). The known transient envelope "Eligibility check
+failed: UNAVAILABLE (code 503): The service is currently unavailable" yields to
+auth_invalid if auth matches, quota_exhausted if quota matches, else
+temporary_no_capacity (not eligibility_blocked). Other eligibility checks stay
+eligibility_blocked before auth/quota.
 Scheduler mapping (agy_account_pool.apply_class_to_state):
   eligibility_blocked / auth_invalid -> unavailable (do not dispatch)
   quota_exhausted -> cooldown (pool cooldown_sec / cooldown_mode; recoverable)
@@ -98,8 +104,18 @@ def classify(stdout: str = "", stderr: str = "", rc: int | None = None) -> str:
             blob += "\n" + str(obj.get("error") or "")
     except Exception:
         pass
-    # Eligibility is more specific than auth/quota and must win first:
-    # the account is logged in; the product is geo-blocked.
+    # Explicit genuine location/product eligibility block must win first (even if mixed with 503 or auth/quota):
+    if re.search(r"not currently available in your location|not eligible for Antigravity", blob, re.I):
+        return CLASS_ELIGIBILITY_BLOCKED
+    # Fixed known eligibility 503 envelope (transient service unavailable, not account/geo block).
+    # Only this exact known 503 envelope yields to AUTH or QUOTA when mixed:
+    if re.search(r"Eligibility check failed:\s*UNAVAILABLE\s*\(code\s*503\):\s*The service is currently unavailable", blob, re.I):
+        if AUTH.search(blob):
+            return CLASS_AUTH_INVALID
+        if QUOTA.search(blob):
+            return CLASS_QUOTA_EXHAUSTED
+        return CLASS_TEMPORARY_NO_CAPACITY
+    # Remaining bare or other eligibility blocks (including unknown mixed with auth or quota):
     if ELIG.search(blob):
         return CLASS_ELIGIBILITY_BLOCKED
     if AUTH.search(blob):

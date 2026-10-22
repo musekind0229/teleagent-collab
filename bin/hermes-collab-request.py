@@ -1016,25 +1016,75 @@ def _decision_summary(row: dict[str, Any]) -> str:
     return _one_line(str(kind or ""))
 
 
+_AGY_OLD_REASON = "TeleAgent worker requires a bounded decision"
+_AGY_NEW_REASON = "agy run awaits a lead review decision"
+_AGY_TITLE_PREFIX = "TeleAgent "
+
+
+def _is_agy_decision(row: dict[str, Any]) -> bool:
+    """An agy row: payload.backend starts with antigravity. or an id starts with agyrev:."""
+    details = row.get("details") if isinstance(row.get("details"), dict) else {}
+    payload = details.get("payload") if isinstance(details.get("payload"), dict) else {}
+    backend = payload.get("backend")
+    if isinstance(backend, str) and backend.startswith("antigravity."):
+        return True
+    ids = (
+        row.get("backend_request_id"),
+        details.get("backend_request_id"),
+        row.get("request_id"),
+    )
+    return any(isinstance(item, str) and item.startswith("agyrev:") for item in ids)
+
+
+def _agy_display(text: str, *, field: str) -> str:
+    """Title drops a leading TeleAgent. Reason and summary map only the known strings."""
+    if field != "title" and text == _AGY_OLD_REASON:
+        return _AGY_NEW_REASON
+    if field == "reason" or (field == "summary" and not text.startswith("TeleAgent review")):
+        return text
+    if text.startswith(_AGY_TITLE_PREFIX):
+        return "agy " + text[len(_AGY_TITLE_PREFIX):]
+    return text
+
+
 def _decision_brief(row: dict[str, Any]) -> dict[str, Any]:
     def _text(value: Any) -> str:
         if value is None:
             return ""
         return str(value)
 
+    title = _text(row.get("title"))
+    reason = _text(row.get("reason"))
+    summary = _decision_summary(row)
+    if _is_agy_decision(row):
+        title = _agy_display(title, field="title")
+        reason = _agy_display(reason, field="reason")
+        summary = _agy_display(summary, field="summary")
     brief = {
         "decision_id": _text(row.get("decision_id")),
         "kind": _text(row.get("kind")),
-        "title": _text(row.get("title")),
+        "title": title,
         "task_id": _text(row.get("task_id")),
         "status": _text(row.get("status")),
-        "reason": _text(row.get("reason")),
-        "summary": _decision_summary(row),
+        "reason": reason,
+        "summary": summary,
     }
     if "awaiting" in row and row.get("awaiting") is not None:
         awaiting = str(row.get("awaiting"))
         if awaiting:
             brief["awaiting"] = awaiting
+    details = row.get("details")
+    if isinstance(details, dict) and isinstance(details.get("lead_review"), dict):
+        # Progress only. The runner event log stays out of the brief.
+        lead = details["lead_review"]
+        shown: dict[str, Any] = {}
+        for key in ("status", "round", "attempt", "max_attempts", "started_at_iso"):
+            if key in lead:
+                shown[key] = lead[key]
+        last_error = lead.get("last_error")
+        if isinstance(last_error, dict) and "code" in last_error:
+            shown["error_code"] = last_error["code"]
+        brief["lead_review"] = shown
     return brief
 
 
@@ -1875,6 +1925,11 @@ def summarize_status(payload: dict[str, Any]) -> dict[str, Any]:
     Free-text fields are capped; ``truncated`` is true when any cap fired.
     ``progress.percent`` is included only when the server sent it.
     ``usage`` is copied from task results and is never summed.
+    A task result ``rework`` dict adds ``used``, ``max``, and the last verdict.
+    A task result ``lead_review`` dict adds that outcome brief.
+    Scheduler ``execution_limit`` is the agy execution (account pool) cap.
+    ``active_task_limit`` is the coordinator active-task limit, not worker
+    concurrency. Each is copied only as a non-bool int >= 0.
     """
     cut = _Cut()
     tasks = _task_rows(payload)
@@ -1900,6 +1955,11 @@ def summarize_status(payload: dict[str, Any]) -> dict[str, Any]:
         for key in ("title", "reason", "summary", "kind", "decision_id", "awaiting", "status", "task_id"):
             if key in brief and isinstance(brief[key], str):
                 brief[key] = cut.text(brief[key], _SUMMARY_TEXT_CAP)
+        lead_brief = brief.get("lead_review")
+        if isinstance(lead_brief, dict):
+            for key, value in list(lead_brief.items()):
+                if isinstance(value, str):
+                    lead_brief[key] = cut.text(value, _SUMMARY_TEXT_CAP)
         briefs.append(brief)
     lead_count, human_count = _awaiting_counts(payload, rows)
     task_views: list[dict[str, Any]] = []
@@ -1933,6 +1993,35 @@ def summarize_status(payload: dict[str, Any]) -> dict[str, Any]:
                 "review": _task_review(task, result, cut),
             }
         )
+        if isinstance(result, dict):
+            view = task_views[-1]
+            rework = result.get("rework")
+            if isinstance(rework, dict):
+                history = rework.get("history")
+                last_verdict = None
+                if isinstance(history, list) and history and isinstance(history[-1], dict):
+                    verdict = history[-1].get("verdict")
+                    if isinstance(verdict, str):
+                        last_verdict = cut.text(verdict, _SUMMARY_TEXT_CAP) or None
+                    elif verdict:
+                        last_verdict = verdict
+                used = rework.get("used")
+                maximum = rework.get("max")
+                view["rework"] = {
+                    "used": cut.text(used, _SUMMARY_TEXT_CAP) if isinstance(used, str) else used,
+                    "max": cut.text(maximum, _SUMMARY_TEXT_CAP) if isinstance(maximum, str) else maximum,
+                    "last_verdict": last_verdict,
+                }
+            lead = result.get("lead_review")
+            if isinstance(lead, dict):
+                shown_lead: dict[str, Any] = {}
+                for key in ("outcome", "code", "next_step", "human_action_required"):
+                    value = lead.get(key)
+                    if isinstance(value, str):
+                        shown_lead[key] = cut.text(value, _SUMMARY_TEXT_CAP)
+                    else:
+                        shown_lead[key] = value
+                view["lead_review"] = shown_lead
     summary: dict[str, Any] = {
         "ok": True if ok_value is None else _as_bool(ok_value),
         "request_id": request_id_text,
@@ -2034,6 +2123,10 @@ def summarize_status(payload: dict[str, Any]) -> dict[str, Any]:
             "capacity": 0 if capacity is None else capacity,
             "waiting_reason": cut.text("" if reason is None else str(reason), _SUMMARY_TEXT_CAP),
         }
+        for key in ("execution_limit", "parked_review_runs", "active_task_limit"):
+            value = scheduler.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                summary["scheduler"][key] = value
     if isinstance(wait, dict):
         summary["wait"] = wait
     return summary

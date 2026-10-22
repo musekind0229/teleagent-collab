@@ -1600,6 +1600,8 @@ class AppCoordinator:
         # coordination so a queued Task is dispatched at most once by this
         # service instance. Released only around start_run.
         self._lock = threading.RLock()
+        from framework.lead_review_runner import LeadReviewRunner
+        self._review_runner = LeadReviewRunner.for_coordinator(self)
 
     def now(self) -> float:
         return float(self._clock())
@@ -1694,6 +1696,7 @@ class AppCoordinator:
         snap = current["goal"]
         if snap.get("state") == "cancel_requested":
             self._stop_planning_async(goal_id, "goal cancelled")
+            self._review_runner.stop_goal(goal_id, "goal cancelled")
             active = [
                 t
                 for t in (snap.get("tasks") or [])
@@ -1727,6 +1730,7 @@ class AppCoordinator:
         if snap.get("state") in {"completed", "failed", "cancelled"}:
             # Failed/cancelled while the lead was still planning: stop it now.
             self._stop_planning_async(goal_id, f"goal {snap.get('state')}")
+            self._review_runner.stop_goal(goal_id, f"goal {snap.get('state')}")
             return {"ok": True, "goal_id": goal_id, "state": snap.get("state"), "action": "terminal"}
         tasks = [dict(t) for t in (snap.get("tasks") or []) if isinstance(t, Mapping)]
         if not tasks:
@@ -1878,6 +1882,7 @@ class AppCoordinator:
             row = self.stop_planning(goal_id, reason)
             if row is not None:
                 out.append({"goal_id": goal_id, **row})
+        out.extend(self._review_runner.stop_all(reason))
         return out
 
     def _stop_planning_async(self, goal_id: str, reason: str) -> None:
@@ -2460,7 +2465,16 @@ class AppCoordinator:
             payload["state"] = state
         return payload
 
-    def _backend_run_limit(self) -> int | None:
+    def _backend_run_limit(self, parts: dict | None = None) -> int | None:
+        """Return the coordinator active-task limit, not worker concurrency.
+
+        ``execution_limit`` is the agy execution (account pool) cap. When
+        ``parts`` is a dict and this returns a limit, it records that cap, the
+        parked-review count actually added, and whether async_v1 was opted in.
+        A ``None`` result leaves ``parts`` empty.
+        """
+        if isinstance(parts, dict):
+            parts.clear()
         fn = getattr(self.backend, "capabilities", None)
         if not callable(fn):
             return None
@@ -2473,7 +2487,23 @@ class AppCoordinator:
         conc = raw.get("concurrency")
         if not isinstance(conc, dict):
             return None
-        return as_limit(conc.get("max_runs"))
+        base = as_limit(conc.get("max_runs"))
+        if base is None:
+            return None
+        try:
+            opted_in = getattr(self.backend, "lead_review_mode", None) == "async_v1"
+        except Exception:
+            opted_in = False
+        pending = conc.get("pending_review_runs") if opted_in else 0
+        if isinstance(pending, int) and not isinstance(pending, bool) and pending >= 0:
+            added = pending
+        else:
+            added = 0
+        if isinstance(parts, dict):
+            parts["execution_limit"] = base
+            parts["parked_review_runs"] = added
+            parts["opted_in"] = opted_in
+        return base + added
 
     def _goal_task_rows(self) -> list[tuple[str, list[dict[str, Any]]]]:
         out: list[tuple[str, list[dict[str, Any]]]] = []
@@ -2529,10 +2559,18 @@ class AppCoordinator:
         snap: Mapping[str, Any],
         public_caps: Mapping[str, Any],
     ) -> dict[str, Any]:
+        """Derived scheduler view for one goal.
+
+        The backend cap is the coordinator active-task limit, not worker
+        concurrency. When async_v1 is opted in, ``execution_limit`` is the agy
+        execution (account pool) cap and ``active_task_limit`` is that
+        coordinator limit.
+        """
         conc = public_caps.get("concurrency") if isinstance(public_caps.get("concurrency"), Mapping) else {}
         per = as_limit(conc.get("max_parallel_per_goal")) or self.max_parallel_per_goal
         glob = as_limit(conc.get("max_parallel_global")) or self.max_parallel_global
-        backend_limit = as_limit(conc.get("backend_max_runs"))
+        parts: dict[str, Any] = {}
+        backend_limit = self._backend_run_limit(parts)
         running_elsewhere = 0
         held: set[str] = set()
         for gid, tasks in self._goal_task_rows():
@@ -2546,7 +2584,7 @@ class AppCoordinator:
                 )
                 if key:
                     held.add(key)
-        return scheduler_view(
+        view = scheduler_view(
             tasks=snap.get("tasks") or [],
             pending=snap.get("pending_decisions") or [],
             per_goal=per,
@@ -2557,6 +2595,13 @@ class AppCoordinator:
             workspaces_root=self.workspaces_root,
             goal_id=goal_id,
         )
+        if parts.get("opted_in") is True:
+            execution_limit = parts["execution_limit"]
+            parked_review_runs = parts["parked_review_runs"]
+            view["execution_limit"] = execution_limit
+            view["parked_review_runs"] = parked_review_runs
+            view["active_task_limit"] = execution_limit + parked_review_runs
+        return view
 
     def _after_observe(
         self,
@@ -3066,6 +3111,8 @@ class AppCoordinator:
         decision: Mapping[str, Any],
         action: Mapping[str, Any],
     ) -> dict[str, Any]:
+        if self._review_runner.owns(action):
+            return self._review_runner.step(snap, task, decision=decision, action=action)
         lead_decider = getattr(self.planner, "decide_action", None)
         backend_resolver = getattr(self.backend, "resolve_decision", None)
         backend_kind = str(action.get("kind") or "")

@@ -110,11 +110,13 @@ class GrokCliLeadAdapter(LeadAdapterABC):
         bin_path: str | None = None,
         disallowed_tools: str = "bash,shell,edit,write,web_search,web_fetch",
         max_turns: int = 1,
+        bounded_inline_review_profile: bool = False,
     ) -> None:
         explicit = (bin_path or "").strip()
         self.bin_path = explicit or resolve_lead_bin()
         self.disallowed_tools = disallowed_tools
         self.max_turns = max_turns
+        self.bounded_inline_review_profile = bounded_inline_review_profile
 
     def decide(
         self,
@@ -146,6 +148,23 @@ class GrokCliLeadAdapter(LeadAdapterABC):
             "--disallowed-tools",
             self.disallowed_tools,
         ]
+        if self.bounded_inline_review_profile and request.get("kind") == "review":
+            system_prompt = (
+                "You are an inline technical reviewer. "
+                "Output strict JSON conforming to the response schema. "
+                "Do not use tools, web search, or subagents."
+            )
+            cmd.extend([
+                "--tools",
+                "",
+                "--no-subagents",
+                "--disable-web-search",
+                "--reasoning-effort",
+                "low",
+                "--system-prompt-override",
+                system_prompt,
+            ])
+
         # Intentionally NO retry that drops --disallowed-tools (条3: delete that degradation).
         try:
             # Own process group (planning and permission/review decisions):
